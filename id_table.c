@@ -24,6 +24,7 @@
  * hash
  *   21: funny falcon's Coalesced Hashing implementation [Feature #6962]
  *   22: simple open addressing with quadratic probing.
+ *   23: open addressing with quadratic probing without thumbstone count.
  * mix (list + hash)
  *   31: list(12) (capa <= 32) + hash(22)
  *   32: list(14) (capa <= 32) + hash(22)
@@ -32,7 +33,7 @@
  */
 
 #ifndef ID_TABLE_IMPL
-#define ID_TABLE_IMPL 31
+#define ID_TABLE_IMPL 23
 #endif
 
 #if ID_TABLE_IMPL == 0
@@ -104,6 +105,13 @@
 #define ID_TABLE_IMPL_TYPE struct hash_id_table
 
 #define ID_TABLE_USE_SMALL_HASH 1
+#define ID_TABLE_USE_ID_SERIAL 1
+
+#elif ID_TABLE_IMPL == 23
+#define ID_TABLE_NAME hash
+#define ID_TABLE_IMPL_TYPE struct hash_id_table
+
+#define ID_TABLE_USE_SMALLER_HASH 1
 #define ID_TABLE_USE_ID_SERIAL 1
 
 #elif ID_TABLE_IMPL == 31
@@ -740,7 +748,6 @@ typedef struct sa_entry {
 typedef struct {
     sa_index_t num_bins;
     sa_index_t num_entries;
-    sa_index_t free_pos;
     sa_entry *entries;
 } sa_table;
 
@@ -751,7 +758,6 @@ sa_init_table(register sa_table *table, sa_index_t num_bins)
         table->num_entries = 0;
         table->entries = ZALLOC_N(sa_entry, num_bins);
         table->num_bins = num_bins;
-        table->free_pos = num_bins;
     }
 }
 
@@ -789,36 +795,30 @@ calc_pos(register sa_table* table, id_key_t key)
     return key & (table->num_bins - 1);
 }
 
-static void
-fix_empty(register sa_table* table)
-{
-    while(--table->free_pos &&
-            table->entries[table->free_pos-1].next != SA_EMPTY);
-}
-
 #define FLOOR_TO_4 ((~((sa_index_t)0)) << 2)
 static sa_index_t
 find_empty(register sa_table* table, register sa_index_t pos)
 {
-    sa_index_t new_pos = table->free_pos-1;
+    sa_index_t dlt = 4;
     sa_entry *entry;
-    static unsigned offsets[][3] = {
-	    {1, 2, 3},
-	    {2, 3, 0},
-	    {3, 1, 0},
-	    {2, 1, 0}
-    };
-    unsigned *check = offsets[pos&3];
     pos &= FLOOR_TO_4;
     entry = table->entries+pos;
 
-    if (entry[check[0]].next == SA_EMPTY) { new_pos = pos + check[0]; goto check; }
-    if (entry[check[1]].next == SA_EMPTY) { new_pos = pos + check[1]; goto check; }
-    if (entry[check[2]].next == SA_EMPTY) { new_pos = pos + check[2]; goto check; }
+    /* use open-addressing style for searching empty slot:
+     * quadratic probing with buckets of 4 entries,
+     * exit on empty found.
+     * since we maintain fill factor, empty will be certainly found */
+    for (;;) {
+	    if (entry[0].next == SA_EMPTY) { pos = pos + 0; break; }
+	    if (entry[1].next == SA_EMPTY) { pos = pos + 1; break; }
+	    if (entry[2].next == SA_EMPTY) { pos = pos + 2; break; }
+	    if (entry[3].next == SA_EMPTY) { pos = pos + 3; break; }
+	    pos = (pos + dlt) & (table->num_bins - 1);
+	    entry = table->entries + pos;
+	    dlt += 4;
+    }
 
-  check:
-    if (new_pos+1 == table->free_pos) fix_empty(table);
-    return new_pos;
+    return pos;
 }
 
 static void resize(register sa_table* table);
@@ -843,7 +843,6 @@ sa_insert(register sa_table* table, id_key_t key, VALUE value)
         entry->key = key;
         entry->value = value;
         table->num_entries++;
-        if (pos+1 == table->free_pos) fix_empty(table);
         return 0;
     }
 
@@ -852,7 +851,7 @@ sa_insert(register sa_table* table, id_key_t key, VALUE value)
         return 1;
     }
 
-    if (table->num_entries + (table->num_entries >> 2) > table->num_bins) {
+    if (table->num_entries + (table->num_entries >> 2) >= table->num_bins) {
         resize(table);
 	return sa_insert(table, key, value);
     }
@@ -862,10 +861,6 @@ sa_insert(register sa_table* table, id_key_t key, VALUE value)
         return insert_into_chain(table, key, value, pos);
     }
     else {
-        if (!table->free_pos) {
-            resize(table);
-            return sa_insert(table, key, value);
-        }
         return insert_into_main(table, key, value, pos, main_pos);
     }
 }
@@ -889,11 +884,6 @@ insert_into_chain(register sa_table* table, id_key_t key, st_data_t value, sa_in
             entry->value = value;
             return 1;
         }
-    }
-
-    if (!table->free_pos) {
-        resize(table);
-        return sa_insert(table, key, value);
     }
 
     new_pos = find_empty(table, pos);
@@ -977,18 +967,11 @@ hash_id_table_lookup(register sa_table *table, ID id, VALUE *valuep)
     entry = table->entries + calc_pos(table, key);
     if (entry->next == SA_EMPTY) return 0;
 
-    if (entry->key == key) goto found;
-    if (entry->next == SA_LAST) return 0;
-
-    entry = table->entries + (entry->next - SA_OFFSET);
-    if (entry->key == key) goto found;
-
-    while(entry->next != SA_LAST) {
+    while (entry->key != key) {
+	if (entry->next == SA_LAST)
+	    return 0;
         entry = table->entries + (entry->next - SA_OFFSET);
-        if (entry->key == key) goto found;
     }
-    return 0;
-found:
     if (valuep) *valuep = entry->value;
     return 1;
 }
@@ -1000,46 +983,43 @@ hash_id_table_size(sa_table *table)
 }
 
 static int
-hash_id_table_delete(sa_table *table, ID id)
-{
-    sa_index_t pos, prev_pos = ~0;
+sa_delete_key(sa_table *table, id_key_t key) {
+    sa_index_t prev_pos = ~0, pos;
     sa_entry *entry;
-    id_key_t key = id2key(id);
-
-    if (table->num_entries == 0) goto not_found;
 
     pos = calc_pos(table, key);
     entry = table->entries + pos;
+    if (entry->next == SA_EMPTY) return 0;
 
-    if (entry->next == SA_EMPTY) goto not_found;
-
-    do {
-        if (entry->key == key) {
-            if (entry->next != SA_LAST) {
-                sa_index_t npos = entry->next - SA_OFFSET;
-                *entry = table->entries[npos];
-                memset(table->entries + npos, 0, sizeof(sa_entry));
-            }
-            else {
-                memset(table->entries + pos, 0, sizeof(sa_entry));
-                if (~prev_pos) {
-                    table->entries[prev_pos].next = SA_LAST;
-                }
-            }
-            table->num_entries--;
-            if (table->num_entries < table->num_bins / 4) {
-                resize(table);
-            }
-            return 1;
-        }
-        if (entry->next == SA_LAST) break;
+    while (entry->key != key) {
+        if (entry->next == SA_LAST) return 0;
         prev_pos = pos;
         pos = entry->next - SA_OFFSET;
         entry = table->entries + pos;
-    } while(1);
+    }
+    if (~prev_pos) {
+	table->entries[prev_pos].next = entry->next;
+	MEMZERO(entry, sa_entry, 1);
+    } else if (entry->next != SA_LAST) {
+	pos = entry->next - SA_OFFSET;
+	*entry = table->entries[pos];
+	MEMZERO(table->entries+pos, sa_entry, 1);
+    } else {
+	MEMZERO(entry, sa_entry, 1);
+    }
+    table->num_entries--;
+    return 1;
+}
 
-not_found:
-    return 0;
+static int
+hash_id_table_delete(sa_table *table, ID id)
+{
+    id_key_t key = id2key(id);
+    int res = sa_delete_key(table, key);
+    if (res && table->num_entries < table->num_bins / 4) {
+	resize(table);
+    }
+    return res;
 }
 
 enum foreach_type {
@@ -1054,28 +1034,49 @@ hash_foreach(sa_table *table, enum rb_id_table_iterator_result (*func)(ANYARGS),
 
     if (table->num_bins > 0) {
 	for(i = 0; i < table->num_bins ; i++) {
-	    if (table->entries[i].next != SA_EMPTY) {
-		id_key_t key = table->entries[i].key;
-		st_data_t val = table->entries[i].value;
-		enum rb_id_table_iterator_result ret;
+	    sa_entry *entry = table->entries + i;
+	    id_key_t key = entry->key;
+	    st_data_t val = entry->value;
+	    enum rb_id_table_iterator_result ret;
 
-		switch (type) {
-		  case foreach_key_values:
-		    ret = (*func)(key2id(key), val, arg);
-		    break;
-		  case foreach_values:
-		    ret = (*func)(val, arg);
-		    break;
-		}
+	    if (entry->next == SA_EMPTY) {
+		continue;
+	    }
 
-		switch (ret) {
-		  case ID_TABLE_DELETE:
-		    rb_warn("unsupported yet");
-		    break;
-		  default:
-		    break;
+	    switch (type) {
+	      case foreach_key_values:
+		ret = (*func)(key2id(key), val, arg);
+		break;
+	      case foreach_values:
+		ret = (*func)(val, arg);
+		break;
+	    }
+
+	    switch (ret) {
+	      case ID_TABLE_STOP:
+		return;
+	      case ID_TABLE_DELETE:
+		if (entry->next != SA_LAST) {
+		    sa_index_t next = entry->next - SA_OFFSET;
+		    *entry = table->entries[next];
+		    MEMZERO(table->entries + next, sa_entry, 1);
+		    /* visit rewriten empty once again */
+		    if (next > i) i--;
+		} else {
+		    sa_index_t pos = calc_pos(table, key);
+		    MEMZERO(table->entries + i, sa_entry, 1);
+		    if (pos != i) {
+			entry = table->entries + pos;
+			while ((entry->next - SA_OFFSET) != i) {
+			    entry = table->entries + (entry->next - SA_OFFSET);
+			}
+			entry->next = SA_LAST;
+		    }
 		}
-		if (ret == ID_TABLE_STOP) break;
+		table->num_entries--;
+		break;
+	      default:
+		break;
 	    }
 	}
     }
@@ -1368,6 +1369,241 @@ hash_id_table_foreach_values(struct hash_id_table *tbl, enum rb_id_table_iterato
     }
 }
 #endif /* ID_TABLE_USE_SMALL_HASH */
+
+#if ID_TABLE_USE_SMALLER_HASH
+#define HASH_MIN_CAPA 4
+
+struct hash_id_table {
+    int capa;
+    int num;
+    id_key_t *keys;
+};
+#define TABLE_VALUES(tbl) ((VALUE *)((tbl)->keys + (tbl)->capa))
+static struct hash_id_table *
+hash_id_table_init(struct hash_id_table *tbl, size_t capa)
+{
+    if (capa > 0) {
+	tbl->capa = (int)capa;
+	tbl->keys = (id_key_t *)xmalloc(sizeof(id_key_t) * capa + sizeof(VALUE) * capa);
+    }
+    return tbl;
+}
+
+static struct hash_id_table *
+hash_id_table_create(size_t capa)
+{
+    struct hash_id_table *tbl = ZALLOC(struct hash_id_table);
+    return hash_id_table_init(tbl, capa);
+}
+
+static void
+hash_id_table_free(struct hash_id_table *tbl)
+{
+    xfree(tbl->keys);
+    xfree(tbl);
+}
+
+static void
+hash_id_table_clear(struct hash_id_table *tbl)
+{
+    xfree(tbl->keys);
+    memset(tbl, 0, sizeof(*tbl));
+}
+
+static size_t
+hash_id_table_size(struct hash_id_table *tbl)
+{
+    return (size_t)tbl->num;
+}
+
+static size_t
+hash_id_table_memsize(struct hash_id_table *tbl)
+{
+    return (sizeof(id_key_t) + sizeof(VALUE)) * tbl->capa + sizeof(struct hash_id_table);
+}
+
+static void
+hash_table_add(struct hash_id_table *tbl, id_key_t key, VALUE val)
+{
+    id_key_t *keys = tbl->keys;
+    int mask = tbl->capa - 1;
+    int pos = key & mask;
+    int d = 1;
+    while (keys[pos]) {
+	pos = (pos + d) & mask;
+	d++;
+    }
+    keys[pos] = key;
+    TABLE_VALUES(tbl)[pos] = val;
+    tbl->num++;
+}
+
+static void
+hash_table_extend(struct hash_id_table *tbl)
+{
+    const int capa = tbl->capa == 0 ? HASH_MIN_CAPA : (tbl->capa * 2);
+    struct hash_id_table ttbl = {capa, 0}, tttbl;
+    const int size = sizeof(id_key_t) * capa + sizeof(VALUE) * capa;
+    int i;
+    ttbl.keys = (id_key_t*)xcalloc(1, size);
+    for (i=tbl->capa-1; i>=0;i--) {
+	if (tbl->keys[i] && ~tbl->keys[i]) {
+	    hash_table_add(&ttbl, tbl->keys[i], TABLE_VALUES(tbl)[i]);
+	}
+    }
+    tttbl = *tbl;
+    *tbl = ttbl;
+    xfree(tttbl.keys);
+}
+
+static int
+hash_table_index(struct hash_id_table *tbl, id_key_t key)
+{
+    id_key_t *keys = tbl->keys;
+    int mask = tbl->capa - 1;
+    int pos = key & mask;
+    int d = 1;
+    if (tbl->capa == 0) {
+	return -1;
+    }
+    while (keys[pos] != key) {
+	if (!keys[pos]) return -1;
+	pos = (pos + d) & mask;
+	d++;
+    }
+    return pos;
+}
+
+static int
+hash_id_table_lookup(struct hash_id_table *tbl, ID id, VALUE *valp)
+{
+    id_key_t key = id2key(id);
+    int index = hash_table_index(tbl, key);
+
+    if (index >= 0) {
+	*valp = TABLE_VALUES(tbl)[index];
+	return TRUE;
+    }
+    else {
+	return FALSE;
+    }
+}
+
+static int
+hash_id_table_insert(struct hash_id_table *tbl, ID id, VALUE val)
+{
+    id_key_t key = id2key(id);
+    id_key_t *keys = tbl->keys;
+    int mask = tbl->capa - 1;
+    int free = 0;
+    int pos = key & mask;
+    int d = 1;
+    /* we should be sure that empty slot remains after insertion */
+    int max = tbl->capa == 4 ? 4 :
+	      tbl->capa <= 16 ? tbl->capa / 2 : tbl->capa / 4;
+    int freecnt = 2;
+    int set = FALSE;
+    while (max && freecnt) {
+	if (keys[pos] == key) {
+	    TABLE_VALUES(tbl)[pos] = val;
+	    set = TRUE;
+	    freecnt--;
+	}
+	if (!free && !(keys[pos] && ~keys[pos])) {
+	    free = pos+1;
+	}
+	if (!keys[pos])
+	    freecnt--;
+	pos = (pos + d) & mask;
+	d++;
+	max--;
+    }
+    if (!max) {
+	hash_table_extend(tbl);
+	hash_id_table_insert(tbl, id, val);
+    } else if (!set) {
+	pos = free - 1;
+	keys[pos] = key;
+	TABLE_VALUES(tbl)[pos] = val;
+	tbl->num++;
+    }
+    return TRUE;
+}
+
+static int
+hash_delete_index(struct hash_id_table *tbl, int index)
+{
+    if (index >= 0) {
+	tbl->keys[index] = ~0;
+	tbl->num--;
+	return TRUE;
+    } else {
+	return FALSE;
+    }
+}
+
+static int
+hash_id_table_delete(struct hash_id_table *tbl, ID id)
+{
+    const id_key_t key = id2key(id);
+    int index = hash_table_index(tbl, key);
+    return hash_delete_index(tbl, index);
+}
+
+static void
+hash_id_table_foreach(struct hash_id_table *tbl, enum rb_id_table_iterator_result (*func)(ID id, VALUE val, void *data), void *data)
+{
+    int capa = tbl->capa;
+    int i;
+    const id_key_t *keys = tbl->keys;
+    const VALUE *values = TABLE_VALUES(tbl);
+    enum rb_id_table_iterator_result ret;
+
+    for (i=0; i<capa; i++) {
+	const id_key_t key = keys[i];
+	if (key && ~key) {
+	    ret = (*func)(key2id(key), values[i], data);
+	    assert(key != 0);
+
+	    switch (ret) {
+	      case ID_TABLE_STOP:
+		return;
+	      case ID_TABLE_DELETE:
+		hash_delete_index(tbl, i);
+	      case ID_TABLE_CONTINUE:
+		break;
+	    }
+	}
+    }
+}
+
+static void
+hash_id_table_foreach_values(struct hash_id_table *tbl, enum rb_id_table_iterator_result (*func)(VALUE val, void *data), void *data)
+{
+    int capa = tbl->capa;
+    int i;
+    const id_key_t *keys = tbl->keys;
+    VALUE *values = TABLE_VALUES(tbl);
+    enum rb_id_table_iterator_result ret;
+
+    for (i=0; i<capa; i++) {
+	const id_key_t key = keys[i];
+	if (key && ~key) {
+	    ret = (*func)(values[i], data);
+	    assert(key != 0);
+
+	    switch (ret) {
+	      case ID_TABLE_STOP:
+		return;
+	      case ID_TABLE_DELETE:
+		hash_delete_index(tbl, i);
+	      case ID_TABLE_CONTINUE:
+		break;
+	    }
+	}
+    }
+}
+#endif /* ID_TABLE_USE_SMALLER_HASH */
 
 #if ID_TABLE_USE_MIX
 
