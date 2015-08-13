@@ -616,7 +616,7 @@ next_id_base(void)
 {
     rb_id_serial_t next_serial = global_symbols.last_id + 1;
 
-    if (next_serial == 0) {
+    if (next_serial == ~(rb_id_serial_t)0) {
 	return (ID)-1;
     }
     else {

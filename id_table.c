@@ -24,6 +24,7 @@
  * hash
  *   21: funny falcon's Coalesced Hashing implementation [Feature #6962]
  *   22: simple open addressing with quadratic probing.
+ *   23: open addressing with quadratic probing without thumbstone count.
  * mix (list + hash)
  *   31: list(12) (capa <= 32) + hash(22)
  *   32: list(14) (capa <= 32) + hash(22)
@@ -32,7 +33,7 @@
  */
 
 #ifndef ID_TABLE_IMPL
-#define ID_TABLE_IMPL 31
+#define ID_TABLE_IMPL 23
 #endif
 
 #if ID_TABLE_IMPL == 0
@@ -104,6 +105,13 @@
 #define ID_TABLE_IMPL_TYPE struct hash_id_table
 
 #define ID_TABLE_USE_SMALL_HASH 1
+#define ID_TABLE_USE_ID_SERIAL 1
+
+#elif ID_TABLE_IMPL == 23
+#define ID_TABLE_NAME hash
+#define ID_TABLE_IMPL_TYPE struct hash_id_table
+
+#define ID_TABLE_USE_SMALLER_HASH 1
 #define ID_TABLE_USE_ID_SERIAL 1
 
 #elif ID_TABLE_IMPL == 31
@@ -1361,6 +1369,241 @@ hash_id_table_foreach_values(struct hash_id_table *tbl, enum rb_id_table_iterato
     }
 }
 #endif /* ID_TABLE_USE_SMALL_HASH */
+
+#if ID_TABLE_USE_SMALLER_HASH
+#define HASH_MIN_CAPA 4
+
+struct hash_id_table {
+    int capa;
+    int num;
+    id_key_t *keys;
+};
+#define TABLE_VALUES(tbl) ((VALUE *)((tbl)->keys + (tbl)->capa))
+static struct hash_id_table *
+hash_id_table_init(struct hash_id_table *tbl, size_t capa)
+{
+    if (capa > 0) {
+	tbl->capa = (int)capa;
+	tbl->keys = (id_key_t *)xmalloc(sizeof(id_key_t) * capa + sizeof(VALUE) * capa);
+    }
+    return tbl;
+}
+
+static struct hash_id_table *
+hash_id_table_create(size_t capa)
+{
+    struct hash_id_table *tbl = ZALLOC(struct hash_id_table);
+    return hash_id_table_init(tbl, capa);
+}
+
+static void
+hash_id_table_free(struct hash_id_table *tbl)
+{
+    xfree(tbl->keys);
+    xfree(tbl);
+}
+
+static void
+hash_id_table_clear(struct hash_id_table *tbl)
+{
+    xfree(tbl->keys);
+    memset(tbl, 0, sizeof(*tbl));
+}
+
+static size_t
+hash_id_table_size(struct hash_id_table *tbl)
+{
+    return (size_t)tbl->num;
+}
+
+static size_t
+hash_id_table_memsize(struct hash_id_table *tbl)
+{
+    return (sizeof(id_key_t) + sizeof(VALUE)) * tbl->capa + sizeof(struct hash_id_table);
+}
+
+static void
+hash_table_add(struct hash_id_table *tbl, id_key_t key, VALUE val)
+{
+    id_key_t *keys = tbl->keys;
+    int mask = tbl->capa - 1;
+    int pos = key & mask;
+    int d = 1;
+    while (keys[pos]) {
+	pos = (pos + d) & mask;
+	d++;
+    }
+    keys[pos] = key;
+    TABLE_VALUES(tbl)[pos] = val;
+    tbl->num++;
+}
+
+static void
+hash_table_extend(struct hash_id_table *tbl)
+{
+    const int capa = tbl->capa == 0 ? HASH_MIN_CAPA : (tbl->capa * 2);
+    struct hash_id_table ttbl = {capa, 0}, tttbl;
+    const int size = sizeof(id_key_t) * capa + sizeof(VALUE) * capa;
+    int i;
+    ttbl.keys = (id_key_t*)xcalloc(1, size);
+    for (i=tbl->capa-1; i>=0;i--) {
+	if (tbl->keys[i] && ~tbl->keys[i]) {
+	    hash_table_add(&ttbl, tbl->keys[i], TABLE_VALUES(tbl)[i]);
+	}
+    }
+    tttbl = *tbl;
+    *tbl = ttbl;
+    xfree(tttbl.keys);
+}
+
+static int
+hash_table_index(struct hash_id_table *tbl, id_key_t key)
+{
+    id_key_t *keys = tbl->keys;
+    int mask = tbl->capa - 1;
+    int pos = key & mask;
+    int d = 1;
+    if (tbl->capa == 0) {
+	return -1;
+    }
+    while (keys[pos] != key) {
+	if (!keys[pos]) return -1;
+	pos = (pos + d) & mask;
+	d++;
+    }
+    return pos;
+}
+
+static int
+hash_id_table_lookup(struct hash_id_table *tbl, ID id, VALUE *valp)
+{
+    id_key_t key = id2key(id);
+    int index = hash_table_index(tbl, key);
+
+    if (index >= 0) {
+	*valp = TABLE_VALUES(tbl)[index];
+	return TRUE;
+    }
+    else {
+	return FALSE;
+    }
+}
+
+static int
+hash_id_table_insert(struct hash_id_table *tbl, ID id, VALUE val)
+{
+    id_key_t key = id2key(id);
+    id_key_t *keys = tbl->keys;
+    int mask = tbl->capa - 1;
+    int free = 0;
+    int pos = key & mask;
+    int d = 1;
+    /* we should be sure that empty slot remains after insertion */
+    int max = tbl->capa == 4 ? 4 :
+	      tbl->capa <= 16 ? tbl->capa / 2 : tbl->capa / 4;
+    int freecnt = 2;
+    int set = FALSE;
+    while (max && freecnt) {
+	if (keys[pos] == key) {
+	    TABLE_VALUES(tbl)[pos] = val;
+	    set = TRUE;
+	    freecnt--;
+	}
+	if (!free && !(keys[pos] && ~keys[pos])) {
+	    free = pos+1;
+	}
+	if (!keys[pos])
+	    freecnt--;
+	pos = (pos + d) & mask;
+	d++;
+	max--;
+    }
+    if (!max) {
+	hash_table_extend(tbl);
+	hash_id_table_insert(tbl, id, val);
+    } else if (!set) {
+	pos = free - 1;
+	keys[pos] = key;
+	TABLE_VALUES(tbl)[pos] = val;
+	tbl->num++;
+    }
+    return TRUE;
+}
+
+static int
+hash_delete_index(struct hash_id_table *tbl, int index)
+{
+    if (index >= 0) {
+	tbl->keys[index] = ~0;
+	tbl->num--;
+	return TRUE;
+    } else {
+	return FALSE;
+    }
+}
+
+static int
+hash_id_table_delete(struct hash_id_table *tbl, ID id)
+{
+    const id_key_t key = id2key(id);
+    int index = hash_table_index(tbl, key);
+    return hash_delete_index(tbl, index);
+}
+
+static void
+hash_id_table_foreach(struct hash_id_table *tbl, enum rb_id_table_iterator_result (*func)(ID id, VALUE val, void *data), void *data)
+{
+    int capa = tbl->capa;
+    int i;
+    const id_key_t *keys = tbl->keys;
+    const VALUE *values = TABLE_VALUES(tbl);
+    enum rb_id_table_iterator_result ret;
+
+    for (i=0; i<capa; i++) {
+	const id_key_t key = keys[i];
+	if (key && ~key) {
+	    ret = (*func)(key2id(key), values[i], data);
+	    assert(key != 0);
+
+	    switch (ret) {
+	      case ID_TABLE_STOP:
+		return;
+	      case ID_TABLE_DELETE:
+		hash_delete_index(tbl, i);
+	      case ID_TABLE_CONTINUE:
+		break;
+	    }
+	}
+    }
+}
+
+static void
+hash_id_table_foreach_values(struct hash_id_table *tbl, enum rb_id_table_iterator_result (*func)(VALUE val, void *data), void *data)
+{
+    int capa = tbl->capa;
+    int i;
+    const id_key_t *keys = tbl->keys;
+    VALUE *values = TABLE_VALUES(tbl);
+    enum rb_id_table_iterator_result ret;
+
+    for (i=0; i<capa; i++) {
+	const id_key_t key = keys[i];
+	if (key && ~key) {
+	    ret = (*func)(values[i], data);
+	    assert(key != 0);
+
+	    switch (ret) {
+	      case ID_TABLE_STOP:
+		return;
+	      case ID_TABLE_DELETE:
+		hash_delete_index(tbl, i);
+	      case ID_TABLE_CONTINUE:
+		break;
+	    }
+	}
+    }
+}
+#endif /* ID_TABLE_USE_SMALLER_HASH */
 
 #if ID_TABLE_USE_MIX
 
