@@ -41,7 +41,10 @@ enum ruby_encoding_consts {
 #define ENCODING_SHIFT RUBY_ENCODING_SHIFT
 #define ENCODING_MASK RUBY_ENCODING_MASK
 
+int rb_enc_capable(VALUE obj);
+
 #define RB_ENCODING_SET_INLINED(obj,i) do {\
+    if (!rb_enc_capable(obj)) rb_bug("RB_ENCODING_SET_INLINED: not capable"); \
     RBASIC(obj)->flags &= ~RUBY_ENCODING_MASK;\
     RBASIC(obj)->flags |= (VALUE)(i) << RUBY_ENCODING_SHIFT;\
 } while (0)

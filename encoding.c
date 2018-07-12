@@ -836,12 +836,17 @@ rb_enc_set_index(VALUE obj, int idx)
     must_encindex(idx);
     enc_set_index(obj, idx);
 }
-
+#include "gc.h"
+#include "vm_debug.h"
 VALUE
 rb_enc_associate_index(VALUE obj, int idx)
 {
     rb_encoding *enc;
     int oldidx, oldtermlen, termlen;
+
+    if (!enc_capable(obj)) {
+        rb_bug("rb_enc_associate_index: not enc_capable");
+    }
 
 /*    enc_check_capable(obj);*/
     rb_check_frozen(obj);

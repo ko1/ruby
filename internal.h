@@ -1073,6 +1073,9 @@ VALUE rb_gvar_defined(struct rb_global_entry *);
 struct vtm; /* defined by timev.h */
 
 /* array.c */
+#define RARRAY_TRANSIENT_FLAG FL_USER13
+#define ARY_TRANSIENT_P(ary) FL_TEST_RAW((ary), RARRAY_TRANSIENT_FLAG)
+
 VALUE rb_ary_last(int, const VALUE *, VALUE);
 void rb_ary_set_len(VALUE, long);
 void rb_ary_delete_same(VALUE, VALUE);

@@ -276,16 +276,23 @@ module DRbCore
   end
 
   def test_11_remote_no_method_error
+    #tp = TracePoint.new(:line){ GC.verify_transient_heap_internal_consistency }
+    #tp.enable do
     assert_raise(DRb::DRbRemoteError) do
+      GC.verify_transient_heap_internal_consistency
       @there.remote_no_method_error
     end
     begin
+      GC.verify_transient_heap_internal_consistency
       @there.remote_no_method_error
     rescue
+      GC.verify_transient_heap_internal_consistency
       error = $!
       assert_match(/^undefined method .*\(NoMethodError\)/, error.message)
       assert_equal('NoMethodError', error.reason)
+      GC.verify_transient_heap_internal_consistency
     end
+    #end
   end
 end
 

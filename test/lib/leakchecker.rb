@@ -20,6 +20,7 @@ class LeakChecker
       check_verbose(test_name),
     ]
     GC.start if leaks.any?
+    # GC.verify_internal_consistency
   end
 
   def check_safe test_name
