@@ -1,6 +1,3 @@
-﻿
-return
-
 # -*- encoding: utf-8 -*-
 require_relative 'spec_helper'
 require_relative 'fixtures/encoding'
@@ -15,29 +12,7 @@ describe :rb_enc_get_index, shared: true do
   it "returns the index of the encoding of a Regexp" do
     @s.send(@method, /regexp/).should >= 0
   end
-<<<<<<< Updated upstream
 end
-=======
-
-  it "returns the index of the encoding of an Object" do
-    obj = mock("rb_enc_get_index string")
-    @s.rb_enc_set_index(obj, 1)
-    @s.send(@method, obj).should == 1
-  end
-
-  it "returns the index of the dummy encoding of an Object" do
-    obj = mock("rb_enc_get_index string")
-    index = Encoding.list.index(Encoding::UTF_16)
-    @s.rb_enc_set_index(obj, index)
-    @s.send(@method, obj).should == index
-  end
-
-  it "returns 0 for an object without an encoding" do
-    obj = mock("rb_enc_get_index string")
-    @s.send(@method, obj).should == 0
-  end
-end if false
->>>>>>> Stashed changes
 
 describe :rb_enc_set_index, shared: true do
   it "sets the object's encoding to the Encoding specified by the index" do
@@ -55,17 +30,7 @@ describe :rb_enc_set_index, shared: true do
     result = @s.send(@method, str, 1)
     result.first.should == result.last
   end
-<<<<<<< Updated upstream
 end
-=======
-
-  it "associates an encoding with an object" do
-    obj = mock("rb_enc_set_index string")
-    result = @s.send(@method, obj, 1)
-    result.first.should == result.last
-  end
-end if false
->>>>>>> Stashed changes
 
 describe "C-API Encoding function" do
   before :each do
