@@ -2251,6 +2251,9 @@ obj_free(rb_objspace_t *objspace, VALUE obj)
         rb_ary_free(obj);
 	break;
       case T_HASH:
+	if (RANY(obj)->as.hash.ltbl) {
+	    free(RANY(obj)->as.hash.ltbl);
+	}
 	if (RANY(obj)->as.hash.ntbl) {
 	    st_free_table(RANY(obj)->as.hash.ntbl);
 	}
@@ -3264,6 +3267,9 @@ obj_memsize_of(VALUE obj, int use_all_types)
 	size += rb_ary_memsize(obj);
 	break;
       case T_HASH:
+        if (RHASH(obj)->ltbl) {
+	    size += sizeof(li_table);
+	}
 	if (RHASH(obj)->ntbl) {
 	    size += st_memsize(RHASH(obj)->ntbl);
 	}
@@ -4158,6 +4164,13 @@ mark_hash(rb_objspace_t *objspace, st_table *tbl)
     st_foreach(tbl, mark_keyvalue, (st_data_t)objspace);
 }
 
+static void
+mark_hash_linear(rb_objspace_t *objspace, li_table *tbl)
+{
+    if (!tbl) return;
+    linear_foreach(tbl, mark_keyvalue, (st_data_t)objspace);
+}
+
 void
 rb_mark_hash(st_table *tbl)
 {
@@ -4625,6 +4638,7 @@ gc_mark_children(rb_objspace_t *objspace, VALUE obj)
 	break;
 
       case T_HASH:
+	mark_hash_linear(objspace, any->as.hash.ltbl);
 	mark_hash(objspace, any->as.hash.ntbl);
 	gc_mark(objspace, any->as.hash.ifnone);
 	break;
