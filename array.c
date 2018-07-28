@@ -4382,8 +4382,9 @@ ary_recycle_hash(VALUE hash)
     if (RHASH(hash)->ntbl) {
 	st_table *tbl = RHASH(hash)->ntbl;
 	st_free_table(tbl);
+	RHASH(hash)->ntbl = NULL;
     }
-    rb_gc_force_recycle(hash);
+    //rb_gc_force_recycle(hash);
 }
 
 /*

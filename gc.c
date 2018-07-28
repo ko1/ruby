@@ -2251,12 +2251,7 @@ obj_free(rb_objspace_t *objspace, VALUE obj)
         rb_ary_free(obj);
 	break;
       case T_HASH:
-	if (RANY(obj)->as.hash.ltbl) {
-	    free(RANY(obj)->as.hash.ltbl);
-	}
-	if (RANY(obj)->as.hash.ntbl) {
-	    st_free_table(RANY(obj)->as.hash.ntbl);
-	}
+	rb_hash_free(obj);
 	break;
       case T_REGEXP:
 	if (RANY(obj)->as.regexp.ptr) {
@@ -4165,10 +4160,17 @@ mark_hash(rb_objspace_t *objspace, st_table *tbl)
 }
 
 static void
-mark_hash_linear(rb_objspace_t *objspace, li_table *tbl)
+mark_hash_linear(rb_objspace_t *objspace, VALUE hash)
 {
-    if (!tbl) return;
-    linear_foreach(tbl, mark_keyvalue, (st_data_t)objspace);
+    if (RHASH(hash)->ltbl) {
+        linear_foreach(RHASH(hash)->ltbl, mark_keyvalue, (st_data_t)objspace);
+	if (objspace->mark_func_data == NULL && RHASH_TRANSIENT_P(hash)) {
+            rb_transient_heap_mark(hash, RHASH(hash)->ltbl);
+        }
+    }
+    else if (RHASH(hash)->ntbl)
+        mark_hash(objspace, RHASH(hash)->ntbl);
+    gc_mark(objspace, RHASH(hash)->ifnone);
 }
 
 void
@@ -4638,9 +4640,7 @@ gc_mark_children(rb_objspace_t *objspace, VALUE obj)
 	break;
 
       case T_HASH:
-	mark_hash_linear(objspace, any->as.hash.ltbl);
-	mark_hash(objspace, any->as.hash.ntbl);
-	gc_mark(objspace, any->as.hash.ifnone);
+	mark_hash_linear(objspace, obj);
 	break;
 
       case T_STRING:

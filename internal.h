@@ -1355,6 +1355,9 @@ RUBY_SYMBOL_EXPORT_END
 #define NEWOBJ_OF(obj,type,klass,flags) RB_NEWOBJ_OF(obj,type,klass,flags)
 
 /* hash.c */
+#define RHASH_TRANSIENT_FLAG FL_USER14
+#define RHASH_TRANSIENT_P(hash) FL_TEST_RAW((hash), RHASH_TRANSIENT_FLAG)
+
 struct st_table *rb_hash_tbl_raw(VALUE hash);
 VALUE rb_hash_new_with_size(st_index_t size);
 RUBY_SYMBOL_EXPORT_BEGIN
@@ -1375,6 +1378,7 @@ VALUE rb_hash_key_str(VALUE);
 VALUE rb_hash_keys(VALUE hash);
 VALUE rb_hash_values(VALUE hash);
 VALUE rb_hash_rehash(VALUE hash);
+void rb_hash_free(VALUE hash);
 int rb_hash_add_new_element(VALUE hash, VALUE key, VALUE val);
 int linear_foreach(li_table *, int (*)(ANYARGS), st_data_t);
 int linear_lookup(li_table *, st_data_t, st_data_t *);

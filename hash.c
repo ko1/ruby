@@ -20,8 +20,8 @@
 #include "id.h"
 #include "symbol.h"
 #include "gc.h"
-
-#include <assert.h>
+#include "transient_heap.h"
+#include "ruby_assert.h"
 #ifdef __APPLE__
 # ifdef HAVE_CRT_EXTERNS_H
 #  include <crt_externs.h>
@@ -316,6 +316,50 @@ static const struct st_hash_type identhash = {
 
 #define RHASH_TYPE(hash) (RHASH(hash)->ltbl ? RHASH(hash)->ltbl->type : RHASH(hash)->ntbl->type)
 
+#ifndef RHASH_DEBUG
+#define RHASH_DEBUG 0
+#endif
+
+#define HASH_ASSERT(expr) RUBY_ASSERT_MESG_WHEN(RHASH_DEBUG > 0, expr, #expr)
+#if RHASH_DEBUG > 0
+#define hash_varify(hash) hash_varify_(hash, __FILE__, __LINE__)
+
+static VALUE
+hash_varify_(VALUE hash, const char *file, int line)
+{
+    HASH_ASSERT(RB_TYPE_P(hash, T_HASH));
+    if (RHASH(hash)->ltbl) {
+    	li_table *tab = RHASH(hash)->ltbl;
+	li_table_entry *cur_entry, *entries;
+	st_data_t h, k, v;
+	uint8_t i, n = 0;
+	HASH_ASSERT(tab->type != NULL);
+	entries = tab->entries;
+	for (i = 0; i < LINEAR_TABLE_BOUND; i++) {
+	    cur_entry = &entries[i];
+	    if (!empty_entry(cur_entry)) {
+		h = cur_entry->hash;
+		k = cur_entry->key;
+		v = cur_entry->record;
+		HASH_ASSERT(h != 0);
+		HASH_ASSERT(k != Qundef);
+		HASH_ASSERT(v != Qundef);
+	        n++;
+	    }
+    	}
+	HASH_ASSERT(n == tab->num_entries);
+    }
+	
+    if (RHASH_TRANSIENT_P(hash)) {
+	HASH_ASSERT(RHASH(hash)->ltbl != NULL);
+        HASH_ASSERT(rb_transient_heap_managed_ptr_p(RHASH(hash)->ltbl));
+    }
+    return hash;
+}
+#else
+#define hash_varify(h) ((void)0)
+#endif
+
 typedef st_data_t st_hash_t;
 
 static inline st_hash_t
@@ -349,12 +393,18 @@ empty_entry(li_table_entry *entry)
 }
 
 static li_table*
-linear_init_table(const struct st_hash_type *type)
+linear_init_table(VALUE hash, const struct st_hash_type *type)
 {
     li_table *tab;
     uint8_t i;
-    tab = (li_table*)malloc(sizeof(li_table));
-    if (tab == NULL) rb_bug("linear_init_table: malloc failed");
+    tab = (li_table*)rb_transient_heap_alloc(hash, sizeof(li_table));
+    if (tab != NULL) {
+	FL_SET_RAW(hash, RHASH_TRANSIENT_FLAG);
+    }
+    else {
+	FL_UNSET_RAW(hash, RHASH_TRANSIENT_FLAG);
+	tab = (li_table*)malloc(sizeof(li_table));
+    }
     tab->type = type;
     tab->num_entries = 0;
     for (i = 0; i < LINEAR_TABLE_BOUND; i++)
@@ -363,15 +413,15 @@ linear_init_table(const struct st_hash_type *type)
 }
 
 static li_table*
-linear_init_identtable(void)
+linear_init_identtable(VALUE hash)
 {
-    return linear_init_table(&identhash);
+    return linear_init_table(hash, &identhash);
 }
 
 static li_table*
-linear_init_objtable(void)
+linear_init_objtable(VALUE hash)
 {
-    return linear_init_table(&objhash);
+    return linear_init_table(hash, &objhash);
 }
 
 static st_index_t
@@ -389,6 +439,34 @@ find_entry(li_table *tab, st_hash_t hash_value, st_data_t key)
     return LINEAR_TABLE_BOUND;
 }
 
+static inline void
+linear_free_table(VALUE hash, li_table *tab)
+{
+    if (!RHASH_TRANSIENT_P(hash) && tab)
+    	free(tab);
+}
+
+static void
+rb_hash_heap_free(VALUE hash)
+{
+    // fprintf(stderr, "rb_hash_heap_free: %p\n", (void*)hash);
+    if (RHASH_TRANSIENT_P(hash)) {
+	FL_UNSET_RAW(hash, RHASH_TRANSIENT_FLAG);
+    } else {
+	linear_free_table(hash, RHASH(hash)->ltbl);
+    }
+}
+
+void
+rb_hash_free(VALUE hash)
+{
+    if (RHASH(hash)->ltbl) {
+	rb_hash_heap_free(hash);
+    }
+    else if (RHASH(hash)->ntbl) {
+	st_free_table(RHASH(hash)->ntbl);
+    }
+}
 static void
 try_convert_table(VALUE hash)
 {
@@ -405,10 +483,13 @@ try_convert_table(VALUE hash)
 
     entries = tab->entries;
     for (i = 0; i < LINEAR_TABLE_BOUND; i++) {
-	assert(entries[i].hash != 0);
+	HASH_ASSERT(entries[i].hash != 0);
 	st_add_direct(new_tab, entries[i].key, entries[i].record);
     }
-    free(tab);
+    HASH_ASSERT(tab == RHASH(hash)->ltbl);
+    linear_free_table(hash, tab);
+    /* converting table means to promote the hash, unset the transient flag anyway*/
+    FL_UNSET_RAW(hash, RHASH_TRANSIENT_FLAG);
     RHASH(hash)->ltbl = NULL;
     RHASH(hash)->ntbl = new_tab;
     return;
@@ -434,7 +515,10 @@ force_convert_table(VALUE hash)
 	    if (empty_entry(cur_entry)) continue;
 	    st_add_direct(new_tab, cur_entry->key, cur_entry->record);
 	}
-	free(tab);
+	HASH_ASSERT(tab == RHASH(hash)->ltbl);
+	linear_free_table(hash, tab);
+	/* converting table means to promote the hash, unset the transient flag anyway*/
+	FL_UNSET_RAW(hash, RHASH_TRANSIENT_FLAG);
     }
     else if (!RHASH(hash)->ntbl) {
 	new_tab = st_init_table(&objhash);
@@ -467,7 +551,7 @@ compact_table(li_table *tab)
 	clear_entry(&entries[non_empty]);
     }
 done:
-    assert(empty < LINEAR_TABLE_BOUND);
+    HASH_ASSERT(empty < LINEAR_TABLE_BOUND);
     return empty;
 }
 
@@ -481,7 +565,7 @@ add_direct_with_hash(li_table *tab, st_data_t key, st_data_t val, st_hash_t hash
 	return 1;
 
     bin = compact_table(tab);
-    assert(bin < LINEAR_TABLE_BOUND);
+    HASH_ASSERT(bin < LINEAR_TABLE_BOUND);
     entry = &tab->entries[bin];
     set_entry(entry, key, val, hash);
     tab->num_entries++;
@@ -613,7 +697,7 @@ linear_insert(li_table *tab, st_data_t key, st_data_t value)
 	if (tab->num_entries >= LINEAR_TABLE_MAX_SIZE)
 	    return -1;
 	bin = compact_table(tab);
-	assert(bin < LINEAR_TABLE_BOUND);
+	HASH_ASSERT(bin < LINEAR_TABLE_BOUND);
 	set_entry(&tab->entries[bin], key, value, hash_value);
 	tab->num_entries++;
 	return 0;
@@ -633,7 +717,7 @@ linear_lookup(li_table *tab, st_data_t key, st_data_t *value)
     if (bin == LINEAR_TABLE_BOUND) {
 	return 0;
     }
-    assert(bin < LINEAR_TABLE_BOUND);
+    HASH_ASSERT(bin < LINEAR_TABLE_BOUND);
     if (value != 0)
         *value = tab->entries[bin].record;
     return 1;
@@ -721,11 +805,17 @@ linear_values(li_table *tab, st_data_t *values, st_index_t size)
 }
 
 static li_table*
-linear_copy(li_table *old_tab)
+linear_copy(VALUE hash, li_table *old_tab)
 {
     li_table *new_tab;
-    new_tab = (li_table*) malloc(sizeof(li_table));
-    if (new_tab == NULL) rb_bug("linear_copy: malloc failed");
+    new_tab = (li_table*) rb_transient_heap_alloc(hash, sizeof(li_table));
+    if (new_tab != NULL) {
+	FL_SET_RAW(hash, RHASH_TRANSIENT_FLAG);
+    }
+    else {
+	FL_UNSET_RAW(hash, RHASH_TRANSIENT_FLAG);
+	new_tab = (li_table*) malloc(sizeof(li_table));
+    }
     *new_tab = *old_tab;
     return new_tab;
 }
@@ -737,11 +827,32 @@ linear_clear(li_table *tab)
     memset(tab->entries, 0, 8 * sizeof(li_table_entry));
 }
 
-static inline void
-linear_free_table(li_table *tab)
+void
+rb_hash_transient_heap_promote(VALUE hash, int promote)
 {
-    free(tab);
+    if (RHASH_TRANSIENT_P(hash)) {
+	li_table *new_tab;
+	li_table *old_tab = RHASH(hash)->ltbl;
+	if (UNLIKELY(RHASH(hash)->ltbl == NULL)) {
+	    rb_gc_force_recycle(hash);
+	    return;
+	}
+	HASH_ASSERT(old_tab != NULL);
+	if (promote) {
+	    new_tab = malloc(sizeof(li_table));
+	    FL_UNSET_RAW(hash, RHASH_TRANSIENT_FLAG);
+	}
+	else {
+	    new_tab = rb_transient_heap_alloc(hash, sizeof(li_table));
+	}
+	*new_tab = *old_tab;
+	HASH_ASSERT(new_tab->type == old_tab->type);
+	HASH_ASSERT(new_tab->num_entries == old_tab->num_entries);
+	RHASH(hash)->ltbl = new_tab;
+    }
+    hash_varify(hash);
 }
+
 
 typedef int st_foreach_func(st_data_t, st_data_t, st_data_t);
 
@@ -791,14 +902,15 @@ hash_linear_foreach_iter(st_data_t key, st_data_t value, st_data_t argp, int err
 {
     struct hash_foreach_arg *arg = (struct hash_foreach_arg *)argp;
     int status;
-    li_table *tbl;
+    // li_table *tbl;
 
     if (error) return ST_STOP;
-    tbl = RHASH(arg->hash)->ltbl;
+    /* linear table will move it's position due to escaping from transient heap */
+    // tbl = RHASH(arg->hash)->ltbl; 
     status = (*arg->func)((VALUE)key, (VALUE)value, arg->arg);
-    if (RHASH(arg->hash)->ltbl != tbl) {
-	rb_raise(rb_eRuntimeError, "rehash occurred during iteration");
-    }
+    // if (RHASH(arg->hash)->ltbl != tbl) {
+    //	rb_raise(rb_eRuntimeError, "rehash occurred during iteration");
+    // }
     switch (status) {
       case ST_DELETE:
 	return ST_DELETE;
@@ -821,7 +933,7 @@ hash_foreach_iter(st_data_t key, st_data_t value, st_data_t argp, int error)
     tbl = RHASH(arg->hash)->ntbl;
     status = (*arg->func)((VALUE)key, (VALUE)value, arg->arg);
     if (RHASH(arg->hash)->ntbl != tbl) {
-	rb_raise(rb_eRuntimeError, "rehash occurred during iteration");
+    	rb_raise(rb_eRuntimeError, "rehash occurred during iteration");
     }
     switch (status) {
       case ST_DELETE:
@@ -877,6 +989,7 @@ rb_hash_foreach(VALUE hash, int (*func)(ANYARGS), VALUE farg)
     arg.func = (rb_foreach_func *)func;
     arg.arg  = farg;
     rb_ensure(hash_foreach_call, (VALUE)&arg, hash_foreach_ensure, hash);
+    hash_varify(hash);
 }
 
 static VALUE
@@ -924,7 +1037,7 @@ rb_hash_new_with_size(st_index_t size)
     VALUE ret = rb_hash_new();
     if (size) {
 	if (size <= LINEAR_TABLE_MAX_SIZE)
-	    RHASH(ret)->ltbl = linear_init_objtable();
+	    RHASH(ret)->ltbl = linear_init_objtable(ret);
 	else
 	    RHASH(ret)->ntbl = st_init_table_with_size(&objhash, size);
     }
@@ -938,7 +1051,7 @@ hash_dup(VALUE hash, VALUE klass, VALUE flags)
 				 RHASH_IFNONE(hash));
     if (!RHASH_EMPTY_P(hash)) {
 	if (RHASH(hash)->ltbl)
-	    RHASH(ret)->ltbl = linear_copy(RHASH(hash)->ltbl);
+	    RHASH(ret)->ltbl = linear_copy(ret, RHASH(hash)->ltbl);
 	else
 	    RHASH(ret)->ntbl = st_copy(RHASH(hash)->ntbl);
     }
@@ -966,7 +1079,7 @@ static li_table *
 hash_ltbl(VALUE hash)
 {
     if (!RHASH(hash)->ltbl) {
-	RHASH(hash)->ltbl = linear_init_objtable();
+	RHASH(hash)->ltbl = linear_init_objtable(hash);
     }
     return RHASH(hash)->ltbl;
 }
@@ -1180,7 +1293,7 @@ rb_hash_s_create(int argc, VALUE *argv, VALUE klass)
 	if (!NIL_P(tmp)) {
 	    hash = hash_alloc(klass);
 	    if (RHASH(tmp)->ltbl) {
-		RHASH(hash)->ltbl = linear_copy(RHASH(tmp)->ltbl);
+		RHASH(hash)->ltbl = linear_copy(hash, RHASH(tmp)->ltbl);
 	    }
 	    else if (RHASH(tmp)->ntbl) {
 		RHASH(hash)->ntbl = st_copy(RHASH(tmp)->ntbl);
@@ -1231,7 +1344,7 @@ rb_hash_s_create(int argc, VALUE *argv, VALUE klass)
 
     hash = hash_alloc(klass);
     rb_hash_bulk_insert(argc, argv, hash);
-
+    hash_varify(hash);
     return hash;
 }
 
@@ -1321,11 +1434,11 @@ rb_hash_rehash(VALUE hash)
     rb_hash_modify_check(hash);
     if (RHASH(hash)->ltbl) {
 	tmp = hash_alloc(0);
-	ltbl = linear_init_table(RHASH(hash)->ltbl->type);
+	ltbl = linear_init_table(hash, RHASH(hash)->ltbl->type);
 	RHASH(tmp)->ltbl = ltbl;
 
 	rb_hash_foreach(hash, rb_hash_rehash_opt_i, (VALUE)ltbl);
-	linear_free_table(RHASH(hash)->ltbl);
+	linear_free_table(hash, RHASH(hash)->ltbl); // TODO
 	RHASH(hash)->ltbl = ltbl;
 	RHASH(tmp)->ltbl = 0;
     }
@@ -1339,6 +1452,7 @@ rb_hash_rehash(VALUE hash)
 	RHASH(hash)->ntbl = tbl;
 	RHASH(tmp)->ntbl = 0;
     }
+    hash_varify(hash);
     return hash;
 }
 
@@ -1381,6 +1495,7 @@ rb_hash_aref(VALUE hash, VALUE key)
     else if (RHASH(hash)->ntbl && st_lookup(RHASH(hash)->ntbl, key, &val)) {
 	return (VALUE)val;
     }
+    hash_varify(hash);
     return rb_hash_default_value(hash, key);
 }
 
@@ -1395,6 +1510,7 @@ rb_hash_lookup2(VALUE hash, VALUE key, VALUE def)
     else if (RHASH(hash)->ntbl && st_lookup(RHASH(hash)->ntbl, key, &val)) {
 	return (VALUE)val;
     }
+    hash_varify(hash);
     return def; /* without Hash#default */
 }
 
@@ -1462,6 +1578,7 @@ rb_hash_fetch_m(int argc, VALUE *argv, VALUE hash)
 	desc = rb_str_ellipsize(desc, 65);
 	rb_key_err_raise(rb_sprintf("key not found: %"PRIsVALUE, desc), hash, key);
     }
+    hash_varify(hash);
     return argv[1];
 }
 
@@ -2197,7 +2314,7 @@ rb_hash_aset(VALUE hash, VALUE key, VALUE val)
     rb_hash_modify(hash);
     if (HASH_HAS_NO_TABLE(hash)) {
 	if (iter_lev > 0) no_new_key();
-	RHASH(hash)->ltbl = linear_init_objtable();
+	RHASH(hash)->ltbl = linear_init_objtable(hash);
     }
     type = RHASH_TYPE(hash);
     if (type == &identhash || rb_obj_class(key) != rb_cString) {
@@ -2234,8 +2351,8 @@ rb_hash_initialize_copy(VALUE hash, VALUE hash2)
     ltbl = RHASH(hash)->ltbl;
     ntbl = RHASH(hash)->ntbl;
     if (RHASH(hash2)->ltbl) {
-	if (ltbl) linear_free_table(ltbl);
-	RHASH(hash)->ltbl = linear_copy(RHASH(hash2)->ltbl);
+	if (ltbl) linear_free_table(hash, ltbl);
+	RHASH(hash)->ltbl = linear_copy(hash, RHASH(hash2)->ltbl);
 	if (RHASH(hash)->ltbl->num_entries)
 	    rb_hash_rehash(hash);
     }
@@ -3579,10 +3696,10 @@ rb_hash_compare_by_id(VALUE hash)
 
     if (!RHASH(hash)->ntbl) {
 	li_table *identtable;
-	identtable = linear_init_identtable();
+	identtable = linear_init_identtable(hash);
 	rb_hash_foreach(hash, rb_hash_rehash_opt_i, (VALUE)identtable);
 	if (RHASH(hash)->ltbl)
-	    linear_free_table(RHASH(hash)->ltbl);
+	    linear_free_table(hash, RHASH(hash)->ltbl);
 	RHASH(hash)->ltbl = identtable;
     }
     else {
@@ -3924,20 +4041,16 @@ rb_hash_bulk_insert(long argc, const VALUE *argv, VALUE hash)
     st_index_t size;
     li_table *ltbl = RHASH(hash)->ltbl;
 
-    assert(argc % 2 == 0);
+    HASH_ASSERT(argc % 2 == 0);
     if (! argc)
         return;
     size = argc / 2;
     if (HASH_HAS_NO_TABLE(hash)) {
-        VALUE tmp = rb_hash_new_with_size(size);
-        RBASIC_CLEAR_CLASS(tmp);
 	if (size <= LINEAR_TABLE_MAX_SIZE) {
-	    RHASH(hash)->ltbl = ltbl = RHASH(tmp)->ltbl;
-	    RHASH(tmp)->ltbl = NULL;
+	    hash_ltbl(hash);
 	}
 	else {
-            RHASH(hash)->ntbl = RHASH(tmp)->ntbl;
-            RHASH(tmp)->ntbl = NULL;
+            hash_tbl(hash);
 	}
     }
     if (ltbl && (ltbl->num_entries + size <= LINEAR_TABLE_MAX_SIZE)) {

@@ -14,7 +14,7 @@
  * 2: enable verify
  */
 #ifndef TRANSIENT_HEAP_CHECK_MODE
-#define TRANSIENT_HEAP_CHECK_MODE 0
+#define TRANSIENT_HEAP_CHECK_MODE 1
 #endif
 #define TH_ASSERT(expr) RUBY_ASSERT_MESG_WHEN(TRANSIENT_HEAP_CHECK_MODE > 0, expr, #expr)
 
@@ -344,7 +344,7 @@ rb_transient_heap_alloc(VALUE obj, size_t req_size)
     struct transient_heap* theap = transient_heap_get();
     size_t size = ROUND_UP(req_size + sizeof(struct transient_alloc_header), TRANSIENT_HEAP_ALLOC_ALIGN);
 
-    TH_ASSERT(RB_TYPE_P(obj, T_ARRAY)); /* supported types */
+    TH_ASSERT(RB_TYPE_P(obj, T_ARRAY) || RB_TYPE_P(obj, T_HASH)); /* supported types */
 
     if (size > TRANSIENT_HEAP_ALLOC_MAX) {
         if (TRANSIENT_HEAP_DEBUG >= 3) fprintf(stderr, "rb_transient_heap_alloc: [too big: %ld] %s\n", (long)size, rb_obj_info(obj));
@@ -495,7 +495,7 @@ void
 rb_transient_heap_mark(VALUE obj, const void *ptr)
 {
     struct transient_alloc_header *header = ptr_to_alloc_header(ptr);
-
+    if (header->magic != TRANSIENT_HEAP_ALLOC_MAGIC) rb_bug("rb_transient_heap_mark: wrong header, %s (%p)", rb_obj_info(obj), ptr);
     if (TRANSIENT_HEAP_DEBUG >= 3) fprintf(stderr, "rb_transient_heap_mark: %s (%p)\n", rb_obj_info(obj), ptr);
 
 #if TRANSIENT_HEAP_CHECK_MODE > 0
@@ -545,6 +545,14 @@ transient_heap_ptr(VALUE obj, int error)
             ptr = NULL;
         }
         break;
+      case T_HASH:
+        if (RHASH_TRANSIENT_P(obj)) {
+	    ptr = (VALUE *)(RHASH(obj)->ltbl);
+	}
+	else {
+	    ptr = NULL;
+	}
+	break;
       default:
         if (error) {
             rb_bug("transient_heap_ptr: unknown obj %s\n", rb_obj_info(obj));
@@ -599,6 +607,7 @@ alloc_header(struct transient_heap_block* block, int index)
 }
 
 void rb_ary_transient_heap_promote(VALUE ary, int promote);
+void rb_hash_transient_heap_promote(VALUE hash, int promote);
 
 static void
 transient_heap_reset(void)
@@ -643,6 +652,8 @@ transient_heap_block_escape(struct transient_heap* theap, struct transient_heap_
     while (marked_index >= 0) {
         struct transient_alloc_header *header = alloc_header(block, marked_index);
         VALUE obj = header->obj;
+	TH_ASSERT(header->magic == TRANSIENT_HEAP_ALLOC_MAGIC);
+	if (header->magic != TRANSIENT_HEAP_ALLOC_MAGIC) rb_bug("rb_transient_heap_mark: wrong header %s\n", rb_obj_info(obj));
 
         if (TRANSIENT_HEAP_DEBUG >= 3) fprintf(stderr, " * transient_heap_block_escape %p %s\n", header, rb_obj_info(obj));
 
@@ -655,6 +666,9 @@ transient_heap_block_escape(struct transient_heap* theap, struct transient_heap_
                 rb_ary_transient_heap_promote(obj, TRUE);
 #endif
                 break;
+	      case T_HASH:
+	        rb_hash_transient_heap_promote(obj, TRUE);
+		break;
               default:
                 rb_bug("unsupporeted");
             }
