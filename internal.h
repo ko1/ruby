@@ -670,9 +670,26 @@ struct RComplex {
 #define RCOMPLEX_SET_IMAG(cmp, i) RB_OBJ_WRITE((cmp), &((struct RComplex *)(cmp))->imag,(i))
 #endif
 
+#define LINEAR_TABLE_MAX_SIZE 8
+#define LINEAR_TABLE_BOUND LINEAR_TABLE_MAX_SIZE
+
+typedef struct LinearPair {
+    VALUE key;
+    VALUE record;
+} LinearPair;
+
+typedef struct LinearTable {
+    const struct st_hash_type *type;
+    uint32_t num_entries;
+    uint32_t entries_bound;
+    st_data_t hashes[LINEAR_TABLE_MAX_SIZE];
+    LinearPair pairs[LINEAR_TABLE_MAX_SIZE];
+} li_table;
+
 struct RHash {
     struct RBasic basic;
     struct st_table *ntbl;      /* possibly 0 */
+    struct LinearTable *ltbl;
     int iter_lev;
     const VALUE ifnone;
 };
@@ -685,7 +702,8 @@ struct RHash {
 #undef RHASH_SIZE
 #define RHASH_ITER_LEV(h) (RHASH(h)->iter_lev)
 #define RHASH_IFNONE(h) (RHASH(h)->ifnone)
-#define RHASH_SIZE(h) (RHASH(h)->ntbl ? RHASH(h)->ntbl->num_entries : (st_index_t)0)
+#define RHASH_SIZE_NTBL(h) (RHASH(h)->ntbl ? RHASH(h)->ntbl->num_entries : (st_index_t)0)
+#define RHASH_SIZE(h) (RHASH(h)->ltbl ? RHASH(h)->ltbl->num_entries : RHASH_SIZE_NTBL(h))
 #endif
 
 /* missing/setproctitle.c */
@@ -1359,6 +1377,9 @@ VALUE rb_hash_keys(VALUE hash);
 VALUE rb_hash_values(VALUE hash);
 VALUE rb_hash_rehash(VALUE hash);
 int rb_hash_add_new_element(VALUE hash, VALUE key, VALUE val);
+int linear_foreach(li_table *, int (*)(ANYARGS), st_data_t);
+int linear_lookup(li_table *, st_data_t, st_data_t *);
+void rb_hash_bulk_insert(long, const VALUE *, VALUE);
 #define HASH_PROC_DEFAULT FL_USER2
 
 /* inits.c */
