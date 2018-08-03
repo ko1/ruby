@@ -2287,7 +2287,7 @@ void
 rb_hash_bulk_insert_into_st_table(long argc, const VALUE *argv, VALUE hash)
 {
     st_index_t n, size = argc / 2;
-    st_table *tab = RHASH(hash)->ntbl;
+    st_table *tab = RHASH(hash)->as.ntbl;
 
     tab = rb_hash_tbl_raw(hash);
     n = tab->num_entries + size;

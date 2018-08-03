@@ -14,7 +14,7 @@
  * 2: enable verify
  */
 #ifndef TRANSIENT_HEAP_CHECK_MODE
-#define TRANSIENT_HEAP_CHECK_MODE 1
+#define TRANSIENT_HEAP_CHECK_MODE 0
 #endif
 #define TH_ASSERT(expr) RUBY_ASSERT_MESG_WHEN(TRANSIENT_HEAP_CHECK_MODE > 0, expr, #expr)
 
@@ -509,7 +509,7 @@ rb_transient_heap_mark(VALUE obj, const void *ptr)
             rb_bug("rb_transient_heap_mark: magic is broken");
         }
         else if (header->obj != obj) {
-            transient_heap_dump(theap);
+            // transient_heap_dump(theap);
             rb_bug("rb_transient_heap_mark: unmatch (%s is stored, but %s is given)\n",
                    rb_obj_info(header->obj), rb_obj_info(obj));
         }
@@ -547,7 +547,7 @@ transient_heap_ptr(VALUE obj, int error)
         break;
       case T_HASH:
         if (RHASH_TRANSIENT_P(obj)) {
-	    ptr = (VALUE *)(RHASH(obj)->ltbl);
+	    ptr = (VALUE *)(RHASH(obj)->as.ltbl);
 	}
 	else {
 	    ptr = NULL;
@@ -670,7 +670,7 @@ transient_heap_block_escape(struct transient_heap* theap, struct transient_heap_
 	        rb_hash_transient_heap_promote(obj, TRUE);
 		break;
               default:
-                rb_bug("unsupporeted");
+                rb_bug("unsupporeted: %s\n", rb_obj_info(obj));
             }
             header->obj = Qundef; // to verify
         }

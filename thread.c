@@ -3506,10 +3506,10 @@ rb_thread_variable_p(VALUE thread, VALUE key)
 
     locals = rb_ivar_get(thread, id_locals);
 
-    if (RHASH(locals)->ltbl && linear_lookup(RHASH(locals)->ltbl, ID2SYM(id), 0)) {
+    if (RHASH_ARRAY_P(locals) && linear_lookup(locals, ID2SYM(id), 0)) {
 	return Qtrue;
     }
-    else if (RHASH(locals)->ntbl && st_lookup(RHASH(locals)->ntbl, ID2SYM(id), 0)) {
+    else if (RHASH_TABLE_P(locals) && st_lookup(RHASH(locals)->as.ntbl, ID2SYM(id), 0)) {
 	return Qtrue;
     }
 
