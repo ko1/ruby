@@ -2251,9 +2251,7 @@ obj_free(rb_objspace_t *objspace, VALUE obj)
         rb_ary_free(obj);
 	break;
       case T_HASH:
-	if (RANY(obj)->as.hash.ntbl) {
-	    st_free_table(RANY(obj)->as.hash.ntbl);
-	}
+	rb_hash_free(obj);
 	break;
       case T_REGEXP:
 	if (RANY(obj)->as.regexp.ptr) {
@@ -3264,8 +3262,11 @@ obj_memsize_of(VALUE obj, int use_all_types)
 	size += rb_ary_memsize(obj);
 	break;
       case T_HASH:
-	if (RHASH(obj)->ntbl) {
-	    size += st_memsize(RHASH(obj)->ntbl);
+        if (RHASH_ARRAY_P(obj)) {
+	    size += sizeof(li_table);
+	}
+	else if (RHASH(obj)->as.ntbl) {
+	    size += st_memsize(RHASH(obj)->as.ntbl);
 	}
 	break;
       case T_REGEXP:
@@ -4158,6 +4159,20 @@ mark_hash(rb_objspace_t *objspace, st_table *tbl)
     st_foreach(tbl, mark_keyvalue, (st_data_t)objspace);
 }
 
+static void
+mark_hash_linear(rb_objspace_t *objspace, VALUE hash)
+{
+    if (RHASH_ARRAY_P(hash)) {
+        linear_foreach(hash, mark_keyvalue, (st_data_t)objspace);
+	if (objspace->mark_func_data == NULL && RHASH_TRANSIENT_P(hash)) {
+            rb_transient_heap_mark(hash, RHASH(hash)->as.ltbl);
+        }
+    }
+    else if (RHASH_TABLE_P(hash))
+        st_foreach(RHASH(hash)->as.ntbl, mark_keyvalue, (st_data_t)objspace);
+    gc_mark(objspace, RHASH(hash)->ifnone);
+}
+
 void
 rb_mark_hash(st_table *tbl)
 {
@@ -4625,8 +4640,7 @@ gc_mark_children(rb_objspace_t *objspace, VALUE obj)
 	break;
 
       case T_HASH:
-	mark_hash(objspace, any->as.hash.ntbl);
-	gc_mark(objspace, any->as.hash.ifnone);
+	mark_hash_linear(objspace, obj);
 	break;
 
       case T_STRING:

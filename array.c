@@ -4379,11 +4379,12 @@ static inline void
 ary_recycle_hash(VALUE hash)
 {
     assert(RBASIC_CLASS(hash) == 0);
-    if (RHASH(hash)->ntbl) {
-	st_table *tbl = RHASH(hash)->ntbl;
+    if (RHASH_TABLE_P(hash)) {
+	st_table *tbl = RHASH(hash)->as.ntbl;
 	st_free_table(tbl);
+	RHASH(hash)->as.ntbl = NULL;
     }
-    rb_gc_force_recycle(hash);
+    //rb_gc_force_recycle(hash);
 }
 
 /*

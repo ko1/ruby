@@ -2012,7 +2012,7 @@ static void
 local_var_list_init(struct local_var_list *vars)
 {
     vars->tbl = rb_hash_new();
-    RHASH(vars->tbl)->ntbl = st_init_numtable(); /* compare_by_identity */
+    RHASH(vars->tbl)->as.ntbl = st_init_numtable(); /* compare_by_identity */
     RBASIC_CLEAR_CLASS(vars->tbl);
 }
 

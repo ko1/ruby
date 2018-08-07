@@ -670,9 +670,50 @@ struct RComplex {
 #define RCOMPLEX_SET_IMAG(cmp, i) RB_OBJ_WRITE((cmp), &((struct RComplex *)(cmp))->imag,(i))
 #endif
 
+enum ruby_rhash_flags {
+    RHASH_ARRAY_LEN_MAX = 8,
+    RHASH_ARRAY_FLAG = FL_USER3,
+    RHASH_ARRAY_LEN_MASK = (FL_USER4|FL_USER5|FL_USER6|FL_USER7),
+    RHASH_ARRAY_LEN_SHIFT = (FL_USHIFT+4),
+    RHASH_ARRAY_BOUND_MASK = (FL_USER8|FL_USER9|FL_USER10|FL_USER11),
+    RHASH_ARRAY_BOUND_SHIFT = (FL_USHIFT+8),
+
+    RHASH_ENUM_END
+};
+
+#define HASH_PROC_DEFAULT FL_USER2
+#define RHASH_ARRAY_FLAG (VALUE)RHASH_ARRAY_FLAG
+#define RHASH_ARRAY_P(hash) FL_TEST_RAW((hash), RHASH_ARRAY_FLAG)
+#define RHASH_ARRAY_LEN_MASK (VALUE)RHASH_ARRAY_LEN_MASK
+#define RHASH_ARRAY_LEN_SHIFT RHASH_ARRAY_LEN_SHIFT
+#define RHASH_ARRAY_BOUND_MASK (VALUE)RHASH_ARRAY_BOUND_MASK
+#define RHASH_ARRAY_BOUND_SHIFT RHASH_ARRAY_BOUND_SHIFT
+#define RHASH_TRANSIENT_FLAG FL_USER14
+#define RHASH_TRANSIENT_P(hash) FL_TEST_RAW((hash), RHASH_TRANSIENT_FLAG)
+
+#define RHASH_ARRAY_LEN(h) \
+    (long)((RBASIC(h)->flags & RHASH_ARRAY_LEN_MASK) >> RHASH_ARRAY_LEN_SHIFT)
+
+#define LINEAR_TABLE_MAX_SIZE 8
+#define LINEAR_TABLE_BOUND LINEAR_TABLE_MAX_SIZE
+
+typedef struct li_table_entry {
+    VALUE hash;
+    VALUE key;
+    VALUE record;
+} li_table_entry;
+
+typedef struct LinearTable {
+    const struct st_hash_type *type;
+    li_table_entry entries[LINEAR_TABLE_MAX_SIZE];
+} li_table;
+
 struct RHash {
     struct RBasic basic;
-    struct st_table *ntbl;      /* possibly 0 */
+    union {
+	struct st_table *ntbl;      /* possibly 0 */
+	struct LinearTable *ltbl;
+    } as;
     int iter_lev;
     const VALUE ifnone;
 };
@@ -685,7 +726,9 @@ struct RHash {
 #undef RHASH_SIZE
 #define RHASH_ITER_LEV(h) (RHASH(h)->iter_lev)
 #define RHASH_IFNONE(h) (RHASH(h)->ifnone)
-#define RHASH_SIZE(h) (RHASH(h)->ntbl ? RHASH(h)->ntbl->num_entries : (st_index_t)0)
+#define RHASH_SIZE_NTBL(h) (RHASH(h)->as.ntbl ? RHASH(h)->as.ntbl->num_entries : (st_index_t)0)
+#define RHASH_SIZE(h) (RHASH_ARRAY_P(h) ? RHASH_ARRAY_LEN(h) : RHASH_SIZE_NTBL(h))
+#define RHASH_TABLE_P(h) (!RHASH_ARRAY_P(h) && RHASH(h)->as.ntbl)
 #endif
 
 /* missing/setproctitle.c */
@@ -1358,8 +1401,11 @@ VALUE rb_hash_key_str(VALUE);
 VALUE rb_hash_keys(VALUE hash);
 VALUE rb_hash_values(VALUE hash);
 VALUE rb_hash_rehash(VALUE hash);
+void rb_hash_free(VALUE hash);
 int rb_hash_add_new_element(VALUE hash, VALUE key, VALUE val);
-#define HASH_PROC_DEFAULT FL_USER2
+int linear_foreach(VALUE hash, int (*)(ANYARGS), st_data_t);
+int linear_lookup(VALUE hash, st_data_t, st_data_t *);
+void rb_hash_bulk_insert(long, const VALUE *, VALUE);
 
 /* inits.c */
 void rb_call_inits(void);
