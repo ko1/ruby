@@ -44,6 +44,8 @@ static void vm_analysis_insn(int insn);
 static VALUE
 vm_exec_core(rb_execution_context_t *ec)
 {
+    ec = NULL;
+
 #if defined(__GNUC__) && defined(__i386__)
     DECL_SC_REG(const VALUE *, pc, "di");
     DECL_SC_REG(rb_control_frame_t *, cfp, "si");
