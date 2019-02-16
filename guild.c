@@ -350,7 +350,7 @@ guild_channel_move(VALUE obj)
 			}
 		    }
 		}
-		memcpy((VALUE *)dst+2, (VALUE *)obj + 2, sizeof(VALUE) * 3);
+		rb_array_replace(dst, obj);
 		if (FL_TEST(obj, RARRAY_EMBED_FLAG)) FL_SET(dst, RARRAY_EMBED_FLAG);
 
 		/* reset src obj */
