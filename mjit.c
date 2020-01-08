@@ -25,6 +25,7 @@
 #include "internal/warnings.h"
 
 #include "mjit_worker.c"
+#include "vm_callinfo.h"
 
 // Copy ISeq's states so that race condition does not happen on compilation.
 static void
@@ -53,7 +54,7 @@ mjit_copy_job_handler(void *data)
     const struct rb_iseq_constant_body *body = job->iseq->body;
     if (job->cc_entries) {
         unsigned int i;
-        struct rb_call_cache *sink = job->cc_entries;
+        const struct rb_callcache **sink = job->cc_entries;
         const struct rb_call_data *calls = body->call_data;
         for (i = 0; i < body->ci_size; i++) {
             *sink++ = calls[i].cc;

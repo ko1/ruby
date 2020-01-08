@@ -565,6 +565,8 @@ static void
 verify_call_cache(rb_iseq_t *iseq)
 {
 #if CPDEBUG
+    // fprintf(stderr, "ci_size:%d\t", iseq->body->ci_size); rp(iseq);
+
     VALUE *original = rb_iseq_original_iseq(iseq);
     size_t i = 0;
     while (i < iseq->body->iseq_size) {
@@ -573,15 +575,26 @@ verify_call_cache(rb_iseq_t *iseq)
 
         for (int j=0; types[j]; j++) {
             if (types[j] == TS_CALLDATA) {
-                struct rb_call_cache cc;
                 struct rb_call_data *cd = (struct rb_call_data *)original[i+j+1];
-                MEMZERO(&cc, cc, 1);
-                if (memcmp(&cc, &cd->cc, sizeof(cc))) {
-                    rb_bug("call cache not zero for fresh iseq");
+                const struct rb_callinfo *ci = cd->ci;
+                const struct rb_callcache *cc = cd->cc;
+                if (cc != vm_cc_empty()) {
+                    vm_ci_dump(ci);
+                    rb_bug("call cache is not initialized by vm_cc_empty()");
                 }
             }
         }
         i += insn_len(insn);
+    }
+
+    for (unsigned int i=0; i<iseq->body->ci_size; i++) {
+        struct rb_call_data *cd = &iseq->body->call_data[i];
+        const struct rb_callinfo *ci = cd->ci;
+        const struct rb_callcache *cc = cd->cc;
+        if (cc != NULL && cc != vm_cc_empty()) {
+            vm_ci_dump(ci);
+            rb_bug("call cache is not initialized by vm_cc_empty()");
+        }
     }
 #endif
 }
@@ -660,7 +673,7 @@ rb_iseq_compile_node(rb_iseq_t *iseq, const NODE *node)
     DECL_ANCHOR(ret);
     INIT_ANCHOR(ret);
 
-    if (imemo_type_p((VALUE)node, imemo_ifunc)) {
+    if (IMEMO_TYPE_P(node, imemo_ifunc)) {
         rb_raise(rb_eArgError, "unexpected imemo_ifunc");
     }
 
@@ -1211,6 +1224,7 @@ new_callinfo(rb_iseq_t *iseq, ID mid, int argc, unsigned int flag, struct rb_cal
         argc += kw_arg->keyword_len;
     }
 
+    // fprintf(stderr, "[%d] id:%s\t", (int)iseq->body->ci_size, rb_id2name(mid)); rp(iseq);
     iseq->body->ci_size++;
     const struct rb_callinfo *ci = vm_ci_new(mid, flag, argc, kw_arg);
     RB_OBJ_WRITTEN(iseq, Qundef, ci);
@@ -2222,6 +2236,7 @@ iseq_set_sequence(rb_iseq_t *iseq, LINK_ANCHOR *const anchor)
                             struct rb_call_data *cd = &body->call_data[ISEQ_COMPILE_DATA(iseq)->ci_index++];
                             assert(ISEQ_COMPILE_DATA(iseq)->ci_index <= body->ci_size);
                             cd->ci = source_ci;
+                            cd->cc = vm_cc_empty();
                             generated_iseq[code_index + 1 + j] = (VALUE)cd;
                             break;
                         }
@@ -10315,6 +10330,7 @@ ibf_load_ci_entries(const struct ibf_load *load,
 
         cds[i].ci = vm_ci_new(mid, flag, argc, kwarg);
         RB_OBJ_WRITTEN(load->iseq, Qundef, cds[i].ci);
+        cds[i].cc = vm_cc_empty();
     }
 
     return cds;

@@ -1117,7 +1117,7 @@ convert_unit_to_func(struct rb_mjit_unit *unit)
 
 typedef struct {
     const rb_iseq_t *iseq;
-    struct rb_call_cache *cc_entries;
+    const struct rb_callcache **cc_entries;
     union iseq_inline_storage_entry *is_entries;
     bool finish_p;
 } mjit_copy_job_t;
@@ -1138,7 +1138,8 @@ int rb_workqueue_register(unsigned flags, rb_postponed_job_func_t , void *);
 // We're lazily copying cache values from main thread because these cache values
 // could be different between ones on enqueue timing and ones on dequeue timing.
 bool
-mjit_copy_cache_from_main_thread(const rb_iseq_t *iseq, struct rb_call_cache *cc_entries, union iseq_inline_storage_entry *is_entries)
+mjit_copy_cache_from_main_thread(const rb_iseq_t *iseq, const struct rb_callcache * const *cc_entries,
+                                 union iseq_inline_storage_entry *is_entries)
 {
     mjit_copy_job_t *job = &mjit_copy_job; // just a short hand
 
@@ -1146,7 +1147,7 @@ mjit_copy_cache_from_main_thread(const rb_iseq_t *iseq, struct rb_call_cache *cc
     job->finish_p = true; // disable dispatching this job in mjit_copy_job_handler while it's being modified
     CRITICAL_SECTION_FINISH(3, "in mjit_copy_cache_from_main_thread");
 
-    job->cc_entries = cc_entries;
+    job->cc_entries = (void *)cc_entries; // TODO
     job->is_entries = is_entries;
 
     CRITICAL_SECTION_START(3, "in mjit_copy_cache_from_main_thread");

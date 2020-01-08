@@ -14,7 +14,7 @@
     MAYBE_UNUSED(<%= ope.fetch(:decl) %>) = (<%= ope.fetch(:type) %>)operands[<%= i %>];
 % end
 % # compiler: Use copied cc to avoid race condition
-    CALL_CACHE cc_copy = status->cc_entries + call_data_index(cd, body);
+    CALL_CACHE cc_copy = status->cc_entries[call_data_index(cd, body)];
 %
     if (!status->compile_info->disable_send_cache && has_valid_method_type(cc_copy)) {
         const rb_iseq_t *iseq;
@@ -25,7 +25,7 @@
 % end
 
         if (!(vm_ci_flag(ci) & VM_CALL_TAILCALL) // inlining non-tailcall path
-                && cc_copy->me->def->type == VM_METHOD_TYPE_ISEQ && fastpath_applied_iseq_p(ci, cc_copy, iseq = def_iseq_ptr(cc_copy->me->def))) { // CC_SET_FASTPATH in vm_callee_setup_arg
+                && vm_cc_cme(cc_copy)->def->type == VM_METHOD_TYPE_ISEQ && fastpath_applied_iseq_p(ci, cc_copy, iseq = def_iseq_ptr(vm_cc_cme(cc_copy)->def))) { // CC_SET_FASTPATH in vm_callee_setup_arg
             int param_size = iseq->body->param.size;
 
             fprintf(f, "{\n");
@@ -35,8 +35,10 @@
             }
 
 % # JIT: Invalidate call cache if it requires vm_search_method. This allows to inline some of following things.
-            fprintf(f, "    if (UNLIKELY(GET_GLOBAL_METHOD_STATE() != %"PRI_SERIALT_PREFIX"u ||\n", cc_copy->method_state);
-            fprintf(f, "        RCLASS_SERIAL(CLASS_OF(stack[%d])) != %"PRI_SERIALT_PREFIX"u)) {\n", b->stack_size - 1 - argc, cc_copy->class_serial[0]);
+            fprintf(f, "    if (UNLIKELY(!vm_cc_valid_p((const struct rb_callcache *)0x%"PRIxVALUE", CLASS_OF(stack[%d])))) {\n",
+                    (VALUE)cc_copy, b->stack_size - 1 - argc);
+            // TODO: need to check cc->cme
+            // TODO: need to free cc
             fprintf(f, "        reg_cfp->pc = original_body_iseq + %d;\n", pos);
             fprintf(f, "        reg_cfp->sp = vm_base_ptr(reg_cfp) + %d;\n", b->stack_size);
             fprintf(f, "        goto send_cancel;\n");
@@ -70,7 +72,7 @@
                 fprintf(f, "        {\n");
                 fprintf(f, "            VALUE v;\n");
                 fprintf(f, "            vm_call_iseq_setup_normal(ec, reg_cfp, &calling, (const rb_callable_method_entry_t *)0x%"PRIxVALUE", 0, %d, %d);\n",
-                        (VALUE)cc_copy->me, param_size, iseq->body->local_table_size); // fastpath_applied_iseq_p checks rb_simple_iseq_p, which ensures has_opt == FALSE
+                        (VALUE)vm_cc_cme(cc_copy), param_size, iseq->body->local_table_size); // fastpath_applied_iseq_p checks rb_simple_iseq_p, which ensures has_opt == FALSE
                 if (iseq->body->catch_except_p) {
                     fprintf(f, "            VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH);\n");
                     fprintf(f, "            v = vm_exec(ec, TRUE);\n");

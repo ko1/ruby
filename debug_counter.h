@@ -18,42 +18,49 @@
  * method cache (mc) counts.
  *
  * * mc_inline_hit/miss: inline mc hit/miss counts (VM send insn)
- * * mc_global_hit/miss: global method cache hit/miss counts
- *                       two types: (1) inline cache miss (VM send insn)
- *                                  (2) called from C (rb_funcall).
- * * mc_global_state_miss: inline mc miss by global_state miss.
- * * mc_class_serial_miss:            ... by mc_class_serial_miss
  * * mc_cme_complement: callable_method_entry complement counts.
  * * mc_cme_complement_hit: callable_method_entry cache hit counts.
  * * mc_search_super: search_method() call counts.
- * * mc_miss_by_nome: inline mc miss by no ment.
- * * mc_miss_by_distinct:        ... by distinct ment.
- * * mc_miss_by_refine:          ... by ment being refined.
- * * mc_miss_by_visi:            ... by visibility change.
- * * mc_miss_spurious: spurious inline mc misshit.
- * * mc_miss_reuse_call: count of reuse of cc->call.
  */
 RB_DEBUG_COUNTER(mc_inline_hit)
-RB_DEBUG_COUNTER(mc_inline_miss)
-RB_DEBUG_COUNTER(mc_global_hit)
-RB_DEBUG_COUNTER(mc_global_miss)
-RB_DEBUG_COUNTER(mc_global_state_miss)
-RB_DEBUG_COUNTER(mc_class_serial_miss)
+RB_DEBUG_COUNTER(mc_inline_miss_klass)
+RB_DEBUG_COUNTER(mc_inline_miss_disabled)
 RB_DEBUG_COUNTER(mc_cme_complement)
 RB_DEBUG_COUNTER(mc_cme_complement_hit)
+
+RB_DEBUG_COUNTER(mc_search)
+RB_DEBUG_COUNTER(mc_search_notfound)
 RB_DEBUG_COUNTER(mc_search_super)
-RB_DEBUG_COUNTER(mc_miss_by_nome)
-RB_DEBUG_COUNTER(mc_miss_by_distinct)
-RB_DEBUG_COUNTER(mc_miss_by_refine)
-RB_DEBUG_COUNTER(mc_miss_by_visi)
-RB_DEBUG_COUNTER(mc_miss_spurious)
-RB_DEBUG_COUNTER(mc_miss_reuse_call)
 
 // callinfo
 RB_DEBUG_COUNTER(ci_packed)
 RB_DEBUG_COUNTER(ci_kw)
 RB_DEBUG_COUNTER(ci_nokw)
 RB_DEBUG_COUNTER(ci_runtime)
+
+// callcache
+RB_DEBUG_COUNTER(cc_new)
+RB_DEBUG_COUNTER(cc_temp)
+RB_DEBUG_COUNTER(cc_found)
+RB_DEBUG_COUNTER(cc_disabled)
+
+RB_DEBUG_COUNTER(cc_ent_invalidate)
+RB_DEBUG_COUNTER(cc_cme_invalidate)
+
+RB_DEBUG_COUNTER(cc_invalidate_leaf)
+RB_DEBUG_COUNTER(cc_invalidate_leaf_ccs)
+RB_DEBUG_COUNTER(cc_invalidate_leaf_callable)
+RB_DEBUG_COUNTER(cc_invalidate_tree)
+RB_DEBUG_COUNTER(cc_invalidate_tree_cme)
+RB_DEBUG_COUNTER(cc_invalidate_tree_callable)
+
+RB_DEBUG_COUNTER(ccs_maxlen)
+RB_DEBUG_COUNTER(ccs_found)
+
+
+// iseq
+RB_DEBUG_COUNTER(iseq_num)
+RB_DEBUG_COUNTER(iseq_cd_num)
 
 /*
  * call cache fastpath usage
@@ -289,6 +296,7 @@ RB_DEBUG_COUNTER(obj_imemo_ifunc)
 RB_DEBUG_COUNTER(obj_imemo_memo)
 RB_DEBUG_COUNTER(obj_imemo_parser_strterm)
 RB_DEBUG_COUNTER(obj_imemo_callinfo)
+RB_DEBUG_COUNTER(obj_imemo_callcache)
 
 /* ar_table */
 RB_DEBUG_COUNTER(artable_hint_hit)
@@ -375,17 +383,33 @@ rb_debug_counter_add(enum rb_debug_counter_type type, int add, int cond)
     return cond;
 }
 
+inline static int
+rb_debug_counter_max(enum rb_debug_counter_type type, unsigned int num)
+{
+    if (rb_debug_counter[(int)type] < num) {
+        rb_debug_counter[(int)type] = num;
+        return 1;
+    }
+    else {
+        return 0;
+    }
+}
+
 VALUE rb_debug_counter_reset(VALUE klass);
 VALUE rb_debug_counter_show(VALUE klass);
 
 #define RB_DEBUG_COUNTER_INC(type)                rb_debug_counter_add(RB_DEBUG_COUNTER_##type, 1, 1)
 #define RB_DEBUG_COUNTER_INC_UNLESS(type, cond) (!rb_debug_counter_add(RB_DEBUG_COUNTER_##type, 1, !(cond)))
 #define RB_DEBUG_COUNTER_INC_IF(type, cond)       rb_debug_counter_add(RB_DEBUG_COUNTER_##type, 1, (cond))
+#define RB_DEBUG_COUNTER_ADD(type, num)           rb_debug_counter_add(RB_DEBUG_COUNTER_##type, (num), 1)
+#define RB_DEBUG_COUNTER_SETMAX(type, num)        rb_debug_counter_max(RB_DEBUG_COUNTER_##type, (unsigned int)(num))
 
 #else
 #define RB_DEBUG_COUNTER_INC(type)              ((void)0)
 #define RB_DEBUG_COUNTER_INC_UNLESS(type, cond) (cond)
 #define RB_DEBUG_COUNTER_INC_IF(type, cond)     (cond)
+#define RB_DEBUG_COUNTER_ADD(type, num)         ((void)0)
+#define RB_DEBUG_COUNTER_SETMAX(type, num)      0
 #endif
 
 void rb_debug_counter_show_results(const char *msg);

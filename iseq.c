@@ -247,6 +247,7 @@ rb_iseq_update_references(rb_iseq_t *iseq)
                 if (!SPECIAL_CONST_P(cds[i].ci)) {
                     cds[i].ci = (struct rb_callinfo *)rb_gc_location((VALUE)cds[i].ci);
                 }
+                cds[i].cc = (struct rb_callcache *)rb_gc_location((VALUE)cds[i].cc);
             }
         }
         if (FL_TEST(iseq, ISEQ_MARKABLE_ISEQ)) {
@@ -323,6 +324,11 @@ rb_iseq_mark(const rb_iseq_t *iseq)
             struct rb_call_data *cds = (struct rb_call_data *)body->call_data;
             for (unsigned int i=0; i<body->ci_size; i++) {
                 rb_gc_mark_movable((VALUE)cds[i].ci);
+                const struct rb_callcache *cc = cds[i].cc;
+                if (cc && vm_cc_markable(cds[i].cc)) {
+                    rb_gc_mark_movable((VALUE)cc);
+                    // TODO: check enable
+                }
             }
         }
 
@@ -662,6 +668,9 @@ finish_iseq_build(rb_iseq_t *iseq)
 	rb_funcallv(err, rb_intern("set_backtrace"), 1, &path);
 	rb_exc_raise(err);
     }
+
+    RB_DEBUG_COUNTER_INC(iseq_num);
+    RB_DEBUG_COUNTER_ADD(iseq_cd_num, iseq->body->ci_size);
 
     rb_iseq_init_trace(iseq);
     return Qtrue;
