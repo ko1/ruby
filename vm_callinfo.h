@@ -90,7 +90,7 @@ struct rb_callinfo {
 #define CI_EMBED_ID_SHFT   (CI_EMBED_TAG_bits + CI_EMBED_ARGC_bits + CI_EMBED_FLAG_bits)
 #define CI_EMBED_ID_MASK   ((((VALUE)1)<<CI_EMBED_ID_bits) - 1)
 
-static inline int
+static inline bool
 vm_ci_packed_p(const struct rb_callinfo *ci)
 {
 #if USE_EMBED_CI
@@ -106,7 +106,7 @@ vm_ci_packed_p(const struct rb_callinfo *ci)
 #endif
 }
 
-static inline int
+static inline bool
 vm_ci_p(const struct rb_callinfo *ci)
 {
     if (vm_ci_packed_p(ci) || IMEMO_TYPE_P(ci, imemo_callinfo)) {
@@ -275,7 +275,7 @@ vm_cc_fill(struct rb_callcache *cc,
     return cc;
 }
 
-static inline int
+static inline bool
 vm_cc_class_check(const struct rb_callcache *cc, VALUE klass)
 {
     VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
@@ -319,7 +319,7 @@ vm_cc_markable(const struct rb_callcache *cc)
     return FL_TEST_RAW(cc, VM_CALLCACHE_UNMARKABLE) == 0;
 }
 
-static inline int
+static inline bool
 vm_cc_valid_p(const struct rb_callcache *cc, VALUE klass)
 {
     VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
@@ -417,7 +417,7 @@ struct rb_class_cc_entries {
 };
 
 #if VM_CHECK_MODE > 0
-static inline int
+static inline bool
 vm_ccs_p(const struct rb_class_cc_entries *ccs)
 {
     return ccs->debug_sig == ~(VALUE)ccs;
