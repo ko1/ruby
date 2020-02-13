@@ -221,8 +221,6 @@ static bool vm_stack_canary_was_born = false;
 MJIT_FUNC_EXPORTED void
 vm_check_canary(const rb_execution_context_t *ec, VALUE *sp)
 {
-    return;
-
     const struct rb_control_frame_struct *reg_cfp = ec->cfp;
     const struct rb_iseq_struct *iseq;
 
