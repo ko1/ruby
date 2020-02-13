@@ -1147,7 +1147,7 @@ mjit_copy_cache_from_main_thread(const rb_iseq_t *iseq, const struct rb_callcach
     job->finish_p = true; // disable dispatching this job in mjit_copy_job_handler while it's being modified
     CRITICAL_SECTION_FINISH(3, "in mjit_copy_cache_from_main_thread");
 
-    job->cc_entries = (void *)cc_entries; // TODO
+    job->cc_entries = (void *)cc_entries; // TODO (maybe) we need to copy cc_entries for GC.
     job->is_entries = is_entries;
 
     CRITICAL_SECTION_START(3, "in mjit_copy_cache_from_main_thread");
