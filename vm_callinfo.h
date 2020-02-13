@@ -132,7 +132,7 @@ static inline unsigned int
 vm_ci_flag(const struct rb_callinfo *ci)
 {
     if (vm_ci_packed_p(ci)) {
-        return (((VALUE)ci) >> CI_EMBED_FLAG_SHFT) & CI_EMBED_FLAG_MASK;
+        return (unsigned int)((((VALUE)ci) >> CI_EMBED_FLAG_SHFT) & CI_EMBED_FLAG_MASK);
     }
     else {
         return ci->u2.flag;
@@ -143,7 +143,7 @@ static inline unsigned int
 vm_ci_argc(const struct rb_callinfo *ci)
 {
     if (vm_ci_packed_p(ci)) {
-        return (((VALUE)ci) >> CI_EMBED_ARGC_SHFT) & CI_EMBED_ARGC_MASK;
+        return (unsigned int)((((VALUE)ci) >> CI_EMBED_ARGC_SHFT) & CI_EMBED_ARGC_MASK);
     }
     else {
         return ci->u3.orig_argc;
