@@ -3233,12 +3233,14 @@ iseq_peephole_optimize(rb_iseq_t *iseq, LINK_ELEMENT *list, const int do_tailcal
 	    if (IS_INSN_ID(piobj, send) ||
                 IS_INSN_ID(piobj, invokesuper)) {
                 if (OPERAND_AT(piobj, 1) == 0) { /* no blockiseq */
-                    OPERAND_AT(piobj, 0) = (VALUE)(ci = ci_flag_set(iseq, ci, VM_CALL_TAILCALL));
+                    ci = ci_flag_set(iseq, ci, VM_CALL_TAILCALL);
+                    OPERAND_AT(piobj, 0) = (VALUE)ci;
                     RB_OBJ_WRITTEN(iseq, Qundef, ci);
 		}
 	    }
 	    else {
-                OPERAND_AT(piobj, 0) = (VALUE)(ci = ci_flag_set(iseq, ci, VM_CALL_TAILCALL));
+                ci = ci_flag_set(iseq, ci, VM_CALL_TAILCALL);
+                OPERAND_AT(piobj, 0) = (VALUE)ci;
                 RB_OBJ_WRITTEN(iseq, Qundef, ci);
 	    }
 	}
@@ -4439,14 +4441,16 @@ compile_massign_lhs(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *const n
 	iobj = (INSN *)get_prev_insn((INSN *)LAST_ELEMENT(ret)); /* send insn */
         const struct rb_callinfo *ci = (struct rb_callinfo *)OPERAND_AT(iobj, 0);
         int argc = vm_ci_argc(ci) + 1;
-        OPERAND_AT(iobj, 0) = (VALUE)(ci = ci_argc_set(iseq, ci, argc));
+        ci = ci_argc_set(iseq, ci, argc);
+        OPERAND_AT(iobj, 0) = (VALUE)ci;
         RB_OBJ_WRITTEN(iseq, Qundef, ci);
         dupidx = INT2FIX(argc);
 
 	INSERT_BEFORE_INSN1(iobj, line, topn, dupidx);
 	if (vm_ci_flag(ci) & VM_CALL_ARGS_SPLAT) {
             int argc = vm_ci_argc(ci);
-            OPERAND_AT(iobj, 0) = (VALUE)(ci = ci_argc_set(iseq, ci, argc - 1));
+            ci = ci_argc_set(iseq, ci, argc - 1);
+            OPERAND_AT(iobj, 0) = (VALUE)ci;
             RB_OBJ_WRITTEN(iseq, Qundef, iobj);
             INSERT_BEFORE_INSN1(iobj, line, newarray, INT2FIX(1));
 	    INSERT_BEFORE_INSN(iobj, line, concatarray);
