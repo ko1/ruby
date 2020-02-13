@@ -14,53 +14,45 @@
 
 #ifdef RB_DEBUG_COUNTER
 
-/*
- * method cache (mc) counts.
- *
- * * mc_inline_hit/miss: inline mc hit/miss counts (VM send insn)
- * * mc_cme_complement: callable_method_entry complement counts.
- * * mc_cme_complement_hit: callable_method_entry cache hit counts.
- * * mc_search_super: search_method() call counts.
- */
-RB_DEBUG_COUNTER(mc_inline_hit)
-RB_DEBUG_COUNTER(mc_inline_miss_klass)
-RB_DEBUG_COUNTER(mc_inline_miss_disabled)
-RB_DEBUG_COUNTER(mc_cme_complement)
-RB_DEBUG_COUNTER(mc_cme_complement_hit)
+// method cache (IMC: inline method cache)
+RB_DEBUG_COUNTER(mc_inline_hit)              // IMC hit
+RB_DEBUG_COUNTER(mc_inline_miss_klass)       // IMC miss by different class
+RB_DEBUG_COUNTER(mc_inline_miss_invalidated) // IMC miss by invalidated ME
+RB_DEBUG_COUNTER(mc_cme_complement)          // number of acquiring complement CME
+RB_DEBUG_COUNTER(mc_cme_complement_hit)      // number of cahche hit for complemented CME
 
-RB_DEBUG_COUNTER(mc_search)
-RB_DEBUG_COUNTER(mc_search_notfound)
-RB_DEBUG_COUNTER(mc_search_super)
+RB_DEBUG_COUNTER(mc_search)                  // count for method lookup in class tree
+RB_DEBUG_COUNTER(mc_search_notfound)         //           method lookup, but not found
+RB_DEBUG_COUNTER(mc_search_super)            // total traversed classes
 
 // callinfo
-RB_DEBUG_COUNTER(ci_packed)
-RB_DEBUG_COUNTER(ci_kw)
-RB_DEBUG_COUNTER(ci_nokw)
-RB_DEBUG_COUNTER(ci_runtime)
+RB_DEBUG_COUNTER(ci_packed)  // number of packed CI
+RB_DEBUG_COUNTER(ci_kw)      //           non-packed CI w/ keywords
+RB_DEBUG_COUNTER(ci_nokw)    //           non-packed CI w/o keywords
+RB_DEBUG_COUNTER(ci_runtime) //           creating temporary CI
 
 // callcache
-RB_DEBUG_COUNTER(cc_new)
-RB_DEBUG_COUNTER(cc_temp)
-RB_DEBUG_COUNTER(cc_found)
-RB_DEBUG_COUNTER(cc_disabled)
+RB_DEBUG_COUNTER(cc_new)        // number of CC
+RB_DEBUG_COUNTER(cc_temp)       //           dummy CC (stack-allocated)
+RB_DEBUG_COUNTER(cc_found_ccs)  // count for CC lookup sucess in CCS
 
-RB_DEBUG_COUNTER(cc_ent_invalidate)
-RB_DEBUG_COUNTER(cc_cme_invalidate)
+RB_DEBUG_COUNTER(cc_ent_invalidate) // count for invalidating cc (cc->klass = 0)
+RB_DEBUG_COUNTER(cc_cme_invalidate) // coutn for invalidating CME
 
-RB_DEBUG_COUNTER(cc_invalidate_leaf)
-RB_DEBUG_COUNTER(cc_invalidate_leaf_ccs)
-RB_DEBUG_COUNTER(cc_invalidate_leaf_callable)
-RB_DEBUG_COUNTER(cc_invalidate_tree)
-RB_DEBUG_COUNTER(cc_invalidate_tree_cme)
-RB_DEBUG_COUNTER(cc_invalidate_tree_callable)
+RB_DEBUG_COUNTER(cc_invalidate_leaf)          // count for invalidating klass if klass has no-sublcasses
+RB_DEBUG_COUNTER(cc_invalidate_leaf_ccs)      //                        corresponding CCS
+RB_DEBUG_COUNTER(cc_invalidate_leaf_callable) //                        complimented cache (no-subclasses)
+RB_DEBUG_COUNTER(cc_invalidate_tree)          // count for invalidating klass if klass has sublcasses
+RB_DEBUG_COUNTER(cc_invalidate_tree_cme)      //                        cme if cme is found in this class or superclasses
+RB_DEBUG_COUNTER(cc_invalidate_tree_callable) //                        complimented cache (subclasses)
 
-RB_DEBUG_COUNTER(ccs_maxlen)
-RB_DEBUG_COUNTER(ccs_found)
-
+RB_DEBUG_COUNTER(ccs_free)   // count for free'ing ccs
+RB_DEBUG_COUNTER(ccs_maxlen) // maximum length of ccs
+RB_DEBUG_COUNTER(ccs_found)  // count for finding corresponding ccs on method lookup
 
 // iseq
-RB_DEBUG_COUNTER(iseq_num)
-RB_DEBUG_COUNTER(iseq_cd_num)
+RB_DEBUG_COUNTER(iseq_num)    // number of total created iseq
+RB_DEBUG_COUNTER(iseq_cd_num) // number of total created cd (call_data)
 
 /*
  * call cache fastpath usage

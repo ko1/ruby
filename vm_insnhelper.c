@@ -1523,7 +1523,6 @@ vm_search_cc(VALUE klass, const struct rb_callinfo *ci)
             VM_ASSERT(vm_ccs_verify(ccs, mid, klass));
 
             if (UNLIKELY(METHOD_ENTRY_INVALIDATED(ccs->cme))) {
-                RB_DEBUG_COUNTER_INC(cc_disabled);
                 rb_vm_ccs_free(ccs);
                 rb_id_table_delete(cc_tbl, mid);
                 ccs = NULL;
@@ -1537,7 +1536,7 @@ vm_search_cc(VALUE klass, const struct rb_callinfo *ci)
                     VM_ASSERT(IMEMO_TYPE_P(ccs_cc, imemo_callcache));
 
                     if (ccs_ci == ci) { // TODO: equality
-                        RB_DEBUG_COUNTER_INC(cc_found);
+                        RB_DEBUG_COUNTER_INC(cc_found_ccs);
 
                         VM_ASSERT(vm_cc_cme(ccs_cc)->called_id == mid);
                         VM_ASSERT(ccs_cc->klass == klass);
@@ -1613,7 +1612,7 @@ vm_search_method_fastpath(VALUE cd_owner, struct rb_call_data *cd, VALUE klass)
             return;
         }
         cd->cc = vm_cc_empty();
-        RB_DEBUG_COUNTER_INC(mc_inline_miss_disabled);
+        RB_DEBUG_COUNTER_INC(mc_inline_miss_invalidated);
     }
     else {
         RB_DEBUG_COUNTER_INC(mc_inline_miss_klass);

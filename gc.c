@@ -2559,6 +2559,7 @@ vm_ccs_free(struct rb_class_cc_entries *ccs, int alive, rb_objspace_t *objspace,
 void
 rb_vm_ccs_free(struct rb_class_cc_entries *ccs)
 {
+    RB_DEBUG_COUNTER_INC(ccs_free);
     vm_ccs_free(ccs, TRUE, NULL, Qundef);
 }
 

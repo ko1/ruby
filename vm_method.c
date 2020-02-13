@@ -997,9 +997,10 @@ cached_callable_method_entry(VALUE klass, ID mid)
             RB_DEBUG_COUNTER_INC(ccs_found);
             return ccs->cme;
         }
-
-        rb_vm_ccs_free(ccs);
-        rb_id_table_delete(cc_tbl, mid);
+        else {
+            rb_vm_ccs_free(ccs);
+            rb_id_table_delete(cc_tbl, mid);
+        }
     }
     return NULL;
 }
