@@ -1808,8 +1808,8 @@ rb_define_singleton_method(VALUE obj, const char *name, VALUE (*func)(ANYARGS), 
 void
 rb_define_module_function(VALUE module, const char *name, VALUE (*func)(ANYARGS), int argc)
 {
-    rb_define_singleton_method(module, name, func, argc);
     rb_define_private_method(module, name, func, argc);
+    rb_define_singleton_method(module, name, func, argc);
 }
 
 #ifdef rb_define_global_function
