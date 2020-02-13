@@ -29,7 +29,6 @@ class TestTracepointObj < Test::Unit::TestCase
   end
 
   def test_tracks_objspace_count
-    return
     stat1 = {}
     stat2 = {}
     GC.disable
