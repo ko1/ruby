@@ -3259,12 +3259,12 @@ Init_VM(void)
 #if VMDEBUG
     rb_define_singleton_method(rb_cRubyVM, "SDR", sdr, 0);
     rb_define_singleton_method(rb_cRubyVM, "NSDR", nsdr, 0);
+    rb_define_singleton_method(rb_cRubyVM, "mtbl", vm_mtbl, 2);
 #else
     (void)sdr;
     (void)nsdr;
     (void)vm_mtbl;
 #endif
-    rb_define_singleton_method(rb_cRubyVM, "mtbl", vm_mtbl, 2);
 
     /* VM bootstrap: phase 2 */
     {
