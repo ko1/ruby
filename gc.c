@@ -2566,7 +2566,7 @@ rb_vm_ccs_free(struct rb_class_cc_entries *ccs)
 struct cc_tbl_i_data {
     rb_objspace_t *objspace;
     VALUE klass;
-    int alive;
+    bool alive;
 };
 
 static enum rb_id_table_iterator_result
@@ -2619,7 +2619,7 @@ cc_table_free_i(ID id, VALUE ccs_ptr, void *data_ptr)
 }
 
 static void
-cc_table_free(rb_objspace_t *objspace, VALUE klass, int alive)
+cc_table_free(rb_objspace_t *objspace, VALUE klass, bool alive)
 {
     struct rb_id_table *cc_tbl = RCLASS_CC_TBL(klass);
 
