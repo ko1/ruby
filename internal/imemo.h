@@ -133,6 +133,7 @@ rb_imemo_tmpbuf_t *rb_imemo_tmpbuf_parser_heap(void *buf, rb_imemo_tmpbuf_t *old
 struct vm_ifunc *rb_vm_ifunc_new(rb_block_call_func_t func, const void *data, int min_argc, int max_argc);
 void rb_strterm_mark(VALUE obj);
 static inline enum imemo_type imemo_type(VALUE imemo);
+static inline int imemo_type_p(VALUE imemo, enum imemo_type imemo_type);
 static inline bool imemo_throw_data_p(VALUE imemo);
 static inline struct vm_ifunc *rb_vm_ifunc_proc_new(rb_block_call_func_t func, const void *data);
 static inline VALUE rb_imemo_tmpbuf_auto_free_pointer(void);
