@@ -234,7 +234,9 @@ struct rb_callcache {
     const VALUE flags; 
 
     /* inline cache: key */
-    const VALUE klass; // should not mark it
+    const VALUE klass; // should not mark it because klass can not be free'd
+                       // because of this marking. When klass is collected,
+                       // cc will be cleared (cc->klass = 0) at vm_ccs_free().
 
     /* inline cache: values */
     const struct rb_callable_method_entry_struct * const cme_;
