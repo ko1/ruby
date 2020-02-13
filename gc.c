@@ -2615,7 +2615,7 @@ cc_table_free_i(ID id, VALUE ccs_ptr, void *data_ptr)
     struct rb_class_cc_entries *ccs = (struct rb_class_cc_entries *)ccs_ptr;
     VM_ASSERT(vm_ccs_p(ccs));
     vm_ccs_free(ccs, data->alive, data->objspace, data->klass);
-    return ST_CONTINUE;
+    return ID_TABLE_CONTINUE;
 }
 
 static void
@@ -11831,7 +11831,7 @@ rb_raw_obj_info(char *buff, const int buff_size, VALUE obj)
                     APPENDF((BUFF_ARGS, "(klass:%s, cme:%s (%p) call:%p",
                              NIL_P(class_path) ? "??" : RSTRING_PTR(class_path),
                              vm_cc_cme(cc) ? rb_id2name(vm_cc_cme(cc)->called_id) : "<NULL>",
-                             vm_cc_cme(cc), vm_cc_call(cc)));
+                             (void *)vm_cc_cme(cc), (void *)vm_cc_call(cc)));
                     break;
                 }
 	      default:
