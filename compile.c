@@ -10304,16 +10304,18 @@ ibf_dump_ci_entries(struct ibf_dump *dump, const rb_iseq_t *iseq)
 }
 
 /* note that we dump out rb_call_info but load back rb_call_data */
-static struct rb_call_data *
+static void
 ibf_load_ci_entries(const struct ibf_load *load,
                     ibf_offset_t ci_entries_offset,
-                    unsigned int ci_size)
+                    unsigned int ci_size,
+                    struct rb_call_data **cd_ptr)
 {
     ibf_offset_t reading_pos = ci_entries_offset;
 
     unsigned int i;
 
     struct rb_call_data *cds = ZALLOC_N(struct rb_call_data, ci_size);
+    *cd_ptr = cds;
 
     for (i = 0; i < ci_size; i++) {
         VALUE mid_index = ibf_load_small_value(load, &reading_pos);
@@ -10336,9 +10338,7 @@ ibf_load_ci_entries(const struct ibf_load *load,
         RB_OBJ_WRITTEN(load->iseq, Qundef, cds[i].ci);
         cds[i].cc = vm_cc_empty();
     }
-
-    return cds;
-} 
+}
 
 static ibf_offset_t
 ibf_dump_iseq_each(struct ibf_dump *dump, const rb_iseq_t *iseq)
@@ -10592,7 +10592,7 @@ ibf_load_iseq_each(struct ibf_load *load, rb_iseq_t *iseq, ibf_offset_t offset)
     load_body->catch_except_p = catch_except_p;
 
     load_body->is_entries           = ZALLOC_N(union iseq_inline_storage_entry, is_size);
-    load_body->call_data            = ibf_load_ci_entries(load, ci_entries_offset, ci_size);
+                                      ibf_load_ci_entries(load, ci_entries_offset, ci_size, &load_body->call_data);
     load_body->param.opt_table      = ibf_load_param_opt_table(load, param_opt_table_offset, param_opt_num);
     load_body->param.keyword        = ibf_load_param_keyword(load, param_keyword_offset);
     load_body->param.flags.has_kw   = (param_flags >> 4) & 1;
