@@ -48,18 +48,9 @@ rb_callinfo_kwarg_bytes(int keyword_len)
 struct rb_callinfo {
     VALUE flags;
     const struct rb_callinfo_kwarg *kwarg;
-    union {
-        ID mid;
-        VALUE v1;
-    } u1;
-    union {
-        unsigned int flag;
-        VALUE v2;
-    } u2;
-    union {
-        unsigned int orig_argc;
-        VALUE v3;
-    } u3;
+    VALUE mid;
+    VALUE flag;
+    VALUE argc;
 };
 
 #ifndef USE_EMBED_CI
@@ -124,7 +115,7 @@ vm_ci_mid(const struct rb_callinfo *ci)
         return (((VALUE)ci) >> CI_EMBED_ID_SHFT) & CI_EMBED_ID_MASK;
     }
     else {
-        return ci->u1.mid;
+        return (ID)ci->mid;
     }
 }
 
@@ -135,7 +126,7 @@ vm_ci_flag(const struct rb_callinfo *ci)
         return (unsigned int)((((VALUE)ci) >> CI_EMBED_FLAG_SHFT) & CI_EMBED_FLAG_MASK);
     }
     else {
-        return ci->u2.flag;
+        return (unsigned int)ci->flag;
     }
 }
 
@@ -146,7 +137,7 @@ vm_ci_argc(const struct rb_callinfo *ci)
         return (unsigned int)((((VALUE)ci) >> CI_EMBED_ARGC_SHFT) & CI_EMBED_ARGC_MASK);
     }
     else {
-        return ci->u3.orig_argc;
+        return (unsigned int)ci->argc;
     }
 }
 
@@ -210,6 +201,9 @@ vm_ci_new_(ID mid, unsigned int flag, unsigned int argc, const struct rb_callinf
     else {
         RB_DEBUG_COUNTER_INC(ci_nokw);
     }
+
+    VM_ASSERT(vm_ci_flag(ci) == flag);
+    VM_ASSERT(vm_ci_argc(ci) == argc);
 
     return ci;
 }
