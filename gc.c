@@ -11795,7 +11795,7 @@ rb_raw_obj_info(char *buff, const int buff_size, VALUE obj)
                              METHOD_ENTRY_CACHED(me) ? ",cc" : "",
                              METHOD_ENTRY_INVALIDATED(me) ? ",inv" : "",
                              rb_method_type_name(me->def->type),
-                             me->def->alias_count,
+			     me->def->alias_count,
                              (void *)me->owner, // obj_info(me->owner),
                              (void *)me->defined_class)); //obj_info(me->defined_class)));
 

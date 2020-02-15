@@ -148,7 +148,7 @@ vm_call0_body(rb_execution_context_t *ec, struct rb_calling_info *calling, struc
         }
 
 	rb_check_arity(calling->argc, 1, 1);
-	ret = rb_ivar_set(calling->recv, vm_cc_cme(cc)->def->body.attr.id, argv[0]);
+        ret = rb_ivar_set(calling->recv, vm_cc_cme(cc)->def->body.attr.id, argv[0]);
 	goto success;
       case VM_METHOD_TYPE_IVAR:
         if (calling->kw_splat &&
@@ -159,7 +159,7 @@ vm_call0_body(rb_execution_context_t *ec, struct rb_calling_info *calling, struc
         }
 
 	rb_check_arity(calling->argc, 0, 0);
-	ret = rb_attr_get(calling->recv, vm_cc_cme(cc)->def->body.attr.id);
+        ret = rb_attr_get(calling->recv, vm_cc_cme(cc)->def->body.attr.id);
 	goto success;
       case VM_METHOD_TYPE_BMETHOD:
         ret = vm_call_bmethod_body(ec, calling, cd, argv);
@@ -167,15 +167,15 @@ vm_call0_body(rb_execution_context_t *ec, struct rb_calling_info *calling, struc
       case VM_METHOD_TYPE_ZSUPER:
       case VM_METHOD_TYPE_REFINED:
 	{
-	    const rb_method_type_t type = vm_cc_cme(cc)->def->type;
-	    VALUE super_class = vm_cc_cme(cc)->defined_class;
+            const rb_method_type_t type = vm_cc_cme(cc)->def->type;
+            VALUE super_class = vm_cc_cme(cc)->defined_class;
 
 	    if (type == VM_METHOD_TYPE_ZSUPER) {
 		super_class = RCLASS_ORIGIN(super_class);
 	    }
-	    else if (vm_cc_cme(cc)->def->body.refined.orig_me) {
+            else if (vm_cc_cme(cc)->def->body.refined.orig_me) {
                 vm_cc_cme_set(cc, refined_method_callable_without_refinement(vm_cc_cme(cc)));
-                goto again;
+		goto again;
 	    }
 
 	    super_class = RCLASS_SUPER(super_class);
@@ -197,11 +197,11 @@ vm_call0_body(rb_execution_context_t *ec, struct rb_calling_info *calling, struc
       case VM_METHOD_TYPE_MISSING:
 	{
 	    vm_passed_block_handler_set(ec, calling->block_handler);
-	    return method_missing(calling->recv, vm_ci_mid(ci), calling->argc,
+            return method_missing(calling->recv, vm_ci_mid(ci), calling->argc,
                                   argv, MISSING_NOENTRY, calling->kw_splat);
 	}
       case VM_METHOD_TYPE_OPTIMIZED:
-	switch (vm_cc_cme(cc)->def->body.optimize_type) {
+        switch (vm_cc_cme(cc)->def->body.optimize_type) {
 	  case OPTIMIZED_METHOD_TYPE_SEND:
             ret = send_internal(calling->argc, argv, calling->recv, calling->kw_splat ? CALL_FCALL_KW : CALL_FCALL);
 	    goto success;
@@ -213,7 +213,7 @@ vm_call0_body(rb_execution_context_t *ec, struct rb_calling_info *calling, struc
 		goto success;
 	    }
 	  default:
-	    rb_bug("vm_call0: unsupported optimized method type (%d)", vm_cc_cme(cc)->def->body.optimize_type);
+            rb_bug("vm_call0: unsupported optimized method type (%d)", vm_cc_cme(cc)->def->body.optimize_type);
 	}
 	break;
       case VM_METHOD_TYPE_UNDEF:
@@ -444,7 +444,7 @@ check_funcall_missing(rb_execution_context_t *ec, VALUE klass, VALUE recv, ID mi
 	ec->method_missing_reason = MISSING_NOENTRY;
 	args.ec = ec;
 	args.recv = recv;
-	args.cme = cme;
+        args.cme = cme;
 	args.mid = mid;
 	args.argc = argc + 1;
 	args.argv = new_args;

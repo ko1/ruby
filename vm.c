@@ -2809,8 +2809,8 @@ m_core_undef_method(VALUE self, VALUE cbase, VALUE sym)
 {
     REWIND_CFP({
         ID mid = SYM2ID(sym);
-	rb_undef(cbase, mid);
-	rb_clear_method_cache(self, mid);
+        rb_undef(cbase, mid);
+        rb_clear_method_cache(self, mid);
     });
     return Qnil;
 }

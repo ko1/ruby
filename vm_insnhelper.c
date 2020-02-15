@@ -1133,9 +1133,9 @@ vm_setivar(VALUE obj, ID id, VALUE val, IVC ic, const struct rb_callcache *cc, i
 
 	if (LIKELY(
 	    (!is_attr && RB_DEBUG_COUNTER_INC_UNLESS(ivar_set_ic_miss_serial, ic->ic_serial == RCLASS_SERIAL(klass))) ||
-	    ( is_attr && RB_DEBUG_COUNTER_INC_UNLESS(ivar_set_ic_miss_unset, vm_cc_attr_index(cc) > 0)))) {
+            ( is_attr && RB_DEBUG_COUNTER_INC_UNLESS(ivar_set_ic_miss_unset, vm_cc_attr_index(cc) > 0)))) {
 	    VALUE *ptr = ROBJECT_IVPTR(obj);
-	    index = !is_attr ? ic->index : vm_cc_attr_index(cc)-1;
+            index = !is_attr ? ic->index : vm_cc_attr_index(cc)-1;
 
 	    if (RB_DEBUG_COUNTER_INC_UNLESS(ivar_set_ic_miss_oorange, index < ROBJECT_NUMIV(obj))) {
 		RB_OBJ_WRITE(obj, &ptr[index], val);
@@ -1155,7 +1155,7 @@ vm_setivar(VALUE obj, ID id, VALUE val, IVC ic, const struct rb_callcache *cc, i
 		    rb_raise(rb_eArgError, "too many instance variables");
 		}
 		else {
-		    vm_cc_attr_index_set(cc, (int)(index + 1));
+                    vm_cc_attr_index_set(cc, (int)(index + 1));
 		}
 	    }
 	    /* fall through */
@@ -2597,11 +2597,11 @@ find_defined_class_by_owner(VALUE current_class, VALUE target_owner)
     if (RB_TYPE_P(klass, T_ICLASS) && FL_TEST(klass, RICLASS_IS_ORIGIN)) klass = RBASIC_CLASS(klass);
 
     while (RTEST(klass)) {
-	VALUE owner = RB_TYPE_P(klass, T_ICLASS) ? RBASIC_CLASS(klass) : klass;
-	if (owner == target_owner) {
-	    return klass;
-	}
-	klass = RCLASS_SUPER(klass);
+        VALUE owner = RB_TYPE_P(klass, T_ICLASS) ? RBASIC_CLASS(klass) : klass;
+        if (owner == target_owner) {
+            return klass;
+        }
+        klass = RCLASS_SUPER(klass);
     }
 
     return current_class; /* maybe module function */
@@ -2614,21 +2614,21 @@ aliased_callable_method_entry(const rb_callable_method_entry_t *me)
     const rb_callable_method_entry_t *cme;
 
     if (orig_me->defined_class == 0) {
-	VALUE defined_class = find_defined_class_by_owner(me->defined_class, orig_me->owner);
-	VM_ASSERT(RB_TYPE_P(orig_me->owner, T_MODULE));
-	cme = rb_method_entry_complement_defined_class(orig_me, me->called_id, defined_class);
+        VALUE defined_class = find_defined_class_by_owner(me->defined_class, orig_me->owner);
+        VM_ASSERT(RB_TYPE_P(orig_me->owner, T_MODULE));
+        cme = rb_method_entry_complement_defined_class(orig_me, me->called_id, defined_class);
 
-	if (me->def->alias_count + me->def->complemented_count == 0) {
-	    RB_OBJ_WRITE(me, &me->def->body.alias.original_me, cme);
-	}
-	else {
-	    rb_method_definition_t *def =
-		rb_method_definition_create(VM_METHOD_TYPE_ALIAS, me->def->original_id);
-	    rb_method_definition_set((rb_method_entry_t *)me, def, (void *)cme);
-	}
+        if (me->def->alias_count + me->def->complemented_count == 0) {
+            RB_OBJ_WRITE(me, &me->def->body.alias.original_me, cme);
+        }
+        else {
+            rb_method_definition_t *def =
+                rb_method_definition_create(VM_METHOD_TYPE_ALIAS, me->def->original_id);
+            rb_method_definition_set((rb_method_entry_t *)me, def, (void *)cme);
+        }
     }
     else {
-	cme = (const rb_callable_method_entry_t *)orig_me;
+        cme = (const rb_callable_method_entry_t *)orig_me;
     }
 
     VM_ASSERT(callable_method_entry_p(cme));
@@ -2714,11 +2714,11 @@ static inline VALUE vm_invoke_block(rb_execution_context_t *ec, rb_control_frame
 
 NOINLINE(static VALUE
 	 vm_invoke_block_opt_call(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
-				  struct rb_calling_info *calling, const struct rb_callinfo *ci, VALUE block_handler));
+                                  struct rb_calling_info *calling, const struct rb_callinfo *ci, VALUE block_handler));
 
 static VALUE
 vm_invoke_block_opt_call(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
-			 struct rb_calling_info *calling, const struct rb_callinfo *ci, VALUE block_handler)
+                         struct rb_calling_info *calling, const struct rb_callinfo *ci, VALUE block_handler)
 {
     int argc = calling->argc;
 
@@ -2961,7 +2961,7 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
         CALLER_REMOVE_EMPTY_KW_SPLAT(cfp, calling, ci);
 
 	rb_check_arity(calling->argc, 1, 1);
-	vm_cc_attr_index_set(cc, 0);
+        vm_cc_attr_index_set(cc, 0);
         CC_SET_FASTPATH(cc, vm_call_attrset, !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT | VM_CALL_KWARG)));
         return vm_call_attrset(ec, cfp, calling, cd);
 
@@ -2969,7 +2969,7 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
         CALLER_SETUP_ARG(cfp, calling, ci);
         CALLER_REMOVE_EMPTY_KW_SPLAT(cfp, calling, ci);
 	rb_check_arity(calling->argc, 0, 0);
-	vm_cc_attr_index_set(cc, 0);
+        vm_cc_attr_index_set(cc, 0);
         CC_SET_FASTPATH(cc, vm_call_ivar, !(vm_ci_flag(ci) & (VM_CALL_ARGS_SPLAT | VM_CALL_KW_SPLAT)));
         return vm_call_ivar(ec, cfp, calling, cd);
 
@@ -2987,7 +2987,7 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
         return vm_call_alias(ec, cfp, calling, cd);
 
       case VM_METHOD_TYPE_OPTIMIZED:
-	switch (vm_cc_cme(cc)->def->body.optimize_type) {
+        switch (vm_cc_cme(cc)->def->body.optimize_type) {
 	  case OPTIMIZED_METHOD_TYPE_SEND:
             CC_SET_FASTPATH(cc, vm_call_opt_send, TRUE);
             return vm_call_opt_send(ec, cfp, calling, cd);
@@ -2999,7 +2999,7 @@ vm_call_method_each_type(rb_execution_context_t *ec, rb_control_frame_t *cfp, st
             return vm_call_opt_block_call(ec, cfp, calling, cd);
 	  default:
 	    rb_bug("vm_call_method: unsupported optimized method type (%d)",
-		   vm_cc_cme(cc)->def->body.optimize_type);
+                   vm_cc_cme(cc)->def->body.optimize_type);
 	}
 
       case VM_METHOD_TYPE_UNDEF:
@@ -3045,14 +3045,14 @@ vm_call_method(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_ca
     VM_ASSERT(callable_method_entry_p(vm_cc_cme(cc)));
 
     if (vm_cc_cme(cc) != NULL) {
-	switch (METHOD_ENTRY_VISI(vm_cc_cme(cc))) {
+        switch (METHOD_ENTRY_VISI(vm_cc_cme(cc))) {
 	  case METHOD_VISI_PUBLIC: /* likely */
             return vm_call_method_each_type(ec, cfp, calling, cd);
 
 	  case METHOD_VISI_PRIVATE:
-	    if (!(vm_ci_flag(ci) & VM_CALL_FCALL)) {
+            if (!(vm_ci_flag(ci) & VM_CALL_FCALL)) {
 		enum method_missing_reason stat = MISSING_PRIVATE;
-		if (vm_ci_flag(ci) & VM_CALL_VCALL) stat |= MISSING_VCALL;
+                if (vm_ci_flag(ci) & VM_CALL_VCALL) stat |= MISSING_VCALL;
 
                 vm_cc_method_missing_reason_set(cc, stat);
                 CC_SET_FASTPATH(cc, vm_call_method_missing, TRUE);
@@ -3061,14 +3061,14 @@ vm_call_method(rb_execution_context_t *ec, rb_control_frame_t *cfp, struct rb_ca
             return vm_call_method_each_type(ec, cfp, calling, cd);
 
 	  case METHOD_VISI_PROTECTED:
-	    if (!(vm_ci_flag(ci) & VM_CALL_OPT_SEND)) {
-		if (!rb_obj_is_kind_of(cfp->self, vm_cc_cme(cc)->defined_class)) {
+            if (!(vm_ci_flag(ci) & VM_CALL_OPT_SEND)) {
+                if (!rb_obj_is_kind_of(cfp->self, vm_cc_cme(cc)->defined_class)) {
                     vm_cc_method_missing_reason_set(cc, MISSING_PROTECTED);
                     return vm_call_method_missing(ec, cfp, calling, cd);
 		}
 		else {
 		    /* caching method info to dummy cc */
-		    VM_ASSERT(vm_cc_cme(cc) != NULL);
+                    VM_ASSERT(vm_cc_cme(cc) != NULL);
                     struct rb_callcache cc_body;
                     struct rb_call_data cd_body = {
                         .ci = ci,
@@ -3360,7 +3360,7 @@ vm_yield_setup_args(rb_execution_context_t *ec, const rb_iseq_t *iseq, const int
 
 static VALUE
 vm_invoke_iseq_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
-		     struct rb_calling_info *calling, const struct rb_callinfo *ci,
+                     struct rb_calling_info *calling, const struct rb_callinfo *ci,
 		     int is_lambda, const struct rb_captured_block *captured)
 {
     const rb_iseq_t *iseq = rb_iseq_check(captured->code.iseq);
@@ -3383,7 +3383,7 @@ vm_invoke_iseq_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
 
 static VALUE
 vm_invoke_symbol_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
-		       struct rb_calling_info *calling, const struct rb_callinfo *ci,
+                       struct rb_calling_info *calling, const struct rb_callinfo *ci,
 		       VALUE symbol)
 {
     VALUE val;
@@ -3397,7 +3397,7 @@ vm_invoke_symbol_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
 
 static VALUE
 vm_invoke_ifunc_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
-		      struct rb_calling_info *calling, const struct rb_callinfo *ci,
+                      struct rb_calling_info *calling, const struct rb_callinfo *ci,
 		      const struct rb_captured_block *captured)
 {
     VALUE val;
@@ -3431,7 +3431,7 @@ vm_proc_to_block_handler(VALUE procval)
 
 static inline VALUE
 vm_invoke_block(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp,
-		struct rb_calling_info *calling, const struct rb_callinfo *ci, VALUE block_handler)
+                struct rb_calling_info *calling, const struct rb_callinfo *ci, VALUE block_handler)
 {
     int is_lambda = FALSE;
 

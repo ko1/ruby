@@ -2214,7 +2214,7 @@ iseq_set_sequence(rb_iseq_t *iseq, LINK_ANCHOR *const anchor)
 			}
 		      case TS_ISE: /* inline storage entry */
 			/* Treated as an IC, but may contain a markable VALUE */
-                        FL_SET(iseq, ISEQ_MARKABLE_ISEQ);
+			FL_SET(iseq, ISEQ_MARKABLE_ISEQ);
                         /* fall through */
 		      case TS_IC: /* inline cache */
 		      case TS_IVC: /* inline ivar cache */
@@ -3173,13 +3173,13 @@ iseq_peephole_optimize(rb_iseq_t *iseq, LINK_ELEMENT *list, const int do_tailcal
 	INSN *niobj = (INSN *)iobj->link.next;
         const struct rb_callinfo *ci = (struct rb_callinfo *)OPERAND_AT(niobj, 0);
 
-        /*
+	/*
 	 *  freezestring nil # no debug_info
 	 *  send <:+@, 0, ARG_SIMPLE>  # :-@, too
 	 * =>
 	 *  send <:+@, 0, ARG_SIMPLE>  # :-@, too
 	 */
-	if ((vm_ci_mid(ci) == idUPlus || vm_ci_mid(ci) == idUMinus) &&
+        if ((vm_ci_mid(ci) == idUPlus || vm_ci_mid(ci) == idUMinus) &&
             (vm_ci_flag(ci) & VM_CALL_ARGS_SIMPLE) &&
             vm_ci_argc(ci) == 0) {
 	    ELEM_REMOVE(list);
@@ -3230,7 +3230,7 @@ iseq_peephole_optimize(rb_iseq_t *iseq, LINK_ELEMENT *list, const int do_tailcal
 
 	if (piobj) {
             const struct rb_callinfo *ci = (struct rb_callinfo *)OPERAND_AT(piobj, 0);
-	    if (IS_INSN_ID(piobj, send) ||
+            if (IS_INSN_ID(piobj, send) ||
                 IS_INSN_ID(piobj, invokesuper)) {
                 if (OPERAND_AT(piobj, 1) == 0) { /* no blockiseq */
                     ci = ci_flag_set(iseq, ci, VM_CALL_TAILCALL);
@@ -3324,7 +3324,7 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 	if (IS_INSN_ID(niobj, send)) {
             const struct rb_callinfo *ci = (struct rb_callinfo *)OPERAND_AT(niobj, 0);
             if ((vm_ci_flag(ci) & VM_CALL_ARGS_SIMPLE) && vm_ci_argc(ci) == 0) {
-		switch (vm_ci_mid(ci)) {
+                switch (vm_ci_mid(ci)) {
 		  case idMax:
 		    iobj->insn_id = BIN(opt_newarray_max);
 		    ELEM_REMOVE(&niobj->link);
@@ -3343,10 +3343,10 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
         const rb_iseq_t *blockiseq = (rb_iseq_t *)OPERAND_AT(iobj, 1);
 
 #define SP_INSN(opt) insn_set_specialized_instruction(iseq, iobj, BIN(opt_##opt))
-	if (vm_ci_flag(ci) & VM_CALL_ARGS_SIMPLE) {
-	    switch (vm_ci_argc(ci)) {
+        if (vm_ci_flag(ci) & VM_CALL_ARGS_SIMPLE) {
+            switch (vm_ci_argc(ci)) {
 	      case 0:
-		switch (vm_ci_mid(ci)) {
+                switch (vm_ci_mid(ci)) {
 		  case idLength: SP_INSN(length); return COMPILE_OK;
 		  case idSize:	 SP_INSN(size);	  return COMPILE_OK;
 		  case idEmptyP: SP_INSN(empty_p);return COMPILE_OK;
@@ -3356,7 +3356,7 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 		}
 		break;
 	      case 1:
-		switch (vm_ci_mid(ci)) {
+                switch (vm_ci_mid(ci)) {
 		  case idPLUS:	 SP_INSN(plus);	  return COMPILE_OK;
 		  case idMINUS:	 SP_INSN(minus);  return COMPILE_OK;
 		  case idMULT:	 SP_INSN(mult);	  return COMPILE_OK;
@@ -3376,14 +3376,14 @@ iseq_specialized_instruction(rb_iseq_t *iseq, INSN *iobj)
 		}
 		break;
 	      case 2:
-		switch (vm_ci_mid(ci)) {
+                switch (vm_ci_mid(ci)) {
 		  case idASET:	 SP_INSN(aset);	  return COMPILE_OK;
 		}
 		break;
 	    }
 	}
 
-	if ((vm_ci_flag(ci) & VM_CALL_ARGS_BLOCKARG) == 0 && blockiseq == NULL) {
+        if ((vm_ci_flag(ci) & VM_CALL_ARGS_BLOCKARG) == 0 && blockiseq == NULL) {
 	    iobj->insn_id = BIN(opt_send_without_block);
 	    iobj->operand_size = insn_len(iobj->insn_id) - 1;
 	}
@@ -3471,7 +3471,7 @@ new_unified_insn(rb_iseq_t *iseq,
     }
 
     if (argc > 0) {
-	ptr = operands = compile_data_alloc2(iseq, sizeof(VALUE), argc);
+        ptr = operands = compile_data_alloc2(iseq, sizeof(VALUE), argc);
     }
 
     /* copy operands */
@@ -3896,7 +3896,7 @@ keyword_node_p(const NODE *const node)
 static int
 compile_keyword_arg(rb_iseq_t *iseq, LINK_ANCHOR *const ret,
 			  const NODE *const root_node,
-			  struct rb_callinfo_kwarg **const kw_arg_ptr,
+                          struct rb_callinfo_kwarg **const kw_arg_ptr,
 			  unsigned int *flag)
 {
     if (kw_arg_ptr == NULL) return FALSE;
@@ -4447,12 +4447,12 @@ compile_massign_lhs(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *const n
         dupidx = INT2FIX(argc);
 
 	INSERT_BEFORE_INSN1(iobj, line, topn, dupidx);
-	if (vm_ci_flag(ci) & VM_CALL_ARGS_SPLAT) {
+        if (vm_ci_flag(ci) & VM_CALL_ARGS_SPLAT) {
             int argc = vm_ci_argc(ci);
             ci = ci_argc_set(iseq, ci, argc - 1);
             OPERAND_AT(iobj, 0) = (VALUE)ci;
             RB_OBJ_WRITTEN(iseq, Qundef, iobj);
-            INSERT_BEFORE_INSN1(iobj, line, newarray, INT2FIX(1));
+	    INSERT_BEFORE_INSN1(iobj, line, newarray, INT2FIX(1));
 	    INSERT_BEFORE_INSN(iobj, line, concatarray);
 	}
 	ADD_INSN(ret, line, pop);	/* result */
@@ -5108,7 +5108,7 @@ setup_args_core(rb_iseq_t *iseq, LINK_ANCHOR *const args, const NODE *argn,
 
 static VALUE
 setup_args(rb_iseq_t *iseq, LINK_ANCHOR *const args, const NODE *argn,
-	   unsigned int *flag, struct rb_callinfo_kwarg **keywords)
+           unsigned int *flag, struct rb_callinfo_kwarg **keywords)
 {
     VALUE ret;
     if (argn && nd_type(argn) == NODE_BLOCK_PASS) {
@@ -7695,7 +7695,7 @@ iseq_compile_each0(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, in
 	DECL_ANCHOR(args);
 	int argc;
 	unsigned int flag = 0;
-	struct rb_callinfo_kwarg *keywords = NULL;
+        struct rb_callinfo_kwarg *keywords = NULL;
 	const rb_iseq_t *parent_block = ISEQ_COMPILE_DATA(iseq)->current_block;
 
 	INIT_ANCHOR(args);
@@ -7853,7 +7853,7 @@ iseq_compile_each0(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, in
 	DECL_ANCHOR(args);
 	VALUE argc;
 	unsigned int flag = 0;
-	struct rb_callinfo_kwarg *keywords = NULL;
+        struct rb_callinfo_kwarg *keywords = NULL;
 
 	INIT_ANCHOR(args);
 
@@ -8937,7 +8937,7 @@ iseq_build_callinfo_from_hash(rb_iseq_t *iseq, VALUE op)
 	if (!NIL_P(vkw_arg)) {
 	    int i;
 	    int len = RARRAY_LENINT(vkw_arg);
-	    size_t n = rb_callinfo_kwarg_bytes(len);
+            size_t n = rb_callinfo_kwarg_bytes(len);
 
 	    kw_arg = xmalloc(n);
 	    kw_arg->keyword_len = len;

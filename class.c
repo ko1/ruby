@@ -921,7 +921,7 @@ include_modules_at(const VALUE klass, VALUE c, VALUE module, int search_super)
 	if (klass_m_tbl && klass_m_tbl == RCLASS_M_TBL(module))
 	    return -1;
 	/* ignore if the module included already in superclasses */
-        for (p = RCLASS_SUPER(klass); p; p = RCLASS_SUPER(p)) {
+	for (p = RCLASS_SUPER(klass); p; p = RCLASS_SUPER(p)) {
 	    int type = BUILTIN_TYPE(p);
 	    if (type == T_ICLASS) {
 		if (RCLASS_M_TBL(p) == RCLASS_M_TBL(module)) {
@@ -933,7 +933,7 @@ include_modules_at(const VALUE klass, VALUE c, VALUE module, int search_super)
 	    }
 	    else if (type == T_CLASS) {
 		if (!search_super) break;
-                superclass_seen = TRUE;
+		superclass_seen = TRUE;
 	    }
 	}
 
@@ -956,21 +956,21 @@ include_modules_at(const VALUE klass, VALUE c, VALUE module, int search_super)
         }
 
         // setup T_ICLASS for the include/prepend module
-	iclass = rb_include_class_new(module, super_class);
+        iclass = rb_include_class_new(module, super_class);
 	c = RCLASS_SET_SUPER(c, iclass);
         RCLASS_SET_INCLUDER(iclass, klass);
 
 	{
 	    VALUE m = module;
-            if (BUILTIN_TYPE(m) == T_ICLASS) m = RBASIC(m)->klass;
-            rb_module_add_to_subclasses_list(m, iclass);
+	    if (BUILTIN_TYPE(m) == T_ICLASS) m = RBASIC(m)->klass;
+	    rb_module_add_to_subclasses_list(m, iclass);
 	}
 
 	if (FL_TEST(klass, RMODULE_IS_REFINEMENT)) {
 	    VALUE refined_class =
 		rb_refinement_module_get_refined_class(klass);
 
-            rb_id_table_foreach(RMODULE_M_TBL(module), add_refined_method_entry_i, (void *)refined_class);
+	    rb_id_table_foreach(RMODULE_M_TBL(module), add_refined_method_entry_i, (void *)refined_class);
 	    FL_SET(c, RMODULE_INCLUDED_INTO_REFINEMENT);
 	}
 

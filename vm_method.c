@@ -244,7 +244,7 @@ invalidate_all_cc(void *vstart, void *vend, size_t stride, void *data)
                 }
                 RCLASS_CC_TBL(v) = NULL;
             }
-        }
+	}
     }
     return 0; // continue to iteration
 }
@@ -277,7 +277,7 @@ rb_add_method_cfunc(VALUE klass, ID mid, VALUE (*func)(ANYARGS), int argc, rb_me
 	rb_method_cfunc_t opt;
 	opt.func = func;
 	opt.argc = argc;
-        rb_add_method(klass, mid, VM_METHOD_TYPE_CFUNC, &opt, visi);
+	rb_add_method(klass, mid, VM_METHOD_TYPE_CFUNC, &opt, visi);
     }
     else {
 	rb_define_notimplement_method_id(klass, mid, visi);
@@ -536,7 +536,7 @@ const rb_method_entry_t *
 rb_method_entry_clone(const rb_method_entry_t *src_me)
 {
     rb_method_entry_t *me = rb_method_entry_alloc(src_me->called_id, src_me->owner, src_me->defined_class,
-                                                  method_definition_addref(src_me->def));
+						  method_definition_addref(src_me->def));
     if (METHOD_ENTRY_COMPLEMENTED(src_me)) {
         method_definition_addref_complement(src_me->def);
     }
@@ -628,10 +628,10 @@ lookup_method_table(VALUE klass, ID id)
     struct rb_id_table *m_tbl = RCLASS_M_TBL(klass);
 
     if (rb_id_table_lookup(m_tbl, id, &body)) {
-	return (rb_method_entry_t *) body;
+        return (rb_method_entry_t *) body;
     }
     else {
-	return 0;
+        return 0;
     }
 }
 
@@ -642,7 +642,7 @@ rb_add_refined_method_entry(VALUE refined_class, ID mid)
 
     if (me) {
 	make_method_entry_refined(refined_class, me);
-	rb_clear_method_cache(refined_class, mid);
+        rb_clear_method_cache(refined_class, mid);
     }
     else {
 	rb_add_method(refined_class, mid, VM_METHOD_TYPE_REFINED, 0, METHOD_VISI_PUBLIC);
@@ -950,7 +950,7 @@ prepare_callable_method_entry(VALUE defined_class, ID id, const rb_method_entry_
                 RB_DEBUG_COUNTER_INC(mc_cme_complement_hit);
                 VM_ASSERT(callable_method_entry_p(cme));
                 VM_ASSERT(!METHOD_ENTRY_INVALIDATED(cme));
-            }
+	    }
             else if (create) {
                 if (!mtbl) {
                     mtbl = RCLASS_EXT(defined_class)->callable_m_tbl = rb_id_table_create(0);
@@ -965,9 +965,9 @@ prepare_callable_method_entry(VALUE defined_class, ID id, const rb_method_entry_
         }
         else {
             cme = (const rb_callable_method_entry_t *)me;
-            VM_ASSERT(callable_method_entry_p(cme));
+	    VM_ASSERT(callable_method_entry_p(cme));
             VM_ASSERT(!METHOD_ENTRY_INVALIDATED(cme));
-        }
+	}
         return cme;
     }
     else {
@@ -1119,7 +1119,7 @@ resolve_refined_method(VALUE refinements, const rb_method_entry_t *me, VALUE *de
 
 	refinement = find_refinement(refinements, me->owner);
         if (!NIL_P(refinement)) {
-	    tmp_me = search_method_protect(refinement, me->called_id, defined_class_ptr);
+            tmp_me = search_method_protect(refinement, me->called_id, defined_class_ptr);
 
 	    if (tmp_me && tmp_me->def->type != VM_METHOD_TYPE_REFINED) {
 		return tmp_me;
@@ -1286,7 +1286,7 @@ rb_method_boundp(VALUE klass, ID id, int ex)
     }
 
     if (me != NULL) {
-        if ((ex & ~BOUND_RESPONDS) &&
+	if ((ex & ~BOUND_RESPONDS) &&
 	    ((METHOD_ENTRY_VISI(me) == METHOD_VISI_PRIVATE) ||
 	     ((ex & BOUND_RESPONDS) && (METHOD_ENTRY_VISI(me) == METHOD_VISI_PROTECTED)))) {
 	    return 0;
@@ -2317,7 +2317,7 @@ vm_respond_to(rb_execution_context_t *ec, VALUE klass, VALUE obj, ID id, int pri
 		argc = 2;
 	    }
 	    else if (!NIL_P(ruby_verbose)) {
-		VALUE location = rb_method_entry_location((const rb_method_entry_t *)cme);
+                VALUE location = rb_method_entry_location((const rb_method_entry_t *)cme);
 		rb_warn("%"PRIsVALUE"%c""respond_to?(:%"PRIsVALUE") uses"
 			" the deprecated method signature, which takes one parameter",
 			(FL_TEST(klass, FL_SINGLETON) ? obj : klass),

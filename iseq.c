@@ -1963,15 +1963,15 @@ rb_insn_operand_intern(const rb_iseq_t *iseq,
             ID mid = vm_ci_mid(ci);
 
             if (mid) {
-		rb_ary_push(ary, rb_sprintf("mid:%"PRIsVALUE, rb_id2str(mid)));
+                rb_ary_push(ary, rb_sprintf("mid:%"PRIsVALUE, rb_id2str(mid)));
 	    }
 
-	    rb_ary_push(ary, rb_sprintf("argc:%d", vm_ci_argc(ci)));
+            rb_ary_push(ary, rb_sprintf("argc:%d", vm_ci_argc(ci)));
 
             if (vm_ci_flag(ci) & VM_CALL_KWARG) {
                 const struct rb_callinfo_kwarg *kw_args = vm_ci_kwarg(ci);
-                VALUE kw_ary = rb_ary_new_from_values(kw_args->keyword_len, kw_args->keywords);
-                rb_ary_push(ary, rb_sprintf("kw:[%"PRIsVALUE"]", rb_ary_join(kw_ary, rb_str_new2(","))));
+		VALUE kw_ary = rb_ary_new_from_values(kw_args->keyword_len, kw_args->keywords);
+		rb_ary_push(ary, rb_sprintf("kw:[%"PRIsVALUE"]", rb_ary_join(kw_ary, rb_str_new2(","))));
 	    }
 
             if (vm_ci_flag(ci)) {
@@ -2791,23 +2791,23 @@ iseq_data_to_ary(const rb_iseq_t *iseq)
                     int argc = vm_ci_argc(ci);
 
                     ID mid = vm_ci_mid(ci);
-		    rb_hash_aset(e, ID2SYM(rb_intern("mid")), mid ? ID2SYM(mid) : Qnil);
-		    rb_hash_aset(e, ID2SYM(rb_intern("flag")), UINT2NUM(vm_ci_flag(ci)));
+                    rb_hash_aset(e, ID2SYM(rb_intern("mid")), mid ? ID2SYM(mid) : Qnil);
+                    rb_hash_aset(e, ID2SYM(rb_intern("flag")), UINT2NUM(vm_ci_flag(ci)));
 
                     if (vm_ci_flag(ci) & VM_CALL_KWARG) {
                         const struct rb_callinfo_kwarg *kwarg = vm_ci_kwarg(ci);
-                        int i;
-			VALUE kw = rb_ary_new2((long)kwarg->keyword_len);
+			int i;
+                        VALUE kw = rb_ary_new2((long)kwarg->keyword_len);
 
-			argc -= kwarg->keyword_len;
+                        argc -= kwarg->keyword_len;
                         for (i = 0; i < kwarg->keyword_len; i++) {
-			    rb_ary_push(kw, kwarg->keywords[i]);
+                            rb_ary_push(kw, kwarg->keywords[i]);
 			}
 			rb_hash_aset(e, ID2SYM(rb_intern("kw_arg")), kw);
 		    }
 
 		    rb_hash_aset(e, ID2SYM(rb_intern("orig_argc")),
-				INT2FIX(argc));
+                                INT2FIX(argc));
 		    rb_ary_push(ary, e);
 	        }
 		break;

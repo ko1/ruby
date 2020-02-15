@@ -441,7 +441,7 @@ static int
 setup_parameters_complex(rb_execution_context_t * const ec, const rb_iseq_t * const iseq,
 			 struct rb_calling_info *const calling,
                          const struct rb_callinfo *ci,
-                         VALUE * const locals, const enum arg_setup_type arg_setup_type)
+			 VALUE * const locals, const enum arg_setup_type arg_setup_type)
 {
     const int min_argc = iseq->body->param.lead_num + iseq->body->param.post_num;
     const int max_argc = (iseq->body->param.flags.has_rest == FALSE) ? min_argc + iseq->body->param.opt_num : UNLIMITED_ARGUMENTS;
@@ -481,7 +481,7 @@ setup_parameters_complex(rb_execution_context_t * const ec, const rb_iseq_t * co
     args->rest_dupped = FALSE;
 
     if (kw_flag & VM_CALL_KWARG) {
-	args->kw_arg = vm_ci_kwarg(ci);
+        args->kw_arg = vm_ci_kwarg(ci);
 
 	if (iseq->body->param.flags.has_kw) {
 	    int kw_len = args->kw_arg->keyword_len;
@@ -631,7 +631,7 @@ setup_parameters_complex(rb_execution_context_t * const ec, const rb_iseq_t * co
 	VALUE * const klocals = locals + iseq->body->param.keyword->bits_start - iseq->body->param.keyword->num;
 
 	if (args->kw_argv != NULL) {
-	    const struct rb_callinfo_kwarg *kw_arg = args->kw_arg;
+            const struct rb_callinfo_kwarg *kw_arg = args->kw_arg;
 	    args_setup_kw_parameters(ec, iseq, args->kw_argv, kw_arg->keyword_len, kw_arg->keywords, klocals);
 	}
 	else if (!NIL_P(keyword_hash)) {
