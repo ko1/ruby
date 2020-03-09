@@ -20,7 +20,7 @@
 // respect RUBY_DUBUG: if given n is 0, then use RUBY_DEBUG
 #define N_OR_RUBY_DEBUG(n) (((n) > 0) ? (n) : RUBY_DEBUG)
 
-#define VM_CHECK_MODE N_OR_RUBY_DEBUG(0)
+#define VM_CHECK_MODE N_OR_RUBY_DEBUG(1)
 #endif
 
 /**
@@ -892,9 +892,12 @@ void rb_ec_initialize_vm_stack(rb_execution_context_t *ec, VALUE *stack, size_t 
 // @param ec the execution context to update.
 void rb_ec_clear_vm_stack(rb_execution_context_t *ec);
 
+typedef struct rb_guild_struct rb_guild_t;
+
 typedef struct rb_thread_struct {
     struct list_node vmlt_node;
     VALUE self;
+    rb_guild_t *guild;
     rb_vm_t *vm;
 
     rb_execution_context_t *ec;
@@ -960,6 +963,7 @@ typedef struct rb_thread_struct {
     enum {
         thread_invoke_type_none = 0,
         thread_invoke_type_proc,
+        thread_invoke_type_guild_proc,
         thread_invoke_type_func
     } invoke_type;
 
@@ -1716,6 +1720,7 @@ RUBY_EXTERN unsigned int    ruby_vm_event_local_num;
 RUBY_SYMBOL_EXPORT_END
 
 #define GET_VM()     rb_current_vm()
+#define GET_GUILD()  rb_current_guild()
 #define GET_THREAD() rb_current_thread()
 #define GET_EC()     rb_current_execution_context()
 
@@ -1723,6 +1728,19 @@ static inline rb_thread_t *
 rb_ec_thread_ptr(const rb_execution_context_t *ec)
 {
     return ec->thread_ptr;
+}
+
+static inline rb_guild_t *
+rb_ec_guild_ptr(const rb_execution_context_t *ec)
+{
+    const rb_thread_t *th = rb_ec_thread_ptr(ec);
+    if (th) {
+        VM_ASSERT(th->guild != NULL);
+	return th->guild;
+    }
+    else {
+        return NULL;
+    }
 }
 
 static inline rb_vm_t *
@@ -1748,6 +1766,13 @@ rb_current_thread(void)
 {
     const rb_execution_context_t *ec = GET_EC();
     return rb_ec_thread_ptr(ec);
+}
+
+static inline rb_guild_t *
+rb_current_guild(void)
+{
+    const rb_execution_context_t *ec = GET_EC();
+    return rb_ec_guild_ptr(ec);
 }
 
 static inline rb_vm_t *

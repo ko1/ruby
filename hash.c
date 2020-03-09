@@ -1427,6 +1427,8 @@ RHASH_ITER_LEV(VALUE hash)
     }
 }
 
+#include "guild.h"
+
 static void
 hash_iter_lev_inc(VALUE hash)
 {

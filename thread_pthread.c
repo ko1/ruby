@@ -122,19 +122,6 @@ static struct {
 };
 #endif
 
-void rb_native_mutex_lock(rb_nativethread_lock_t *lock);
-void rb_native_mutex_unlock(rb_nativethread_lock_t *lock);
-static int native_mutex_trylock(rb_nativethread_lock_t *lock);
-void rb_native_mutex_initialize(rb_nativethread_lock_t *lock);
-void rb_native_mutex_destroy(rb_nativethread_lock_t *lock);
-void rb_native_cond_signal(rb_nativethread_cond_t *cond);
-void rb_native_cond_broadcast(rb_nativethread_cond_t *cond);
-void rb_native_cond_wait(rb_nativethread_cond_t *cond, rb_nativethread_lock_t *mutex);
-void rb_native_cond_initialize(rb_nativethread_cond_t *cond);
-void rb_native_cond_destroy(rb_nativethread_cond_t *cond);
-static void clear_thread_cache_altstack(void);
-static void ubf_wakeup_all_threads(void);
-static int ubf_threads_empty(void);
 static int native_cond_timedwait(rb_nativethread_cond_t *, pthread_mutex_t *,
                                  const rb_hrtime_t *abs);
 static const rb_hrtime_t *sigwait_timeout(rb_thread_t *, int sigwait_fd,
@@ -142,6 +129,9 @@ static const rb_hrtime_t *sigwait_timeout(rb_thread_t *, int sigwait_fd,
                                               int *drained_p);
 static void ubf_timer_disarm(void);
 static void threadptr_trap_interrupt(rb_thread_t *);
+static void clear_thread_cache_altstack(void);
+static void ubf_wakeup_all_threads(void);
+static int ubf_threads_empty(void);
 
 #define TIMER_THREAD_CREATED_P() (signal_self_pipe.owner_process == getpid())
 

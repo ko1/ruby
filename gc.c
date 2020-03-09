@@ -102,6 +102,7 @@
 #include "transient_heap.h"
 #include "vm_core.h"
 #include "vm_callinfo.h"
+#include "guild.h"
 
 #include "builtin.h"
 
@@ -380,7 +381,7 @@ int ruby_rgengc_debug;
  * 5: show all references
  */
 #ifndef RGENGC_CHECK_MODE
-#define RGENGC_CHECK_MODE  0
+#define RGENGC_CHECK_MODE  1
 #endif
 
 // Note: using RUBY_ASSERT_WHEN() extend a macro in expr (info by nobu).
@@ -2087,6 +2088,10 @@ newobj_init(VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, int wb_prote
     };
     MEMCPY(RANY(obj), &buf, RVALUE, 1);
 
+#if GUILD_CHECK_MODE
+    rb_guild_setup_belonging(obj);
+#endif
+
 #if RGENGC_CHECK_MODE
     GC_ASSERT(RVALUE_MARKED(obj) == FALSE);
     GC_ASSERT(RVALUE_MARKING(obj) == FALSE);
@@ -2250,6 +2255,18 @@ VALUE
 rb_newobj_of(VALUE klass, VALUE flags)
 {
     return newobj_of(klass, flags & ~FL_WB_PROTECTED, 0, 0, 0, flags & FL_WB_PROTECTED);
+}
+
+VALUE
+rb_newobj_with(VALUE src)
+{
+    VALUE klass = RBASIC_CLASS(src);
+    VALUE flags = RBASIC(src)->flags;
+
+    VALUE v1 = RANY(src)->as.values.v1;
+    VALUE v2 = RANY(src)->as.values.v2;
+    VALUE v3 = RANY(src)->as.values.v3;
+    return newobj_of(klass, flags & ~FL_WB_PROTECTED, v1, v2, v3, flags & FL_WB_PROTECTED);
 }
 
 #define UNEXPECTED_NODE(func) \
