@@ -20,8 +20,6 @@
 #define ROBJECT_TRANSIENT_FLAG    FL_USER13
 
 /* variable.c */
-void rb_gc_mark_global_tbl(void);
-void rb_gc_update_global_tbl(void);
 size_t rb_generic_ivar_memsize(VALUE);
 VALUE rb_search_class_path(VALUE);
 VALUE rb_attr_delete(VALUE, ID);
@@ -50,6 +48,7 @@ MJIT_SYMBOL_EXPORT_BEGIN
 VALUE rb_gvar_get(ID);
 VALUE rb_gvar_set(ID, VALUE);
 VALUE rb_gvar_defined(ID);
+struct st_table *rb_ivar_generic_ivtbl(void);
 void rb_const_warn_if_deprecated(const rb_const_entry_t *, VALUE, ID);
 MJIT_SYMBOL_EXPORT_END
 

@@ -31,6 +31,9 @@ typedef struct rb_guild_struct {
     uint32_t id;
     VALUE name;
     VALUE loc;
+
+    // variables
+    struct rb_id_table *global_tbl;
 } rb_guild_t;
 
 enum rb_guild_channel_basket_type {
@@ -74,6 +77,7 @@ guild_mark(void *ptr)
     rb_gc_mark(g->running_thread);
     rb_gc_mark(g->loc);
     rb_gc_mark(g->name);
+    rb_guild_mark_global_tbl(g->global_tbl);
 }
 
 static void
@@ -660,34 +664,60 @@ guild_channel_new(VALUE self)
 }
 
 static VALUE
-guild_alloc(VALUE klass)
+guild_next_id(void)
+{
+    // TODO: lock
+    return ++guild_last_id;
+}
+
+static void
+guild_setup(rb_guild_t *g)
 {
     rb_execution_context_t *ec = GET_EC();
+    g->incoming_channel = guild_channel_create(ec);
+    g->outgoing_channel = guild_channel_create(ec);
+    rb_native_mutex_initialize(&g->sleep_lock);
+    rb_native_cond_initialize(&g->sleep_cond);
+}
+
+static VALUE
+guild_alloc(VALUE klass)
+{
     rb_guild_t *g;
     VALUE gv = TypedData_Make_Struct(klass, rb_guild_t, &guild_data_type, g);
 
     // namig
-    // TODO: global lock
-    g->id = ++guild_last_id;
+    g->id = guild_next_id();
     g->loc = Qnil;
     g->name = Qnil;
-
-    g->incoming_channel = guild_channel_create(ec);
-    g->outgoing_channel = guild_channel_create(ec);
-
-    rb_native_mutex_initialize(&g->sleep_lock);
-    rb_native_cond_initialize(&g->sleep_cond);
-
     g->self = gv;
+    guild_setup(g);
     return gv;
 }
 
 rb_guild_t *
-rb_guild_alloc(void)
+rb_guild_main_alloc(void)
 {
-    VALUE gv = guild_alloc(rb_cGuild);
-    return GUILD_PTR(gv);
+    rb_guild_t *g = ruby_mimmalloc(sizeof(rb_guild_t));
+    if (g == NULL) {
+	fprintf(stderr, "[FATAL] failed to allocate memory for main guild\n");
+        exit(EXIT_FAILURE);
+    }
+    MEMZERO(g, rb_guild_t, 1);
+    g->id = ++guild_last_id;
+    g->loc = Qnil;
+    g->name = Qnil;
+
+    return g;
 }
+
+void
+rb_guild_main_setup(rb_guild_t *g)
+{
+    g->self = TypedData_Wrap_Struct(rb_cGuild, &guild_data_type, g);
+    guild_setup(g);
+}
+
 
 VALUE
 rb_guild_self(const rb_guild_t *g)
@@ -872,4 +902,13 @@ rb_guild_sharable_p_continue(VALUE obj)
   sharable:
     FL_SET_RAW(obj, RUBY_FL_SHARABLE);
     return true;
+}
+
+struct rb_id_table *
+rb_guild_global_tbl(rb_guild_t *g)
+{
+    if (!g->global_tbl) {
+        g->global_tbl = rb_id_table_create(0);
+    }
+    return g->global_tbl;
 }

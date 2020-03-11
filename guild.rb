@@ -41,11 +41,6 @@ class Guild
     }
   end
 
-  # Short-hand of Guild.current.recv
-  def self.recv
-    self.current.recv
-  end
-
   # Wait for multiple channels.
   #
   # ch, obj = Guild.select(ch1, ch2, ch3)

@@ -160,7 +160,7 @@ assert_equal 'ok', %q{
   end
 }
 
-
+# send sharable and unsharable objects
 assert_equal "[[[1, true], [:sym, true], [:xyzzy, true], [\"frozen\", true], " \
              "[(3/1), true], [(3+4i), true], [/regexp/, true], [C, true]], " \
              "[[\"mutable str\", false], [[:array], false], [{:hash=>true}, false]]]", %q{
@@ -189,6 +189,8 @@ assert_equal "[[[1, true], [:sym, true], [:xyzzy, true], [\"frozen\", true], " \
   [sr, ur].inspect
 }
 
+# move example2: String
+# touching moved object causes an error
 assert_equal 'hello world', %q{
   # move
   g = Guild.new do
@@ -209,6 +211,7 @@ assert_equal 'hello world', %q{
   end
 }
 
+# move example2: Array
 assert_equal '[0, 1]', %q{
   g = Guild.new do
     ary = Guild.recv
@@ -223,4 +226,14 @@ assert_equal '[0, 1]', %q{
   rescue Guild::Channel::Error
     a2.inspect
   end
+}
+
+# global-variable $gv
+assert_equal '[0, 1]', %q{
+  $gv = 1
+  g = Guild.new do
+    $gv = 0 # $g is guild local variable.
+    $gv
+  end
+  [g.recv, $gv]
 }

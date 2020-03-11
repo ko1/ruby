@@ -1,17 +1,22 @@
 #include "ruby/ruby.h"
 #include "vm_core.h"
+#include "id_table.h"
 
 #ifndef GUILD_CHECK_MODE
 #define GUILD_CHECK_MODE (1 || RUBY_DEBUG)
 #endif
 
-rb_guild_t *rb_guild_alloc(void);
+rb_guild_t *rb_guild_main_alloc(void);
+void rb_guild_main_setup(rb_guild_t *main_guild);
 
 VALUE rb_guild_self(const rb_guild_t *g);
 void rb_guild_atexit(rb_execution_context_t *ec, VALUE result);
 void rb_guild_atexit_exception(rb_execution_context_t *ec);
 void rb_guild_recv_parameters(rb_execution_context_t *ec, rb_guild_t *g, int len, VALUE *ptr);
 void rb_guild_send_parameters(rb_execution_context_t *ec, rb_guild_t *g, VALUE args);
+struct rb_id_table *rb_guild_global_tbl(rb_guild_t *g);
+void rb_guild_mark_global_tbl(struct rb_id_table *tbl); // defined in variable.c
+
 
 // TODO: deep frozen
 #define RB_OBJ_SHARABLE_P(obj) FL_TEST_RAW((obj), RUBY_FL_SHARABLE)

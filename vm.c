@@ -3376,7 +3376,7 @@ Init_VM(void)
 	rb_define_global_const("TOPLEVEL_BINDING", rb_binding_new());
 
         // Guild setup
-        th->guild = rb_guild_alloc();
+        rb_guild_main_setup(th->guild);
     }
     vm_init_redefined_flag();
 
@@ -3423,6 +3423,8 @@ Init_BareVM(void)
     th_init(th, 0);
     rb_thread_set_current_raw(th);
     ruby_thread_init_stack(th);
+
+    th->guild = rb_guild_main_alloc();
 }
 
 void
