@@ -284,3 +284,14 @@ assert_equal 'ArgumentError', %q{
   end
 }
 
+# given block Proc will be isolated, so can not access outer variables.
+assert_equal 'ArgumentError', %q{
+  begin
+    a = true
+    g = Guild.new do
+      a
+    end
+  rescue => e
+    e.class
+  end
+}
