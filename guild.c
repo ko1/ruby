@@ -725,15 +725,14 @@ rb_guild_self(const rb_guild_t *g)
     return g->self;
 }
 
-VALUE rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g);
-
 static VALUE
-guild_create(rb_execution_context_t *ec, VALUE self, VALUE block, VALUE args, VALUE loc, VALUE name)
+guild_create(rb_execution_context_t *ec, VALUE self, VALUE block, VALUE args,
+             VALUE loc, VALUE name, VALUE self_class)
 {
     VALUE gv = guild_alloc(self);
     rb_guild_t *g = GUILD_PTR(gv);
     VALUE proc = rb_block_proc();
-    g->running_thread = rb_thread_create_guild(proc, args, g);
+    g->running_thread = rb_thread_create_guild(proc, args, g, self_class);
     g->loc = loc;
     g->name = name;
     return gv;
@@ -864,7 +863,7 @@ Init_Guild(void)
     rb_obj_freeze(rb_cGuildMovedObject);
 }
 
-bool
+MJIT_FUNC_EXPORTED bool
 rb_guild_sharable_p_continue(VALUE obj)
 {
     switch (BUILTIN_TYPE(obj)) {

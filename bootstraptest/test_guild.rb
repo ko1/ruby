@@ -237,3 +237,20 @@ assert_equal '[0, 1]', %q{
   end
   [g.recv, $gv]
 }
+
+# selfs are different objects
+assert_equal 'false', %q{
+  g = Guild.new do
+    self.object_id
+  end
+  g.recv == self.object_id
+}
+
+# we can specify self class with self_class keyword.
+assert_equal 'C', %q{
+  class C; end
+  g = Guild.new self_class: C do
+    self.class
+  end
+  g.recv
+}

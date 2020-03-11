@@ -26,11 +26,14 @@ class Guild
   # p g.recv   # recv from g's outgoing channel. => 3
   # p g.recv   #                                 => 4
   # p g.recv   # raise Guild::Channel::ClosedError
-  def self.new *args, name: nil, &block
+  #
+  # name: Guild's name
+  # 
+  def self.new *args, name: nil, self_class: ::Object, &block
     loc = caller_locations(1, 1).first
     loc = "#{loc.path}:#{loc.lineno}"
     __builtin_cexpr! %q{
-      guild_create(ec, self, block, args, loc, name)
+      guild_create(ec, self, block, args, loc, name, self_class)
     }
   end
 

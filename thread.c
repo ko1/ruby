@@ -670,6 +670,10 @@ rb_vm_proc_local_ep(VALUE proc)
     }
 }
 
+// for guild, defined in vm.c
+VALUE rb_vm_invoke_proc_with_self(rb_execution_context_t *ec, rb_proc_t *proc, VALUE self,
+                                  int argc, const VALUE *argv, int kw_splat, VALUE passed_block_handler);
+
 static void
 thread_do_start_proc(rb_thread_t *th)
 {
@@ -692,6 +696,16 @@ thread_do_start_proc(rb_thread_t *th)
         args_len = FIX2INT(args);
         args_ptr = ALLOCA_N(VALUE, args_len);
         rb_guild_recv_parameters(th->ec, th->guild, args_len, (VALUE *)args_ptr);
+
+        vm_check_ints_blocking(th->ec);
+
+        VALUE self = rb_obj_alloc(th->invoke_arg.proc.self_class);
+
+        // kick thread
+        th->value = rb_vm_invoke_proc_with_self(th->ec, proc, self,
+                                                args_len, args_ptr,
+                                                th->invoke_arg.proc.kw_splat,
+                                                VM_BLOCK_HANDLER_NONE);
     }
     else {
         args_len = RARRAY_LENINT(args);
@@ -704,13 +718,15 @@ thread_do_start_proc(rb_thread_t *th)
         else {
             args_ptr = RARRAY_CONST_PTR(args);
         }
-    }
 
-    vm_check_ints_blocking(th->ec);
-    th->value = rb_vm_invoke_proc(th->ec, proc,
-                                  args_len, args_ptr,
-                                  th->invoke_arg.proc.kw_splat,
-                                  VM_BLOCK_HANDLER_NONE);
+        vm_check_ints_blocking(th->ec);
+
+        // kick thread
+        th->value = rb_vm_invoke_proc(th->ec, proc,
+                                      args_len, args_ptr,
+                                      th->invoke_arg.proc.kw_splat,
+                                      VM_BLOCK_HANDLER_NONE);
+    }
 
     EXEC_EVENT_HOOK(th->ec, RUBY_EVENT_THREAD_END, th->self, 0, 0, 0, Qundef);
 
@@ -864,8 +880,23 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     return 0;
 }
 
+struct thread_create_params {
+    enum thread_invoke_type type;
+
+    // for normal proc thread
+    VALUE args;
+    VALUE proc;
+
+    // for guild
+    rb_guild_t *g;
+    VALUE self_class;
+
+    // for func
+    VALUE (*fn)(void *);
+};
+
 static VALUE
-thread_create_core(VALUE thval, rb_guild_t *g, VALUE args, VALUE proc, VALUE (*fn)(void *))
+thread_create_core(VALUE thval, struct thread_create_params *params)
 {
     rb_execution_context_t *ec = GET_EC();
     rb_thread_t *th = rb_thread_ptr(thval), *current_th = rb_ec_thread_ptr(ec);
@@ -876,25 +907,29 @@ thread_create_core(VALUE thval, rb_guild_t *g, VALUE args, VALUE proc, VALUE (*f
 		 "can't start a new thread (frozen ThreadGroup)");
     }
 
-    if (fn == NULL) {
-        if (g) {
-            th->guild = g;
-            th->invoke_type = thread_invoke_type_guild_proc;
-            th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(args));
-            rb_guild_send_parameters(ec, g, args);
-        }
-        else {
-            th->invoke_type = thread_invoke_type_proc;
-            th->invoke_arg.proc.args = args;
-        }
-        th->invoke_arg.proc.proc = proc;
+    switch (params->type) {
+      case thread_invoke_type_proc:
+        th->invoke_type = thread_invoke_type_proc;
+        th->invoke_arg.proc.args = params->args;
+        th->invoke_arg.proc.proc = params->proc;
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
-    }
-    else {
-        VM_ASSERT(proc == Qfalse);
+        break;
+      case thread_invoke_type_guild_proc:
+        th->invoke_type = thread_invoke_type_guild_proc;
+        th->guild = params->g;
+        th->invoke_arg.proc.self_class = params->self_class;
+        th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
+        rb_guild_send_parameters(ec, params->g, params->args);
+        th->invoke_arg.proc.proc = params->proc;
+        th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
+        break;
+      case thread_invoke_type_func:
         th->invoke_type = thread_invoke_type_func;
-        th->invoke_arg.func.func = fn;
-        th->invoke_arg.func.arg = (void *)args;
+        th->invoke_arg.func.func = params->fn;
+        th->invoke_arg.func.arg = (void *)params->args;
+        break;
+      default:
+        rb_bug("unreachable");
     }
 
     th->priority = current_th->priority;
@@ -970,7 +1005,12 @@ thread_s_new(int argc, VALUE *argv, VALUE klass)
 static VALUE
 thread_start(VALUE klass, VALUE args)
 {
-    return thread_create_core(rb_thread_alloc(klass), NULL, args, rb_block_proc(), NULL);
+    struct thread_create_params params = {
+        .type = thread_invoke_type_proc,
+        .args = args,
+        .proc = rb_block_proc(),
+    };
+    return thread_create_core(rb_thread_alloc(klass), &params);
 }
 
 static VALUE
@@ -1005,20 +1045,37 @@ thread_initialize(VALUE thread, VALUE args)
         }
     }
     else {
-        return thread_create_core(thread, NULL, args, rb_block_proc(), NULL);
+        struct thread_create_params params = {
+            .type = thread_invoke_type_proc,
+            .args = args,
+            .proc = rb_block_proc(),
+        };
+        return thread_create_core(thread, &params);
     }
 }
 
 VALUE
 rb_thread_create(VALUE (*fn)(void *), void *arg)
 {
-    return thread_create_core(rb_thread_alloc(rb_cThread), NULL, (VALUE)arg, Qfalse, fn);
+    struct thread_create_params params = {
+        .type = thread_invoke_type_func,
+        .fn = fn,
+        .args = (VALUE)arg,
+    };
+    return thread_create_core(rb_thread_alloc(rb_cThread), &params);
 }
 
 VALUE
-rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g)
+rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g, VALUE self_class)
 {
-    return thread_create_core(rb_thread_alloc(rb_cThread), g, (VALUE)args, proc, NULL);
+    struct thread_create_params params = {
+        .type = thread_invoke_type_guild_proc,
+        .g = g,
+        .args = args,
+        .proc = proc,
+        .self_class = self_class,
+    };
+    return thread_create_core(rb_thread_alloc(rb_cThread), &params);
 }
 
 

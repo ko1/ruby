@@ -1284,6 +1284,20 @@ rb_vm_invoke_proc(rb_execution_context_t *ec, rb_proc_t *proc,
     }
 }
 
+VALUE
+rb_vm_invoke_proc_with_self(rb_execution_context_t *ec, rb_proc_t *proc, VALUE self,
+                            int argc, const VALUE *argv, int kw_splat, VALUE passed_block_handler)
+{
+    vm_block_handler_verify(passed_block_handler);
+
+    if (proc->is_from_method) {
+        return rb_vm_invoke_bmethod(ec, proc, self, argc, argv, kw_splat, passed_block_handler, NULL);
+    }
+    else {
+	return vm_invoke_proc(ec, proc, self, argc, argv, kw_splat, passed_block_handler);
+    }
+}
+
 /* special variable */
 
 static rb_control_frame_t *

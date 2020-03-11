@@ -953,6 +953,7 @@ typedef struct rb_thread_struct {
             VALUE proc;
             VALUE args;
             int kw_splat;
+            VALUE self_class; // only for guild
         } proc;
         struct {
             VALUE (*func)(void *);
@@ -960,7 +961,7 @@ typedef struct rb_thread_struct {
         } func;
     } invoke_arg;
 
-    enum {
+    enum thread_invoke_type {
         thread_invoke_type_none = 0,
         thread_invoke_type_proc,
         thread_invoke_type_guild_proc,

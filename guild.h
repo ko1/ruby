@@ -15,8 +15,9 @@ void rb_guild_atexit_exception(rb_execution_context_t *ec);
 void rb_guild_recv_parameters(rb_execution_context_t *ec, rb_guild_t *g, int len, VALUE *ptr);
 void rb_guild_send_parameters(rb_execution_context_t *ec, rb_guild_t *g, VALUE args);
 struct rb_id_table *rb_guild_global_tbl(rb_guild_t *g);
-void rb_guild_mark_global_tbl(struct rb_id_table *tbl); // defined in variable.c
 
+void rb_guild_mark_global_tbl(struct rb_id_table *tbl); // defined in variable.c
+VALUE rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g, VALUE self); // defined in thread.c
 
 // TODO: deep frozen
 #define RB_OBJ_SHARABLE_P(obj) FL_TEST_RAW((obj), RUBY_FL_SHARABLE)
