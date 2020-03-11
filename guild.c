@@ -37,7 +37,7 @@ typedef struct rb_guild_struct {
 } rb_guild_t;
 
 enum rb_guild_channel_basket_type {
-    basket_type_sharable,
+    basket_type_shareable,
     basket_type_copy_marshal,
     basket_type_copy_custom,
     basket_type_move,
@@ -210,7 +210,7 @@ guild_channel_alloc(VALUE klass)
 {
     rb_guild_channel_t *gc;
     VALUE gcv = TypedData_Make_Struct(klass, rb_guild_channel_t, &guild_channel_data_type, gc);
-    FL_SET_RAW(gcv, RUBY_FL_SHARABLE);
+    FL_SET_RAW(gcv, RUBY_FL_SHAREABLE);
 
     gc->size = 2;
     gc->cnt = 0;
@@ -263,7 +263,7 @@ guild_channel_move_new(VALUE obj)
 static VALUE
 guild_channel_move_shallow_copy(VALUE obj)
 {
-    if (rb_guild_sharable_p(obj)) {
+    if (rb_guild_shareable_p(obj)) {
         return obj;
     }
     else {
@@ -296,8 +296,8 @@ guild_channel_move_shallow_copy(VALUE obj)
 static void
 guild_channel_move_setup(struct rb_guild_channel_basket *b, VALUE obj)
 {
-    if (rb_guild_sharable_p(obj)) {
-        b->type = basket_type_sharable;
+    if (rb_guild_shareable_p(obj)) {
+        b->type = basket_type_shareable;
         b->v = obj;
     }
     else {
@@ -321,7 +321,7 @@ guild_channel_moved_setup(VALUE obj)
         long len = RARRAY_LEN(obj);
         for (long i=0; i<len; i++) {
             VALUE e = RARRAY_AREF(obj, i);
-            if (!rb_guild_sharable_p(e)) {
+            if (!rb_guild_shareable_p(e)) {
                 guild_channel_moved_setup(e);
             }
         }
@@ -337,8 +337,8 @@ static VALUE
 guild_channel_recv_accept(struct rb_guild_channel_basket *b)
 {
     switch (b->type) {
-      case basket_type_sharable:
-        VM_ASSERT(rb_guild_sharable_p(b->v));
+      case basket_type_shareable:
+        VM_ASSERT(rb_guild_shareable_p(b->v));
         return b->v;
       case basket_type_copy_marshal:
         return rb_marshal_load(b->v);
@@ -356,8 +356,8 @@ guild_channel_recv_accept(struct rb_guild_channel_basket *b)
 static void
 guild_channel_copy_setup(struct rb_guild_channel_basket *b, VALUE obj)
 {
-    if (rb_guild_sharable_p(obj)) {
-        b->type = basket_type_sharable;
+    if (rb_guild_shareable_p(obj)) {
+        b->type = basket_type_shareable;
         b->v = obj;
     }
     else {
@@ -687,7 +687,7 @@ guild_alloc(VALUE klass)
 {
     rb_guild_t *g;
     VALUE gv = TypedData_Make_Struct(klass, rb_guild_t, &guild_data_type, g);
-    FL_SET_RAW(gv, RUBY_FL_SHARABLE);
+    FL_SET_RAW(gv, RUBY_FL_SHAREABLE);
 
     // namig
     g->id = guild_next_id();
@@ -882,13 +882,13 @@ Init_Guild(void)
 }
 
 MJIT_FUNC_EXPORTED bool
-rb_guild_sharable_p_continue(VALUE obj)
+rb_guild_shareable_p_continue(VALUE obj)
 {
     switch (BUILTIN_TYPE(obj)) {
       case T_CLASS:
       case T_MODULE:
       case T_ICLASS:
-        goto sharable;
+        goto shareable;
 
       case T_FLOAT:
       case T_COMPLEX:
@@ -896,21 +896,21 @@ rb_guild_sharable_p_continue(VALUE obj)
       case T_BIGNUM:
       case T_SYMBOL:
         VM_ASSERT(RB_OBJ_FROZEN_RAW(obj));
-        goto sharable;
+        goto shareable;
 
       case T_STRING:
       case T_REGEXP:
         if (RB_OBJ_FROZEN_RAW(obj) &&
             !FL_TEST_RAW(obj, RUBY_FL_EXIVAR)) {
-            goto sharable;
+            goto shareable;
         }
         return false;
 
       default:
         return false;
     }
-  sharable:
-    FL_SET_RAW(obj, RUBY_FL_SHARABLE);
+  shareable:
+    FL_SET_RAW(obj, RUBY_FL_SHAREABLE);
     return true;
 }
 

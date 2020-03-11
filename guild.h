@@ -22,21 +22,21 @@ void rb_guild_mark_global_tbl(struct rb_id_table *tbl); // defined in variable.c
 VALUE rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g, VALUE self_class, VALUE self_instance); // defined in thread.c
 
 // TODO: deep frozen
-#define RB_OBJ_SHARABLE_P(obj) FL_TEST_RAW((obj), RUBY_FL_SHARABLE)
+#define RB_OBJ_SHAREABLE_P(obj) FL_TEST_RAW((obj), RUBY_FL_SHAREABLE)
 
-bool rb_guild_sharable_p_continue(VALUE obj);
+bool rb_guild_shareable_p_continue(VALUE obj);
 
 static inline bool
-rb_guild_sharable_p(VALUE obj)
+rb_guild_shareable_p(VALUE obj)
 {
     if (SPECIAL_CONST_P(obj)) {
         return true;
     }
-    else if (RB_OBJ_SHARABLE_P(obj)) {
+    else if (RB_OBJ_SHAREABLE_P(obj)) {
         return true;
     }
     else {
-        return rb_guild_sharable_p_continue(obj);
+        return rb_guild_shareable_p_continue(obj);
     }
 }
 
@@ -55,7 +55,7 @@ rb_guild_setup_belonging(VALUE obj)
 static inline uint32_t
 rb_guild_belonging(VALUE obj)
 {
-    if (rb_guild_sharable_p(obj)) {
+    if (rb_guild_shareable_p(obj)) {
         return 0;
     }
     else {
@@ -69,9 +69,9 @@ rb_guild_confirm_belonging(VALUE obj)
     uint32_t id = rb_guild_belonging(obj);
 
     if (id == 0) {
-        if (!rb_guild_sharable_p(obj)) {
+        if (!rb_guild_shareable_p(obj)) {
             rp(obj);
-            rb_bug("id == 0 but not sharable");
+            rb_bug("id == 0 but not shareable");
         }
     }
     else if (id != rb_guild_current_id()) {

@@ -875,8 +875,8 @@ rb_alias_variable(ID name1, ID name2)
 static inline struct st_table *
 generic_ivtbl(VALUE obj)
 {
-    if (UNLIKELY(rb_guild_sharable_p(obj) && !rb_guild_main_p())) {
-        rb_raise(rb_eRuntimeError, "can not access instance variables of sharable objects from non-main guild.");
+    if (UNLIKELY(rb_guild_shareable_p(obj) && !rb_guild_main_p())) {
+        rb_raise(rb_eRuntimeError, "can not access instance variables of shareable objects from non-main guild.");
     }
     return generic_iv_tbl_;
 }
