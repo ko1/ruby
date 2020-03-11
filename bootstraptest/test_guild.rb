@@ -295,3 +295,59 @@ assert_equal 'ArgumentError', %q{
     e.class
   end
 }
+
+# ivar in sharable-objects are not allowed to access from non-main guild
+assert_equal 'RuntimeError', %q{
+  class C
+    @iv = 'str'
+  end
+
+  g = Guild.new do
+    class C
+      p @iv
+    end
+  end
+
+
+  begin
+    g.recv
+  rescue => e
+    e.class
+  end
+}
+
+# ivar in sharable-objects are not allowed to access from non-main guild
+assert_equal 'RuntimeError', %q{
+  ch = Guild::Channel.new
+  ch.instance_variable_set(:@iv, 'str')
+
+  g = Guild.new ch do |ch|
+    p ch.instance_variable_get(:@iv)
+  end
+
+  begin
+    g.recv
+  rescue => e
+    e.class
+  end
+}
+
+# cvar in sharable-objects are not allowed to access from non-main guild
+assert_equal 'RuntimeError', %q{
+  class C
+    @@cv = 'str'
+  end
+
+  g = Guild.new do
+    class C
+      p @@cv
+    end
+  end
+
+
+  begin
+    g.recv
+  rescue => e
+    e.class
+  end
+}

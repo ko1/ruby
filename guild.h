@@ -16,6 +16,8 @@ void rb_guild_recv_parameters(rb_execution_context_t *ec, rb_guild_t *g, int len
 void rb_guild_send_parameters(rb_execution_context_t *ec, rb_guild_t *g, VALUE args, VALUE self_instance);
 struct rb_id_table *rb_guild_global_tbl(rb_guild_t *g);
 
+int rb_guild_main_p(void);
+
 void rb_guild_mark_global_tbl(struct rb_id_table *tbl); // defined in variable.c
 VALUE rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g, VALUE self_class, VALUE self_instance); // defined in thread.c
 

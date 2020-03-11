@@ -725,6 +725,14 @@ rb_guild_self(const rb_guild_t *g)
     return g->self;
 }
 
+int
+rb_guild_main_p(void)
+{
+    rb_execution_context_t *ec = GET_EC();
+    return rb_ec_guild_ptr(ec) == rb_ec_vm_ptr(ec)->main_guild;
+}
+
+
 static VALUE
 guild_create(rb_execution_context_t *ec, VALUE self, VALUE block, VALUE args,
              VALUE loc, VALUE name, VALUE self_class, VALUE self_instance)

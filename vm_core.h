@@ -560,6 +560,7 @@ typedef struct rb_vm_struct {
     rb_global_vm_lock_t gvl;
 
     struct rb_thread_struct *main_thread;
+    struct rb_guild_struct *main_guild;
 
     /* persists across uncontended GVL release/acquire for time slice */
     const struct rb_thread_struct *running_thread;

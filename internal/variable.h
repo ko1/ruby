@@ -48,7 +48,6 @@ MJIT_SYMBOL_EXPORT_BEGIN
 VALUE rb_gvar_get(ID);
 VALUE rb_gvar_set(ID, VALUE);
 VALUE rb_gvar_defined(ID);
-struct st_table *rb_ivar_generic_ivtbl(void);
 void rb_const_warn_if_deprecated(const rb_const_entry_t *, VALUE, ID);
 MJIT_SYMBOL_EXPORT_END
 
