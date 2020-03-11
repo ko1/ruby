@@ -247,9 +247,8 @@ assert_equal 'false', %q{
 }
 
 # we can specify self class with self_class keyword.
-assert_equal 'C', %q{
-  class C; end
-  g = Guild.new self_class: C do
+assert_equal 'Array', %q{
+  g = Guild.new self_class: Array do
     self.class
   end
   g.recv
@@ -277,9 +276,8 @@ assert_equal '[true, false]', %q{
 
 # should not specify self_instance and self_class keywords.
 assert_equal 'ArgumentError', %q{
-  class C; end
   begin
-    g = Guild.new self_instance: 1, self_class: C do
+    g = Guild.new self_instance: 1, self_class: Array do
     end
   rescue => e
     e.class # ArgumentError
