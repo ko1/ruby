@@ -210,6 +210,8 @@ guild_channel_alloc(VALUE klass)
 {
     rb_guild_channel_t *gc;
     VALUE gcv = TypedData_Make_Struct(klass, rb_guild_channel_t, &guild_channel_data_type, gc);
+    FL_SET_RAW(gcv, RUBY_FL_SHARABLE);
+
     gc->size = 2;
     gc->cnt = 0;
     gc->baskets = ALLOC_N(struct rb_guild_channel_basket, gc->size);
@@ -685,6 +687,7 @@ guild_alloc(VALUE klass)
 {
     rb_guild_t *g;
     VALUE gv = TypedData_Make_Struct(klass, rb_guild_t, &guild_data_type, g);
+    FL_SET_RAW(gv, RUBY_FL_SHARABLE);
 
     // namig
     g->id = guild_next_id();
@@ -899,13 +902,6 @@ rb_guild_sharable_p_continue(VALUE obj)
       case T_REGEXP:
         if (RB_OBJ_FROZEN_RAW(obj) &&
             !FL_TEST_RAW(obj, RUBY_FL_EXIVAR)) {
-            goto sharable;
-        }
-        return false;
-
-      case T_DATA:
-        if (rb_guild_p(obj) ||
-            rb_guild_channel_p(obj)) {
             goto sharable;
         }
         return false;
