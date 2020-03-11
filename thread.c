@@ -935,7 +935,7 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         }
         th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
         rb_guild_send_parameters(ec, params->g, params->args, params->self_instance);
-        th->invoke_arg.proc.proc = params->proc;
+        th->invoke_arg.proc.proc = rb_proc_isolate_bang(params->proc);
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
         break;
 

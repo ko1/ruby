@@ -1598,6 +1598,16 @@ iseq_block_param_id_p(const rb_iseq_t *iseq, ID id, int *pidx, int *plevel)
 }
 
 static void
+check_access_outer_variables(const rb_iseq_t *iseq, int level)
+{
+    // set access_outer_variables
+    for (int i=0; i<level; i++) {
+        iseq->body->access_outer_variables = TRUE;
+        iseq = iseq->body->parent_iseq;
+    }
+}
+
+static void
 iseq_add_getlocal(rb_iseq_t *iseq, LINK_ANCHOR *const seq, int line, int idx, int level)
 {
     if (iseq_local_block_param_p(iseq, idx, level)) {
@@ -1606,6 +1616,7 @@ iseq_add_getlocal(rb_iseq_t *iseq, LINK_ANCHOR *const seq, int line, int idx, in
     else {
 	ADD_INSN2(seq, line, getlocal, INT2FIX((idx) + VM_ENV_DATA_SIZE - 1), INT2FIX(level));
     }
+    check_access_outer_variables(iseq, level);
 }
 
 static void
@@ -1617,6 +1628,7 @@ iseq_add_setlocal(rb_iseq_t *iseq, LINK_ANCHOR *const seq, int line, int idx, in
     else {
 	ADD_INSN2(seq, line, setlocal, INT2FIX((idx) + VM_ENV_DATA_SIZE - 1), INT2FIX(level));
     }
+    check_access_outer_variables(iseq, level);
 }
 
 
@@ -8177,6 +8189,8 @@ iseq_compile_each0(rb_iseq_t *iseq, LINK_ANCHOR *const ret, const NODE *node, in
 	if (popped) {
 	    ADD_INSN(ret, line, pop);
 	}
+
+        iseq->body->access_outer_variables = TRUE;
 	break;
       }
       case NODE_LVAR:{

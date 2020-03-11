@@ -419,6 +419,7 @@ struct rb_iseq_constant_body {
 
     char catch_except_p; /* If a frame of this ISeq may catch exception, set TRUE */
     bool builtin_inline_p; // This ISeq's builtin func is safe to be inlined by MJIT
+    char access_outer_variables;
 
 #if USE_MJIT
     /* The following fields are MJIT related info.  */
@@ -1046,7 +1047,11 @@ typedef struct {
     const struct rb_block block;
     unsigned int is_from_method: 1;	/* bool */
     unsigned int is_lambda: 1;		/* bool */
+    unsigned int is_isolated: 1;        /* bool */
 } rb_proc_t;
+
+VALUE rb_proc_isolate(VALUE self);
+VALUE rb_proc_isolate_bang(VALUE self);
 
 typedef struct {
     VALUE flags; /* imemo header */
