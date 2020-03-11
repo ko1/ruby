@@ -695,11 +695,17 @@ thread_do_start_proc(rb_thread_t *th)
         VM_ASSERT(FIXNUM_P(args));
         args_len = FIX2INT(args);
         args_ptr = ALLOCA_N(VALUE, args_len);
-        rb_guild_recv_parameters(th->ec, th->guild, args_len, (VALUE *)args_ptr);
+
+        VALUE self;
+        if (RTEST(th->invoke_arg.proc.self_class)) {
+            self = rb_obj_alloc(th->invoke_arg.proc.self_class);
+            rb_guild_recv_parameters(th->ec, th->guild, args_len, (VALUE *)args_ptr, NULL);
+        }
+        else {
+            rb_guild_recv_parameters(th->ec, th->guild, args_len, (VALUE *)args_ptr, &self);
+        }
 
         vm_check_ints_blocking(th->ec);
-
-        VALUE self = rb_obj_alloc(th->invoke_arg.proc.self_class);
 
         // kick thread
         th->value = rb_vm_invoke_proc_with_self(th->ec, proc, self,
@@ -890,6 +896,7 @@ struct thread_create_params {
     // for guild
     rb_guild_t *g;
     VALUE self_class;
+    VALUE self_instance;
 
     // for func
     VALUE (*fn)(void *);
@@ -914,20 +921,30 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         th->invoke_arg.proc.proc = params->proc;
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
         break;
+
       case thread_invoke_type_guild_proc:
         th->invoke_type = thread_invoke_type_guild_proc;
         th->guild = params->g;
-        th->invoke_arg.proc.self_class = params->self_class;
+
+        if (RTEST(params->self_instance)) {
+            VM_ASSERT(params->self_class == Qnil);
+            th->invoke_arg.proc.self_class = Qnil;
+        }
+        else {
+            th->invoke_arg.proc.self_class = params->self_class;
+        }
         th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
-        rb_guild_send_parameters(ec, params->g, params->args);
+        rb_guild_send_parameters(ec, params->g, params->args, params->self_instance);
         th->invoke_arg.proc.proc = params->proc;
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
         break;
+
       case thread_invoke_type_func:
         th->invoke_type = thread_invoke_type_func;
         th->invoke_arg.func.func = params->fn;
         th->invoke_arg.func.arg = (void *)params->args;
         break;
+
       default:
         rb_bug("unreachable");
     }
@@ -1066,7 +1083,7 @@ rb_thread_create(VALUE (*fn)(void *), void *arg)
 }
 
 VALUE
-rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g, VALUE self_class)
+rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g, VALUE self_class, VALUE self_instance)
 {
     struct thread_create_params params = {
         .type = thread_invoke_type_guild_proc,
@@ -1074,6 +1091,7 @@ rb_thread_create_guild(VALUE proc, VALUE args, rb_guild_t *g, VALUE self_class)
         .args = args,
         .proc = proc,
         .self_class = self_class,
+        .self_instance = self_instance,
     };
     return thread_create_core(rb_thread_alloc(rb_cThread), &params);
 }

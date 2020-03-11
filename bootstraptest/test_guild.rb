@@ -254,3 +254,35 @@ assert_equal 'C', %q{
   end
   g.recv
 }
+
+# we can specify self class with self_instance keyword.
+assert_equal 'Symbol', %q{
+  g = Guild.new self_instance: :sym do
+    self.class
+  end
+  g.recv
+}
+
+# we can specify self class with self_instance keyword.
+# self_instance will be copied.
+assert_equal '[true, false]', %q{
+  class C; end
+  obj = C.new
+  g = Guild.new self_instance: obj do
+    [self.class, self.object_id]
+  end
+  klass, objid = *g.recv
+  [klass == C, self.object_id == objid] # [true, false]
+}
+
+# should not specify self_instance and self_class keywords.
+assert_equal 'ArgumentError', %q{
+  class C; end
+  begin
+    g = Guild.new self_instance: 1, self_class: C do
+    end
+  rescue => e
+    e.class # ArgumentError
+  end
+}
+

@@ -29,11 +29,19 @@ class Guild
   #
   # name: Guild's name
   # 
-  def self.new *args, name: nil, self_class: ::Object, &block
+  def self.new*args, name: nil,
+               self_class: ::Object,
+               self_instance: nil,
+               &block
     loc = caller_locations(1, 1).first
     loc = "#{loc.path}:#{loc.lineno}"
+    if self_instance
+      raise ArgumentError, "Both self_class and self_instance can not be specified." if self_class != ::Object
+      self_class = nil
+    end
+
     __builtin_cexpr! %q{
-      guild_create(ec, self, block, args, loc, name, self_class)
+      guild_create(ec, self, block, args, loc, name, self_class, self_instance)
     }
   end
 
