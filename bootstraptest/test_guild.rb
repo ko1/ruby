@@ -1,3 +1,5 @@
+# A return value of a guild block will be a
+# message from the guild.
 assert_equal 'ok', %q{
   # join
   g = Guild.new do
@@ -6,6 +8,8 @@ assert_equal 'ok', %q{
   g.recv
 }
 
+# Passed arguments to Guild.new will be a block parameter
+# The values are passed with guild-communication pass.
 assert_equal 'ok', %q{
   # ping-pong with arg
   g = Guild.new 'ok' do |msg|
@@ -22,6 +26,8 @@ assert_equal 'ok', %q{
   'ok' if g.recv == ['ping', 'pong']
 }
 
+# Guild#send passes an object with copy to a guild
+# and Guild.recv in the guild block can receive the passed value.
 assert_equal 'ok', %q{
   # ping-pong with channel
   g = Guild.new do
@@ -31,6 +37,9 @@ assert_equal 'ok', %q{
   g.recv
 }
 
+# Guild.select(*channels) receives a values from a channel.
+# It is similar to select(2) and Go's select syntax.
+# The return value is [ch, received_value]
 assert_equal 'ok', %q{
   # select 1
   g1 = Guild.new{'g1'}
@@ -83,6 +92,8 @@ assert_equal 'ok', %q{
   'ok'
 }
 
+# communication channels belong to a guild will be closed
+# if the guild is terminated.
 assert_equal 'ok', %q{
   # closed-channel (Guild)
   g = Guild.new do
@@ -114,41 +125,42 @@ assert_equal 'ok', %q{
 }
 
 assert_equal 'ok', %q{
-task_ch = Guild::Channel.new
-result_ch = Guild::Channel.new
+  task_ch = Guild::Channel.new
+  result_ch = Guild::Channel.new
 
-def work i, task
-  Thread.pass
-  "done #{task} by #{i}"
-end
-
-GN = 10
-TN = 1_000
-
-gs = (1..GN).map do |i|
-  g = Guild.new i, task_ch, result_ch do |i, task_ch, result_ch|
-    while task = task_ch.recv
-      result_ch << work(i, task)
-    end
-  rescue Guild::Channel::ClosedError
-    :ok
+  def work i, task
+    Thread.pass
+    "done #{task} by #{i}"
   end
-end
 
-TN.times{|i| task_ch << i}
-tn_results = TN.times.map{result_ch.recv}
-task_ch.close_send
+  GN = 10
+  TN = 1_000
 
-gn_results = (1..GN).map{
-  g, obj = Guild.select(*gs)
-  gs.delete(g)
-  obj
+  gs = (1..GN).map do |i|
+    g = Guild.new i, task_ch, result_ch do |i, task_ch, result_ch|
+      while task = task_ch.recv
+        result_ch << work(i, task)
+      end
+    rescue Guild::Channel::ClosedError
+      :ok
+    end
+  end
+
+  TN.times{|i| task_ch << i}
+  tn_results = TN.times.map{result_ch.recv}
+  task_ch.close_send
+
+  gn_results = (1..GN).map{
+    g, obj = Guild.select(*gs)
+    gs.delete(g)
+    obj
+  }
+
+  'ok' if tn_results.size == TN &&
+          gn_results.size == GN
 }
 
-'ok' if tn_results.size == TN &&
-        gn_results.size == GN
-}
-
+# an exception in a guild will be re-raised at Guild#recv
 assert_equal 'ok', %q{
   g = Guild.new do
     raise 'ok' # exception will be transferred receiver
@@ -381,8 +393,16 @@ assert_equal 'NameError', %q{
   end
 }
 
+# A guild can have a name
 assert_equal 'test-name', %q{
   g = Guild.new name: 'test-name' do
+  end
+  g.name
+end
+
+# If Guild doesn't have a name, Guild#name returns nil.
+assert_equal 'nil', %q{
+  g = Guild.new do
   end
   g.name
 end
