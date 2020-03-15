@@ -985,7 +985,13 @@ vm_get_ev_const(rb_execution_context_t *ec, VALUE orig_klass, ID id, bool allow_
 			if (is_defined) {
 			    return 1;
 			}
-			else {
+                        else {
+                            if (UNLIKELY(!rb_guild_main_p())) {
+                                if (!rb_guild_shareable_p(val)) {
+                                    rb_raise(rb_eNameError,
+                                             "can not access non-sharable objects in constant %s by non-main guild.", rb_id2name(id));
+                                }
+                            }
 			    return val;
 			}
 		    }
@@ -4293,7 +4299,8 @@ vm_opt_newarray_min(rb_num_t num, const VALUE *ptr)
 static int
 vm_ic_hit_p(IC ic, const VALUE *reg_ep)
 {
-    if (ic->ic_serial == GET_GLOBAL_CONSTANT_STATE()) {
+    if (ic->ic_serial == GET_GLOBAL_CONSTANT_STATE() &&
+        rb_guild_main_p()) {
         return (ic->ic_cref == NULL || // no need to check CREF
                 ic->ic_cref == vm_get_cref(reg_ep));
     }

@@ -351,3 +351,38 @@ assert_equal 'RuntimeError', %q{
     e.class
   end
 }
+
+# Getting non-sharable objects via constants by other guilds is not allowed
+assert_equal 'NameError', %q{
+  class C
+    CONST = 'str'
+  end
+  g = Guild.new do
+    C::CONST
+  end
+  begin
+    g.recv
+  rescue => e
+    e.class
+  end
+}
+
+# Setting non-sharable objects into constants by other guilds is not allowed
+assert_equal 'NameError', %q{
+  class C
+  end
+  g = Guild.new do
+    C::CONST = 'str'
+  end
+  begin
+    g.recv
+  rescue => e
+    e.class
+  end
+}
+
+assert_equal 'test-name', %q{
+  g = Guild.new name: 'test-name' do
+  end
+  g.name
+end

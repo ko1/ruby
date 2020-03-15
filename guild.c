@@ -728,7 +728,7 @@ rb_guild_self(const rb_guild_t *g)
     return g->self;
 }
 
-int
+MJIT_FUNC_EXPORTED int
 rb_guild_main_p(void)
 {
     rb_execution_context_t *ec = GET_EC();

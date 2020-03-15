@@ -116,6 +116,10 @@ class Guild
     "#<Guild:##{id}#{name ? ' '+name : ''}#{loc ? " " + loc : ''}>"
   end
 
+  def name
+    __builtin_cexpr! %q{ GUILD_PTR(self)->name }
+  end
+
   class Channel
     # Send an object from this channel from send-side edge.
     # No blocking on current implementation.
