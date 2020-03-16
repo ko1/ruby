@@ -37,6 +37,17 @@ assert_equal 'ok', %q{
   g.recv
 }
 
+# communicate via Guild::Channel
+assert_equal 'ok', %q{
+  ch = Guild::Channel.new
+  g = Guild.new ch do |ch|
+    ch.recv #=> 'ok'
+  end
+
+  ch << 'ok'
+  ch.recv
+}
+
 # Guild.select(*channels) receives a values from a channel.
 # It is similar to select(2) and Go's select syntax.
 # The return value is [ch, received_value]
@@ -398,11 +409,11 @@ assert_equal 'test-name', %q{
   g = Guild.new name: 'test-name' do
   end
   g.name
-end
+}
 
 # If Guild doesn't have a name, Guild#name returns nil.
 assert_equal 'nil', %q{
   g = Guild.new do
   end
-  g.name
-end
+  g.name.inspect
+}
