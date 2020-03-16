@@ -135,6 +135,42 @@ assert_equal 'ok', %q{
   end
 }
 
+# multiple guilds can recv (wait) from one channel
+assert_equal '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]', %q{
+  ch = Guild::Channel.new
+  GN = 10
+  gs = GN.times.map{|i|
+    Guild.new ch, i do |ch, i|
+      msg = ch.recv
+      msg # ping-pong
+    end
+  }
+  GN.times{|i|
+    ch << i
+  }
+  rs = GN.times.map{
+    g, n = Guild.select(*gs)
+    gs.delete g
+    n
+  }.sort
+  rs
+}
+
+# multiple guilds can send to one channel
+assert_equal '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]', %q{
+  ch = Guild::Channel.new
+  GN = 10
+  gs = GN.times.map{|i|
+    Guild.new ch, i do |ch, i|
+      ch << i
+    end
+  }
+  rs = GN.times.map{
+    ch.recv
+  }.sort
+  rs
+}
+
 assert_equal 'ok', %q{
   task_ch = Guild::Channel.new
   result_ch = Guild::Channel.new
@@ -180,6 +216,30 @@ assert_equal 'ok', %q{
     g.recv
   rescue => e
     e.message
+  end
+}
+
+# unshareable object are copied
+assert_equal 'false', %q{
+  obj = 'str'.dup
+  g = Guild.new obj do |msg|
+    msg.object_id
+  end
+  
+  obj.object_id == g.recv
+}
+
+# To copy the object, now Marshal#dump is used
+assert_equal 'no _dump_data is defined for class Thread', %q{
+  obj = Thread.new{}
+  begin
+    g = Guild.new obj do |msg|
+      msg
+    end
+  rescue TypeError => e
+    e.message #=> no _dump_data is defined for class Thread
+  else
+    'ng'
   end
 }
 
