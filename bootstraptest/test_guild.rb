@@ -208,14 +208,15 @@ assert_equal 'ok', %q{
 }
 
 # an exception in a guild will be re-raised at Guild#recv
-assert_equal 'ok', %q{
+assert_equal '[RuntimeError, "ok"]', %q{
   g = Guild.new do
     raise 'ok' # exception will be transferred receiver
   end
   begin
     g.recv
-  rescue => e
-    e.message
+  rescue Guild::RemoteError => e
+    [e.cause.class,   #=> RuntimeError
+     e.cause.message] #=> 'ok'
   end
 }
 
@@ -350,7 +351,7 @@ assert_equal 'ArgumentError', %q{
 }
 
 # ivar in sharable-objects are not allowed to access from non-main guild
-assert_equal 'RuntimeError', %q{
+assert_equal 'can not access instance variables of classes/modules from non-main guild.', %q{
   class C
     @iv = 'str'
   end
@@ -364,13 +365,13 @@ assert_equal 'RuntimeError', %q{
 
   begin
     g.recv
-  rescue => e
-    e.class
+  rescue Guild::RemoteError => e
+    e.cause.message
   end
 }
 
 # ivar in sharable-objects are not allowed to access from non-main guild
-assert_equal 'RuntimeError', %q{
+assert_equal 'can not access instance variables of shareable objects from non-main guild.', %q{
   ch = Guild::Channel.new
   ch.instance_variable_set(:@iv, 'str')
 
@@ -380,13 +381,13 @@ assert_equal 'RuntimeError', %q{
 
   begin
     g.recv
-  rescue => e
-    e.class
+  rescue Guild::RemoteError => e
+    e.cause.message
   end
 }
 
 # cvar in sharable-objects are not allowed to access from non-main guild
-assert_equal 'RuntimeError', %q{
+assert_equal 'can not access class variables from non-main guild.', %q{
   class C
     @@cv = 'str'
   end
@@ -400,13 +401,13 @@ assert_equal 'RuntimeError', %q{
 
   begin
     g.recv
-  rescue => e
-    e.class
+  rescue Guild::RemoteError => e
+    e.cause.message
   end
 }
 
 # Getting non-sharable objects via constants by other guilds is not allowed
-assert_equal 'NameError', %q{
+assert_equal 'can not access non-sharable objects in constant CONST by non-main guild.', %q{
   class C
     CONST = 'str'
   end
@@ -415,13 +416,13 @@ assert_equal 'NameError', %q{
   end
   begin
     g.recv
-  rescue => e
-    e.class
+  rescue Guild::RemoteError => e
+    e.cause.message
   end
 }
 
 # Setting non-sharable objects into constants by other guilds is not allowed
-assert_equal 'NameError', %q{
+assert_equal 'can not set constants with non-shareable objects by non-main guilds', %q{
   class C
   end
   g = Guild.new do
@@ -429,8 +430,8 @@ assert_equal 'NameError', %q{
   end
   begin
     g.recv
-  rescue => e
-    e.class
+  rescue Guild::RemoteError => e
+    e.cause.message
   end
 }
 

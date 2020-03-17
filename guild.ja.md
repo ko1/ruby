@@ -1,9 +1,9 @@
-
 # まとめ
 
 * 1つのGuildは並行実行単位として実行される
   * 1つのGuildは1つ以上のスレッドをもつ
-  * スレッドは Guild に属するグローバルロックで共有される
+  * スレッドは各 Guild に属するグローバルロックで共有される
+* Guild 間はチャンネルを用いて通信・同期を行いながら実行する
 * オブジェクトは共有可能・不可能オブジェクトに二分され、共有不可能オブジェクトはたかだか一つの Guild からしか参照されない
 * 共有可能オブジェクトへのアクセスは必ず排他制御される
   * C レベルでの SEGV は起こらない
@@ -11,14 +11,20 @@
 
 # Guild の生成と終了
 
+* `Guild.new do ... end` で Guild を生成する
+* 渡したブロックが新しい Guild 上で実行される
+  * ブロックは外側の環境と隔離される
+  * `Guild.new` に渡した引数が、incoming メッセージとしてブロックパラメータで受け取る
+  * ブロックの返値が、outgoing メッセージとなる
+
 ## Guild の生成
 
 * `Guild.new` メソッドで Guild 作成
+* 渡したブロックが生成された Guild で並行実行される
 
 ```ruby
 Guild.new do
-  # 新 Guild ブロック
-  # 並行に実行される
+  # このブロックが並行に実行される
 end
 ```
 
@@ -30,7 +36,10 @@ end
   g.name #=> 'test-name'
 ```
 
+## Guild に渡したブロックは、生成側の環境からは隔離される
+
 * 与えられたブロックは、`Proc#isolate` によって外側の環境にアクセスできない
+* エラーは `Proc#isolate` が実行された瞬間に起こる。つまり `Guild.new` したときに起こる
 
 ```ruby
   begin
@@ -43,7 +52,7 @@ end
   end
 ```
 
-* 与えられたブロックの `self` は、その Guild オブジェクト自身になる
+* 与えられたブロックの `self` は、その Guild オブジェクト自身になる（外側の `self` とは別になる）
 
 ```ruby
   g = Guild.new do
@@ -52,7 +61,7 @@ end
   g.recv == self.object_id #=> true
 ```
 
-* `Guild.new` に渡された（キーワード引数以外の）引数は、生成された Guild に送られる（`send` される）
+* `Guild.new` に渡された（キーワード引数以外の）引数は、ブロックの引数になる。ただし、参照を渡すのでは無く、その Guild へのincoming メッセージとなる（コピーになる。詳細は後述）
 
 ```ruby
   g = Guild.new 'ok' do |msg|
@@ -61,13 +70,31 @@ end
   g.recv
 ```
 
-* ブロックの返値は、その Guild からの outgoing メッセージとなる（次節で紹介）
+```ruby
+  # 上のコードとほぼ同じ意味
+  g = Guild.new do
+    msg = Guild.recv
+    msg
+  end
+  g.send 'ok'
+  g.recv #=> 'ok'
+```
+
+* ブロックの返値は、その Guild からの outgoing メッセージとなる（コピーになる。詳細は後述）
 
 ```ruby
   g = Guild.new do
     'ok'
   end
   g.recv #=> `ok`
+```
+
+```ruby
+  # 上のコードとほぼ同じ意味
+  g = Guild.new do
+    Guild.send 'ok'
+  end
+  g.recv #=> 'ok'
 ```
 
 * ブロックのエラー値は、outgoing メッセージを受信した Guild 上でエラーが伝搬する
@@ -78,12 +105,10 @@ end
   end
   begin
     g.recv
-  rescue => e
-    e.message #=> 'ok'
+  rescue Guild::RemoteError => e
+    e.cause.class   #=> RuntimeError
+    e.cause.message #=> 'ok'
   end
-
-  # 現在、例外発生元と同じエラー RuntimeError を返しているが、
-  # GuildError みたいなもので wrap したほうがいいかも
 ```
 
 # Guild 間のコミュニケーション

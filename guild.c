@@ -7,6 +7,8 @@
 #include "guild.h"
 
 static VALUE rb_cGuild;
+static VALUE rb_eGuildRemoteError;
+
 static VALUE rb_cGuildChannel;
 static VALUE rb_eGuildChannelClosedError;
 static VALUE rb_eGuildChannelError;
@@ -343,9 +345,13 @@ guild_channel_recv_accept(struct rb_guild_channel_basket *b)
       case basket_type_copy_marshal:
         return rb_marshal_load(b->v);
       case basket_type_exception:
-        rb_exc_raise(rb_marshal_load(b->v));
+        {
+            VALUE cause = rb_marshal_load(b->v);
+            VALUE err = rb_exc_new_cstr(rb_eGuildRemoteError, "thrown by remote Guild.");
+            rb_ec_setup_exception(NULL, err, cause);
+            rb_exc_raise(err);
+        }
         // unreachable
-        // TODO: wrap by another exception?
       case basket_type_move:
         return guild_channel_moved_setup(b->v);
       default:
@@ -852,6 +858,8 @@ Init_Guild(void)
     rb_cGuildChannel = rb_define_class_under(rb_cGuild, "Channel", rb_cObject);
     rb_undef_alloc_func(rb_cGuildChannel);
     rb_define_singleton_method(rb_cGuildChannel, "new", guild_channel_new, 0);
+
+    rb_eGuildRemoteError = rb_define_class_under(rb_cGuild, "RemoteError", rb_eRuntimeError);
 
     rb_eGuildChannelClosedError = rb_define_class_under(rb_cGuildChannel, "ClosedError", rb_eRuntimeError);
     rb_eGuildChannelError = rb_define_class_under(rb_cGuildChannel, "Error", rb_eRuntimeError);
