@@ -33,9 +33,6 @@ typedef struct rb_guild_struct {
     uint32_t id;
     VALUE name;
     VALUE loc;
-
-    // variables
-    struct rb_id_table *global_tbl;
 } rb_guild_t;
 
 enum rb_guild_channel_basket_type {
@@ -80,7 +77,6 @@ guild_mark(void *ptr)
     rb_gc_mark(g->running_thread);
     rb_gc_mark(g->loc);
     rb_gc_mark(g->name);
-    rb_guild_mark_global_tbl(g->global_tbl);
 }
 
 static void
@@ -916,13 +912,4 @@ rb_guild_shareable_p_continue(VALUE obj)
   shareable:
     FL_SET_RAW(obj, RUBY_FL_SHAREABLE);
     return true;
-}
-
-struct rb_id_table *
-rb_guild_global_tbl(rb_guild_t *g)
-{
-    if (!g->global_tbl) {
-        g->global_tbl = rb_id_table_create(0);
-    }
-    return g->global_tbl;
 }

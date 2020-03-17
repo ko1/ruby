@@ -20,6 +20,7 @@
 #define ROBJECT_TRANSIENT_FLAG    FL_USER13
 
 /* variable.c */
+void rb_gc_mark_global_tbl(void);
 size_t rb_generic_ivar_memsize(VALUE);
 VALUE rb_search_class_path(VALUE);
 VALUE rb_attr_delete(VALUE, ID);

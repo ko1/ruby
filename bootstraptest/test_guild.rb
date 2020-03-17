@@ -313,14 +313,31 @@ assert_equal '[0, 1]', %q{
   end
 }
 
-# global-variable $gv
-assert_equal '[0, 1]', %q{
+# Access to global-variables are prohibitted
+assert_equal 'can not access global variables from non-main guild.', %q{
   $gv = 1
   g = Guild.new do
-    $gv = 0 # $g is guild local variable.
     $gv
   end
-  [g.recv, $gv]
+
+  begin
+    g.recv
+  rescue Guild::RemoteError => e
+    e.cause.message
+  end
+}
+
+# Access to global-variables are prohibitted
+assert_equal 'can not access global variables from non-main guild.', %q{
+  g = Guild.new do
+    $gv = 1
+  end
+
+  begin
+    g.recv
+  rescue Guild::RemoteError => e
+    e.cause.message
+  end
 }
 
 # selfs are different objects

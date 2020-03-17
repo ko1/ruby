@@ -5760,6 +5760,9 @@ gc_mark_roots(rb_objspace_t *objspace, const char **categoryp)
     MARK_CHECKPOINT("end_proc");
     rb_mark_end_proc();
 
+    MARK_CHECKPOINT("global_tbl");
+    rb_gc_mark_global_tbl();
+
     MARK_CHECKPOINT("object_id");
     rb_gc_mark(objspace->next_object_id);
     mark_tbl_no_pin(objspace, objspace->obj_to_id_tbl); /* Only mark ids */
