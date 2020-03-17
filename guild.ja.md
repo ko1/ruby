@@ -43,31 +43,13 @@ end
   end
 ```
 
-* ブロックの `self` は、無指定では `Object.new` されたものになる（暗黙の `instance_eval`）
+* 与えられたブロックの `self` は、その Guild オブジェクト自身になる
 
 ```ruby
   g = Guild.new do
     self.object_id
   end
-  g.recv == self.object_id #=> false
-```
-
-* ブロックの `self` は、`self_class:` キーワードか、`self_instance:` キーワードで変更可能
-
-```ruby
-  g = Guild.new self_class: Array do
-    # Array.new したものが self になる
-    self.class #=> Array
-  end
-  g.recv
-```
-
-```ruby
-  g = Guild.new self_instance: :sym do
-    # :sym が Guild に send され、それが self になる
-    self.class #=> Symbol
-  end
-  g.recv
+  g.recv == self.object_id #=> true
 ```
 
 * `Guild.new` に渡された（キーワード引数以外の）引数は、生成された Guild に送られる（`send` される）

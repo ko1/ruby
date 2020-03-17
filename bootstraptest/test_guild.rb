@@ -329,42 +329,12 @@ assert_equal 'false', %q{
   g.recv == self.object_id
 }
 
-# we can specify self class with self_class keyword.
-assert_equal 'Array', %q{
-  g = Guild.new self_class: Array do
-    self.class
+# self is a guild instance
+assert_equal 'true', %q{
+  g = Guild.new do
+    self.object_id
   end
-  g.recv
-}
-
-# we can specify self class with self_instance keyword.
-assert_equal 'Symbol', %q{
-  g = Guild.new self_instance: :sym do
-    self.class
-  end
-  g.recv
-}
-
-# we can specify self class with self_instance keyword.
-# self_instance will be copied.
-assert_equal '[true, false]', %q{
-  class C; end
-  obj = C.new
-  g = Guild.new self_instance: obj do
-    [self.class, self.object_id]
-  end
-  klass, objid = *g.recv
-  [klass == C, self.object_id == objid] # [true, false]
-}
-
-# should not specify self_instance and self_class keywords.
-assert_equal 'ArgumentError', %q{
-  begin
-    g = Guild.new self_instance: 1, self_class: Array do
-    end
-  rescue => e
-    e.class # ArgumentError
-  end
+  g.object_id == g.recv
 }
 
 # given block Proc will be isolated, so can not access outer variables.

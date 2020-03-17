@@ -27,21 +27,15 @@ class Guild
   # p g.recv   #                                 => 4
   # p g.recv   # raise Guild::Channel::ClosedError
   #
-  # name: Guild's name
+  # other options:
+  #   name: Guild's name
   # 
-  def self.new*args, name: nil,
-               self_class: ::Object,
-               self_instance: nil,
-               &block
+  def self.new *args, name: nil, &block
+    b = block # TODO: builtin bug
     loc = caller_locations(1, 1).first
     loc = "#{loc.path}:#{loc.lineno}"
-    if self_instance
-      raise ArgumentError, "Both self_class and self_instance can not be specified." if self_class != ::Object
-      self_class = nil
-    end
-
     __builtin_cexpr! %q{
-      guild_create(ec, self, block, args, loc, name, self_class, self_instance)
+      guild_create(ec, self, args, b, loc, name)
     }
   end
 

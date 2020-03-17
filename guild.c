@@ -737,14 +737,12 @@ rb_guild_main_p(void)
 
 
 static VALUE
-guild_create(rb_execution_context_t *ec, VALUE self, VALUE block, VALUE args,
-             VALUE loc, VALUE name, VALUE self_class, VALUE self_instance)
+guild_create(rb_execution_context_t *ec, VALUE self,
+             VALUE args, VALUE block, VALUE loc, VALUE name)
 {
     VALUE gv = guild_alloc(self);
     rb_guild_t *g = GUILD_PTR(gv);
-    VALUE proc = rb_block_proc();
-    g->running_thread = rb_thread_create_guild(proc, args, g,
-                                               self_class, self_instance);
+    g->running_thread = rb_thread_create_guild(g, args, block);
     g->loc = loc;
     g->name = name;
     return gv;
@@ -769,22 +767,16 @@ rb_guild_atexit_exception(rb_execution_context_t *ec)
 }
 
 void
-rb_guild_recv_parameters(rb_execution_context_t *ec, rb_guild_t *g, int len, VALUE *ptr, VALUE *pself)
+rb_guild_recv_parameters(rb_execution_context_t *ec, rb_guild_t *g, int len, VALUE *ptr)
 {
-    if (pself) *pself = guild_channel_recv(ec, g->incoming_channel);
-
     for (int i=0; i<len; i++) {
         ptr[i] = guild_channel_recv(ec, g->incoming_channel);
     }
 }
 
 void
-rb_guild_send_parameters(rb_execution_context_t *ec, rb_guild_t *g, VALUE args, VALUE self_instance)
+rb_guild_send_parameters(rb_execution_context_t *ec, rb_guild_t *g, VALUE args)
 {
-    if (!NIL_P(self_instance)) {
-        guild_channel_send(ec, g->incoming_channel, self_instance);
-    }
-
     int len = RARRAY_LENINT(args);
     for (int i=0; i<len; i++) {
         guild_channel_send(ec, g->incoming_channel, RARRAY_AREF(args, i));
