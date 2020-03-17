@@ -49,6 +49,7 @@ enum rb_guild_channel_basket_type {
 struct rb_guild_channel_basket {
     int type;
     VALUE v;
+    VALUE sender;
 };
 
 typedef struct rb_guild_channel_struct {
@@ -116,6 +117,7 @@ guild_channel_mark(void *ptr)
     rb_guild_channel_t *gc = (rb_guild_channel_t *)ptr;
     for (int i=0; i<gc->cnt; i++) {
         rb_gc_mark(gc->baskets[i].v);
+        rb_gc_mark(gc->baskets[i].sender);
     }
 }
 
@@ -348,6 +350,7 @@ guild_channel_recv_accept(struct rb_guild_channel_basket *b)
         {
             VALUE cause = rb_marshal_load(b->v);
             VALUE err = rb_exc_new_cstr(rb_eGuildRemoteError, "thrown by remote Guild.");
+            rb_ivar_set(err, rb_intern("@guild"), b->sender);
             rb_ec_setup_exception(NULL, err, cause);
             rb_exc_raise(err);
         }
@@ -574,6 +577,7 @@ guild_channel_send_basket(rb_execution_context_t *ec, rb_guild_channel_t *gc, st
                 gc->size *= 2;
                 REALLOC_N(gc->baskets, struct rb_guild_channel_basket, gc->size);
             }
+            b->sender = rb_ec_guild_ptr(ec)->self;
             gc->baskets[gc->cnt++] = *b;
 
             if (guild_channel_waiting_p(gc)) {

@@ -208,7 +208,7 @@ assert_equal 'ok', %q{
 }
 
 # an exception in a guild will be re-raised at Guild#recv
-assert_equal '[RuntimeError, "ok"]', %q{
+assert_equal '[RuntimeError, "ok", true]', %q{
   g = Guild.new do
     raise 'ok' # exception will be transferred receiver
   end
@@ -216,7 +216,8 @@ assert_equal '[RuntimeError, "ok"]', %q{
     g.recv
   rescue Guild::RemoteError => e
     [e.cause.class,   #=> RuntimeError
-     e.cause.message] #=> 'ok'
+     e.cause.message, #=> 'ok'
+     e.guild == g]    #=> true
   end
 }
 

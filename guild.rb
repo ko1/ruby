@@ -114,6 +114,10 @@ class Guild
     __builtin_cexpr! %q{ GUILD_PTR(self)->name }
   end
 
+  class RemoteError
+    attr_reader :guild
+  end
+
   class Channel
     # Send an object from this channel from send-side edge.
     # No blocking on current implementation.
