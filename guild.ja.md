@@ -39,6 +39,8 @@ end
       a #=> ArgumentError
     end
     g.recv
+  rescue ArgumentError
+  end
 ```
 
 * ブロックの `self` は、無指定では `Object.new` されたものになる（暗黙の `instance_eval`）
@@ -548,5 +550,5 @@ Guild 外                                   Guild 内
   * recv する Guild が居る、というのを陽に示したい（いなくなったら close_recv して欲しい）
   * Channel を見えるようにするのでは無く、recv_port, send_port のように（pipe の read/write みたいに）扱う方が良いか？　その Guild が send/recv するというのをどうやって表明させるか？
 
-  
+
 
