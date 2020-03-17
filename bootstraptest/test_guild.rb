@@ -195,7 +195,7 @@ assert_equal 'ok', %q{
 
   TN.times{|i| task_ch << i}
   tn_results = TN.times.map{result_ch.recv}
-  task_ch.close_send
+  task_ch.close
 
   gn_results = (1..GN).map{
     g, obj = Guild.select(*gs)

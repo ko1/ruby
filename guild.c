@@ -62,8 +62,7 @@ typedef struct rb_guild_channel_struct {
         rb_guild_t **guilds;
     } waiting;
 
-    bool send_closed;
-    bool recv_closed;
+    bool closed;
 } rb_guild_channel_t;
 
 static void
@@ -398,7 +397,7 @@ guild_channel_try_recv(rb_execution_context_t *ec, rb_guild_channel_t *gc)
     rb_native_mutex_unlock(&gc->lock);
 
     if (basket.v == Qundef) {
-        if (gc->send_closed) {
+        if (gc->closed) {
             rb_raise(rb_eGuildChannelClosedError, "The send-edge is already closed");
         }
         else {
@@ -564,7 +563,7 @@ guild_channel_send_basket(rb_execution_context_t *ec, rb_guild_channel_t *gc, st
 
     rb_native_mutex_lock(&gc->lock);
     {
-        if (gc->recv_closed) {
+        if (gc->closed) {
             closed = true;
         }
         else {
@@ -624,45 +623,29 @@ guild_channel_move(rb_execution_context_t *ec, VALUE gcv, VALUE obj)
 }
 
 static VALUE
-guild_channel_close_send(rb_execution_context_t *ec, VALUE gcv)
+guild_channel_close(rb_execution_context_t *ec, VALUE gcv)
 {
     rb_guild_channel_t *gc = GUILD_CHANNEL_PTR(gcv);
-    VALUE changed = Qfalse;
+    VALUE prev;
 
     rb_native_mutex_lock(&gc->lock);
     {
-        if (!gc->send_closed) {
-            changed = Qtrue;
-            gc->send_closed = true;
+        if (!gc->closed) {
+            prev = Qfalse;
+            gc->closed = true;
 
             if (guild_channel_waiting_p(gc)) {
                 guild_channel_wakeup_all(gc);
             }
         }
-    }
-    rb_native_mutex_unlock(&gc->lock);
-
-    RB_GC_GUARD(gcv);
-    return changed;
-}
-
-static VALUE
-guild_channel_close_recv(rb_execution_context_t *ec, VALUE gcv)
-{
-    rb_guild_channel_t *gc = GUILD_CHANNEL_PTR(gcv);
-    VALUE changed = Qfalse;
-
-    rb_native_mutex_lock(&gc->lock);
-    {
-        if (!gc->recv_closed) {
-            gc->recv_closed = true;
-            changed = Qtrue;
+        else {
+            prev = Qtrue;
         }
     }
     rb_native_mutex_unlock(&gc->lock);
 
     RB_GC_GUARD(gcv);
-    return changed;
+    return prev;
 }
 
 static VALUE
@@ -759,8 +742,8 @@ rb_guild_atexit(rb_execution_context_t *ec, VALUE result)
 {
     rb_guild_t *g = rb_ec_guild_ptr(ec);
     guild_channel_send(ec, g->outgoing_channel, result);
-    guild_channel_close_send(ec, g->outgoing_channel);
-    guild_channel_close_recv(ec, g->incoming_channel);
+    guild_channel_close(ec, g->outgoing_channel);
+    guild_channel_close(ec, g->incoming_channel);
 }
 
 void
@@ -768,8 +751,8 @@ rb_guild_atexit_exception(rb_execution_context_t *ec)
 {
     rb_guild_t *g = rb_ec_guild_ptr(ec);
     guild_channel_send_exception(ec, g->outgoing_channel, ec->errinfo);
-    guild_channel_close_send(ec, g->outgoing_channel);
-    guild_channel_close_recv(ec, g->incoming_channel);
+    guild_channel_close(ec, g->outgoing_channel);
+    guild_channel_close(ec, g->incoming_channel);
 }
 
 void

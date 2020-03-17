@@ -144,25 +144,11 @@ class Guild
 
     alias << send
 
-    # Close recv-side edge.
-    def close_recv
-      __builtin_cexpr! %q{
-        guild_channel_close_recv(ec, self);
-      }
-    end
-
-    # Close send-side edge.
-    def close_send
-      __builtin_cexpr! %q{
-        guild_channel_close_send(ec, self);
-      }
-    end
-
-    # Close both sides
+    # Close this channel.
     def close
-      close_recv
-      close_send
-      nil
+      __builtin_cexpr! %q{
+        guild_channel_close(ec, self);
+      }
     end
   end
 end
