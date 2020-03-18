@@ -560,7 +560,7 @@ typedef struct rb_vm_struct {
     rb_global_vm_lock_t gvl;
 
     struct rb_thread_struct *main_thread;
-    struct rb_guild_struct *main_guild;
+    struct rb_ractor_struct *main_ractor;
 
     /* persists across uncontended GVL release/acquire for time slice */
     const struct rb_thread_struct *running_thread;
@@ -894,12 +894,12 @@ void rb_ec_initialize_vm_stack(rb_execution_context_t *ec, VALUE *stack, size_t 
 // @param ec the execution context to update.
 void rb_ec_clear_vm_stack(rb_execution_context_t *ec);
 
-typedef struct rb_guild_struct rb_guild_t;
+typedef struct rb_ractor_struct rb_ractor_t;
 
 typedef struct rb_thread_struct {
     struct list_node vmlt_node;
     VALUE self;
-    rb_guild_t *guild;
+    rb_ractor_t *ractor;
     rb_vm_t *vm;
 
     rb_execution_context_t *ec;
@@ -965,7 +965,7 @@ typedef struct rb_thread_struct {
     enum thread_invoke_type {
         thread_invoke_type_none = 0,
         thread_invoke_type_proc,
-        thread_invoke_type_guild_proc,
+        thread_invoke_type_ractor_proc,
         thread_invoke_type_func
     } invoke_type;
 
@@ -1726,7 +1726,7 @@ RUBY_EXTERN unsigned int    ruby_vm_event_local_num;
 RUBY_SYMBOL_EXPORT_END
 
 #define GET_VM()     rb_current_vm()
-#define GET_GUILD()  rb_current_guild()
+#define GET_RACTOR() rb_current_ractor()
 #define GET_THREAD() rb_current_thread()
 #define GET_EC()     rb_current_execution_context()
 
@@ -1736,13 +1736,13 @@ rb_ec_thread_ptr(const rb_execution_context_t *ec)
     return ec->thread_ptr;
 }
 
-static inline rb_guild_t *
-rb_ec_guild_ptr(const rb_execution_context_t *ec)
+static inline rb_ractor_t *
+rb_ec_ractor_ptr(const rb_execution_context_t *ec)
 {
     const rb_thread_t *th = rb_ec_thread_ptr(ec);
     if (th) {
-        VM_ASSERT(th->guild != NULL);
-	return th->guild;
+        VM_ASSERT(th->ractor != NULL);
+	return th->ractor;
     }
     else {
         return NULL;
@@ -1774,11 +1774,11 @@ rb_current_thread(void)
     return rb_ec_thread_ptr(ec);
 }
 
-static inline rb_guild_t *
-rb_current_guild(void)
+static inline rb_ractor_t *
+rb_current_ractor(void)
 {
     const rb_execution_context_t *ec = GET_EC();
-    return rb_ec_guild_ptr(ec);
+    return rb_ec_ractor_ptr(ec);
 }
 
 static inline rb_vm_t *

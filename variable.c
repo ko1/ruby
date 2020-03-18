@@ -35,7 +35,7 @@
 #include "transient_heap.h"
 #include "variable.h"
 #include "vm_core.h"
-#include "guild.h"
+#include "ractor.h"
 
 typedef void rb_gvar_compact_t(void *var);
 
@@ -334,8 +334,8 @@ struct rb_global_entry {
 struct rb_id_table *
 global_tbl(void)
 {
-    if (!rb_guild_main_p()) {
-        rb_raise(rb_eRuntimeError, "can not access global variables from non-main guild."); \
+    if (!rb_ractor_main_p()) {
+        rb_raise(rb_eRuntimeError, "can not access global variables from non-main Ractors"); \
     }
     return rb_global_tbl;
 }
@@ -866,25 +866,25 @@ rb_alias_variable(ID name1, ID name2)
 }
 
 static void
-IVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD(ID id)
+IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(ID id)
 {
-    if (UNLIKELY(!rb_guild_main_p())) {
+    if (UNLIKELY(!rb_ractor_main_p())) {
         if (rb_is_instance_id(id)) { // check only normal ivars
-            rb_raise(rb_eRuntimeError, "can not access instance variables of classes/modules from non-main guild.");
+            rb_raise(rb_eRuntimeError, "can not access instance variables of classes/modules from non-main Ractors");
         }
     }
 }
 
-#define CVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD() \
-  if (UNLIKELY(!rb_guild_main_p())) { \
-      rb_raise(rb_eRuntimeError, "can not access class variables from non-main guild."); \
+#define CVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR() \
+  if (UNLIKELY(!rb_ractor_main_p())) { \
+      rb_raise(rb_eRuntimeError, "can not access class variables from non-main Ractors"); \
   }
 
 static inline struct st_table *
 generic_ivtbl(VALUE obj)
 {
-    if (UNLIKELY(rb_guild_shareable_p(obj) && !rb_guild_main_p())) {
-        rb_raise(rb_eRuntimeError, "can not access instance variables of shareable objects from non-main guild.");
+    if (UNLIKELY(rb_ractor_shareable_p(obj) && !rb_ractor_main_p())) {
+        rb_raise(rb_eRuntimeError, "can not access instance variables of shareable objects from non-main Ractors");
     }
     return generic_iv_tbl_;
 }
@@ -1141,7 +1141,7 @@ rb_ivar_lookup(VALUE obj, ID id, VALUE undef)
 	break;
       case T_CLASS:
       case T_MODULE:
-        IVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD(id);
+        IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(id);
 	if (RCLASS_IV_TBL(obj) &&
 		st_lookup(RCLASS_IV_TBL(obj), (st_data_t)id, &index))
 	    return (VALUE)index;
@@ -1198,7 +1198,7 @@ rb_ivar_delete(VALUE obj, ID id, VALUE undef)
 	break;
       case T_CLASS:
       case T_MODULE:
-        IVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD(id);
+        IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(id);
 	if (RCLASS_IV_TBL(obj) &&
 		st_delete(RCLASS_IV_TBL(obj), (st_data_t *)&id, &index))
 	    return (VALUE)index;
@@ -1379,7 +1379,7 @@ ivar_set(VALUE obj, ID id, VALUE val)
         break;
       case T_CLASS:
       case T_MODULE:
-        IVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD(id);
+        IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(id);
         if (!RCLASS_IV_TBL(obj)) RCLASS_IV_TBL(obj) = st_init_numtable();
         rb_class_ivar_set(obj, id, val);
         break;
@@ -1426,7 +1426,7 @@ rb_ivar_defined(VALUE obj, ID id)
 	break;
       case T_CLASS:
       case T_MODULE:
-        IVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD(id);
+        IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(id);
 	if (RCLASS_IV_TBL(obj) && st_is_member(RCLASS_IV_TBL(obj), (st_data_t)id))
 	    return Qtrue;
 	break;
@@ -1592,7 +1592,7 @@ rb_ivar_foreach(VALUE obj, rb_ivar_foreach_callback_func *func, st_data_t arg)
 	break;
       case T_CLASS:
       case T_MODULE:
-        IVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD(0);
+        IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(0);
 	if (RCLASS_IV_TBL(obj)) {
 	    st_foreach_safe(RCLASS_IV_TBL(obj), func, arg);
 	}
@@ -1756,7 +1756,7 @@ rb_obj_remove_instance_variable(VALUE obj, VALUE name)
 	break;
       case T_CLASS:
       case T_MODULE:
-        IVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD(id);
+        IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(id);
 	n = id;
 	if (RCLASS_IV_TBL(obj) && st_delete(RCLASS_IV_TBL(obj), &n, &v)) {
 	    return (VALUE)v;
@@ -2421,9 +2421,9 @@ rb_const_get_0(VALUE klass, ID id, int exclude, int recurse, int visibility)
 {
     VALUE c = rb_const_search(klass, id, exclude, recurse, visibility);
     if (c != Qundef) {
-        if (UNLIKELY(!rb_guild_main_p())) {
-            if (!rb_guild_shareable_p(c)) {
-                rb_raise(rb_eNameError, "can not access non-sharable objects in constant %s by non-main guild.", rb_id2name(id));
+        if (UNLIKELY(!rb_ractor_main_p())) {
+            if (!rb_ractor_shareable_p(c)) {
+                rb_raise(rb_eNameError, "can not access non-sharable objects in constant %s by non-main Ractors", rb_id2name(id));
             }
         }
         return c;
@@ -2868,8 +2868,8 @@ rb_const_set(VALUE klass, ID id, VALUE val)
 		 QUOTE_ID(id));
     }
 
-    if (!rb_guild_shareable_p(val) && !rb_guild_main_p()) {
-        rb_raise(rb_eNameError, "can not set constants with non-shareable objects by non-main guilds");
+    if (!rb_ractor_shareable_p(val) && !rb_ractor_main_p()) {
+        rb_raise(rb_eNameError, "can not set constants with non-shareable objects by non-main Ractors");
     }
 
     check_before_mod_set(klass, id, val, "constant");
@@ -3187,7 +3187,7 @@ cvar_overtaken(VALUE front, VALUE target, ID id)
     }
 
 #define CVAR_LOOKUP(v,r) do {\
-    CVAR_ACCESSOR_SHOULD_BE_MAIN_GUILD(); \
+    CVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(); \
     if (cvar_lookup_at(klass, id, (v))) {r;}\
     CVAR_FOREACH_ANCESTORS(klass, v, r);\
 } while(0)

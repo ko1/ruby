@@ -122,10 +122,10 @@ end
 * (3) は、データの送受信は行うことができるが、待ち合わせには用いない。
 * まだ送信されていないチャンネルから `recv` しようとすると、何か来るまで待つ（タイムアウトはまだ実装していない）
 * 複数のチャンネルを同時に待つ `Guild.select(channels...)` がある。
-* 端点を close することができる
-  * `close_send` されたチャンネルから recv してブロックしようとすると、例外
-  * `close_recv` されたチャンネルへ send しようとすると例外
-  * Guild が終了すると、その Guild の incoming/outgoing channel は、それぞれ `close_recv`、`close_send` される
+* チャンネルは close することができる
+  * `close` されたチャンネルから recv してブロックしようとすると、例外（未受信だと例外）
+  * `close` されたチャンネルへ send しようとすると例外
+  * Guild が終了すると、その Guild の incoming/outgoing channel はそれぞれ `close` される
 * チャンネル間送受信において、送るオブジェクトはコピーと移動の2種類がある
   * すべてコピーして送る `send`
   * 送信元で、以降一切用いないことを前提に転送を高速化する `move`
@@ -253,8 +253,9 @@ Guild 外                                   Guild 内
 
 ## チャンネルの端点を close
 
-* `close_send` されたチャンネルから recv してブロックしようとするとエラー
-* Guild が終了すると、outgoing channel が `close_send` される
+* `Guild::Channel#close` でチャンネルを close することができる（`Queue#close` と同じ）
+* `close` されたチャンネルから recv してブロックしようとするとエラー
+* Guild が終了すると、outgoing channel が `close` される
 
 ```ruby
   # closed-channel (Guild)
@@ -271,8 +272,8 @@ Guild 外                                   Guild 内
   end
 ```
 
-* `close_recv` されたチャンネルへ send しようとするとエラー
-* Guild が終了すると、incoming channel が `close_recv` される
+* `close` されたチャンネルへ send しようとするとエラー
+* Guild が終了すると、incoming channel が `close` される
 
 ```ruby
   g = Guild.new do
@@ -289,7 +290,7 @@ Guild 外                                   Guild 内
   end
 ```
 
-* `close_send` を使って、複数 Guild へ一斉に情報を発信することができる
+* `close` を使って、複数 Guild へ一斉に close されたという情報を発信することができる
 
 ```ruby
   task_ch = Guild::Channel.new
@@ -316,9 +317,9 @@ Guild 外                                   Guild 内
   TN.times{|i| task_ch << i}
   tn_results = TN.times.map{result_ch.recv}
 
-  # close_send することで、もう受信することができないことを 
+  # close で、もう受信することができないことを 
   # worker guilds へ伝える
-  task_ch.close_send
+  task_ch.close
 
   gn_results = (1..GN).map{
     g, obj = Guild.select(*gs)
@@ -554,7 +555,7 @@ Guild 外                                   Guild 内
 # 悩んでいること
 
 * Channel の取り扱い
-  * recv する Guild が居る、というのを陽に示したい（いなくなったら close_recv して欲しい）
+  * recv する Guild が居る、というのを陽に示したい（いなくなったら close して欲しい）
   * Channel を見えるようにするのでは無く、recv_port, send_port のように（pipe の read/write みたいに）扱う方が良いか？　その Guild が send/recv するというのをどうやって表明させるか？
 
 

@@ -1,6 +1,6 @@
 /**********************************************************************
 
-  vm.c -
+  Vm.c -
 
   $Author$
 
@@ -34,7 +34,7 @@
 #include "vm_debug.h"
 #include "vm_exec.h"
 #include "vm_insnhelper.h"
-#include "guild.h"
+#include "ractor.h"
 
 #include "builtin.h"
 
@@ -2676,7 +2676,7 @@ thread_mark(void *ptr)
     /* mark ruby objects */
     switch (th->invoke_type) {
       case thread_invoke_type_proc:
-      case thread_invoke_type_guild_proc:
+      case thread_invoke_type_ractor_proc:
         RUBY_MARK_UNLESS_NULL(th->invoke_arg.proc.proc);
         RUBY_MARK_UNLESS_NULL(th->invoke_arg.proc.args);
         break;
@@ -2687,7 +2687,7 @@ thread_mark(void *ptr)
         break;
     }
 
-    rb_gc_mark(rb_guild_self(th->guild));
+    rb_gc_mark(rb_ractor_self(th->ractor));
     RUBY_MARK_UNLESS_NULL(th->thgroup);
     RUBY_MARK_UNLESS_NULL(th->value);
     RUBY_MARK_UNLESS_NULL(th->pending_interrupt_queue);
@@ -2863,7 +2863,7 @@ ruby_thread_init(VALUE self)
     targe_th->top_wrapper = 0;
     targe_th->top_self = rb_vm_top_self();
     targe_th->ec->root_svar = Qfalse;
-    targe_th->guild = th->guild;
+    targe_th->ractor = th->ractor;
     return self;
 }
 
@@ -3410,8 +3410,8 @@ Init_VM(void)
 	 */
 	rb_define_global_const("TOPLEVEL_BINDING", rb_binding_new());
 
-        // Guild setup
-        rb_guild_main_setup(th->guild);
+        // Ractor setup
+        rb_ractor_main_setup(th->ractor);
     }
     vm_init_redefined_flag();
 
@@ -3459,7 +3459,7 @@ Init_BareVM(void)
     rb_thread_set_current_raw(th);
     ruby_thread_init_stack(th);
 
-    vm->main_guild = th->guild = rb_guild_main_alloc();
+    vm->main_ractor = th->ractor = rb_ractor_main_alloc();
 }
 
 void

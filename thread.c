@@ -92,7 +92,7 @@
 #include "ruby/thread_native.h"
 #include "timev.h"
 #include "vm_core.h"
-#include "guild.h"
+#include "ractor.h"
 
 #ifndef USE_NATIVE_THREAD_PRIORITY
 #define USE_NATIVE_THREAD_PRIORITY 0
@@ -670,7 +670,7 @@ rb_vm_proc_local_ep(VALUE proc)
     }
 }
 
-// for guild, defined in vm.c
+// for ractor, defined in vm.c
 VALUE rb_vm_invoke_proc_with_self(rb_execution_context_t *ec, rb_proc_t *proc, VALUE self,
                                   int argc, const VALUE *argv, int kw_splat, VALUE passed_block_handler);
 
@@ -691,12 +691,12 @@ thread_do_start_proc(rb_thread_t *th)
     EXEC_EVENT_HOOK(th->ec, RUBY_EVENT_THREAD_BEGIN, th->self, 0, 0, 0, Qundef);
     vm_check_ints_blocking(th->ec);
 
-    if (th->invoke_type == thread_invoke_type_guild_proc) {
-        VALUE self = rb_guild_self(th->guild);
+    if (th->invoke_type == thread_invoke_type_ractor_proc) {
+        VALUE self = rb_ractor_self(th->ractor);
         VM_ASSERT(FIXNUM_P(args));
         args_len = FIX2INT(args);
         args_ptr = ALLOCA_N(VALUE, args_len);
-        rb_guild_recv_parameters(th->ec, th->guild, args_len, (VALUE *)args_ptr);
+        rb_ractor_recv_parameters(th->ec, th->ractor, args_len, (VALUE *)args_ptr);
         vm_check_ints_blocking(th->ec);
 
         // kick thread
@@ -728,8 +728,8 @@ thread_do_start_proc(rb_thread_t *th)
 
     EXEC_EVENT_HOOK(th->ec, RUBY_EVENT_THREAD_END, th->self, 0, 0, 0, Qundef);
 
-    if (th->invoke_type == thread_invoke_type_guild_proc) {
-        rb_guild_atexit(th->ec, th->value);
+    if (th->invoke_type == thread_invoke_type_ractor_proc) {
+        rb_ractor_atexit(th->ec, th->value);
     }
 }
 
@@ -740,7 +740,7 @@ thread_do_start(rb_thread_t *th)
 
     switch (th->invoke_type) {
       case thread_invoke_type_proc:
-      case thread_invoke_type_guild_proc:
+      case thread_invoke_type_ractor_proc:
         thread_do_start_proc(th);
         break;
       case thread_invoke_type_func:
@@ -804,8 +804,8 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 		/* exit on main_thread. */
 	    }
 	    else {
-                if (th->invoke_type == thread_invoke_type_guild_proc) {
-                    rb_guild_atexit_exception(th->ec);
+                if (th->invoke_type == thread_invoke_type_ractor_proc) {
+                    rb_ractor_atexit_exception(th->ec);
                 }
 		if (th->report_on_exception) {
 		    VALUE mesg = rb_thread_to_s(th->self);
@@ -885,8 +885,8 @@ struct thread_create_params {
     VALUE args;
     VALUE proc;
 
-    // for guild
-    rb_guild_t *g;
+    // for ractor
+    rb_ractor_t *g;
 
     // for func
     VALUE (*fn)(void *);
@@ -912,11 +912,11 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
         break;
 
-      case thread_invoke_type_guild_proc:
-        th->invoke_type = thread_invoke_type_guild_proc;
-        th->guild = params->g;
+      case thread_invoke_type_ractor_proc:
+        th->invoke_type = thread_invoke_type_ractor_proc;
+        th->ractor = params->g;
         th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
-        rb_guild_send_parameters(ec, params->g, params->args);
+        rb_ractor_send_parameters(ec, params->g, params->args);
         th->invoke_arg.proc.proc = rb_proc_isolate_bang(params->proc);
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
         break;
@@ -1065,10 +1065,10 @@ rb_thread_create(VALUE (*fn)(void *), void *arg)
 }
 
 VALUE
-rb_thread_create_guild(rb_guild_t *g, VALUE args, VALUE proc)
+rb_thread_create_ractor(rb_ractor_t *g, VALUE args, VALUE proc)
 {
     struct thread_create_params params = {
-        .type = thread_invoke_type_guild_proc,
+        .type = thread_invoke_type_ractor_proc,
         .g = g,
         .args = args,
         .proc = proc,

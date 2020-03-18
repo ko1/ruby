@@ -100,7 +100,6 @@ COMMONOBJS    = array.$(OBJEXT) \
 		eval.$(OBJEXT) \
 		file.$(OBJEXT) \
 		gc.$(OBJEXT) \
-		guild.$(OBJEXT) \
 		hash.$(OBJEXT) \
 		inits.$(OBJEXT) \
 		io.$(OBJEXT) \
@@ -117,6 +116,7 @@ COMMONOBJS    = array.$(OBJEXT) \
 		parse.$(OBJEXT) \
 		proc.$(OBJEXT) \
 		process.$(OBJEXT) \
+		ractor.$(OBJEXT) \
 		random.$(OBJEXT) \
 		range.$(OBJEXT) \
 		rational.$(OBJEXT) \
@@ -760,8 +760,8 @@ no-btest-ruby: PHONY
 yes-btest-ruby: prog PHONY
 	$(Q)$(exec) $(RUNRUBY) "$(srcdir)/bootstraptest/runner.rb" --ruby="$(PROGRAM) -I$(srcdir)/lib $(RUN_OPTS)" -q $(OPTS) $(TESTOPTS) $(BTESTS)
 
-gtest: fake miniruby$(EXEEXT) PHONY
-	$(Q)$(exec) $(BOOTSTRAPRUBY) "$(srcdir)/bootstraptest/runner.rb" --ruby="$(BTESTRUBY) $(RUN_OPTS)" --sets=guild
+rtest: fake miniruby$(EXEEXT) PHONY
+	$(Q)$(exec) $(BOOTSTRAPRUBY) "$(srcdir)/bootstraptest/runner.rb" --ruby="$(BTESTRUBY) $(RUN_OPTS)" --sets=ractor
 
 test-basic: $(TEST_RUNNABLE)-test-basic
 no-test-basic: PHONY
@@ -1012,16 +1012,16 @@ $(srcs_vpath)mjit_compile.inc: $(tooldir)/ruby_vm/views/mjit_compile.inc.erb $(i
 
 BUILTIN_RB_SRCS = \
 		$(srcdir)/ast.rb \
+		$(srcdir)/dir.rb \
 		$(srcdir)/gc.rb \
-		$(srcdir)/guild.rb \
 		$(srcdir)/integer.rb \
 		$(srcdir)/io.rb \
-		$(srcdir)/dir.rb \
 		$(srcdir)/pack.rb \
 		$(srcdir)/trace_point.rb \
 		$(srcdir)/warning.rb \
 		$(srcdir)/array.rb \
 		$(srcdir)/kernel.rb \
+		$(srcdir)/ractor.rb \
 		$(srcdir)/prelude.rb \
 		$(srcdir)/gem_prelude.rb \
 		$(empty)
@@ -5700,7 +5700,6 @@ gc.$(OBJEXT): {$(VPATH)}eval_intern.h
 gc.$(OBJEXT): {$(VPATH)}gc.c
 gc.$(OBJEXT): {$(VPATH)}gc.h
 gc.$(OBJEXT): {$(VPATH)}gc.rbinc
-gc.$(OBJEXT): {$(VPATH)}guild.h
 gc.$(OBJEXT): {$(VPATH)}id.h
 gc.$(OBJEXT): {$(VPATH)}id_table.h
 gc.$(OBJEXT): {$(VPATH)}intern.h
@@ -5855,6 +5854,7 @@ gc.$(OBJEXT): {$(VPATH)}onigmo.h
 gc.$(OBJEXT): {$(VPATH)}oniguruma.h
 gc.$(OBJEXT): {$(VPATH)}probes.dmyh
 gc.$(OBJEXT): {$(VPATH)}probes.h
+gc.$(OBJEXT): {$(VPATH)}ractor.h
 gc.$(OBJEXT): {$(VPATH)}re.h
 gc.$(OBJEXT): {$(VPATH)}regenc.h
 gc.$(OBJEXT): {$(VPATH)}regex.h
@@ -5872,16 +5872,16 @@ gc.$(OBJEXT): {$(VPATH)}util.h
 gc.$(OBJEXT): {$(VPATH)}vm_callinfo.h
 gc.$(OBJEXT): {$(VPATH)}vm_core.h
 gc.$(OBJEXT): {$(VPATH)}vm_opts.h
-guild.$(OBJEXT): {$(VPATH)}config.h
-guild.$(OBJEXT): {$(VPATH)}constant.h
-guild.$(OBJEXT): {$(VPATH)}debug.h
-guild.$(OBJEXT): {$(VPATH)}debug_counter.h
-guild.$(OBJEXT): {$(VPATH)}defines.h
-guild.$(OBJEXT): {$(VPATH)}guild.c
-guild.$(OBJEXT): {$(VPATH)}guild.h
-guild.$(OBJEXT): {$(VPATH)}guild.rbinc
-guild.$(OBJEXT): {$(VPATH)}vm_core.h
-guild.$(OBJEXT): {$(VPATH)}vm_opts.h
+ractor.$(OBJEXT): {$(VPATH)}config.h
+ractor.$(OBJEXT): {$(VPATH)}constant.h
+ractor.$(OBJEXT): {$(VPATH)}debug.h
+ractor.$(OBJEXT): {$(VPATH)}debug_counter.h
+ractor.$(OBJEXT): {$(VPATH)}defines.h
+ractor.$(OBJEXT): {$(VPATH)}ractor.c
+ractor.$(OBJEXT): {$(VPATH)}ractor.h
+ractor.$(OBJEXT): {$(VPATH)}ractor.rbinc
+ractor.$(OBJEXT): {$(VPATH)}vm_core.h
+ractor.$(OBJEXT): {$(VPATH)}vm_opts.h
 golf_prelude.$(OBJEXT): $(CCAN_DIR)/check_type/check_type.h
 golf_prelude.$(OBJEXT): $(CCAN_DIR)/container_of/container_of.h
 golf_prelude.$(OBJEXT): $(CCAN_DIR)/list/list.h
@@ -13590,7 +13590,6 @@ thread.$(OBJEXT): {$(VPATH)}defines.h
 thread.$(OBJEXT): {$(VPATH)}encoding.h
 thread.$(OBJEXT): {$(VPATH)}eval_intern.h
 thread.$(OBJEXT): {$(VPATH)}gc.h
-thread.$(OBJEXT): {$(VPATH)}guild.h
 thread.$(OBJEXT): {$(VPATH)}hrtime.h
 thread.$(OBJEXT): {$(VPATH)}id.h
 thread.$(OBJEXT): {$(VPATH)}id_table.h
@@ -13744,6 +13743,7 @@ thread.$(OBJEXT): {$(VPATH)}mjit.h
 thread.$(OBJEXT): {$(VPATH)}node.h
 thread.$(OBJEXT): {$(VPATH)}onigmo.h
 thread.$(OBJEXT): {$(VPATH)}oniguruma.h
+thread.$(OBJEXT): {$(VPATH)}ractor.h
 thread.$(OBJEXT): {$(VPATH)}ruby_assert.h
 thread.$(OBJEXT): {$(VPATH)}ruby_atomic.h
 thread.$(OBJEXT): {$(VPATH)}st.h
@@ -14655,6 +14655,7 @@ variable.$(OBJEXT): {$(VPATH)}missing.h
 variable.$(OBJEXT): {$(VPATH)}node.h
 variable.$(OBJEXT): {$(VPATH)}onigmo.h
 variable.$(OBJEXT): {$(VPATH)}oniguruma.h
+variable.$(OBJEXT): {$(VPATH)}ractor.h
 variable.$(OBJEXT): {$(VPATH)}ruby_assert.h
 variable.$(OBJEXT): {$(VPATH)}ruby_atomic.h
 variable.$(OBJEXT): {$(VPATH)}st.h
@@ -14913,7 +14914,6 @@ vm.$(OBJEXT): {$(VPATH)}defs/opt_operand.def
 vm.$(OBJEXT): {$(VPATH)}encoding.h
 vm.$(OBJEXT): {$(VPATH)}eval_intern.h
 vm.$(OBJEXT): {$(VPATH)}gc.h
-vm.$(OBJEXT): {$(VPATH)}guild.h
 vm.$(OBJEXT): {$(VPATH)}id.h
 vm.$(OBJEXT): {$(VPATH)}id_table.h
 vm.$(OBJEXT): {$(VPATH)}insns.def
@@ -15071,6 +15071,7 @@ vm.$(OBJEXT): {$(VPATH)}oniguruma.h
 vm.$(OBJEXT): {$(VPATH)}probes.dmyh
 vm.$(OBJEXT): {$(VPATH)}probes.h
 vm.$(OBJEXT): {$(VPATH)}probes_helper.h
+vm.$(OBJEXT): {$(VPATH)}ractor.h
 vm.$(OBJEXT): {$(VPATH)}ruby_assert.h
 vm.$(OBJEXT): {$(VPATH)}ruby_atomic.h
 vm.$(OBJEXT): {$(VPATH)}st.h
