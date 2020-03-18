@@ -331,7 +331,7 @@ struct rb_global_entry {
     ID id;
 };
 
-struct rb_id_table *
+static struct rb_id_table *
 global_tbl(void)
 {
     if (!rb_ractor_main_p()) {
