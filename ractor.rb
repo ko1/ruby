@@ -118,6 +118,18 @@ class Ractor
     attr_reader :ractor
   end
 
+  def close_incoming
+    __builtin_cexpr! %q{
+      ractor_channel_close(ec, RACTOR_PTR(self)->incoming_channel);
+    }
+  end
+
+  def close_outgoing
+    __builtin_cexpr! %q{
+      ractor_channel_close(ec, RACTOR_PTR(self)->outgoing_channel);
+    }
+  end
+
   class Channel
     # Send an object from this channel from send-side edge.
     # No blocking on current implementation.
