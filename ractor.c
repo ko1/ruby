@@ -44,7 +44,7 @@ typedef struct rb_ractor_channel_struct {
     bool closed;
 } rb_ractor_channel_t;
 
-typedef struct rb_ractor_struct {
+struct rb_ractor_struct {
     // default channels
     rb_ractor_channel_t *incoming_channel;
     rb_ractor_channel_t *outgoing_channel;
@@ -63,7 +63,7 @@ typedef struct rb_ractor_struct {
     uint32_t id;
     VALUE name;
     VALUE loc;
-} rb_ractor_t;
+}; // rb_ractor_t is defined in vm_core.h
 
 static void
 ractor_channel_mark(rb_ractor_channel_t *gc)
