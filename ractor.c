@@ -382,17 +382,19 @@ ractor_channel_try_recv(rb_execution_context_t *ec, rb_ractor_channel_t *gc)
     struct rb_ractor_channel_basket basket;
 
     rb_native_mutex_lock(&gc->lock);
-    if (gc->cnt > 0) {
-        basket = gc->baskets[0];
+    {
+        if (gc->cnt > 0) {
+            basket = gc->baskets[0];
 
-        // TODO: use Queue
-        gc->cnt--;
-        for (int i=0; i<gc->cnt; i++) {
-            gc->baskets[i] = gc->baskets[i+1];
+            // TODO: use Queue
+            gc->cnt--;
+            for (int i=0; i<gc->cnt; i++) {
+                gc->baskets[i] = gc->baskets[i+1];
+            }
         }
-    }
-    else {
-        basket.v = Qundef;
+        else {
+            basket.v = Qundef;
+        }
     }
     rb_native_mutex_unlock(&gc->lock);
 
@@ -849,7 +851,7 @@ Init_Ractor(void)
 
     rb_eRactorRemoteError = rb_define_class_under(rb_cRactor, "RemoteError", rb_eRuntimeError);
 
-    rb_eRactorChannelClosedError = rb_define_class_under(rb_cRactorChannel, "ClosedError", rb_eRuntimeError);
+    rb_eRactorChannelClosedError = rb_define_class_under(rb_cRactorChannel, "ClosedError", rb_eStopIteration);
     rb_eRactorChannelError = rb_define_class_under(rb_cRactorChannel, "Error", rb_eRuntimeError);
 
     rb_cRactorMovedObject = rb_define_class_under(rb_cRactor, "MovedObject", rb_cBasicObject);

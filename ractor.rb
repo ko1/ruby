@@ -70,6 +70,13 @@ class Ractor
     self
   end
 
+  def self.move obj
+    __builtin_cexpr! %q{
+      ractor_channel_move(ec, rb_ec_ractor_ptr(ec)->outgoing_channel, obj)
+    }
+    self
+  end
+
   # Recv via Ractor's outgoing channel.
   #
   # Example:
