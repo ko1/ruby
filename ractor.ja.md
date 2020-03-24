@@ -447,17 +447,17 @@ TODO: 例
 ```
 
 ```ruby
-  ch = Ractor::Channel.new
-  ch.instance_variable_set(:@iv, 'str')
+  shared = Ractor.new{}
+  shared.instance_variable_set(:@iv, 'str')
 
-  r = Ractor.new ch do |ch|
-    p ch.instance_variable_get(:@iv)
+  r = Ractor.new shared do |shared|
+    p shared.instance_variable_get(:@iv)
   end
 
   begin
     r.recv
-  rescue => e
-    e.class #=> RuntimeError
+  rescue Ractor::RemoteError => e
+    e.cause.message
   end
 ```
 
@@ -519,12 +519,4 @@ TODO: 例
 * まだ並列化していない（実は全部従来の GVL 使っている）
 * デバッグモード
   * 生成時に Ractor ID（uint32_t、連番）を振り、VM push 時に現 Ractor ID と異なれば rb_bug()
-
-# 悩んでいること
-
-* Channel の取り扱い
-  * recv する Ractor が居る、というのを陽に示したい（いなくなったら close して欲しい）
-  * Channel を見えるようにするのでは無く、recv_port, send_port のように（pipe の read/write みたいに）扱う方が良いか？　その Ractor が send/recv するというのをどうやって表明させるか？
-
-
 
