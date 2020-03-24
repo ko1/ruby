@@ -36,17 +36,6 @@ assert_equal 'ok', %q{
   r.recv
 }
 
-# communicate via Ractor::Channel
-assert_equal 'ok', %q{
-  ch = Ractor::Channel.new
-  r = Ractor.new ch do |ch|
-    ch.recv #=> 'ok'
-  end
-
-  ch << 'ok'
-  ch.recv
-}
-
 # Ractor.select(*channels) receives a values from a channel.
 # It is similar to select(2) and Go's select syntax.
 # The return value is [ch, received_value]
@@ -110,7 +99,7 @@ assert_equal 'ok', %q{
   r.recv
   begin
     o = r.recv
-  rescue Ractor::Channel::ClosedError
+  rescue Ractor::ClosedError
     'ok'
   else
     "ng: #{o}"
@@ -125,81 +114,55 @@ assert_equal 'ok', %q{
 
   begin
     r.send(1)
-  rescue Ractor::Channel::ClosedError
+  rescue Ractor::ClosedError
     'ok'
   else
     'ng'
   end
 }
 
-# multiple Ractors can recv (wait) from one channel
+# multiple Ractors can recv (wait) from one Ractor
 assert_equal '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]', %q{
-  ch = Ractor::Channel.new
-  GN = 10
-  rs = GN.times.map{|i|
-    Ractor.new ch, i do |ch, i|
-      msg = ch.recv
+  pipe = Ractor.new do
+    loop do
+      Ractor.send Ractor.recv
+    end
+  end
+
+  RN = 10
+  rs = RN.times.map{|i|
+    Ractor.new pipe, i do |pipe, i|
+      msg = pipe.recv
       msg # ping-pong
     end
   }
-  GN.times{|i|
-    ch << i
+  RN.times{|i|
+    pipe << i
   }
-  GN.times.map{
+  RN.times.map{
     r, n = Ractor.select(*rs)
     rs.delete r
     n
   }.sort
 }
 
-# multiple Ractors can send to one channel
+# multiple Ractors can send to one Ractor
 assert_equal '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]', %q{
-  ch = Ractor::Channel.new
+  pipe = Ractor.new do
+    loop do
+      Ractor.send Ractor.recv
+    end
+  end
+
   RN = 10
   rs = RN.times.map{|i|
-    Ractor.new ch, i do |ch, i|
-      ch << i
+    Ractor.new pipe, i do |pipe, i|
+      pipe << i
     end
   }
   RN.times.map{
-    ch.recv
+    pipe.recv
   }.sort
-}
-
-assert_equal 'ok', %q{
-  task_ch = Ractor::Channel.new
-  result_ch = Ractor::Channel.new
-
-  def work i, task
-    Thread.pass
-    "done #{task} by #{i}"
-  end
-
-  RN = 10
-  TN = 1_000
-
-  rs = (1..RN).map do |i|
-    r = Ractor.new i, task_ch, result_ch do |i, task_ch, result_ch|
-      while task = task_ch.recv
-        result_ch << work(i, task)
-      end
-    rescue Ractor::Channel::ClosedError
-      :ok
-    end
-  end
-
-  TN.times{|i| task_ch << i}
-  tn_results = TN.times.map{result_ch.recv}
-  task_ch.close
-
-  rn_results = (1..RN).map{
-    r, obj = Ractor.select(*rs)
-    rs.delete(r)
-    obj
-  }
-
-  'ok' if tn_results.size == TN &&
-          rn_results.size == RN
 }
 
 # an exception in a Ractor will be re-raised at Ractor#recv
@@ -283,8 +246,8 @@ assert_equal 'hello world', %q{
   modified = r.recv
 
   begin
-    str << ' exception' # raise Ractor::Channel::Error
-  rescue Ractor::Channel::Error
+    str << ' exception' # raise Ractor::MovedError
+  rescue Ractor::MovedError
     modified #=> 'hello world'
   else
     raise 'unreachable'
@@ -302,8 +265,8 @@ assert_equal '[0, 1]', %q{
   r.move a1
   a2 = r.recv
   begin
-    a1 << 2 # raise Ractor::Channel::Error
-  rescue Ractor::Channel::Error
+    a1 << 2 # raise Ractor::MovedError
+  rescue Ractor::MovedError
     a2.inspect
   end
 }
@@ -385,11 +348,11 @@ assert_equal 'can not access instance variables of classes/modules from non-main
 
 # ivar in sharable-objects are not allowed to access from non-main Ractor
 assert_equal 'can not access instance variables of shareable objects from non-main Ractors', %q{
-  ch = Ractor::Channel.new
-  ch.instance_variable_set(:@iv, 'str')
+  shared = Ractor.new{}
+  shared.instance_variable_set(:@iv, 'str')
 
-  r = Ractor.new ch do |ch|
-    p ch.instance_variable_get(:@iv)
+  r = Ractor.new shared do |shared|
+    p shared.instance_variable_get(:@iv)
   end
 
   begin

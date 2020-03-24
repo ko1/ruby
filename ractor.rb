@@ -64,17 +64,17 @@ class Ractor
 
   # Send via current ractor's outgoing channel.
   def self.send obj
-    __builtin_cexpr! %q{
-      ractor_channel_send(ec, rb_ec_ractor_ptr(ec)->outgoing_channel, obj)
+    __builtin_cstmt! %q{
+      ractor_channel_send(ec, rb_ec_ractor_ptr(ec)->outgoing_channel, obj);
+      return self;
     }
-    self
   end
 
   def self.move obj
-    __builtin_cexpr! %q{
-      ractor_channel_move(ec, rb_ec_ractor_ptr(ec)->outgoing_channel, obj)
+    __builtin_cstmt! %q{
+      ractor_channel_move(ec, rb_ec_ractor_ptr(ec)->outgoing_channel, obj);
+      return self;
     }
-    self
   end
 
   # Recv via Ractor's outgoing channel.
@@ -96,18 +96,19 @@ class Ractor
   #   end
   #   g.send 'ok'
   def send obj
-    __builtin_cexpr! %q{
-      ractor_channel_send(ec, RACTOR_PTR(self)->incoming_channel, obj)
+    __builtin_cstmt! %q{
+      ractor_channel_send(ec, RACTOR_PTR(self)->incoming_channel, obj);
+      return self;
     }
   end
 
   alias << send
 
   def move obj
-    __builtin_cexpr! %q{
-      ractor_channel_move(ec, RACTOR_PTR(self)->incoming_channel, obj)
+    __builtin_cstmt! %q{
+      ractor_channel_move(ec, RACTOR_PTR(self)->incoming_channel, obj);
+      return self;
     }
-    self
   end
 
   def inspect
@@ -137,37 +138,8 @@ class Ractor
     }
   end
 
-  class Channel
-    # Send an object from this channel from send-side edge.
-    # No blocking on current implementation.
-    #
-    # If the recv-side edge is closed,
-    # raises Ractor::Channel::ClosedError
-    def send obj
-      __builtin_ractor_channel_send obj
-    end
-
-    def move obj
-      __builtin_ractor_channel_move obj
-    end
-
-    # Receive an object from recv-side edge.
-    #
-    # If no objects are sent, wait until any objects are sent.
-    #
-    # If send-side edge is closed while blocking,
-    # raises Ractor::Channel::ClosedError
-    def recv
-      __builtin_ractor_channel_recv
-    end
-
-    alias << send
-
-    # Close this channel.
-    def close
-      __builtin_cexpr! %q{
-        ractor_channel_close(ec, self);
-      }
-    end
+  def close
+    close_incoming
+    close_outgoing
   end
 end

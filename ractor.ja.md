@@ -3,8 +3,12 @@
 * 1つのRactorは並行実行単位として実行される
   * 1つのRactorは1つ以上のスレッドをもつ
   * スレッドは各 Ractor に属するグローバルロックで共有される
-* Ractor 間はチャンネルを用いて通信・同期を行いながら実行する
-* オブジェクトは共有可能・不可能オブジェクトに二分され、共有不可能オブジェクトはたかだか一つの Ractor からしか参照されない
+* Ractor へメッセージを送受信しながら同期して実行をすすめる
+  * メッセージは Ruby のオブジェクト
+  * オブジェクトは共有可能・不可能オブジェクトに二分され、共有不可能オブジェクトはたかだか一つの Ractor からしか参照されない
+  * 共有可能オブジェクトをメッセージとして転送すると、単に参照が送られる
+  * 共有不可能オブジェクトをメッセージとして転送すると、原則コピーされる
+  * 共有不可能オブジェクトは、（ほぼ）コピーしない move ができるものがあるが、転送元からは参照できなくなる
 * 共有可能オブジェクトへのアクセスは必ず排他制御される
   * C レベルでの SEGV は起こらない
   * ただし、トランザクションが足りないことがあるため、レースは発生しうる。例えば、トランザクションをまたいだ変更など。
@@ -31,12 +35,14 @@ end
 * `name:` で名前を与えられる
 
 ```ruby
-  g = Ractor.new name: 'test-name' do
+  r = Ractor.new name: 'test-name' do
   end
-  g.name #=> 'test-name'
+  r.name #=> 'test-name'
 ```
 
 ## Ractor に渡したブロックは、生成側の環境からは隔離される
+
+* Ractor 間でオブジェクトが共有されないように、「ブロックの外側のローカル変数（など）」「self」は隔離される
 
 * 与えられたブロックは、`Proc#isolate` によって外側の環境にアクセスできない
 * エラーは `Proc#isolate` が実行された瞬間に起こる。つまり `Ractor.new` したときに起こる
@@ -44,10 +50,10 @@ end
 ```ruby
   begin
     a = true
-    g = Ractor.new do
+    r = Ractor.new do
       a #=> ArgumentError
     end
-    g.recv
+    r.recv # Ractor の実行を待つ。後述
   rescue ArgumentError
   end
 ```
@@ -55,84 +61,85 @@ end
 * 与えられたブロックの `self` は、その Ractor オブジェクト自身になる（外側の `self` とは別になる）
 
 ```ruby
-  g = Ractor.new do
+  r = Ractor.new do
     self.object_id
   end
-  g.recv == self.object_id #=> true
+  r.recv == self.object_id #=> true
 ```
 
 * `Ractor.new` に渡された（キーワード引数以外の）引数は、ブロックの引数になる。ただし、参照を渡すのでは無く、その Ractor へのincoming メッセージとなる（コピーになる。詳細は後述）
 
 ```ruby
-  g = Ractor.new 'ok' do |msg|
+  r = Ractor.new 'ok' do |msg|
     msg #=> 'ok'
   end
-  g.recv
+  r.recv #=> 'ok'
 ```
 
 ```ruby
   # 上のコードとほぼ同じ意味
-  g = Ractor.new do
+  r = Ractor.new do
     msg = Ractor.recv
     msg
   end
-  g.send 'ok'
-  g.recv #=> 'ok'
+  r.send 'ok'
+  r.recv #=> 'ok'
 ```
 
 * ブロックの返値は、その Ractor からの outgoing メッセージとなる（コピーになる。詳細は後述）
 
 ```ruby
-  g = Ractor.new do
+  r = Ractor.new do
     'ok'
   end
-  g.recv #=> `ok`
+  r.recv #=> `ok`
 ```
 
 ```ruby
   # 上のコードとほぼ同じ意味
-  g = Ractor.new do
+  r = Ractor.new do
     Ractor.send 'ok'
   end
-  g.recv #=> 'ok'
+  r.recv #=> 'ok'
 ```
 
 * ブロックのエラー値は、outgoing メッセージを受信した Ractor 上でエラーが伝搬する
 
 ```ruby
-  g = Ractor.new do
+  r = Ractor.new do
     raise 'ok' # exception will be transferred receiver
   end
   begin
-    g.recv
+    r.recv
   rescue Ractor::RemoteError => e
     e.cause.class   #=> RuntimeError
     e.cause.message #=> 'ok'
+    e.ractor        #=> r
   end
 ```
 
 # Ractor 間のコミュニケーション
 
-* Ractor 間のコミュニケーションは、次の3つの方法がある。
+* Ractor 間のコミュニケーションは、次の 2 つの方法がある。
   * (1) Ractor と直接送受信する（カテゴリわけのない Mailbox）
-  * (2) `Ractor::Channel` を用いる（go とかと同じ）
-  * (3) 共有可能なコンテナオブジェクトを用いる（未実装）
-* 同期・待ち合わせは、基本的には `Ractor::Channel` を用いる
-* (1) の Ractor と直接送受信する、というのは、`Ractor::Channel` を内部で用いている
-* (3) は、データの送受信は行うことができるが、待ち合わせには用いない。
+  * (2) 共有可能なコンテナオブジェクトを用いる（未実装）
+* 同期・待ち合わせは、基本的には Ractor 間の通信を用いる
+* (1) は、内部的に双方向チャンネル incoming channel, outgoing channel を持つ
+* (2) は、データの送受信は行うことができるが、待ち合わせには用いない（... 多分）
 * まだ送信されていないチャンネルから `recv` しようとすると、何か来るまで待つ（タイムアウトはまだ実装していない）
-* 複数のチャンネルを同時に待つ `Ractor.select(channels...)` がある。
+* 複数の受信を同時に待つ `Ractor.select(ractors...)` がある。
 * チャンネルは close することができる
   * `close` されたチャンネルから recv してブロックしようとすると、例外（未受信だと例外）
   * `close` されたチャンネルへ send しようとすると例外
+  * `Ractor#close_incoming` および `Ractor#close_outgoing` がある
   * Ractor が終了すると、その Ractor の incoming/outgoing channel はそれぞれ `close` される
-* チャンネル間送受信において、送るオブジェクトはコピーと移動の2種類がある
-  * すべてコピーして送る `send`
-  * 送信元で、以降一切用いないことを前提に転送を高速化する `move`
+* Ractror 間送受信において、メッセージとしてオブジェクトを送受信する方法には、コピーと移動の2種類がある
+  * コピー：すべてコピーして送る `send`
+  * 移動：送信元で、以降一切用いないことを前提に転送を高速化する `move`
   * 受信には `recv` しかない
 * 共有可能オブジェクトは、send、move 関係なく参照のみ送られる。
 
-## Ractor と直接送受信する
+## Ractor 間の送受信
 
 * 各 Ractor は、それぞれ _incoming-channel_、_outgoing-channel_ を持つ
 * `Ractor#send`、`Ractor#recv` は、それぞれ incoming channel への送信、outgoing channel からの受信となる
@@ -147,125 +154,114 @@ Ractor 外                                   Ractor 内
 ```
 
 ```ruby
-  g = Ractor.new do
+  r = Ractor.new do
     msg = Ractor.recv # g の incoming channel からの受信
   end
-  g.send 'ok' # g の incoming channel へ送信
-  g.recv      # g の outgoing channel から受信
+  r.send 'ok' # g の incoming channel へ送信
+  r.recv      # g の outgoing channel から受信
 ```
 
 ```ruby
   # 実引数は incoming channel への送信
-  g = Ractor.new 'ok' do |msg|
+  r = Ractor.new 'ok' do |msg|
     # 仮引数は incoming channel からの受信
 
     msg # ブロックの返値は outgoing channel への送信
   end
 
   # g の outgoing channel からの受信
-  g.recv #=> `ok`
+  r.recv #=> `ok`
 ```
 
-## `Ractor::Channel` を用いて送受信する
-
-* `Ractor::Channel` を用いて送受信可能
+* 複数の Ractor が一つの Ractor に対して待ち合わせが可能（`Ractor.select`）
 
 ```ruby
-  ch = Ractor::Channel.new
-  g = Ractor.new ch do |ch|
-    ch.recv #=> 'ok'
+  pipe = Ractor.new do
+    loop do
+      Ractor.send Ractor.recv
+    end
   end
 
-  ch << 'ok' # << は send の alias
-  ch.recv
-```
-
-* 複数の Ractor が一つの Channel に待ち合わせが可能
-
-```ruby
-  ch = Ractor::Channel.new
-  GN = 10
-  gs = GN.times.map{|i|
-    Ractor.new ch, i do |ch, i|
-      # 複数の Ractor が ch で待ち合わせ
-      msg = ch.recv
+  RN = 10
+  rs = RN.times.map{|i|
+    Ractor.new pipe, i do |pipe, i|
+      msg = pipe.recv
       msg # ping-pong
     end
   }
-  GN.times{|i|
-    # Ractor の数だけ仕事を与える
-    ch << i
+  RN.times{|i|
+    pipe << i
   }
-  rs = GN.times.map{
-    # Ractor.select は後述
-    g, n = Ractor.select(*gs)
-    gs.delete g
+  RN.times.map{
+    r, n = Ractor.select(*rs)
+    rs.delete r
     n
   }.sort #=> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 ```
 
-* 複数の Ractor が一つの Channel に送信可能
+* 複数の Ractor が一つの Ractor に送信可能
 
 ```ruby
-  ch = Ractor::Channel.new
-  GN = 10
-  gs = GN.times.map{|i|
-    Ractor.new ch, i do |ch, i|
-      # 一つの ch に、複数の Ractor からオブジェクトを転送
-      ch << i
+  pipe = Ractor.new do
+    loop do
+      Ractor.send Ractor.recv
+    end
+  end
+
+  RN = 10
+  rs = RN.times.map{|i|
+    Ractor.new pipe, i do |pipe, i|
+      pipe << i
     end
   }
-  rs = GN.times.map{
-    ch.recv
+  RN.times.map{
+    pipe.recv
   }.sort #=> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 ```
 
-## `Ractor.select` で複数のチャンネルから recv する
+## `Ractor.select` で複数の Ractor から recv する
 
-* `Ractor.select(*channels)` を用いて複数のチャンネルから待機できる
-* もし、引数に Ractor が指定されたとき、その Ractor の outgoing-channel が指定されたとみなす
+* `Ractor.select(*ractors)` を用いて複数のチャンネルから待機できる
 * 返値は、「どのチャンネル（もしくは Ractor）から送信されたか」、「送信されたオブジェクト」の2つ
 
 ```ruby
-  g1 = Ractor.new{'g1'}
-  g, obj = Ractor.select(g1)
-  g == g1 and obj == 'g1' #=> true
+  r1 = Ractor.new{'r1'}
+  r, obj = Ractor.select(r1)
+  r == r1 and obj == 'r1' #=> true
 ```
 
 ```ruby
   # select 2
-  g1 = Ractor.new{'g1'}
-  g2 = Ractor.new{'g2'}
-  gs = [g1, g2]
-  rs = []
-  g, obj = Ractor.select(*gs)
-  gs.delete(g)
-  rs << obj
-  g, obj = Ractor.select(*gs)
-  gs.delete(g)
-  rs << obj
-  rs.sort == ['g1', 'g2'] #=> true
+  r1 = Ractor.new{'r1'}
+  r2 = Ractor.new{'r2'}
+  rs = [r1, r2]
+  as = []
+  r, obj = Ractor.select(*rs)
+  rs.delete(r)
+  as << obj
+  r, obj = Ractor.select(*rs)
+  rs.delete(r)
+  as << obj
+  as.sort == ['r1', 'r2'] #=> true
 ```
 
-* `Ractor.select` で Ractor の incoming channel への送信を待つ方法はない。要るかなぁ？
-* `select(2)` と同じ C10K problem があるので、その辺はなんとかしたい。毎回 delete するのもちょっとダサいし。
+* `select(2)` と同じ C10K problem があるので、その辺なんとかしたい（良い感じの API）
 * go-lang の `select` syntax は、同時に受信可能なチャンネルがある場合、ランダム（ラウンドロビン？）に選択するするらしく、こちらもそのようにしたほうが良いと思われる（現在は、最初に見つけた受信可能チャンネル）
 
 ## チャンネルの端点を close
 
-* `Ractor::Channel#close` でチャンネルを close することができる（`Queue#close` と同じ）
+* `Ractor#close_incoming/outgoing` でチャンネルを close することができる（`Queue#close` と同じ）
 * `close` されたチャンネルから recv してブロックしようとするとエラー
-* Ractor が終了すると、outgoing channel が `close` される
+* Ractor が終了すると、outgoing channel が自動的に `close` される
 
 ```ruby
-  # closed-channel (Ractor)
-  g = Ractor.new do
+  r = Ractor.new do
     'finish'
   end
-  g.recv
+  r.recv
   begin
-    o = g.recv
-  rescue Ractor::Channel::ClosedError
+    o = r.recv
+  rescue Ractor::ClosedError
     'ok'
   else
     "ng: #{o}"
@@ -273,17 +269,17 @@ Ractor 外                                   Ractor 内
 ```
 
 * `close` されたチャンネルへ send しようとするとエラー
-* Ractor が終了すると、incoming channel が `close` される
+* Ractor が終了すると、incoming channel が自動的に `close` される
 
 ```ruby
-  g = Ractor.new do
+  r = Ractor.new do
   end
 
-  g.recv # wait terminate
+  r.recv # wait terminate
 
   begin
-    g.send(1)
-  rescue Ractor::Channel::ClosedError
+    r.send(1)
+  rescue Ractor::ClosedError
     'ok'
   else
     'ng'
@@ -292,53 +288,21 @@ Ractor 外                                   Ractor 内
 
 * `close` を使って、複数 Ractor へ一斉に close されたという情報を発信することができる
 
-```ruby
-  task_ch = Ractor::Channel.new
-  result_ch = Ractor::Channel.new
-
-  def work i, task
-    Thread.pass
-    "done #{task} by #{i}"
-  end
-
-  GN = 10
-  TN = 1_000
-
-  gs = (1..GN).map do |i|
-    g = Ractor.new i, task_ch, result_ch do |i, task_ch, result_ch|
-      while task = task_ch.recv
-        result_ch << work(i, task)
-      end
-    rescue Ractor::Channel::ClosedError
-      :ok
-    end
-  end
-
-  TN.times{|i| task_ch << i}
-  tn_results = TN.times.map{result_ch.recv}
-
-  # close で、もう受信することができないことを 
-  # worker ractors へ伝える
-  task_ch.close
-
-  gn_results = (1..GN).map{
-    g, obj = Ractor.select(*gs)
-    gs.delete(g)
-    obj
-  }
+```
+TODO: 例
 ```
 
 ## コピーによるオブジェクトの転送
 
-* `Ractor::Channel#send(obj)` は、`obj` が共有不可能オブジェクトであれば、(deep) コピーする
+* `Ractor::send(obj)` は、`obj` が共有不可能オブジェクトであれば、(deep) コピーする
 
 ```ruby
   obj = 'str'.dup
-  g = Ractor.new obj do |msg|
+  r = Ractor.new obj do |msg|
     msg.object_id
   end
   
-  obj.object_id == g.recv #=> false
+  obj.object_id == r.recv #=> false
 ```
 
 * 現状は `Marshal#dump` し、`recv` 側で `load` する（dRuby と同じ）。なので、対応しないオブジェクトは送ることができない。
@@ -346,7 +310,7 @@ Ractor 外                                   Ractor 内
 ```ruby
   obj = Thread.new{}
   begin
-    g = Ractor.new obj do |msg|
+    r = Ractor.new obj do |msg|
       msg
     end
   rescue TypeError => e
@@ -358,24 +322,24 @@ Ractor 外                                   Ractor 内
 
 ## move によるオブジェクトの転送
 
-* `Ractor::Channel#move(obj)`は、`obj`が共有不可能オブジェクトであれば、move する
+* `Ractor::move(obj)`は、`obj`が共有不可能オブジェクトであれば、move する
 * move されたオブジェクトは、送信元 Ractor で参照しようとすると(例えば、メソッド呼び出し）、エラーになる
 
 ```ruby
   # move
-  g = Ractor.new do
+  r = Ractor.new do
     obj = Ractor.recv
     obj << ' world'
   end
 
   str = 'hello'
-  g.move str
-  modified = g.recv #=> 'hello world'
+  r.move str
+  modified = r.recv #=> 'hello world'
 
   begin
     # move した文字列を触ろうとするのでエラー
-    str << ' exception' # raise Ractor::Channel::Error
-  rescue Ractor::Channel::Error
+    str << ' exception' # raise Ractor::MovedError
+  rescue Ractor::MovedError
     modified #=> 'hello world'
   else
     raise 'unreachable'
@@ -398,14 +362,14 @@ Ractor 外                                   Ractor 内
   * frozen な `T_STRING` と `T_REGEXP`
     * ただし、ivar がない（`FL_EXIVAR` がない）
   * クラス、モジュール：`T_CLASS`、`T_MODULE`、`T_ICLASS`
-  * `Ractor`、`Ractor::Channel` などの共有を前提としたデータ構造
+  * `Ractor` などの共有を前提としたデータ構造
 * 将来的には、immutable なコンテナなども対象に
   * deep frozen な Array, Hash など → FL_IMMUTABLE 作る？
 * 共有可能な !special const オブジェクトは `FL_SHAREABLE` がつく
   * frozen な String など、あとで調査したときに付ける
 
 ```ruby
-  g = Ractor.new do
+  r = Ractor.new do
     while v = Ractor.recv
       Ractor.send v
     end
@@ -417,15 +381,15 @@ Ractor 外                                   Ractor 内
   sharable_objects = [1, :sym, 'xyzzy'.to_sym, 'frozen'.freeze, 1+2r, 3+4i, /regexp/, C]
 
   sr = sharable_objects.map{|o|
-    g << o
-    o2 = g.recv
+    r << o
+    o2 = r.recv
     [o, o.object_id == o2.object_id]
   }
   #=> [[1, true], [:sym, true], [:xyzzy, true], [\"frozen\", true], [(3/1), true], [(3+4i), true], [/regexp/, true], [C, true]]
 
   ur = unsharable_objects = ['mutable str'.dup, [:array], {hash: true}].map{|o|
-    g << o
-    o2 = g.recv
+    r << o
+    o2 = r.recv
     [o, o.object_id == o2.object_id]
   }
   #+> "[[\"mutable str\", false], [[:array], false], [{:hash=>true}, false]]]"
@@ -433,15 +397,19 @@ Ractor 外                                   Ractor 内
 
 # 共有不可オブジェクトを共有させないために
 
-* グローバル変数は Ractor local
+* グローバル変数は main Ractor でのみ利用可能
 
 ```ruby
   $gv = 1
-  g = Ractor.new do
-    $gv = 0 # $g is ractor local variable.
+  r = Ractor.new do
     $gv
   end
-  [g.recv, $gv] #=> [0, 1]
+
+  begin
+    r.recv
+  rescue Ractor::RemoteError => e
+    e.cause.message #=> 'can not access global variables from non-main Ractors'
+  end
 ```
 
 * outer-local variable は参照不可（`Proc#isolate`）
@@ -449,7 +417,7 @@ Ractor 外                                   Ractor 内
 ```ruby
   begin
     a = true
-    g = Ractor.new do
+    r = Ractor.new do
       a
     end
   rescue => e
@@ -464,7 +432,7 @@ Ractor 外                                   Ractor 内
     @iv = 'str'
   end
 
-  g = Ractor.new do
+  r = Ractor.new do
     class C
       p @iv
     end
@@ -472,7 +440,7 @@ Ractor 外                                   Ractor 内
 
 
   begin
-    g.recv
+    r.recv
   rescue => e
     e.class #=> RuntimeError
   end
@@ -482,12 +450,12 @@ Ractor 外                                   Ractor 内
   ch = Ractor::Channel.new
   ch.instance_variable_set(:@iv, 'str')
 
-  g = Ractor.new ch do |ch|
+  r = Ractor.new ch do |ch|
     p ch.instance_variable_get(:@iv)
   end
 
   begin
-    g.recv
+    r.recv
   rescue => e
     e.class #=> RuntimeError
   end
@@ -501,7 +469,7 @@ Ractor 外                                   Ractor 内
     @@cv = 'str'
   end
 
-  g = Ractor.new do
+  r = Ractor.new do
     class C
       p @@cv
     end
@@ -509,38 +477,38 @@ Ractor 外                                   Ractor 内
 
 
   begin
-    g.recv
+    r.recv
   rescue => e
     e.class #=> RuntimeError
   end
 ```
 
-* 共有不可オブジェクトが格納されている定数の参照は、main ractor からしかアクセス不可
+* 共有不可オブジェクトが格納されている定数の参照は、main ractor からのみ可
 
 ```ruby
   class C
     CONST = 'str'
   end
-  g = Ractor.new do
+  r = Ractor.new do
     C::CONST
   end
   begin
-    g.recv
+    r.recv
   rescue => e
     e.class #=> NameError
   end
 ```
 
-* 共有不可オブジェクトを定数にセットするのは、main Ractor のみ
+* 共有不可オブジェクトを定数にセットするのは、main Ractor からのみ可
 
 ```ruby
   class C
   end
-  g = Ractor.new do
+  r = Ractor.new do
     C::CONST = 'str'
   end
   begin
-    g.recv
+    r.recv
   rescue => e
     e.class
   end
