@@ -520,3 +520,9 @@ TODO: 例
 * デバッグモード
   * 生成時に Ractor ID（uint32_t、連番）を振り、VM push 時に現 Ractor ID と異なれば rb_bug()
 
+# 応用
+
+## fork-join
+
+
+

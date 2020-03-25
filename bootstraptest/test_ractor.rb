@@ -1,3 +1,13 @@
+# Ractor.current returns a current ractor
+assert_equal 'Ractor', %q{
+  Ractor.current.class
+}
+
+# Ractor.new returns new Ractor
+assert_equal 'Ractor', %q{
+  Ractor.new{}.class
+}
+
 # A return value of a Ractor block will be a message from the Ractor.
 assert_equal 'ok', %q{
   # join

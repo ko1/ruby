@@ -46,19 +46,19 @@ class Ractor
     }
   end
 
-  # Wait for multiple channels.
+  # Wait for a message from multiple Ractors.
   #
   # ch, obj = Ractor.select(ch1, ch2, ch3)
-  def self.select *channels
+  def self.select *ractors
     __builtin_cexpr! %q{
-      ractor_select(ec, channels)
+      ractor_select(ec, ractors)
     }
   end
 
   # Recv from current ractor's incoming channel.
   def self.recv
     __builtin_cexpr! %q{
-      ractor_channel_recv(ec, rb_ec_ractor_ptr(ec)->incoming_channel)
+      ractor_recv(ec, rb_ec_ractor_ptr(ec)->self)
     }
   end
 
@@ -77,37 +77,50 @@ class Ractor
     }
   end
 
-  # Recv via Ractor's outgoing channel.
+  # Receive a message from a Racror.
+  #
+  # If the receiver is current ractor, it received from the incoming channel.
+  # If not, it received from the outgoing channel.
   #
   # Example:
-  #   g = Ractor.new{ 'oK' }
-  #   p g.recv #=> 'ok'
+  #   r = Ractor.new{ 'oK' }
+  #   p r.recv #=> 'ok', received from r's outgoing channel
   def recv
     __builtin_cexpr! %q{
-      ractor_channel_recv(ec, RACTOR_PTR(self)->outgoing_channel)
+      ractor_recv(ec, self)
     }
   end
 
-  # Send via Ractor's incoming channel.
+  # Send a message to a Ractor.
   #
-  # Example:
-  #   g = Ractor.new do
+  # If the receiver is current ractor, send an object to the outgoing channel.
+  # If not, send an object to incoming channel.
+  #
+  # # Example:
+  #   r = Ractor.new do
   #     p Ractor.recv #=> 'ok'
   #   end
-  #   g.send 'ok'
+  #   r.send 'ok' # send to r's incoming channel.
+  #
+  # # Example:
+  # r = Ractor.new do
+  #   send 'ok' # send to r's outgoing channel.
+  # end
+  # r.recv #=> 'ok'
   def send obj
-    __builtin_cstmt! %q{
-      ractor_channel_send(ec, RACTOR_PTR(self)->incoming_channel, obj);
-      return self;
+    __builtin_cexpr! %q{
+      ractor_send(ec, self, obj)
     }
   end
 
   alias << send
 
+  # Move a message to a Ractor.
+  # Similar to #send, but use "move" semantics.
+  # Sent objects can not be accessed from the sent ractor.
   def move obj
-    __builtin_cstmt! %q{
-      ractor_channel_move(ec, RACTOR_PTR(self)->incoming_channel, obj);
-      return self;
+    __builtin_cexpr! %q{
+      ractor_move(ec, self, obj)
     }
   end
 

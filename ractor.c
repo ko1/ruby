@@ -716,8 +716,9 @@ rb_ractor_send_parameters(rb_execution_context_t *ec, rb_ractor_t *g, VALUE args
     }
 }
 
+
 static rb_ractor_channel_t*
-ractor_channel(rb_execution_context_t *ec, VALUE gv)
+ractor_recv_channel(rb_execution_context_t *ec, VALUE gv)
 {
     if (rb_ractor_p(gv)) {
         if (rb_ec_ractor_ptr(ec)->self == gv) {
@@ -733,6 +734,43 @@ ractor_channel(rb_execution_context_t *ec, VALUE gv)
     }
 }
 
+static rb_ractor_channel_t*
+ractor_send_channel(rb_execution_context_t *ec, VALUE gv)
+{
+    if (rb_ractor_p(gv)) {
+        if (rb_ec_ractor_ptr(ec)->self == gv) {
+            return RACTOR_PTR(gv)->outgoing_channel;
+        }
+        else {
+            return RACTOR_PTR(gv)->incoming_channel;
+        }
+    }
+    else {
+        // TODO: ArgumentError
+        rb_bug("unreachable");
+    }
+}
+
+static VALUE
+ractor_recv(rb_execution_context_t *ec, VALUE gv)
+{
+    return ractor_channel_recv(ec, ractor_recv_channel(ec, gv));
+}
+
+static VALUE
+ractor_send(rb_execution_context_t *ec, VALUE gv, VALUE obj)
+{
+    ractor_channel_send(ec, ractor_send_channel(ec, gv), obj);
+    return gv;
+}
+
+static VALUE
+ractor_move(rb_execution_context_t *ec, VALUE gv, VALUE obj)
+{
+    ractor_channel_move(ec, ractor_send_channel(ec, gv), obj);
+    return gv;
+}
+
 static VALUE
 ractor_select(rb_execution_context_t *ec, VALUE chs)
 {
@@ -744,7 +782,7 @@ ractor_select(rb_execution_context_t *ec, VALUE chs)
         // try // TODO: this order should be shuffle
         for (i=0; i<chs_len; i++) {
             VALUE gv = RARRAY_AREF(chs, i);
-            rb_ractor_channel_t *gc = ractor_channel(ec, gv);
+            rb_ractor_channel_t *gc = ractor_recv_channel(ec, gv);
             VALUE v;
 
             if ((v = ractor_channel_try_recv(ec, gc)) != Qundef) {
@@ -757,7 +795,7 @@ ractor_select(rb_execution_context_t *ec, VALUE chs)
         // register waiters
         for (i=0; i<chs_len; i++) {
             VALUE gv = RARRAY_AREF(chs, i);
-            rb_ractor_channel_t *gc = ractor_channel(ec, gv);
+            rb_ractor_channel_t *gc = ractor_recv_channel(ec, gv);
             ractor_channel_waiting_add(gc, g);
         }
 
@@ -766,7 +804,7 @@ ractor_select(rb_execution_context_t *ec, VALUE chs)
         // remove waiters
         for (i=0; i<chs_len; i++) {
             VALUE gv = RARRAY_AREF(chs, i);
-            rb_ractor_channel_t *gc = ractor_channel(ec, gv);
+            rb_ractor_channel_t *gc = ractor_recv_channel(ec, gv);
             ractor_channel_waiting_del(gc, g);
         }
     }
