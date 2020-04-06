@@ -280,7 +280,7 @@ end
 * `select(2)` と同じ C10K problem があるので、その辺なんとかしたい（良い感じの API）
 * go-lang の `select` syntax は、同時に受信可能なチャンネルがある場合、ランダム（ラウンドロビン？）に選択するするらしく、こちらもそのようにしたほうが良いと思われる（現在は、引数の順序通りに見ていく）
 
-## チャンネルの端点を close
+## Ractor の port を close
 
 * `Ractor#close_incoming/outgoing` で incoming/outgoing port を close することができる（`Queue#close` と同じ）
 * `close_incoming` された Ractor に `Ractor#send`すると例外。incoming queue が空のとき（ブロックしようとするとき） `Ractor.recv` すると例外
