@@ -542,13 +542,25 @@ end
   end
 ```
 
+# 検討
+
+* channel で通信しないのは、エラー伝搬を確実に行うため
+  * Close した（死亡した）Ractor に send
+  * Close した（死亡した）Ractor から take
+  * Close した（おそらく外部から close された）incoming port から recv
+  * Close した（このケースはあるんだろうか...?）outgoing port へ yield
+  * これで、多分 take で結果を受け取るのであれば、間違いに気づくことができる
+* エラー伝搬が起こらないケース
+  * 誰も待っていないのに yield ... これはなんとかなるんだろうか？　無視すればいい？
+  * 誰も送ってくれないのに recv（send する側が死亡した場合）→ 結果は take で待つという文化になるか？
+
 # その他実装
 
 * まだ並列化していない（実は全部従来の GVL 使っている）
 * デバッグモード
   * 生成時に Ractor ID（uint32_t、連番）を振り、VM push 時に現 Ractor ID と異なれば rb_bug()
 
-# sample
+# Examples
 
 ## ring in actor model
 
@@ -574,5 +586,57 @@ p Ractor.recv
 
 ## fork-join
 
+```
+def fib n
+  if n < 2
+    1
+  else
+    fib(n-2) + fib(n-1)
+  end
+end
 
+RN = 10
+rs = (1..RN).map do |i|
+  Ractor.new i do |i|
+    [i, fib(i)]
+  end
+end
+
+until rs.empty?
+  r, v = Ractor.select(*rs)
+  rs.delete r
+  p answer: v
+end
+```
+
+## worker pool
+
+```
+require 'prime'
+
+pipe = Ractor.new do
+  loop do
+    Ractor.yield Ractor.recv
+  end
+end
+
+N = 1000
+RN = 10
+workers = (1..RN).map do
+  Ractor.new pipe do |pipe|
+    while n = pipe.take
+      Ractor.yield [n, n.prime?]
+    end
+  end
+end
+
+(1..N).each{|i|
+  pipe << i
+}
+
+pp (1..N).map{
+  r, (n, b) = Ractor.select(*workers)
+  [n, b]
+}.sort_by{|(n, b)| n}
+```
 
