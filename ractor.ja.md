@@ -65,7 +65,7 @@ end
   r = Ractor.new do
     self.object_id
   end
-  r.take == self.object_id #=> true
+  r.take == self.object_id #=> false
 ```
 
 * `Ractor.new` に渡された（キーワード引数以外の）引数は、ブロックの引数になる。ただし、参照を渡すのでは無く、その Ractor へのincoming messageとなる（詳細は後述）
