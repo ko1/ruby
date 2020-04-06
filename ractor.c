@@ -14,7 +14,8 @@ static VALUE rb_eRactorClosedError;
 
 static VALUE rb_cRactorMovedObject;
 
-enum rb_ractor_channel_basket_type {
+enum rb_ractor_basket_type {
+    basket_type_none,
     basket_type_shareable,
     basket_type_copy_marshal,
     basket_type_copy_custom,
@@ -22,107 +23,213 @@ enum rb_ractor_channel_basket_type {
     basket_type_exception,
 };
 
-struct rb_ractor_channel_basket {
+struct rb_ractor_basket {
     int type;
     VALUE v;
     VALUE sender;
 };
 
-typedef struct rb_ractor_channel_struct {
-    struct rb_ractor_channel_basket *baskets;
+struct rb_ractor_queue {
+    struct rb_ractor_basket *baskets;
     int cnt;
     int size;
+};
 
-    rb_nativethread_lock_t lock;
-
-    struct channel_waitings {
-        int cnt;
-        int size;
-        rb_ractor_t **ractors;
-    } waiting;
-
-    bool closed;
-} rb_ractor_channel_t;
+struct rb_ractor_waiting_list {
+    int cnt;
+    int size;
+    rb_ractor_t **ractors;
+};
 
 struct rb_ractor_struct {
-    // default channels
-    rb_ractor_channel_t *incoming_channel;
-    rb_ractor_channel_t *outgoing_channel;
+    rb_nativethread_lock_t lock;
+#if RACTOR_CHECK_MODE > 0
+    VALUE locked_by;
+#endif
 
-    // sleep management
-    rb_nativethread_lock_t sleep_lock;
-    rb_nativethread_cond_t sleep_cond;
-    bool sleep_interrupted;
+    struct rb_ractor_queue  incoming_queue;
 
-    VALUE running_thread;
+    bool incoming_port_closed;
+    bool outgoing_port_closed;
 
-    // misc
-    VALUE self;
+    struct rb_ractor_waiting_list taking_ractors;
+
+    struct ractor_wait {
+        enum ractor_wait_status {
+            wait_none     = 0x00,
+            wait_recving  = 0x01,
+            wait_taking   = 0x02,
+            wait_yielding = 0x04,
+        } status;
+
+        enum ractor_wakeup_status {
+            wakeup_none,
+            wakeup_by_send,
+            wakeup_by_yield,
+            wakeup_by_take,
+            wakeup_by_close,
+            wakeup_by_interrupt,
+        } wakeup_status;
+
+        struct rb_ractor_basket taken_basket;
+        struct rb_ractor_basket yielded_basket;
+
+        rb_nativethread_cond_t cond;
+    } wait;
+
+    VALUE running_thread; // TODO
 
     // identity
+    VALUE self;
     uint32_t id;
     VALUE name;
     VALUE loc;
 }; // rb_ractor_t is defined in vm_core.h
 
 static void
-ractor_channel_mark(rb_ractor_channel_t *gc)
+ASSERT_ractor_unlocking(rb_ractor_t *r)
 {
-    for (int i=0; i<gc->cnt; i++) {
-        rb_gc_mark(gc->baskets[i].v);
-        rb_gc_mark(gc->baskets[i].sender);
+#if RACTOR_CHECK_MODE > 0
+    if (r->locked_by == GET_RACTOR()->self) {
+        rb_bug("recursive ractor locking");
+    }
+#endif
+}
+
+static void
+ASSERT_ractor_locking(rb_ractor_t *r)
+{
+#if RACTOR_CHECK_MODE > 0
+    if (r->locked_by != GET_RACTOR()->self) {
+        rp(r->locked_by);
+        rb_bug("ractor lock is not acquired.");
+    }
+#endif
+}
+
+static void
+ractor_lock(rb_ractor_t *r)
+{
+    ASSERT_ractor_unlocking(r);
+
+    rb_native_mutex_lock(&r->lock);
+
+#if RACTOR_CHECK_MODE > 0
+    r->locked_by = GET_RACTOR()->self;
+#endif
+}
+
+static void
+ractor_lock_self(rb_ractor_t *cr)
+{
+    VM_ASSERT(cr->locked_by != cr->self);
+    rb_native_mutex_lock(&cr->lock);
+#if RACTOR_CHECK_MODE > 0
+    cr->locked_by = cr->self;
+#endif
+}
+
+static void
+ractor_unlock(rb_ractor_t *r)
+{
+    ASSERT_ractor_locking(r);
+#if RACTOR_CHECK_MODE > 0
+    r->locked_by = Qnil;
+#endif
+    rb_native_mutex_unlock(&r->lock);
+}
+
+static void
+ractor_unlock_self(rb_ractor_t *cr)
+{
+    VM_ASSERT(cr->locked_by == cr->self);
+#if RACTOR_CHECK_MODE > 0
+    cr->locked_by = Qnil;
+#endif
+    rb_native_mutex_unlock(&cr->lock);
+}
+
+static void
+ractor_cond_wait(rb_ractor_t *r)
+{
+#if RACTOR_CHECK_MODE > 0
+    VALUE locked_by = r->locked_by;
+    r->locked_by = Qnil;
+#endif
+    rb_native_cond_wait(&r->wait.cond, &r->lock);
+
+#if RACTOR_CHECK_MODE > 0
+    r->locked_by = locked_by;
+#endif
+}
+
+static void
+ractor_queue_mark(struct rb_ractor_queue *rq)
+{
+    for (int i=0; i<rq->cnt; i++) {
+        rb_gc_mark(rq->baskets[i].v);
+        rb_gc_mark(rq->baskets[i].sender);
     }
 }
 
 static void
 ractor_mark(void *ptr)
 {
-    // fprintf(stderr, "%s:%p\n", __func__, ptr);
-    rb_ractor_t *g = (rb_ractor_t *)ptr;
+    rb_ractor_t *r = (rb_ractor_t *)ptr;
 
-    ractor_channel_mark(g->incoming_channel);
-    ractor_channel_mark(g->outgoing_channel);
-    rb_gc_mark(g->running_thread);
-    rb_gc_mark(g->loc);
-    rb_gc_mark(g->name);
+    ractor_queue_mark(&r->incoming_queue);
+    rb_gc_mark(r->wait.taken_basket.v);
+    rb_gc_mark(r->wait.taken_basket.sender);
+    rb_gc_mark(r->wait.yielded_basket.v);
+    rb_gc_mark(r->wait.yielded_basket.sender);
+    rb_gc_mark(r->running_thread);
+    rb_gc_mark(r->loc);
+    rb_gc_mark(r->name);
 }
 
 static void
-ractor_channel_free(rb_ractor_channel_t *gc)
+ractor_queue_free(struct rb_ractor_queue *rq)
 {
-    ruby_xfree(gc->waiting.ractors);
-    rb_native_mutex_destroy(&gc->lock);
+    ruby_xfree(rq->baskets);
+}
+
+static void
+ractor_waiting_list_free(struct rb_ractor_waiting_list *wl)
+{
+    ruby_xfree(wl->ractors);
 }
 
 static void
 ractor_free(void *ptr)
 {
-    // fprintf(stderr, "%s:%p\n", __func__, ptr);
-
-    rb_ractor_t *g = (rb_ractor_t *)ptr;
-    rb_native_mutex_destroy(&g->sleep_lock);
-    rb_native_cond_destroy(&g->sleep_cond);
-
-    ractor_channel_free(g->incoming_channel);
-    ractor_channel_free(g->outgoing_channel);
+    rb_ractor_t *r = (rb_ractor_t *)ptr;
+    rb_native_mutex_destroy(&r->lock);
+    rb_native_cond_destroy(&r->wait.cond);
+    ractor_queue_free(&r->incoming_queue);
+    ractor_waiting_list_free(&r->taking_ractors);
 }
 
 static size_t
-ractor_channel_memsize(const void *ptr)
+ractor_queue_memsize(const struct rb_ractor_queue *rq)
 {
-    // TODO
-    return sizeof(rb_ractor_channel_t);
+    return sizeof(struct rb_ractor_basket) * rq->size;
+}
+
+static size_t
+ractor_waiting_list_memsize(const struct rb_ractor_waiting_list *wl)
+{
+    return sizeof(rb_ractor_t *) * wl->size;
 }
 
 static size_t
 ractor_memsize(const void *ptr)
 {
-    rb_ractor_t *g = (rb_ractor_t *)ptr;
+    rb_ractor_t *r = (rb_ractor_t *)ptr;
 
     // TODO
     return sizeof(rb_ractor_t) +
-      ractor_channel_memsize(g->incoming_channel) +
-      ractor_channel_memsize(g->outgoing_channel);
+      ractor_queue_memsize(&r->incoming_queue) +
+      ractor_waiting_list_memsize(&r->taking_ractors);
 }
 
 static const rb_data_type_t ractor_data_type = {
@@ -151,9 +258,10 @@ static inline rb_ractor_t *
 RACTOR_PTR(VALUE self)
 {
     VM_ASSERT(rb_ractor_p(self));
-    rb_ractor_t *g = DATA_PTR(self);
+
+    rb_ractor_t *r = DATA_PTR(self);
     // TODO: check
-    return g;
+    return r;
 }
 
 uint32_t
@@ -177,27 +285,63 @@ rb_ractor_current_id(void)
 }
 #endif
 
-static rb_ractor_channel_t *
-ractor_channel_alloc(void)
+static void
+ractor_queue_setup(struct rb_ractor_queue *rq)
 {
-    rb_ractor_channel_t *gc = ZALLOC(rb_ractor_channel_t);
+    rq->size = 2;
+    rq->cnt = 0;
+    rq->baskets = ALLOC_N(struct rb_ractor_basket, rq->size);
+}
 
-    gc->size = 2;
-    gc->cnt = 0;
-    gc->baskets = ALLOC_N(struct rb_ractor_channel_basket, gc->size);
+static bool
+ractor_queue_empty_p(rb_ractor_t *r, struct rb_ractor_queue *rq)
+{
+    ASSERT_ractor_locking(r);
+    return rq->cnt == 0;
+}
 
-    gc->waiting.cnt = 0;
-    gc->waiting.size = 0;
-    gc->waiting.ractors = NULL;
+static bool
+ractor_queue_deq(rb_ractor_t *r, struct rb_ractor_queue *rq, struct rb_ractor_basket *basket)
+{
+    bool b;
 
-    rb_native_mutex_initialize(&gc->lock);
-    return gc;
+    ractor_lock(r);
+    {
+        if (!ractor_queue_empty_p(r, rq)) {
+            // TODO: use good Queue data structure
+            *basket = rq->baskets[0];
+            rq->cnt--;
+            for (int i=0; i<rq->cnt; i++) {
+                rq->baskets[i] = rq->baskets[i+1];
+            }
+            b = true;
+        }
+        else {
+            b = false;
+        }
+    }
+    ractor_unlock(r);
+
+    return b;
+}
+
+static void
+ractor_queue_enq(rb_ractor_t *r, struct rb_ractor_queue *rq, struct rb_ractor_basket *basket)
+{
+    ASSERT_ractor_locking(r);
+
+    if (rq->size <= rq->cnt) {
+        rq->size *= 2;
+        REALLOC_N(rq->baskets, struct rb_ractor_basket, rq->size);
+    }
+    rq->baskets[rq->cnt++] = *basket;
+    // fprintf(stderr, "%s %p->cnt:%d\n", __func__, rq, rq->cnt);
 }
 
 VALUE rb_newobj_with(VALUE src); // gc.c
 
 static VALUE
-ractor_channel_move_new(VALUE obj)
+ractor_moving_new(VALUE obj)
 {
     // create moving object
     VALUE v = rb_newobj_with(obj);
@@ -223,7 +367,7 @@ ractor_channel_move_new(VALUE obj)
 }
 
 static VALUE
-ractor_channel_move_shallow_copy(VALUE obj)
+ractor_move_shallow_copy(VALUE obj)
 {
     if (rb_ractor_shareable_p(obj)) {
         return obj;
@@ -233,16 +377,16 @@ ractor_channel_move_shallow_copy(VALUE obj)
           case T_STRING:
           case T_FILE:
             if (!FL_TEST_RAW(obj, RUBY_FL_EXIVAR)) {
-                return ractor_channel_move_new(obj);
+                return ractor_moving_new(obj);
             }
             break;
           case T_ARRAY:
             if (!FL_TEST_RAW(obj, RUBY_FL_EXIVAR)) {
-                VALUE ary = ractor_channel_move_new(obj);
+                VALUE ary = ractor_moving_new(obj);
                 long len = RARRAY_LEN(ary);
                 for (long i=0; i<len; i++) {
                     VALUE e = RARRAY_AREF(ary, i);
-                    RARRAY_ASET(ary, i, ractor_channel_move_shallow_copy(e)); // confirm WB
+                    RARRAY_ASET(ary, i, ractor_move_shallow_copy(e)); // confirm WB
                 }
                 return ary;
             }
@@ -255,22 +399,8 @@ ractor_channel_move_shallow_copy(VALUE obj)
     }
 }
 
-static void
-ractor_channel_move_setup(struct rb_ractor_channel_basket *b, VALUE obj)
-{
-    if (rb_ractor_shareable_p(obj)) {
-        b->type = basket_type_shareable;
-        b->v = obj;
-    }
-    else {
-        b->type = basket_type_move;
-        b->v = ractor_channel_move_shallow_copy(obj);
-        return;
-    }
-}
-
 static VALUE
-ractor_channel_moved_setup(VALUE obj)
+ractor_moved_setup(VALUE obj)
 {
 #if RACTOR_CHECK_MODE
     switch (BUILTIN_TYPE(obj)) {
@@ -284,7 +414,7 @@ ractor_channel_moved_setup(VALUE obj)
         for (long i=0; i<len; i++) {
             VALUE e = RARRAY_AREF(obj, i);
             if (!rb_ractor_shareable_p(e)) {
-                ractor_channel_moved_setup(e);
+                ractor_moved_setup(e);
             }
         }
         break;
@@ -295,8 +425,22 @@ ractor_channel_moved_setup(VALUE obj)
     return obj;
 }
 
+static void
+ractor_move_setup(struct rb_ractor_basket *b, VALUE obj)
+{
+    if (rb_ractor_shareable_p(obj)) {
+        b->type = basket_type_shareable;
+        b->v = obj;
+    }
+    else {
+        b->type = basket_type_move;
+        b->v = ractor_move_shallow_copy(obj);
+        return;
+    }
+}
+
 static VALUE
-ractor_channel_recv_accept(struct rb_ractor_channel_basket *b)
+ractor_basket_accept(struct rb_ractor_basket *b)
 {
     switch (b->type) {
       case basket_type_shareable:
@@ -314,14 +458,14 @@ ractor_channel_recv_accept(struct rb_ractor_channel_basket *b)
         }
         // unreachable
       case basket_type_move:
-        return ractor_channel_moved_setup(b->v);
+        return ractor_moved_setup(b->v);
       default:
         rb_bug("unreachable");
     }
 }
 
 static void
-ractor_channel_copy_setup(struct rb_ractor_channel_basket *b, VALUE obj)
+ractor_copy_setup(struct rb_ractor_basket *b, VALUE obj)
 {
     if (rb_ractor_shareable_p(obj)) {
         b->type = basket_type_shareable;
@@ -340,264 +484,594 @@ ractor_channel_copy_setup(struct rb_ractor_channel_basket *b, VALUE obj)
 }
 
 static VALUE
-ractor_channel_try_recv(rb_execution_context_t *ec, rb_ractor_channel_t *gc)
+ractor_try_recv(rb_execution_context_t *ec, rb_ractor_t *r)
 {
-    struct rb_ractor_channel_basket basket;
+    struct rb_ractor_queue *rq = &r->incoming_queue;
+    struct rb_ractor_basket basket;
 
-    rb_native_mutex_lock(&gc->lock);
-    {
-        if (gc->cnt > 0) {
-            basket = gc->baskets[0];
-
-            // TODO: use Queue
-            gc->cnt--;
-            for (int i=0; i<gc->cnt; i++) {
-                gc->baskets[i] = gc->baskets[i+1];
-            }
-        }
-        else {
-            basket.v = Qundef;
-        }
-    }
-    rb_native_mutex_unlock(&gc->lock);
-
-    if (basket.v == Qundef) {
-        if (gc->closed) {
-            rb_raise(rb_eRactorClosedError, "The send-edge is already closed");
+    if (ractor_queue_deq(r, rq, &basket) == false) {
+        if (r->incoming_port_closed) {
+            rb_raise(rb_eRactorClosedError, "The incoming port is already closed");
         }
         else {
             return Qundef;
         }
     }
 
-    return ractor_channel_recv_accept(&basket);
+    return ractor_basket_accept(&basket);
 }
 
 static void *
 ractor_sleep_wo_gvl(void *ptr)
 {
-    rb_ractor_t *g = ptr;
-    rb_native_mutex_lock(&g->sleep_lock);
-    if (g->sleep_interrupted == false) {
-        rb_native_cond_wait(&g->sleep_cond, &g->sleep_lock);
+    rb_ractor_t *cr = ptr;
+    ractor_lock_self(cr);
+    VM_ASSERT(cr->wait.status != wait_none);
+    if (cr->wait.wakeup_status == wakeup_none) {
+        ractor_cond_wait(cr);
     }
-    rb_native_mutex_unlock(&g->sleep_lock);
+    cr->wait.status = wait_none;
+    ractor_unlock_self(cr);
     return NULL;
 }
 
 static void
-ractor_sleep_cancel(void *ptr)
+ractor_sleep_interrupt(void *ptr)
 {
-    rb_ractor_t *g = ptr;
-    rb_native_mutex_lock(&g->sleep_lock);
-    rb_native_cond_signal(&g->sleep_cond);
-    rb_native_mutex_unlock(&g->sleep_lock);
+    rb_ractor_t *r = ptr;
+
+    ractor_lock(r);
+    if (r->wait.wakeup_status == wakeup_none) {
+        r->wait.wakeup_status = wakeup_by_interrupt;
+        rb_native_cond_signal(&r->wait.cond);
+    }
+    ractor_unlock(r);
+}
+
+const char *
+wait_status_str(enum ractor_wait_status wait_status)
+{
+    switch ((int)wait_status) {
+      case wait_none: return "none";
+      case wait_recving: return "recving";
+      case wait_taking: return "taking";
+      case wait_yielding: return "yielding";
+      case wait_recving|wait_taking: return "recving|taking";
+      case wait_recving|wait_yielding: return "recving|yielding";
+      case wait_taking|wait_yielding: return "taking|yielding";
+      case wait_recving|wait_taking|wait_yielding: return "recving|taking|yielding";
+    }
+    rb_bug("unrechable");
+}
+
+const char *
+wakeup_status_str(enum ractor_wakeup_status wakeup_status)
+{
+    switch (wakeup_status) {
+      case wakeup_none: return "none";
+      case wakeup_by_send: return "by_send";
+      case wakeup_by_yield: return "by_yield";
+      case wakeup_by_take: return "by_take";
+      case wakeup_by_close: return "by_close";
+      case wakeup_by_interrupt: return "by_interrupt";
+    }
+    rb_bug("unrechable");
 }
 
 static void
-ractor_sleep_setup(rb_execution_context_t *ec, rb_ractor_t *g)
+ractor_sleep(rb_execution_context_t *ec, rb_ractor_t *cr)
 {
-    rb_native_mutex_lock(&g->sleep_lock);
-    {
-        g->sleep_interrupted = false;
-    }
-    rb_native_mutex_unlock(&g->sleep_lock);
-}
+    VM_ASSERT(GET_RACTOR() == cr);
+    VM_ASSERT(cr->wait.status != wait_none);
+    // fprintf(stderr, "%s  r:%p status:%s, wakeup_status:%s\n", __func__, cr,
+    //                 wait_status_str(cr->wait.status), wakeup_status_str(cr->wait.wakeup_status));
 
-static void
-ractor_sleep(rb_execution_context_t *ec, rb_ractor_t *g)
-{
-    rb_native_mutex_lock(&g->sleep_lock);
-    {
-        while (g->sleep_interrupted == false) {
-            rb_native_mutex_unlock(&g->sleep_lock);
-
-            rb_thread_call_without_gvl(ractor_sleep_wo_gvl, g,
-                                       ractor_sleep_cancel, g);
-
-            rb_native_mutex_lock(&g->sleep_lock);
-        }
-    }
-    rb_native_mutex_unlock(&g->sleep_lock);
+    ractor_unlock(cr);
+    rb_thread_call_without_gvl(ractor_sleep_wo_gvl, cr,
+                               ractor_sleep_interrupt, cr);
+    ractor_lock(cr);
 }
 
 static bool
-ractor_channel_waiting_p(rb_ractor_channel_t *gc)
+ractor_wakeup(rb_ractor_t *r, enum ractor_wait_status wait_status, enum ractor_wakeup_status wakeup_status)
 {
-    // TODO: assert(gc->lock is locked)
-    return gc->waiting.cnt > 0;
+    ASSERT_ractor_locking(r);
+
+    // fprintf(stderr, "%s r:%p status:%s/%s wakeup_status:%s/%s\n", __func__, r,
+    //         wait_status_str(r->wait.status), wait_status_str(wait_status),
+    //         wakeup_status_str(r->wait.wakeup_status), wakeup_status_str(wakeup_status));
+
+    if ((r->wait.status & wait_status) &&
+        r->wait.wakeup_status == wakeup_none) {
+        r->wait.wakeup_status = wakeup_status;
+        rb_native_cond_signal(&r->wait.cond);
+        return true;
+    }
+    else {
+        return false;
+    }
 }
 
 static void
-ractor_channel_waiting_add(rb_ractor_channel_t *gc, rb_ractor_t *g)
+ractor_waiting_list_add(rb_ractor_t *r, struct rb_ractor_waiting_list *wl, rb_ractor_t *wr)
 {
-    rb_native_mutex_lock(&gc->lock);
+    // wl is belong to r
+    ractor_lock(r);
     {
-        for (int i=0; i<gc->waiting.cnt; i++) {
-            if (gc->waiting.ractors[i] == g) {
+        for (int i=0; i<wl->cnt; i++) {
+            if (wl->ractors[i] == wr) {
                 // TODO: make it clean code.
-                rb_native_mutex_unlock(&gc->lock);
+                rb_native_mutex_unlock(&r->lock);
                 rb_raise(rb_eRuntimeError, "Already another thread of same ractor is waiting.");
             }
         }
 
-        if (gc->waiting.size == 0) {
-            gc->waiting.size = 4;
-            gc->waiting.ractors = ALLOC_N(rb_ractor_t *, gc->waiting.size);
+        if (wl->size == 0) {
+            wl->size = 1;
+            wl->ractors = ALLOC_N(rb_ractor_t *, wl->size);
         }
-        else if (gc->waiting.size <= gc->waiting.cnt + 1) {
-            gc->waiting.size *= 2;
-            REALLOC_N(gc->waiting.ractors, rb_ractor_t *, gc->waiting.size);
+        else if (wl->size <= wl->cnt + 1) {
+            wl->size *= 2;
+            REALLOC_N(wl->ractors, rb_ractor_t *, wl->size);
         }
-        gc->waiting.ractors[gc->waiting.cnt++] = g;
-        // fprintf(stderr, "cnt:%d size:%d\n", gc->waiting.cnt, gc->waiting.size);
+        wl->ractors[wl->cnt++] = wr;
+        // fprintf(stderr, "cnt:%d size:%d\n", rq->waiting.cnt, rq->waiting.size);
     }
-    rb_native_mutex_unlock(&gc->lock);
+    ractor_unlock(r);
 }
 
 static void
-ractor_channel_waiting_del(rb_ractor_channel_t *gc, rb_ractor_t *g)
+ractor_waiting_list_del(rb_ractor_t *r, struct rb_ractor_waiting_list *wl, rb_ractor_t *wr)
 {
-    rb_native_mutex_lock(&gc->lock);
+    ractor_lock(r);
     {
         int pos = -1;
-        for (int i=0; i<gc->waiting.cnt; i++) {
-            if (gc->waiting.ractors[i] == g) {
+        for (int i=0; i<wl->cnt; i++) {
+            if (wl->ractors[i] == wr) {
                 pos = i;
                 break;
             }
         }
         if (pos >= 0) { // found
-            gc->waiting.cnt--;
-            for (int i=pos; i<gc->waiting.cnt; i++) {
-                gc->waiting.ractors[i] = gc->waiting.ractors[i+1];
+            wl->cnt--;
+            for (int i=pos; i<wl->cnt; i++) {
+                wl->ractors[i] = wl->ractors[i+1];
             }
         }
     }
-    rb_native_mutex_unlock(&gc->lock);
+    ractor_unlock(r);
+}
+
+static rb_ractor_t *
+ractor_waiting_list_shift(rb_ractor_t *r, struct rb_ractor_waiting_list *wl)
+{
+    VM_ASSERT(&r->taking_ractors == wl);
+    rb_ractor_t *tr;
+
+    ractor_lock(r);
+    {
+        if (wl->cnt > 0) {
+            tr = wl->ractors[0];
+            for (int i=1; i<wl->cnt; i++) {
+                wl->ractors[i-1] = wl->ractors[i];
+            }
+            wl->cnt--;
+        }
+        else {
+            tr = NULL;
+        }
+    }
+    ractor_unlock(r);
+
+    return tr;
 }
 
 static VALUE
-ractor_channel_recv(rb_execution_context_t *ec, rb_ractor_channel_t *gc)
+ractor_recv(rb_execution_context_t *ec, rb_ractor_t *r)
 {
-    rb_ractor_t *g = rb_ec_ractor_ptr(ec);
+    VM_ASSERT(r == rb_ec_ractor_ptr(ec));
     VALUE v;
 
-    while ((v = ractor_channel_try_recv(ec, gc)) == Qundef) {
-        ractor_sleep_setup(ec, g);
-        ractor_channel_waiting_add(gc, g);
-        ractor_sleep(ec, g);
-        ractor_channel_waiting_del(gc, g);
+    while ((v = ractor_try_recv(ec, r)) == Qundef) {
+        ractor_lock(r);
+        {
+            if (ractor_queue_empty_p(r, &r->incoming_queue)) {
+                VM_ASSERT(r->wait.status == wait_none);
+                VM_ASSERT(r->wait.wakeup_status == wakeup_none);
+                r->wait.status = wait_recving;
+
+                ractor_sleep(ec, r);
+
+                r->wait.wakeup_status = wakeup_none;
+            }
+        }
+        ractor_unlock(r);
     }
 
     return v;
 }
 
-static bool
-ractor_channel_wakeup(rb_ractor_channel_t *gc, rb_ractor_t *wg)
-{
-    bool result = false;
-
-    rb_native_mutex_lock(&wg->sleep_lock);
-    {
-        if (wg->sleep_interrupted == false) {
-            wg->sleep_interrupted = true;
-            rb_native_cond_signal(&wg->sleep_cond);
-        }
-    }
-    rb_native_mutex_unlock(&wg->sleep_lock);
-    return result;
-}
-
 static void
-ractor_channel_wakeup_all(rb_ractor_channel_t *gc)
-{
-    // TODO: assert(gc->lock is locked)
-    for (int i=0; i<gc->waiting.cnt; i++) {
-        rb_ractor_t *wg = gc->waiting.ractors[i];
-        ractor_channel_wakeup(gc, wg);
-    }
-}
-
-static void
-ractor_channel_send_basket(rb_execution_context_t *ec, rb_ractor_channel_t *gc, struct rb_ractor_channel_basket *b)
+ractor_send_basket(rb_execution_context_t *ec, rb_ractor_t *r, struct rb_ractor_basket *b)
 {
     bool closed = false;
+    struct rb_ractor_queue *rq = &r->incoming_queue;
 
-    rb_native_mutex_lock(&gc->lock);
+    ractor_lock(r);
     {
-        if (gc->closed) {
+        if (r->incoming_port_closed) {
             closed = true;
         }
         else {
-            // enq
-            if (gc->size <= gc->cnt) {
-                gc->size *= 2;
-                REALLOC_N(gc->baskets, struct rb_ractor_channel_basket, gc->size);
-            }
-            b->sender = rb_ec_ractor_ptr(ec)->self;
-            gc->baskets[gc->cnt++] = *b;
-
-            if (ractor_channel_waiting_p(gc)) {
-                ractor_channel_wakeup_all(gc);
+            ractor_queue_enq(r, rq, b);
+            if (ractor_wakeup(r, wait_recving, wakeup_by_send)) {
+                VM_ASSERT(rq->cnt == 1);
             }
         }
     }
-    rb_native_mutex_unlock(&gc->lock);
+    ractor_unlock(r);
 
     if (closed) {
-        rb_raise(rb_eRactorClosedError, "The recv-edge is already closed");
+        rb_raise(rb_eRactorClosedError, "The incoming-port is already closed");
     }
 }
 
 static void
-ractor_channel_send_exception(rb_execution_context_t *ec, rb_ractor_channel_t *gc, VALUE errinfo)
+ractor_basket_clear(struct rb_ractor_basket *b)
 {
-    struct rb_ractor_channel_basket basket;
-    ractor_channel_copy_setup(&basket, errinfo);
-    basket.type = basket_type_exception;
-
-    ractor_channel_send_basket(ec, gc, &basket);
+    b->type = basket_type_none;
+    b->v = Qfalse;
+    b->sender = Qfalse;
 }
 
 static void
-ractor_channel_send(rb_execution_context_t *ec, rb_ractor_channel_t *gc, VALUE obj)
+ractor_basket_setup(rb_execution_context_t *ec, struct rb_ractor_basket *basket, VALUE obj, VALUE move)
 {
-    struct rb_ractor_channel_basket basket;
-    ractor_channel_copy_setup(&basket, obj);
-    ractor_channel_send_basket(ec, gc, &basket);
-}
+    basket->sender = rb_ec_ractor_ptr(ec)->self;
 
-static void
-ractor_channel_move(rb_execution_context_t *ec, rb_ractor_channel_t *gc, VALUE obj)
-{
-    struct rb_ractor_channel_basket basket;
-    ractor_channel_move_setup(&basket, obj);
-    ractor_channel_send_basket(ec, gc, &basket);
+    if (!RTEST(move)) {
+        ractor_copy_setup(basket, obj);
+    }
+    else {
+        ractor_move_setup(basket, obj);
+    }
 }
 
 static VALUE
-ractor_channel_close(rb_execution_context_t *ec, rb_ractor_channel_t *gc)
+ractor_send(rb_execution_context_t *ec, rb_ractor_t *r, VALUE obj, VALUE move)
+{
+    struct rb_ractor_basket basket;
+    ractor_basket_setup(ec, &basket, obj, move);
+    ractor_send_basket(ec, r, &basket);
+    return r->self;
+}
+
+static VALUE
+ractor_try_take(rb_execution_context_t *ec, rb_ractor_t *r)
+{
+    struct rb_ractor_basket basket = {
+        .type = basket_type_none,
+    };
+    bool closed = false;
+
+    ractor_lock(r);
+    {
+        if (ractor_wakeup(r, wait_yielding, wakeup_by_take)) {
+            VM_ASSERT(r->wait.yielded_basket.type != basket_type_none);
+            basket = r->wait.yielded_basket;
+            ractor_basket_clear(&r->wait.yielded_basket);
+        }
+        else if (r->outgoing_port_closed) {
+            closed = true;
+        }
+    }
+    ractor_unlock(r);
+
+    if (basket.type == basket_type_none) {
+        if (closed) {
+            rb_raise(rb_eRactorClosedError, "The outgoing-port is already closed");
+        }
+        else {
+            return Qundef;
+        }
+    }
+    else {
+        return ractor_basket_accept(&basket);
+    }
+}
+
+static bool
+ractor_try_yield(rb_execution_context_t *ec, rb_ractor_t *cr, VALUE obj, bool move, bool exc)
+{
+    rb_ractor_t *r;
+  retry:
+    r = ractor_waiting_list_shift(cr, &cr->taking_ractors);
+
+    if (r) {
+        bool retry = false;
+
+        ractor_lock(r);
+        {
+            if (ractor_wakeup(r, wait_taking, wakeup_by_yield)) {
+                VM_ASSERT(r->wait.taken_basket.type == basket_type_none);
+                ractor_basket_setup(ec, &r->wait.taken_basket, obj, move);
+                if (exc) {
+                    r->wait.taken_basket.type = basket_type_exception;
+                }
+            }
+            else {
+                retry = true;
+            }
+        }
+        ractor_unlock(r);
+
+        if (retry) {
+            // get candidate take-waiting ractor, but already woke up by another reason.
+            // retry to check another ractor.
+            goto retry;
+        }
+        else {
+            return true;
+        }
+    }
+    else {
+        return false;
+    }
+}
+
+// select(r1, r2, r3, receive: true, yield: obj)
+static VALUE
+ractor_select(rb_execution_context_t *ec, const VALUE *rs, int alen, VALUE yielded_value, bool move, VALUE *ret_r)
+{
+    rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
+    VALUE crv = cr->self;
+    VALUE ret;
+    int i;
+    enum ractor_wait_status wait_status = 0;
+
+    bool yield_p = (yielded_value != Qundef) ? true : false;
+
+    struct ractor_select_action {
+        enum ractor_select_action_type {
+            ractor_select_action_take,
+            ractor_select_action_recv,
+            ractor_select_action_yield,
+        } type;
+        VALUE v;
+    } *actions = ALLOCA_N(struct ractor_select_action, alen + (yield_p ? 1 : 0));
+
+    VM_ASSERT(cr->wait.status == wait_none);
+    VM_ASSERT(cr->wait.wakeup_status == wakeup_none);
+    VM_ASSERT(cr->wait.taken_basket.type == basket_type_none);
+    VM_ASSERT(cr->wait.yielded_basket.type == basket_type_none);
+
+    // setup actions
+    for (i=0; i<alen; i++) {
+        VALUE v = rs[i];
+
+        if (v == crv) {
+            actions[i].type = ractor_select_action_recv;
+            actions[i].v = Qnil;
+            wait_status |= wait_recving;
+        }
+        else if (rb_ractor_p(v)) {
+            actions[i].type = ractor_select_action_take;
+            actions[i].v = v;
+            wait_status |= wait_taking;
+        }
+        else {
+            rb_raise(rb_eArgError, "It should be ractor objects");
+        }
+    }
+    rs = NULL;
+    if (yield_p) {
+        actions[i].type = ractor_select_action_yield;
+        actions[i].v = yielded_value;
+        wait_status |= wait_yielding;
+        alen++;
+    }
+
+    // TODO: shuffle actions
+
+    while (1) {
+        // try actions
+        for (i=0; i<alen; i++) {
+            VALUE v, rv;
+            switch (actions[i].type) {
+              case ractor_select_action_take:
+                rv = actions[i].v;
+                v = ractor_try_take(ec, RACTOR_PTR(rv));
+                if (v != Qundef) {
+                    *ret_r = rv;
+                    ret = v;
+                    goto cleanup;
+                }
+                break;
+              case ractor_select_action_recv:
+                v = ractor_try_recv(ec, cr);
+                if (v != Qundef) {
+                    *ret_r = ID2SYM(rb_intern("recv"));
+                    ret = v;
+                    goto cleanup;
+                }
+                break;
+              case ractor_select_action_yield:
+                if (ractor_try_yield(ec, cr, actions[i].v, move, false)) {
+                    *ret_r = ID2SYM(rb_intern("yield"));
+                    ret = Qnil;
+                    goto cleanup;
+                }
+                break;
+            }
+        }
+
+        // setup waiting status
+        ractor_lock(cr);
+        {
+            VM_ASSERT(cr->wait.status == wait_none);
+            VM_ASSERT(cr->wait.wakeup_status == wakeup_none);
+
+            cr->wait.status = wait_status;
+        }
+        ractor_unlock(cr);
+
+        // prepare waiting
+        for (i=0; i<alen; i++) {
+            rb_ractor_t *r;
+            switch (actions[i].type) {
+              case ractor_select_action_take:
+                r = RACTOR_PTR(actions[i].v);
+                ractor_waiting_list_add(r, &r->taking_ractors, cr);
+                break;
+              case ractor_select_action_yield:
+                if (cr->wait.yielded_basket.type == basket_type_none) {
+                    ractor_basket_setup(ec, &cr->wait.yielded_basket, yielded_value, move);
+                }
+                break;
+              case ractor_select_action_recv:
+                break;
+            }
+        }
+
+        // wait
+        ractor_lock(cr);
+        {
+            if (cr->wait.wakeup_status == wakeup_none) {
+                VM_ASSERT(cr->wait.status != wait_none);
+                ractor_sleep(ec, cr);
+            }
+        }
+        ractor_unlock(cr);
+
+        // cleanup waiting
+        for (i=0; i<alen; i++) {
+            rb_ractor_t *r;
+            switch (actions[i].type) {
+              case ractor_select_action_take:
+                r = RACTOR_PTR(actions[i].v);
+                ractor_waiting_list_del(r, &r->taking_ractors, cr);
+                break;
+              case ractor_select_action_recv:
+              case ractor_select_action_yield:
+                break;
+            }
+        }
+
+        // check results
+        enum ractor_wakeup_status wakeup_status = cr->wait.wakeup_status;
+        cr->wait.wakeup_status = wakeup_none;
+
+        switch (wakeup_status) {
+          case wakeup_none:
+            // OK. something happens.
+            // retry loop.
+            break;
+          case wakeup_by_send:
+            // OK.
+            // retry loop and try_recv will succss.
+            break;
+          case wakeup_by_yield:
+            // take was succeeded!
+            // cr.wait.taken_basket contains passed block
+            VM_ASSERT(cr->wait.taken_basket.type != basket_type_none);
+            *ret_r = cr->wait.taken_basket.sender;
+            VM_ASSERT(rb_ractor_p(*ret_r));
+            ret = ractor_basket_accept(&cr->wait.taken_basket);
+            ractor_basket_clear(&cr->wait.taken_basket);
+            goto cleanup;
+          case wakeup_by_take:
+            *ret_r = ID2SYM(rb_intern("yield"));
+            ret = Qnil;
+            goto cleanup;
+          case wakeup_by_close:
+            // OK.
+            // retry loop and will get CloseError.
+            break;
+          case wakeup_by_interrupt:
+            goto cleanup;
+        }
+    }
+
+  cleanup:
+    if (cr->wait.yielded_basket.type != basket_type_none) {
+        ractor_basket_clear(&cr->wait.yielded_basket);
+    }
+
+    VM_ASSERT(cr->wait.status == wait_none);
+    VM_ASSERT(cr->wait.wakeup_status == wakeup_none);
+    VM_ASSERT(cr->wait.taken_basket.type == basket_type_none);
+    VM_ASSERT(cr->wait.yielded_basket.type == basket_type_none);
+
+    RUBY_VM_CHECK_INTS(ec);
+    return ret;
+}
+
+static VALUE
+ractor_yield(rb_execution_context_t *ec, rb_ractor_t *r, VALUE obj, VALUE move)
+{
+    VALUE ret_r;
+    ractor_select(ec, NULL, 0, obj, RTEST(move) ? true : false, &ret_r);
+    return Qnil;
+}
+
+static VALUE
+ractor_take(rb_execution_context_t *ec, rb_ractor_t *r)
+{
+    VALUE ret_r;
+    VALUE v = ractor_select(ec, &r->self, 1, Qundef, false, &ret_r);
+    return v;
+}
+
+static VALUE
+ractor_close_incoming(rb_execution_context_t *ec, rb_ractor_t *r)
 {
     VALUE prev;
 
-    rb_native_mutex_lock(&gc->lock);
+    ractor_lock(r);
     {
-        if (!gc->closed) {
+        if (!r->incoming_port_closed) {
             prev = Qfalse;
-            gc->closed = true;
-
-            if (ractor_channel_waiting_p(gc)) {
-                ractor_channel_wakeup_all(gc);
+            r->incoming_port_closed = true;
+            if (ractor_wakeup(r, wait_recving, wakeup_by_close)) {
+                VM_ASSERT(r->incoming_queue.cnt == 0);
             }
         }
         else {
             prev = Qtrue;
         }
     }
-    rb_native_mutex_unlock(&gc->lock);
+    ractor_unlock(r);
     return prev;
 }
+
+static VALUE
+ractor_close_outgoing(rb_execution_context_t *ec, rb_ractor_t *r)
+{
+    VALUE prev;
+
+    ractor_lock(r);
+    {
+        if (!r->outgoing_port_closed) {
+            prev = Qfalse;
+            r->outgoing_port_closed = true;
+        }
+        else {
+            prev = Qtrue;
+        }
+    }
+    ractor_unlock(r);
+
+    // wakeup all taking ractors
+    rb_ractor_t *taking_ractor;
+    while ((taking_ractor = ractor_waiting_list_shift(r, &r->taking_ractors)) != NULL) {
+        ractor_lock(taking_ractor);
+        ractor_wakeup(taking_ractor, wait_taking, wakeup_by_close);
+        ractor_unlock(taking_ractor);
+    }
+    return prev;
+}
+
+// creation/termination
 
 static VALUE
 ractor_next_id(void)
@@ -607,58 +1081,58 @@ ractor_next_id(void)
 }
 
 static void
-ractor_setup(rb_ractor_t *g)
+ractor_setup(rb_ractor_t *r)
 {
-    g->incoming_channel = ractor_channel_alloc();
-    g->outgoing_channel = ractor_channel_alloc();
-    rb_native_mutex_initialize(&g->sleep_lock);
-    rb_native_cond_initialize(&g->sleep_cond);
+    ractor_queue_setup(&r->incoming_queue);
+    rb_native_mutex_initialize(&r->lock);
+    rb_native_cond_initialize(&r->wait.cond);
 }
 
 static VALUE
 ractor_alloc(VALUE klass)
 {
-    rb_ractor_t *g;
-    VALUE gv = TypedData_Make_Struct(klass, rb_ractor_t, &ractor_data_type, g);
-    FL_SET_RAW(gv, RUBY_FL_SHAREABLE);
+    rb_ractor_t *r;
+    VALUE rv = TypedData_Make_Struct(klass, rb_ractor_t, &ractor_data_type, r);
+    FL_SET_RAW(rv, RUBY_FL_SHAREABLE);
 
     // namig
-    g->id = ractor_next_id();
-    g->loc = Qnil;
-    g->name = Qnil;
-    g->self = gv;
-    ractor_setup(g);
-    return gv;
+    r->id = ractor_next_id();
+    r->loc = Qnil;
+    r->name = Qnil;
+    r->self = rv;
+    ractor_setup(r);
+    return rv;
 }
 
 rb_ractor_t *
 rb_ractor_main_alloc(void)
 {
-    rb_ractor_t *g = ruby_mimmalloc(sizeof(rb_ractor_t));
-    if (g == NULL) {
+    rb_ractor_t *r = ruby_mimmalloc(sizeof(rb_ractor_t));
+    if (r == NULL) {
 	fprintf(stderr, "[FATAL] failed to allocate memory for main ractor\n");
         exit(EXIT_FAILURE);
     }
-    MEMZERO(g, rb_ractor_t, 1);
-    g->id = ++ractor_last_id;
-    g->loc = Qnil;
-    g->name = Qnil;
+    MEMZERO(r, rb_ractor_t, 1);
+    r->id = ++ractor_last_id;
+    r->loc = Qnil;
+    r->name = Qnil;
 
-    return g;
+    return r;
 }
 
 void
-rb_ractor_main_setup(rb_ractor_t *g)
+rb_ractor_main_setup(rb_ractor_t *r)
 {
-    g->self = TypedData_Wrap_Struct(rb_cRactor, &ractor_data_type, g);
-    ractor_setup(g);
+    r->self = TypedData_Wrap_Struct(rb_cRactor, &ractor_data_type, r);
+    FL_SET_RAW(r->self, RUBY_FL_SHAREABLE);
+    ractor_setup(r);
 }
 
 
 VALUE
-rb_ractor_self(const rb_ractor_t *g)
+rb_ractor_self(const rb_ractor_t *r)
 {
-    return g->self;
+    return r->self;
 }
 
 MJIT_FUNC_EXPORTED int
@@ -668,145 +1142,73 @@ rb_ractor_main_p(void)
     return rb_ec_ractor_ptr(ec) == rb_ec_vm_ptr(ec)->main_ractor;
 }
 
-
 static VALUE
 ractor_create(rb_execution_context_t *ec, VALUE self,
              VALUE args, VALUE block, VALUE loc, VALUE name)
 {
-    VALUE gv = ractor_alloc(self);
-    rb_ractor_t *g = RACTOR_PTR(gv);
-    g->running_thread = rb_thread_create_ractor(g, args, block);
-    g->loc = loc;
-    g->name = name;
-    return gv;
+    VALUE rv = ractor_alloc(self);
+    rb_ractor_t *r = RACTOR_PTR(rv);
+    r->running_thread = rb_thread_create_ractor(r, args, block);
+    r->loc = loc;
+    r->name = name;
+    return rv;
+}
+
+static void
+ractor_atexit_yield(rb_execution_context_t *ec, rb_ractor_t *cr, VALUE v, bool exc)
+{
+    if (ractor_try_yield(ec, cr, v, false, exc)) {
+        return; // OK
+    }
+
+    ractor_lock(cr);
+    {
+        VM_ASSERT(cr->wait.status == wait_none);
+        VM_ASSERT(cr->wait.wakeup_status == wakeup_none);
+        cr->wait.status = wait_yielding;
+
+        ractor_basket_setup(ec, &cr->wait.yielded_basket, v, false);
+        if (exc) {
+            cr->wait.yielded_basket.type = basket_type_exception; // TODO opt
+        }
+
+        // leave in waiting status
+    }
+    ractor_unlock(cr);
 }
 
 void
 rb_ractor_atexit(rb_execution_context_t *ec, VALUE result)
 {
-    rb_ractor_t *g = rb_ec_ractor_ptr(ec);
-    ractor_channel_send(ec, g->outgoing_channel, result);
-    ractor_channel_close(ec, g->outgoing_channel);
-    ractor_channel_close(ec, g->incoming_channel);
+    rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
+    ractor_atexit_yield(ec, cr, result, false);
+    ractor_close_incoming(ec, cr);
+    ractor_close_outgoing(ec, cr);
 }
 
 void
 rb_ractor_atexit_exception(rb_execution_context_t *ec)
 {
-    rb_ractor_t *g = rb_ec_ractor_ptr(ec);
-    ractor_channel_send_exception(ec, g->outgoing_channel, ec->errinfo);
-    ractor_channel_close(ec, g->outgoing_channel);
-    ractor_channel_close(ec, g->incoming_channel);
+    rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
+    ractor_atexit_yield(ec, cr, ec->errinfo, true);
+    ractor_close_incoming(ec, cr);
+    ractor_close_outgoing(ec, cr);
 }
 
 void
-rb_ractor_recv_parameters(rb_execution_context_t *ec, rb_ractor_t *g, int len, VALUE *ptr)
+rb_ractor_recv_parameters(rb_execution_context_t *ec, rb_ractor_t *r, int len, VALUE *ptr)
 {
     for (int i=0; i<len; i++) {
-        ptr[i] = ractor_channel_recv(ec, g->incoming_channel);
+        ptr[i] = ractor_recv(ec, r);
     }
 }
 
 void
-rb_ractor_send_parameters(rb_execution_context_t *ec, rb_ractor_t *g, VALUE args)
+rb_ractor_send_parameters(rb_execution_context_t *ec, rb_ractor_t *r, VALUE args)
 {
     int len = RARRAY_LENINT(args);
     for (int i=0; i<len; i++) {
-        ractor_channel_send(ec, g->incoming_channel, RARRAY_AREF(args, i));
-    }
-}
-
-
-static rb_ractor_channel_t*
-ractor_recv_channel(rb_execution_context_t *ec, VALUE gv)
-{
-    if (rb_ractor_p(gv)) {
-        if (rb_ec_ractor_ptr(ec)->self == gv) {
-            return RACTOR_PTR(gv)->incoming_channel;
-        }
-        else {
-            return RACTOR_PTR(gv)->outgoing_channel;
-        }
-    }
-    else {
-        // TODO: ArgumentError
-        rb_bug("unreachable");
-    }
-}
-
-static rb_ractor_channel_t*
-ractor_send_channel(rb_execution_context_t *ec, VALUE gv)
-{
-    if (rb_ractor_p(gv)) {
-        if (rb_ec_ractor_ptr(ec)->self == gv) {
-            return RACTOR_PTR(gv)->outgoing_channel;
-        }
-        else {
-            return RACTOR_PTR(gv)->incoming_channel;
-        }
-    }
-    else {
-        // TODO: ArgumentError
-        rb_bug("unreachable");
-    }
-}
-
-static VALUE
-ractor_recv(rb_execution_context_t *ec, VALUE gv)
-{
-    return ractor_channel_recv(ec, ractor_recv_channel(ec, gv));
-}
-
-static VALUE
-ractor_send(rb_execution_context_t *ec, VALUE gv, VALUE obj)
-{
-    ractor_channel_send(ec, ractor_send_channel(ec, gv), obj);
-    return gv;
-}
-
-static VALUE
-ractor_move(rb_execution_context_t *ec, VALUE gv, VALUE obj)
-{
-    ractor_channel_move(ec, ractor_send_channel(ec, gv), obj);
-    return gv;
-}
-
-static VALUE
-ractor_select(rb_execution_context_t *ec, VALUE chs)
-{
-    rb_ractor_t *g = rb_ec_ractor_ptr(ec);
-    int chs_len = RARRAY_LENINT(chs);
-    int i;
-
-    while (1) {
-        // try // TODO: this order should be shuffle
-        for (i=0; i<chs_len; i++) {
-            VALUE gv = RARRAY_AREF(chs, i);
-            rb_ractor_channel_t *gc = ractor_recv_channel(ec, gv);
-            VALUE v;
-
-            if ((v = ractor_channel_try_recv(ec, gc)) != Qundef) {
-                return rb_ary_new_from_args(2, gv, v);
-            }
-        }
-
-        ractor_sleep_setup(ec, g);
-
-        // register waiters
-        for (i=0; i<chs_len; i++) {
-            VALUE gv = RARRAY_AREF(chs, i);
-            rb_ractor_channel_t *gc = ractor_recv_channel(ec, gv);
-            ractor_channel_waiting_add(gc, g);
-        }
-
-        ractor_sleep(ec, g);
-
-        // remove waiters
-        for (i=0; i<chs_len; i++) {
-            VALUE gv = RARRAY_AREF(chs, i);
-            rb_ractor_channel_t *gc = ractor_recv_channel(ec, gv);
-            ractor_channel_waiting_del(gc, g);
-        }
+        ractor_send(ec, r, RARRAY_AREF(args, i), false);
     }
 }
 

@@ -14,7 +14,7 @@ assert_equal 'ok', %q{
   r = Ractor.new do
     'ok'
   end
-  r.recv
+  r.take
 }
 
 # Passed arguments to Ractor.new will be a block parameter
@@ -24,7 +24,7 @@ assert_equal 'ok', %q{
   r = Ractor.new 'ok' do |msg|
     msg
   end
-  r.recv
+  r.take
 }
 
 assert_equal 'ok', %q{
@@ -32,21 +32,20 @@ assert_equal 'ok', %q{
   r =  Ractor.new 'ping', 'pong' do |msg, msg2|
     [msg, msg2]
   end
-  'ok' if r.recv == ['ping', 'pong']
+  'ok' if r.take == ['ping', 'pong']
 }
 
 # Ractor#send passes an object with copy to a Ractor
 # and Ractor.recv in the Ractor block can receive the passed value.
 assert_equal 'ok', %q{
-  # ping-pong with channel
   r = Ractor.new do
     msg = Ractor.recv
   end
   r.send 'ok'
-  r.recv
+  r.take
 }
 
-# Ractor.select(*channels) receives a values from a channel.
+# Ractor.select(*ractors) receives a values from a ractors.
 # It is similar to select(2) and Go's select syntax.
 # The return value is [ch, received_value]
 assert_equal 'ok', %q{
@@ -99,16 +98,14 @@ assert_equal 'true', %q{
   }.all?('ok')
 }
 
-# communication channels belong to a Ractor will be closed
-# if the Ractor is terminated.
+# Outgoing port of a ractor will be closed when the Ractor is terminated.
 assert_equal 'ok', %q{
-  # closed-channel (Ractor)
   r = Ractor.new do
     'finish'
   end
-  r.recv
+  r.take
   begin
-    o = r.recv
+    o = r.take
   rescue Ractor::ClosedError
     'ok'
   else
@@ -120,7 +117,7 @@ assert_equal 'ok', %q{
   r = Ractor.new do
   end
 
-  r.recv # closed
+  r.take # closed
 
   begin
     r.send(1)
@@ -135,14 +132,14 @@ assert_equal 'ok', %q{
 assert_equal '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]', %q{
   pipe = Ractor.new do
     loop do
-      Ractor.send Ractor.recv
+      Ractor.yield Ractor.recv
     end
   end
 
   RN = 10
   rs = RN.times.map{|i|
     Ractor.new pipe, i do |pipe, i|
-      msg = pipe.recv
+      msg = pipe.take
       msg # ping-pong
     end
   }
@@ -156,11 +153,40 @@ assert_equal '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]', %q{
   }.sort
 }
 
+# Ractor.select also support multiple take, recv and yiled
+assert_equal '[true, true, true]', %q{
+  RN = 10
+  CR = Ractor.current
+
+  rs = (1..RN).map{
+    Ractor.new do
+      CR.send 'send' + CR.take #=> 'sendyield'
+      'take'
+    end
+  }
+  recv = []
+  take = []
+  yiel = []
+  until rs.empty?
+    r, v = Ractor.select(CR, *rs, yield_value: 'yield')
+    case r
+    when :recv
+      recv << v
+    when :yield
+      yiel << v
+    else
+      take << v
+      rs.delete r
+    end
+  end
+  [recv.all?('sendyield'), yiel.all?(nil), take.all?('take')]
+}
+
 # multiple Ractors can send to one Ractor
 assert_equal '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]', %q{
   pipe = Ractor.new do
     loop do
-      Ractor.send Ractor.recv
+      Ractor.yield Ractor.recv
     end
   end
 
@@ -171,7 +197,7 @@ assert_equal '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]', %q{
     end
   }
   RN.times.map{
-    pipe.recv
+    pipe.take
   }.sort
 }
 
@@ -181,7 +207,7 @@ assert_equal '[RuntimeError, "ok", true]', %q{
     raise 'ok' # exception will be transferred receiver
   end
   begin
-    r.recv
+    r.take
   rescue Ractor::RemoteError => e
     [e.cause.class,   #=> RuntimeError
      e.cause.message, #=> 'ok'
@@ -196,7 +222,7 @@ assert_equal 'false', %q{
     msg.object_id
   end
   
-  obj.object_id == r.recv
+  obj.object_id == r.take
 }
 
 # To copy the object, now Marshal#dump is used
@@ -219,7 +245,7 @@ assert_equal "[[[1, true], [:sym, true], [:xyzzy, true], [\"frozen\", true], " \
              "[[\"mutable str\", false], [[:array], false], [{:hash=>true}, false]]]", %q{
   r = Ractor.new do
     while v = Ractor.recv
-      Ractor.send v
+      Ractor.yield v
     end
   end
 
@@ -230,13 +256,13 @@ assert_equal "[[[1, true], [:sym, true], [:xyzzy, true], [\"frozen\", true], " \
 
   sr = sharable_objects.map{|o|
     r << o
-    o2 = r.recv
+    o2 = r.take
     [o, o.object_id == o2.object_id]
   }
 
   ur = unsharable_objects = ['mutable str'.dup, [:array], {hash: true}].map{|o|
     r << o
-    o2 = r.recv
+    o2 = r.take
     [o, o.object_id == o2.object_id]
   }
   [sr, ur].inspect
@@ -252,8 +278,8 @@ assert_equal 'hello world', %q{
   end
 
   str = 'hello'
-  r.move str
-  modified = r.recv
+  r.send str, move: true
+  modified = r.take
 
   begin
     str << ' exception' # raise Ractor::MovedError
@@ -272,8 +298,8 @@ assert_equal '[0, 1]', %q{
   end
 
   a1 = [0]
-  r.move a1
-  a2 = r.recv
+  r.send a1, move: true
+  a2 = r.take
   begin
     a1 << 2 # raise Ractor::MovedError
   rescue Ractor::MovedError
@@ -289,7 +315,7 @@ assert_equal 'can not access global variables from non-main Ractors', %q{
   end
 
   begin
-    r.recv
+    r.take
   rescue Ractor::RemoteError => e
     e.cause.message
   end
@@ -302,7 +328,7 @@ assert_equal 'can not access global variables from non-main Ractors', %q{
   end
 
   begin
-    r.recv
+    r.take
   rescue Ractor::RemoteError => e
     e.cause.message
   end
@@ -313,7 +339,7 @@ assert_equal 'false', %q{
   r = Ractor.new do
     self.object_id
   end
-  r.recv == self.object_id #=> false
+  r.take == self.object_id #=> false
 }
 
 # self is a Ractor instance
@@ -321,7 +347,7 @@ assert_equal 'true', %q{
   r = Ractor.new do
     self.object_id
   end
-  r.object_id == r.recv #=> true
+  r.object_id == r.take #=> true
 }
 
 # given block Proc will be isolated, so can not access outer variables.
@@ -350,7 +376,7 @@ assert_equal 'can not access instance variables of classes/modules from non-main
 
 
   begin
-    r.recv
+    r.take
   rescue Ractor::RemoteError => e
     e.cause.message
   end
@@ -366,7 +392,7 @@ assert_equal 'can not access instance variables of shareable objects from non-ma
   end
 
   begin
-    r.recv
+    r.take
   rescue Ractor::RemoteError => e
     e.cause.message
   end
@@ -386,7 +412,7 @@ assert_equal 'can not access class variables from non-main Ractors', %q{
 
 
   begin
-    r.recv
+    r.take
   rescue Ractor::RemoteError => e
     e.cause.message
   end
@@ -401,7 +427,7 @@ assert_equal 'can not access non-sharable objects in constant CONST by non-main 
     C::CONST
   end
   begin
-    r.recv
+    r.take
   rescue Ractor::RemoteError => e
     e.cause.message
   end
@@ -415,7 +441,7 @@ assert_equal 'can not set constants with non-shareable objects by non-main Racto
     C::CONST = 'str'
   end
   begin
-    r.recv
+    r.take
   rescue Ractor::RemoteError => e
     e.cause.message
   end
