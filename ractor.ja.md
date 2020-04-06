@@ -3,9 +3,9 @@
 * 1つのRactorは並行実行単位として実行される
   * 1つのRactorは1つ以上のスレッドをもつ
   * スレッドは各 Ractor に属するグローバルロックで共有される
-* Ractor へメッセージを送受信しながら同期して実行をすすめる
-  * 投げっぱなし型（actor model）の `Ractor#send` + `Ractor.recv`
-  * ランデブー型の `Ractor.yield` + `Ractor#take`
+* Ractor へメッセージを送受信（message passing）しながら同期して実行をすすめる
+  * push 型（sender knows receiver）（actor model）の `Ractor#send` + `Ractor.recv`
+  * pull 型（receiver knows sender）の `Ractor.yield` + `Ractor#take`
 * メッセージは Ruby のオブジェクト
   * オブジェクトは共有可能・不可能オブジェクトに二分され、共有不可能オブジェクトはたかだか一つの Ractor からしか参照されない
   * 共有可能オブジェクトをメッセージとして転送すると、単に参照が送られる
@@ -121,17 +121,18 @@ end
 
 # Ractor 間のコミュニケーション
 
-* Ractor 間のコミュニケーションは、次の 2 つの方法がある。
-  * (1) Actor model として知られている send/recv
-  * (2) ランデブー型の yield/take
-  * (3) 共有可能なコンテナオブジェクトを用いる（未実装）
+* Ractor 間のコミュニケーションは、メッセージパッシングと、共有可能コンテナオブジェクトによって行う
+  * (1) メッセージパッシング
+    * (1-1) push 型の send/recv（send する側が宛先を知っている） aka actor model
+    * (1-2) pull 型の yield/take（take する側が送信元を知っている） aka ランデブー
+  * (2) 共有可能なコンテナオブジェクトを用いる（未実装）
 * 待ち合わせ
-  * 同期・待ち合わせは、基本的には (1) もしくは (2) を用いる
-  * (3) は、データの送受信は行うことができるが、待ち合わせには用いない（... 多分）
-* (1) send/recv（push 型通信？）
+  * 待ち合わせは、基本的に (1) メッセージパッシングで行う
+  * (2) は、データの送受信は行うことができるが、待ち合わせには用いない（... 多分）
+* (1-1) send/recv（push 型通信？）
   * `Ractor#send`（`Ractor#<<` が alias）は、対象 Ractor の incoming port へメッセージを送信する。incoming port は無限サイズの incoming queue に接続されているので、`Ractor#send` はブロックしない。
   * `Ractor.recv` で、自 Ractor の incoming queue からメッセージを一つ取り出す。incoming queue が空ならブロックする
-* (2) yield/take（pull 型通信？）
+* (1-2) yield/take（pull 型通信？）
   * `Ractor.yield(obj)` でメッセージを `Ractor#taks` している Ractor へ送信する
   * どちらも、相手が発生するまでブロックする
 * `Ractor.select()` で、take, recv, yield のどれかが成功するまで待つことができる
