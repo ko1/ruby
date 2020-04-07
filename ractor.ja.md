@@ -565,7 +565,7 @@ end
 
 ## ring in actor model
 
-```
+```ruby
 RN = 10000
 CR = Ractor.current
 
@@ -587,7 +587,7 @@ p Ractor.recv
 
 ## fork-join
 
-```
+```ruby
 def fib n
   if n < 2
     1
@@ -612,7 +612,7 @@ end
 
 ## worker pool
 
-```
+```ruby
 require 'prime'
 
 pipe = Ractor.new do
@@ -641,3 +641,122 @@ pp (1..N).map{
 }.sort_by{|(n, b)| n}
 ```
 
+## Pipeline
+
+```ruby
+# pipeline with yield/take
+r1 = Ractor.new do
+  'r1'
+end
+
+r2 = Ractor.new r1 do |r1|
+  r1.take + 'r2'
+end
+
+r3 = Ractor.new r2 do |r2|
+  r2.take + 'r3'
+end
+
+p r3.take #=> 'r1r2r3'
+```
+
+```ruby
+# pipeline with send/recv
+
+r3 = Ractor.new Ractor.current do |cr|
+  cr.send Ractor.recv + 'r3'
+end
+
+r2 = Ractor.new r3 do |r3|
+  r3.send Ractor.recv + 'r2'
+end
+
+r1 = Ractor.new r2 do |r2|
+  r2.send Ractor.recv + 'r1'
+end
+
+r1 << 'r0'
+p Ractor.recv #=> "r0r1r2r3"
+```
+
+# Supervise
+
+```ruby
+# ring example again
+
+r = Ractor.current
+rs = (1..10).map{|i|
+  r = Ractor.new r, i do |r, i|
+    r.send Ractor.recv + "r#{i}"
+  end
+}
+
+r.send "r0"
+p Ractor.recv #=> "r0r10r9r8r7r6r5r4r3r2r1"
+```
+
+```ruby
+# ring example again
+
+r = Ractor.current
+rs = (1..10).map{|i|
+  r = Ractor.new r, i do |r, i|
+    loop do
+      msg = Ractor.recv
+      raise if /e/ =~ msg
+      r.send msg + "r#{i}"
+    end
+  end
+}
+
+r.send "r0"
+p Ractor.recv #=> "r0r10r9r8r7r6r5r4r3r2r1"
+r.send "r0"
+p Ractor.select(*rs, Ractor.current)
+[:recv, "r0r10r9r8r7r6r5r4r3r2r1"]
+r.send "e0"
+p Ractor.select(*rs, Ractor.current)
+#=>
+#<Thread:0x000056262de28bd8 run> terminated with exception (report_on_exception is true):
+Traceback (most recent call last):
+        2: from /home/ko1/src/ruby/trunk/test.rb:7:in `block (2 levels) in <main>'
+        1: from /home/ko1/src/ruby/trunk/test.rb:7:in `loop'
+/home/ko1/src/ruby/trunk/test.rb:9:in `block (3 levels) in <main>': unhandled exception
+Traceback (most recent call last):
+        2: from /home/ko1/src/ruby/trunk/test.rb:7:in `block (2 levels) in <main>'
+        1: from /home/ko1/src/ruby/trunk/test.rb:7:in `loop'
+/home/ko1/src/ruby/trunk/test.rb:9:in `block (3 levels) in <main>': unhandled exception
+        1: from /home/ko1/src/ruby/trunk/test.rb:21:in `<main>'
+<internal:ractor>:69:in `select': thrown by remote Ractor. (Ractor::RemoteError)
+```
+
+```ruby
+# resend non-error message
+
+r = Ractor.current
+rs = (1..10).map{|i|
+  r = Ractor.new r, i do |r, i|
+    loop do
+      msg = Ractor.recv
+      raise if /e/ =~ msg
+      r.send msg + "r#{i}"
+    end
+  end
+}
+
+r.send "r0"
+p Ractor.recv #=> "r0r10r9r8r7r6r5r4r3r2r1"
+r.send "r0"
+p Ractor.select(*rs, Ractor.current)
+[:recv, "r0r10r9r8r7r6r5r4r3r2r1"]
+msg = 'e0'
+begin
+  r.send msg
+  p Ractor.select(*rs, Ractor.current)
+rescue Ractor::RemoteError
+  msg = 'r0'
+  retry
+end
+
+#=> <internal:ractor>:100:in `send': The incoming-port is already closed (Ractor::ClosedError)
+```
