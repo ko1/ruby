@@ -439,29 +439,44 @@ ractor_move_setup(struct rb_ractor_basket *b, VALUE obj)
     }
 }
 
+static void
+ractor_basket_clear(struct rb_ractor_basket *b)
+{
+    b->type = basket_type_none;
+    b->v = Qfalse;
+    b->sender = Qfalse;
+}
+
 static VALUE
 ractor_basket_accept(struct rb_ractor_basket *b)
 {
+    VALUE v;
     switch (b->type) {
       case basket_type_shareable:
         VM_ASSERT(rb_ractor_shareable_p(b->v));
-        return b->v;
+        v = b->v;
+        break;
       case basket_type_copy_marshal:
-        return rb_marshal_load(b->v);
+        v = rb_marshal_load(b->v);
+        break;
       case basket_type_exception:
         {
             VALUE cause = rb_marshal_load(b->v);
             VALUE err = rb_exc_new_cstr(rb_eRactorRemoteError, "thrown by remote Ractor.");
             rb_ivar_set(err, rb_intern("@ractor"), b->sender);
+            ractor_basket_clear(b);
             rb_ec_setup_exception(NULL, err, cause);
             rb_exc_raise(err);
         }
         // unreachable
       case basket_type_move:
-        return ractor_moved_setup(b->v);
+        v = ractor_moved_setup(b->v);
+        break;
       default:
         rb_bug("unreachable");
     }
+    ractor_basket_clear(b);
+    return v;
 }
 
 static void
@@ -717,14 +732,6 @@ ractor_send_basket(rb_execution_context_t *ec, rb_ractor_t *r, struct rb_ractor_
 }
 
 static void
-ractor_basket_clear(struct rb_ractor_basket *b)
-{
-    b->type = basket_type_none;
-    b->v = Qfalse;
-    b->sender = Qfalse;
-}
-
-static void
 ractor_basket_setup(rb_execution_context_t *ec, struct rb_ractor_basket *basket, VALUE obj, VALUE move)
 {
     basket->sender = rb_ec_ractor_ptr(ec)->self;
@@ -977,7 +984,6 @@ ractor_select(rb_execution_context_t *ec, const VALUE *rs, int alen, VALUE yield
             *ret_r = cr->wait.taken_basket.sender;
             VM_ASSERT(rb_ractor_p(*ret_r));
             ret = ractor_basket_accept(&cr->wait.taken_basket);
-            ractor_basket_clear(&cr->wait.taken_basket);
             goto cleanup;
           case wakeup_by_take:
             *ret_r = ID2SYM(rb_intern("yield"));
