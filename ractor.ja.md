@@ -157,7 +157,7 @@ end
                  +-------------------------------------------+
                  | incoming                         outgoing |
                  | port                                 port |
-   r.send(obj) --*--[incoming queue]     Ractor.yield(obj) --*-- r.take
+   r.send(obj) ->*->[incoming queue]     Ractor.yield(obj) ->*-> r.take
                  |                |                          |
                  |                v                          |
                  |           Ractor.recv                     |
@@ -696,7 +696,7 @@ p Ractor.recv #=> "r0r10r9r8r7r6r5r4r3r2r1"
 ```
 
 ```ruby
-# ring example again
+# ring example with an error
 
 r = Ractor.current
 rs = (1..10).map{|i|
@@ -759,6 +759,7 @@ rescue Ractor::RemoteError
 end
 
 #=> <internal:ractor>:100:in `send': The incoming-port is already closed (Ractor::ClosedError)
+# because r == r[-1] is terminated.
 ```
 
 ```ruby
