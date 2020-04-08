@@ -321,7 +321,7 @@ end
 
 ## コピーによるオブジェクトの転送
 
-* `Ractor::send(obj)` は、`obj` が共有不可能オブジェクトであれば、(deep) コピーする
+* `Ractor#send(obj)` および `Ractor.yield(obj)` は、`obj` が共有不可能オブジェクトであれば、(deep) コピーする
 
 ```ruby
   obj = 'str'.dup
@@ -350,18 +350,18 @@ end
 
 ## move によるオブジェクトの転送
 
-* `Ractor::send(obj, move: true)`は、`obj`が共有不可能オブジェクトであれば、move する
+* `Ractor#send(obj, move: true)` および `Ractor.yield(obj, move: true)` は、`obj`が共有不可能オブジェクトであれば、move する
 * move されたオブジェクトは、送信元 Ractor で参照しようとすると(例えば、メソッド呼び出し）、エラーになる
 
 ```ruby
-  # move
+  # move with Ractor#send
   r = Ractor.new do
     obj = Ractor.recv
     obj << ' world'
   end
 
   str = 'hello'
-  r.move str
+  r.send str, move: true
   modified = r.take #=> 'hello world'
 
   begin
@@ -371,6 +371,22 @@ end
     modified #=> 'hello world'
   else
     raise 'unreachable'
+  end
+```
+
+```ruby
+  # move with Ractor.yield
+  r = Ractor.new do
+    obj = 'hello'
+    Ractor.yield obj, move: true
+    obj << 'world'
+  end
+
+  str = r.take
+  begin
+    r.take 
+  rescue Ractor::RemoteError
+    p str #=> "hello"
   end
 ```
 
