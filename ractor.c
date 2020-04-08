@@ -493,8 +493,8 @@ ractor_copy_setup(struct rb_ractor_basket *b, VALUE obj)
             
         }
 #endif
-        b->type = basket_type_copy_marshal;
         b->v = rb_marshal_dump(obj, Qnil);
+        b->type = basket_type_copy_marshal;
     }
 }
 
@@ -1163,17 +1163,22 @@ ractor_create(rb_execution_context_t *ec, VALUE self,
 static void
 ractor_atexit_yield(rb_execution_context_t *ec, rb_ractor_t *cr, VALUE v, bool exc)
 {
+    ASSERT_ractor_unlocking(cr);
+
     if (ractor_try_yield(ec, cr, v, false, exc)) {
         return; // OK
     }
+
+    VM_ASSERT(cr->wait.status == wait_none);
+    VM_ASSERT(cr->wait.wakeup_status == wakeup_none);
+    VM_ASSERT(cr->wait.yielded_basket.type == basket_type_none);
+    ractor_basket_setup(ec, &cr->wait.yielded_basket, v, false);
 
     ractor_lock(cr);
     {
         VM_ASSERT(cr->wait.status == wait_none);
         VM_ASSERT(cr->wait.wakeup_status == wakeup_none);
         cr->wait.status = wait_yielding;
-
-        ractor_basket_setup(ec, &cr->wait.yielded_basket, v, false);
         if (exc) {
             cr->wait.yielded_basket.type = basket_type_exception; // TODO opt
         }
