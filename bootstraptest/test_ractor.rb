@@ -307,6 +307,23 @@ assert_equal '[0, 1]', %q{
   end
 }
 
+# move with yield
+assert_equal 'hello', %q{
+  r = Ractor.new do
+    Thread.current.report_on_exception = false
+    obj = 'hello'
+    Ractor.yield obj, move: true
+    obj << 'world'
+  end
+
+  str = r.take
+  begin
+    r.take 
+  rescue Ractor::RemoteError
+    str #=> "hello"
+  end
+}
+
 # Access to global-variables are prohibitted
 assert_equal 'can not access global variables from non-main Ractors', %q{
   $gv = 1

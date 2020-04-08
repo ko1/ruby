@@ -40,14 +40,20 @@ rb_ractor_shareable_p(VALUE obj)
 
 #if RACTOR_CHECK_MODE > 0
 
-uint32_t rb_ractor_id(const rb_ractor_t *g);
+uint32_t rb_ractor_id(const rb_ractor_t *r);
 uint32_t rb_ractor_current_id(void);
+
+static inline void
+rb_ractor_setup_belonging_to(VALUE obj, uint32_t rid)
+{
+    VALUE flags = RBASIC(obj)->flags & 0xffffffff; // 4B
+    RBASIC(obj)->flags = flags | ((VALUE)rid << 32);
+}
 
 static inline void
 rb_ractor_setup_belonging(VALUE obj)
 {
-    VALUE flags = RBASIC(obj)->flags & 0xffffffff; // 4B
-    RBASIC(obj)->flags = flags | ((VALUE)rb_ractor_current_id() << 32);
+    rb_ractor_setup_belonging_to(obj, rb_ractor_current_id());
 }
 
 static inline uint32_t

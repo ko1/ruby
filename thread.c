@@ -913,6 +913,7 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         break;
 
       case thread_invoke_type_ractor_proc:
+        rb_ractor_setup_belonging_to(thval, rb_ractor_id(params->g));
         th->invoke_type = thread_invoke_type_ractor_proc;
         th->ractor = params->g;
         th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
