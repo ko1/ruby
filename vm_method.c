@@ -1422,12 +1422,6 @@ rb_undef(VALUE klass, ID id)
     CALL_METHOD_HOOK(klass, undefined, id);
 }
 
-void
-rb_undef_all(VALUE klass)
-{
-    
-}
-
 /*
  *  call-seq:
  *     undef_method(symbol)    -> self

@@ -80,6 +80,7 @@ static const char* rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th);
 
 #define mutex_mark ((void(*)(void*))0)
 
+#if 0 // TODO: temporary unused
 static size_t
 rb_mutex_num_waiting(rb_mutex_t *mutex)
 {
@@ -92,6 +93,7 @@ rb_mutex_num_waiting(rb_mutex_t *mutex)
 
     return n;
 }
+#endif
 
 static void
 mutex_free(void *ptr)
@@ -264,13 +266,13 @@ do_mutex_lock(VALUE self, int interruptible_p)
 
 	    th->status = THREAD_STOPPED_FOREVER;
 	    th->locking_mutex = self;
-	    th->vm->sleeper++;
+            rb_ractor_sleeper_threads_inc(th->ractor);
 	    /*
 	     * Carefully! while some contended threads are in native_sleep(),
-	     * vm->sleeper is unstable value. we have to avoid both deadlock
+	     * ractor->sleeper is unstable value. we have to avoid both deadlock
 	     * and busy loop.
 	     */
-	    if ((vm_living_thread_num(th->vm) == th->vm->sleeper) &&
+	    if ((rb_ractor_living_thread_num(th->ractor) == rb_ractor_sleeper_thread_num(th->ractor)) &&
 		!patrol_thread) {
 		timeout = &rel;
 		patrol_thread = th;
@@ -294,12 +296,13 @@ do_mutex_lock(VALUE self, int interruptible_p)
 	    if (th->status == THREAD_STOPPED_FOREVER) {
 		th->status = prev_status;
 	    }
-	    th->vm->sleeper--;
+            rb_ractor_sleeper_threads_dec(th->ractor);
 
             if (interruptible_p) {
                 /* release mutex before checking for interrupts...as interrupt checking
                  * code might call rb_raise() */
                 if (mutex->th == th) mutex->th = 0;
+
                 RUBY_VM_CHECK_INTS_BLOCKING(th->ec); /* may release mutex */
                 if (!mutex->th) {
                     mutex->th = th;

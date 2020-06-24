@@ -696,7 +696,7 @@ timer_thread_func(void *dummy)
 	   WAIT_TIMEOUT) {
 	timer_thread_function();
 	ruby_sigchld_handler(vm); /* probably no-op */
-	rb_threadptr_check_signal(vm->main_thread);
+	rb_threadptr_check_signal(vm->ractor.main_thread);
     }
     thread_debug("timer killed\n");
     return 0;

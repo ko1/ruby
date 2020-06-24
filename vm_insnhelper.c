@@ -1639,26 +1639,30 @@ vm_search_cc(VALUE klass, const struct rb_callinfo *ci)
 MJIT_FUNC_EXPORTED void
 rb_vm_search_method_slowpath(VALUE cd_owner, struct rb_call_data *cd, VALUE klass)
 {
-    const struct rb_callcache *cc = vm_search_cc(klass, cd->ci);
+    RB_VM_LOCK_ENTER();
+    {
+        const struct rb_callcache *cc = vm_search_cc(klass, cd->ci);
 
-    VM_ASSERT(cc);
-    VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
+        VM_ASSERT(cc);
+        VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
 
-    if (! cd_owner) {
-        cd->cc = cc;
-    }
-    else if (cc == &vm_empty_cc) {
-        cd->cc = cc;
-    }
-    else {
-        VM_ASSERT(vm_cc_markable(cc));
-        RB_OBJ_WRITE(cd_owner, &cd->cc, cc);
-    }
+        if (! cd_owner) {
+            cd->cc = cc;
+        }
+        else if (cc == &vm_empty_cc) {
+            cd->cc = cc;
+        }
+        else {
+            VM_ASSERT(vm_cc_markable(cc));
+            RB_OBJ_WRITE(cd_owner, &cd->cc, cc);
+        }
 
-    VM_ASSERT(cc == vm_cc_empty() || cc->klass == klass);
-    VM_ASSERT(cc == vm_cc_empty() || callable_method_entry_p(vm_cc_cme(cc)));
-    VM_ASSERT(cc == vm_cc_empty() || !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cc)));
-    VM_ASSERT(cc == vm_cc_empty() || vm_cc_cme(cc)->called_id == vm_ci_mid(cd->ci));
+        VM_ASSERT(cc == vm_cc_empty() || cc->klass == klass);
+        VM_ASSERT(cc == vm_cc_empty() || callable_method_entry_p(vm_cc_cme(cc)));
+        VM_ASSERT(cc == vm_cc_empty() || !METHOD_ENTRY_INVALIDATED(vm_cc_cme(cc)));
+        VM_ASSERT(cc == vm_cc_empty() || vm_cc_cme(cc)->called_id == vm_ci_mid(cd->ci));
+    }
+    RB_VM_LOCK_LEAVE();
 }
 #endif
 

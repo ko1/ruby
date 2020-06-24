@@ -93,6 +93,8 @@
 #include "timev.h"
 #include "vm_core.h"
 #include "ractor.h"
+#include "vm_debug.h"
+#include "vm_sync.h"
 
 #ifndef USE_NATIVE_THREAD_PRIORITY
 #define USE_NATIVE_THREAD_PRIORITY 0
@@ -168,20 +170,12 @@ static inline int blocking_region_begin(rb_thread_t *th, struct rb_blocking_regi
 					rb_unblock_function_t *ubf, void *arg, int fail_if_interrupted);
 static inline void blocking_region_end(rb_thread_t *th, struct rb_blocking_region_buffer *region);
 
-#define RB_GC_SAVE_MACHINE_CONTEXT(th)				\
-    do {							\
-	FLUSH_REGISTER_WINDOWS;					\
-	setjmp((th)->ec->machine.regs);				\
-	SET_MACHINE_STACK_END(&(th)->ec->machine.stack_end);	\
-    } while (0)
-
 #define GVL_UNLOCK_BEGIN(th) do { \
   RB_GC_SAVE_MACHINE_CONTEXT(th); \
-  gvl_release(th->vm);
+  gvl_release(rb_ractor_gvl(th->ractor));
 
 #define GVL_UNLOCK_END(th) \
-  gvl_acquire(th->vm, th); \
-  rb_thread_set_current(th); \
+  gvl_acquire(rb_ractor_gvl(th->ractor), th); \
 } while(0)
 
 #ifdef __GNUC__
@@ -221,12 +215,6 @@ vm_check_ints_blocking(rb_execution_context_t *ec)
 	RUBY_VM_SET_INTERRUPT(ec);
     }
     return rb_threadptr_execute_interrupts(th, 1);
-}
-
-static int
-vm_living_thread_num(const rb_vm_t *vm)
-{
-    return vm->living_thread_num;
 }
 
 /*
@@ -346,7 +334,7 @@ rb_thread_s_debug_set(VALUE self, VALUE val)
 #endif
 
 NOINLINE(static int thread_start_func_2(rb_thread_t *th, VALUE *stack_start));
-static void timer_thread_function(void);
+static void timer_thread_function(rb_global_vm_lock_t *gvl);
 void ruby_sigchld_handler(rb_vm_t *); /* signal.c */
 
 static void
@@ -426,11 +414,13 @@ rb_thread_debug(
 #include "thread_sync.c"
 
 void
-rb_vm_gvl_destroy(rb_vm_t *vm)
+rb_vm_gvl_destroy(rb_global_vm_lock_t *gvl)
 {
-    gvl_release(vm);
-    gvl_destroy(vm);
+    gvl_release(gvl);
+    gvl_destroy(gvl);
+
     if (0) {
+        rb_vm_t *vm = GET_VM();
         /* may be held by running threads */
         rb_native_mutex_destroy(&vm->waitpid_lock);
         rb_native_mutex_destroy(&vm->workqueue_lock);
@@ -527,12 +517,12 @@ threadptr_trap_interrupt(rb_thread_t *th)
 }
 
 static void
-terminate_all(rb_vm_t *vm, const rb_thread_t *main_thread)
+terminate_all(rb_ractor_t *r, const rb_thread_t *main_thread)
 {
     rb_thread_t *th = 0;
 
-    list_for_each(&vm->living_threads, th, vmlt_node) {
-	if (th != main_thread) {
+    list_for_each(&r->threads.set, th, lt_node) {
+        if (th != main_thread) {
 	    thread_debug("terminate_all: begin (thid: %"PRI_THREAD_ID", status: %s)\n",
 			 thread_id_str(th), thread_status_name(th, TRUE));
 	    rb_threadptr_pending_interrupt_enque(th, eTerminateSignal);
@@ -568,12 +558,12 @@ rb_thread_terminate_all(void)
 {
     rb_thread_t *volatile th = GET_THREAD(); /* main thread */
     rb_execution_context_t * volatile ec = th->ec;
-    rb_vm_t *volatile vm = th->vm;
+    rb_ractor_t *r = th->ractor;
     volatile int sleeping = 0;
 
-    if (vm->main_thread != th) {
-	rb_bug("rb_thread_terminate_all: called by child thread (%p, %p)",
-	       (void *)vm->main_thread, (void *)th);
+    if (r->threads.main != th) {
+        rb_bug("rb_thread_terminate_all: called by child thread (%p, %p)",
+               (void *)r->threads.main, (void *)th);
     }
 
     /* unlock all locking mutexes */
@@ -583,11 +573,11 @@ rb_thread_terminate_all(void)
     if (EC_EXEC_TAG() == TAG_NONE) {
       retry:
 	thread_debug("rb_thread_terminate_all (main thread: %p)\n", (void *)th);
-	terminate_all(vm, th);
+	terminate_all(th->ractor, th);
 
-	while (vm_living_thread_num(vm) > 1) {
+	while (rb_ractor_living_thread_num(th->ractor) > 1) {
             rb_hrtime_t rel = RB_HRTIME_PER_SEC;
-	    /*
+	    /*q
 	     * Thread exiting routine in thread_start_func_2 notify
 	     * me when the last sub-thread exit.
 	     */
@@ -764,12 +754,12 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     STACK_GROW_DIR_DETECTION;
     enum ruby_tag_type state;
     rb_thread_list_t *join_list;
-    rb_thread_t *main_th;
     VALUE errinfo = Qnil;
     size_t size = th->vm->default_params.thread_vm_stack_size / sizeof(VALUE);
+    rb_thread_t *ractor_main_th = th->ractor->threads.main;
     VALUE * vm_stack = NULL;
 
-    if (th == th->vm->main_thread) {
+    if (th == th->vm->ractor.main_thread) {
         rb_bug("thread_start_func_2 must not be used for main thread");
     }
 
@@ -779,17 +769,26 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     vm_stack = alloca(size * sizeof(VALUE));
     VM_ASSERT(vm_stack);
 
-    gvl_acquire(th->vm, th);
+    gvl_acquire(rb_ractor_gvl(th->ractor), th);
 
     rb_ec_initialize_vm_stack(th->ec, vm_stack, size);
     th->ec->machine.stack_start = STACK_DIR_UPPER(vm_stack + size, vm_stack);
     th->ec->machine.stack_maxsize -= size * sizeof(VALUE);
-
     ruby_thread_set_native(th);
+    rb_thread_set_current(th);
+
+    if (th->invoke_type == thread_invoke_type_ractor_proc) {
+        RB_VM_LOCK();
+        {
+            // unblock
+            rb_vm_ractor_blocking_cnt_dec(GET_VM(), __FILE__, __LINE__);
+            th->ractor->threads.blocking_cnt--;
+        }
+        RB_VM_UNLOCK();
+    }
 
     {
 	thread_debug("thread start (get lock): %p\n", (void *)th);
-	rb_thread_set_current(th);
 
 	EC_PUSH_TAG(th->ec);
 	if ((state = EC_EXEC_TAG()) == TAG_NONE) {
@@ -797,7 +796,8 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 	}
 	else {
 	    errinfo = th->ec->errinfo;
-	    if (state == TAG_FATAL) {
+
+            if (state == TAG_FATAL) {
 		/* fatal error within this thread, need to stop whole script */
 	    }
 	    else if (rb_obj_is_kind_of(errinfo, rb_eSystemExit)) {
@@ -807,7 +807,8 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
                 if (th->invoke_type == thread_invoke_type_ractor_proc) {
                     rb_ractor_atexit_exception(th->ec);
                 }
-		if (th->report_on_exception) {
+
+                if (th->report_on_exception) {
 		    VALUE mesg = rb_thread_to_s(th->self);
 		    rb_str_cat_cstr(mesg, " terminated with exception (report_on_exception is true):\n");
 		    rb_write_error_str(mesg);
@@ -824,16 +825,20 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 	    th->value = Qnil;
 	}
 
+        if (th->invoke_type == thread_invoke_type_ractor_proc) {
+            rb_ractor_teardown(th->ec);
+        }
+
 	th->status = THREAD_KILLED;
 	thread_debug("thread end: %p\n", (void *)th);
 
-	main_th = th->vm->main_thread;
-	if (main_th == th) {
+        if (th->vm->ractor.main_thread == th) {
 	    ruby_stop(0);
 	}
-	if (RB_TYPE_P(errinfo, T_OBJECT)) {
+
+        if (RB_TYPE_P(errinfo, T_OBJECT)) {
 	    /* treat with normal error object */
-	    rb_threadptr_raise(main_th, 1, &errinfo);
+	    rb_threadptr_raise(ractor_main_th, 1, &errinfo);
 	}
 	EC_POP_TAG();
 
@@ -846,10 +851,11 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 	}
 
 	/* delete self other than main thread from living_threads */
-	rb_vm_living_threads_remove(th->vm, th);
-	if (main_th->status == THREAD_KILLED && rb_thread_alone()) {
+	rb_ractor_living_threads_remove(th->ractor, th);
+
+        if (ractor_main_th->status == THREAD_KILLED && rb_thread_alone()) {
 	    /* I'm last thread. wake up main thread from rb_thread_terminate_all */
-	    rb_threadptr_interrupt(main_th);
+            rb_threadptr_interrupt(ractor_main_th);
 	}
 
 	/* wake up joining threads */
@@ -873,7 +879,7 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     thread_cleanup_func(th, FALSE);
     VM_ASSERT(th->ec->vm_stack == NULL);
 
-    gvl_release(th->vm);
+    gvl_release(rb_ractor_gvl(th->ractor));
 
     return 0;
 }
@@ -913,9 +919,12 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         break;
 
       case thread_invoke_type_ractor_proc:
+#if RACTOR_CHECK_MODE > 0
         rb_ractor_setup_belonging_to(thval, rb_ractor_id(params->g));
+#endif
         th->invoke_type = thread_invoke_type_ractor_proc;
         th->ractor = params->g;
+        th->ractor->threads.main = th;
         th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
         rb_ractor_send_parameters(ec, params->g, params->args);
         th->invoke_arg.proc.proc = rb_proc_isolate_bang(params->proc);
@@ -941,6 +950,7 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     RBASIC_CLEAR_CLASS(th->pending_interrupt_mask_stack);
 
     rb_native_mutex_initialize(&th->interrupt_lock);
+    rb_ractor_living_threads_insert(th->ractor, th, false);
 
     /* kick thread */
     err = native_thread_create(th);
@@ -948,7 +958,6 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
 	th->status = THREAD_KILLED;
 	rb_raise(rb_eThreadError, "can't create Thread: %s", strerror(err));
     }
-    rb_vm_living_threads_insert(th->vm, th);
     return thval;
 }
 
@@ -980,8 +989,9 @@ thread_s_new(int argc, VALUE *argv, VALUE klass)
     rb_thread_t *th;
     VALUE thread = rb_thread_alloc(klass);
 
-    if (GET_VM()->main_thread->status == THREAD_KILLED)
-	rb_raise(rb_eThreadError, "can't alloc thread");
+    if (GET_RACTOR()->threads.main->status == THREAD_KILLED) {
+        rb_raise(rb_eThreadError, "can't alloc thread");
+    }
 
     rb_obj_call_init_kw(thread, argc, argv, RB_PASS_CALLED_KEYWORDS);
     th = rb_thread_ptr(thread);
@@ -1118,10 +1128,10 @@ thread_join_sleep(VALUE arg)
     while (target_th->status != THREAD_KILLED) {
 	if (!p->limit) {
 	    th->status = THREAD_STOPPED_FOREVER;
-	    th->vm->sleeper++;
+            rb_ractor_sleeper_threads_inc(th->ractor);
 	    rb_check_deadlock(th->vm);
 	    native_sleep(th, 0);
-	    th->vm->sleeper--;
+            rb_ractor_sleeper_threads_dec(th->ractor);
 	}
 	else {
             if (hrtime_update_expire(p->limit, end)) {
@@ -1149,7 +1159,7 @@ thread_join(rb_thread_t *target_th, rb_hrtime_t *rel)
     if (th == target_th) {
 	rb_raise(rb_eThreadError, "Target thread must not be current thread");
     }
-    if (GET_VM()->main_thread == target_th) {
+    if (th->ractor->threads.main == target_th) {
 	rb_raise(rb_eThreadError, "Target thread must not be main thread");
     }
 
@@ -1365,12 +1375,12 @@ sleep_forever(rb_thread_t *th, unsigned int fl)
     RUBY_VM_CHECK_INTS_BLOCKING(th->ec);
     while (th->status == status) {
 	if (fl & SLEEP_DEADLOCKABLE) {
-	    th->vm->sleeper++;
+            rb_ractor_sleeper_threads_inc(th->ractor);
 	    rb_check_deadlock(th->vm);
 	}
 	native_sleep(th, 0);
 	if (fl & SLEEP_DEADLOCKABLE) {
-	    th->vm->sleeper--;
+            rb_ractor_sleeper_threads_dec(th->ractor);
 	}
 	woke = vm_check_ints_blocking(th->ec);
 	if (woke && !(fl & SLEEP_SPURIOUS_CHECK))
@@ -1516,7 +1526,7 @@ rb_thread_schedule_limits(uint32_t limits_us)
 	if (th->running_time_us >= limits_us) {
 	    thread_debug("rb_thread_schedule/switch start\n");
 	    RB_GC_SAVE_MACHINE_CONTEXT(th);
-	    gvl_yield(th->vm, th);
+	    gvl_yield(rb_ractor_gvl(th->ractor), th);
 	    rb_thread_set_current(th);
 	    thread_debug("rb_thread_schedule/switch done\n");
 	}
@@ -1540,9 +1550,10 @@ blocking_region_begin(rb_thread_t *th, struct rb_blocking_region_buffer *region,
     if (unblock_function_set(th, ubf, arg, fail_if_interrupted)) {
 	th->blocking_region_buffer = region;
 	th->status = THREAD_STOPPED;
+        rb_ractor_blocking_threads_inc(th->ractor, __FILE__, __LINE__);
 	thread_debug("enter blocking region (%p)\n", (void *)th);
 	RB_GC_SAVE_MACHINE_CONTEXT(th);
-	gvl_release(th->vm);
+	gvl_release(rb_ractor_gvl(th->ractor));
 	return TRUE;
     }
     else {
@@ -1558,10 +1569,11 @@ blocking_region_end(rb_thread_t *th, struct rb_blocking_region_buffer *region)
     /* entry to ubf_list impossible at this point, so unregister is safe: */
     unregister_ubf_list(th);
 
-    gvl_acquire(th->vm, th);
-    rb_thread_set_current(th);
+    gvl_acquire(rb_ractor_gvl(th->ractor), th);
+
     thread_debug("leave blocking region (%p)\n", (void *)th);
     th->blocking_region_buffer = 0;
+    rb_ractor_blocking_threads_dec(th->ractor, __FILE__, __LINE__);
     if (th->status == THREAD_STOPPED) {
 	th->status = region->prev_status;
     }
@@ -1583,7 +1595,7 @@ rb_nogvl(void *(*func)(void *), void *data1,
 	ubf = ubf_select;
 	data2 = th;
     }
-    else if (ubf && vm_living_thread_num(th->vm) == 1) {
+    else if (ubf && rb_ractor_living_thread_num(th->ractor) == 1) {
         if (flags & RB_NOGVL_UBF_ASYNC_SAFE) {
             th->vm->ubf_async_safe = 1;
         }
@@ -2332,18 +2344,25 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
 	int timer_interrupt;
 	int pending_interrupt;
 	int trap_interrupt;
+        int terminate_interrupt;
 
 	timer_interrupt = interrupt & TIMER_INTERRUPT_MASK;
 	pending_interrupt = interrupt & PENDING_INTERRUPT_MASK;
 	postponed_job_interrupt = interrupt & POSTPONED_JOB_INTERRUPT_MASK;
 	trap_interrupt = interrupt & TRAP_INTERRUPT_MASK;
+        terminate_interrupt = interrupt & TERMINATE_INTERRUPT_MASK; // request from other ractors
+
+        if (interrupt & VM_BARRIER_INTERRUPT_MASK) {
+            RB_VM_LOCK_ENTER();
+            RB_VM_LOCK_LEAVE();
+        }
 
 	if (postponed_job_interrupt) {
 	    rb_postponed_job_flush(th->vm);
 	}
 
 	/* signal handling */
-	if (trap_interrupt && (th == th->vm->main_thread)) {
+	if (trap_interrupt && (th == th->vm->ractor.main_thread)) {
 	    enum rb_thread_status prev_status = th->status;
 	    int sigwait_fd = rb_sigwait_fd_get(th);
 
@@ -2372,7 +2391,7 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
 	    else if (err == eKillSignal        /* Thread#kill received */   ||
 		     err == eTerminateSignal   /* Terminate thread */       ||
 		     err == INT2FIX(TAG_FATAL) /* Thread.exit etc. */         ) {
-		rb_threadptr_to_kill(th);
+                terminate_interrupt = 1;
 	    }
 	    else {
 		if (err == th->vm->special_exceptions[ruby_error_stream_closed]) {
@@ -2387,7 +2406,11 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
 	    }
 	}
 
-	if (timer_interrupt) {
+        if (terminate_interrupt) {
+            rb_threadptr_to_kill(th);
+        }
+
+        if (timer_interrupt) {
 	    uint32_t limits_us = TIME_QUANTUM_USEC;
 
 	    if (th->priority > 0)
@@ -2455,7 +2478,7 @@ rb_threadptr_signal_raise(rb_thread_t *th, int sig)
 
     argv[0] = rb_eSignal;
     argv[1] = INT2FIX(sig);
-    rb_threadptr_raise(th->vm->main_thread, 2, argv);
+    rb_threadptr_raise(th->vm->ractor.main_thread, 2, argv);
 }
 
 void
@@ -2465,7 +2488,9 @@ rb_threadptr_signal_exit(rb_thread_t *th)
 
     argv[0] = rb_eSystemExit;
     argv[1] = rb_str_new2("exit");
-    rb_threadptr_raise(th->vm->main_thread, 2, argv);
+
+    // TODO: check signal raise deliverly
+    rb_threadptr_raise(th->vm->ractor.main_thread, 2, argv);
 }
 
 int
@@ -2578,7 +2603,7 @@ rb_thread_kill(VALUE thread)
     if (th->to_kill || th->status == THREAD_KILLED) {
 	return thread;
     }
-    if (th == th->vm->main_thread) {
+    if (th == th->vm->ractor.main_thread) {
 	rb_exit(EXIT_SUCCESS);
     }
 
@@ -2757,21 +2782,8 @@ thread_stop(VALUE _)
 VALUE
 rb_thread_list(void)
 {
-    VALUE ary = rb_ary_new();
-    rb_vm_t *vm = GET_THREAD()->vm;
-    rb_thread_t *th = 0;
-
-    list_for_each(&vm->living_threads, th, vmlt_node) {
-        switch (th->status) {
-          case THREAD_RUNNABLE:
-          case THREAD_STOPPED:
-          case THREAD_STOPPED_FOREVER:
-            rb_ary_push(ary, th->self);
-          default:
-            break;
-        }
-    }
-    return ary;
+    // TODO
+    return rb_ractor_thread_list(GET_RACTOR());
 }
 
 /*
@@ -2824,7 +2836,7 @@ thread_s_current(VALUE klass)
 VALUE
 rb_thread_main(void)
 {
-    return GET_THREAD()->vm->main_thread->self;
+    return GET_RACTOR()->threads.main->self;
 }
 
 /*
@@ -3620,7 +3632,8 @@ thread_keys_i(ID key, VALUE value, void *ary)
 int
 rb_thread_alone(void)
 {
-    return vm_living_thread_num(GET_VM()) == 1;
+    // TODO
+    return rb_ractor_living_thread_num(GET_RACTOR()) == 1;
 }
 
 /*
@@ -4534,14 +4547,13 @@ rb_threadptr_check_signal(rb_thread_t *mth)
 }
 
 static void
-timer_thread_function(void)
+timer_thread_function(rb_global_vm_lock_t *gvl)
 {
-    volatile rb_execution_context_t *ec;
-
-    /* for time slice */
-    ec = ACCESS_ONCE(rb_execution_context_t *,
-                     ruby_current_execution_context_ptr);
-    if (ec) RUBY_VM_SET_TIMER_INTERRUPT(ec);
+    // strictly speaking, accessing gvl->owner is not thread-safe
+    volatile const rb_thread_t *owner = gvl->owner;
+    if (owner) {
+        RUBY_VM_SET_TIMER_INTERRUPT(owner->ec);
+    }
 }
 
 static void
@@ -4612,11 +4624,13 @@ check_signals_nogvl(rb_thread_t *th, int sigwait_fd)
     ubf_wakeup_all_threads();
     ruby_sigchld_handler(vm);
     if (rb_signal_buff_size()) {
-        if (th == vm->main_thread)
+        if (th == vm->ractor.main_thread) {
             /* no need to lock + wakeup if already in main thread */
             RUBY_VM_SET_TRAP_INTERRUPT(th->ec);
-        else
-            threadptr_trap_interrupt(vm->main_thread);
+        }
+        else {
+            threadptr_trap_interrupt(vm->ractor.main_thread);
+        }
         ret = TRUE; /* for SIGCHLD_LOSSY && rb_sigwait_sleep */
     }
     return ret;
@@ -4687,17 +4701,22 @@ static void
 rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const rb_thread_t *))
 {
     rb_thread_t *i = 0;
+    rb_ractor_t *r;
     rb_vm_t *vm = th->vm;
-    vm->main_thread = th;
+    vm->ractor.main_ractor = th->ractor;
+    vm->ractor.main_thread = th;
 
-    gvl_atfork(th->vm);
+    gvl_atfork(rb_ractor_gvl(th->ractor));
     ubf_list_atfork();
 
-    list_for_each(&vm->living_threads, i, vmlt_node) {
-	atfork(i, th);
+    // OK. Only this thread accesses:
+    list_for_each(&vm->ractor.set, r, vmlr_node) {
+        list_for_each(&r->threads.set, i, lt_node) {
+            atfork(i, th);
+        }
     }
-    rb_vm_living_threads_init(vm);
-    rb_vm_living_threads_insert(vm, th);
+    rb_ractor_living_threads_init(th->ractor);
+    rb_ractor_living_threads_insert(th->ractor, th, true);
 
     /* may be held by MJIT threads in parent */
     rb_native_mutex_initialize(&vm->waitpid_lock);
@@ -4707,8 +4726,7 @@ rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const r
     rb_native_mutex_initialize(&th->interrupt_lock);
 
     vm->fork_gen++;
-
-    vm->sleeper = 0;
+    rb_ractor_sleeper_threads_clear(th->ractor);
     rb_clear_coverages();
 }
 
@@ -4826,14 +4844,15 @@ static VALUE
 thgroup_list(VALUE group)
 {
     VALUE ary = rb_ary_new();
-    rb_vm_t *vm = GET_THREAD()->vm;
+#if 0
     rb_thread_t *th = 0;
-
-    list_for_each(&vm->living_threads, th, vmlt_node) {
-	if (th->thgroup == group) {
+    // TODO: ractor::living_threads should be protected.
+    list_for_each(&th->ractor->living_threads, th, lt_node) {
+        if (th->thgroup == group) {
 	    rb_ary_push(ary, th->self);
 	}
     }
+#endif
     return ary;
 }
 
@@ -5460,7 +5479,7 @@ Init_Thread(void)
     rb_define_method(cThGroup, "add", thgroup_add, 1);
 
     {
-	th->thgroup = th->vm->thgroup_default = rb_obj_alloc(cThGroup);
+        th->thgroup = th->ractor->thgroup_default = rb_obj_alloc(cThGroup);
 	rb_define_const(cThGroup, "Default", th->thgroup);
     }
 
@@ -5472,8 +5491,8 @@ Init_Thread(void)
 	/* main thread setting */
 	{
 	    /* acquire global vm lock */
-	    gvl_init(th->vm);
-	    gvl_acquire(th->vm, th);
+            rb_global_vm_lock_t *gvl = rb_ractor_gvl(th->ractor);
+	    gvl_acquire(gvl, th);
             rb_native_mutex_initialize(&th->vm->waitpid_lock);
             rb_native_mutex_initialize(&th->vm->workqueue_lock);
             rb_native_mutex_initialize(&th->interrupt_lock);
@@ -5486,9 +5505,6 @@ Init_Thread(void)
 
     rb_thread_create_timer_thread();
 
-    /* suppress warnings on cygwin, mingw and mswin.*/
-    (void)native_mutex_trylock;
-
     Init_thread_sync();
 }
 
@@ -5500,59 +5516,74 @@ ruby_native_thread_p(void)
     return th != 0;
 }
 
+#if 0 // TODO
 static void
 debug_deadlock_check(rb_vm_t *vm, VALUE msg)
 {
     rb_thread_t *th = 0;
+    rb_ractor_t *r = GET_RACTOR();
     VALUE sep = rb_str_new_cstr("\n   ");
 
     rb_str_catf(msg, "\n%d threads, %d sleeps current:%p main thread:%p\n",
-		vm_living_thread_num(vm), vm->sleeper, (void *)GET_THREAD(), (void *)vm->main_thread);
-    list_for_each(&vm->living_threads, th, vmlt_node) {
-	rb_str_catf(msg, "* %+"PRIsVALUE"\n   rb_thread_t:%p "
-		    "native:%"PRI_THREAD_ID" int:%u",
-		    th->self, (void *)th, thread_id_str(th), th->ec->interrupt_flag);
-	if (th->locking_mutex) {
-	    rb_mutex_t *mutex = mutex_ptr(th->locking_mutex);
-	    rb_str_catf(msg, " mutex:%p cond:%"PRIuSIZE,
-			(void *)mutex->th, rb_mutex_num_waiting(mutex));
-	}
-	{
-	    rb_thread_list_t *list = th->join_list;
-	    while (list) {
-		rb_str_catf(msg, "\n    depended by: tb_thread_id:%p", (void *)list->th);
-		list = list->next;
-	    }
-	}
-	rb_str_catf(msg, "\n   ");
-	rb_str_concat(msg, rb_ary_join(rb_ec_backtrace_str_ary(th->ec, 0, 0), sep));
-	rb_str_catf(msg, "\n");
+		rb_ractor_living_thread_num(r), rb_ractor_sleeper_thread_num(r),
+                (void *)GET_THREAD(), (void *)vm->main_thread);
+
+    RB_VM_LOCK();
+    list_for_each(&vm->living_ractors, r, vmlr_node) {
+        list_for_each(&r->threads.set, th, lt_node) {
+            rb_str_catf(msg, "* %+"PRIsVALUE"\n   rb_thread_t:%p "
+                        "native:%"PRI_THREAD_ID" int:%u",
+                        th->self, (void *)th, thread_id_str(th), th->ec->interrupt_flag);
+            if (th->locking_mutex) {
+                rb_mutex_t *mutex = mutex_ptr(th->locking_mutex);
+                rb_str_catf(msg, " mutex:%p cond:%"PRIuSIZE,
+                            (void *)mutex->th, rb_mutex_num_waiting(mutex));
+            }
+            {
+                rb_thread_list_t *list = th->join_list;
+                while (list) {
+                    rb_str_catf(msg, "\n    depended by: tb_thread_id:%p", (void *)list->th);
+                    list = list->next;
+                }
+            }
+            rb_str_catf(msg, "\n   ");
+            rb_str_concat(msg, rb_ary_join(rb_ec_backtrace_str_ary(th->ec, 0, 0), sep));
+            rb_str_catf(msg, "\n");
+        }
     }
+    RB_VM_UNLOCK();
 }
+#endif
 
 static void
 rb_check_deadlock(rb_vm_t *vm)
 {
+    return; // TODO: deadlock detection algorithm
+
+#if 0 // TODO
     int found = 0;
     rb_thread_t *th = 0;
+    rb_ractor_t *r = GET_RACTOR();
+    int sleeper_num = rb_ractor_sleeper_thread_num(r);
+    int ltnum = rb_ractor_living_thread_num(r);
 
-    if (vm_living_thread_num(vm) > vm->sleeper) return;
-    if (vm_living_thread_num(vm) < vm->sleeper) rb_bug("sleeper must not be more than vm_living_thread_num(vm)");
+    if (ltnum > sleeper_num) return;
+    if (ltnum < sleeper_num) rb_bug("sleeper must not be more than vm_living_thread_num(vm)");
     if (patrol_thread && patrol_thread != GET_THREAD()) return;
 
-    list_for_each(&vm->living_threads, th, vmlt_node) {
-	if (th->status != THREAD_STOPPED_FOREVER || RUBY_VM_INTERRUPTED(th->ec)) {
-	    found = 1;
-	}
-	else if (th->locking_mutex) {
-	    rb_mutex_t *mutex = mutex_ptr(th->locking_mutex);
+    list_for_each(&r->threads.set, th, lt_node) {
+        if (th->status != THREAD_STOPPED_FOREVER || RUBY_VM_INTERRUPTED(th->ec)) {
+            found = 1;
+        }
+        else if (th->locking_mutex) {
+            rb_mutex_t *mutex = mutex_ptr(th->locking_mutex);
 
-	    if (mutex->th == th || (!mutex->th && !list_empty(&mutex->waitq))) {
-		found = 1;
-	    }
-	}
-	if (found)
-	    break;
+            if (mutex->th == th || (!mutex->th && !list_empty(&mutex->waitq))) {
+                found = 1;
+            }
+        }
+        if (found)
+          break;
     }
 
     if (!found) {
@@ -5560,9 +5591,10 @@ rb_check_deadlock(rb_vm_t *vm)
 	argv[0] = rb_eFatal;
 	argv[1] = rb_str_new2("No live threads left. Deadlock?");
 	debug_deadlock_check(vm, argv[1]);
-	vm->sleeper--;
+        rb_ractor_sleeper_threads_dec(GET_RACTOR());
 	rb_threadptr_raise(vm->main_thread, 2, argv);
     }
+#endif
 }
 
 static void

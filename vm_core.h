@@ -557,13 +557,30 @@ typedef const struct rb_builtin_function *RB_BUILTIN;
 typedef struct rb_vm_struct {
     VALUE self;
 
-    rb_global_vm_lock_t gvl;
+    struct {
+        struct list_head set;
+        unsigned int cnt;
+        unsigned int blocking_cnt;
 
-    struct rb_thread_struct *main_thread;
-    struct rb_ractor_struct *main_ractor;
+        struct rb_ractor_struct *main_ractor;
+        struct rb_thread_struct *main_thread; // == vm->ractor.main_ractor->threads.main
 
-    /* persists across uncontended GVL release/acquire for time slice */
-    const struct rb_thread_struct *running_thread;
+        struct {
+            // monitor
+            rb_nativethread_lock_t lock;
+            struct rb_ractor_struct *lock_owner;
+            unsigned int lock_rec;
+
+            // barrier
+            bool barrier_waiting;
+            unsigned int barrier_cnt;
+            rb_nativethread_cond_t barrier_cond;
+
+            // join at exit
+            rb_nativethread_cond_t terminate_cond;
+            bool terminate_waiting;
+        } sync;
+    } ractor;
 
 #ifdef USE_SIGALTSTACK
     void *main_altstack;
@@ -574,9 +591,6 @@ typedef struct rb_vm_struct {
     struct list_head waiting_pids; /* PID > 0: <=> struct waitpid_state */
     struct list_head waiting_grps; /* PID <= 0: <=> struct waitpid_state */
     struct list_head waiting_fds; /* <=> struct waiting_fd */
-    struct list_head living_threads;
-    VALUE thgroup_default;
-    int living_thread_num;
 
     /* set in single-threaded processes only: */
     volatile int ubf_async_safe;
@@ -584,9 +598,7 @@ typedef struct rb_vm_struct {
     unsigned int running: 1;
     unsigned int thread_abort_on_exception: 1;
     unsigned int thread_report_on_exception: 1;
-
     unsigned int safe_level_: 1;
-    int sleeper;
 
     /* object management */
     VALUE mark_object_ary;
@@ -897,7 +909,7 @@ void rb_ec_clear_vm_stack(rb_execution_context_t *ec);
 typedef struct rb_ractor_struct rb_ractor_t;
 
 typedef struct rb_thread_struct {
-    struct list_node vmlt_node;
+    struct list_node lt_node; // managed by a ractor
     VALUE self;
     rb_ractor_t *ractor;
     rb_vm_t *vm;
@@ -1640,10 +1652,11 @@ VALUE rb_vm_env_local_variables(const rb_env_t *env);
 const rb_env_t *rb_vm_env_prev_env(const rb_env_t *env);
 const VALUE *rb_binding_add_dynavars(VALUE bindval, rb_binding_t *bind, int dyncount, const ID *dynvars);
 void rb_vm_inc_const_missing_count(void);
-void rb_vm_gvl_destroy(rb_vm_t *vm);
 VALUE rb_vm_call_kw(rb_execution_context_t *ec, VALUE recv, VALUE id, int argc,
                  const VALUE *argv, const rb_callable_method_entry_t *me, int kw_splat);
 MJIT_STATIC void rb_vm_pop_frame(rb_execution_context_t *ec);
+
+void rb_gvl_destroy(rb_global_vm_lock_t *gvl);
 
 void rb_thread_start_timer_thread(void);
 void rb_thread_stop_timer_thread(void);
@@ -1657,22 +1670,7 @@ rb_vm_living_threads_init(rb_vm_t *vm)
     list_head_init(&vm->waiting_pids);
     list_head_init(&vm->workqueue);
     list_head_init(&vm->waiting_grps);
-    list_head_init(&vm->living_threads);
-    vm->living_thread_num = 0;
-}
-
-static inline void
-rb_vm_living_threads_insert(rb_vm_t *vm, rb_thread_t *th)
-{
-    list_add_tail(&vm->living_threads, &th->vmlt_node);
-    vm->living_thread_num++;
-}
-
-static inline void
-rb_vm_living_threads_remove(rb_vm_t *vm, rb_thread_t *th)
-{
-    list_del(&th->vmlt_node);
-    vm->living_thread_num--;
+    list_head_init(&vm->ractor.set);
 }
 
 typedef int rb_backtrace_iter_func(void *, VALUE, int, VALUE);
@@ -1718,10 +1716,11 @@ VALUE rb_catch_protect(VALUE t, rb_block_call_func *func, VALUE data, enum ruby_
 RUBY_SYMBOL_EXPORT_BEGIN
 
 RUBY_EXTERN rb_vm_t *ruby_current_vm_ptr;
-RUBY_EXTERN rb_execution_context_t *ruby_current_execution_context_ptr;
 RUBY_EXTERN rb_event_flag_t ruby_vm_event_flags;
 RUBY_EXTERN rb_event_flag_t ruby_vm_event_enabled_global_flags;
 RUBY_EXTERN unsigned int    ruby_vm_event_local_num;
+
+RUBY_EXTERN pthread_key_t ruby_current_ec_key;
 
 RUBY_SYMBOL_EXPORT_END
 
@@ -1761,10 +1760,32 @@ rb_ec_vm_ptr(const rb_execution_context_t *ec)
     }
 }
 
+static inline void *
+getspecific(pthread_key_t *key)
+{
+    void *ptr = pthread_getspecific(*key);
+    if (UNLIKELY(ptr == NULL)) {
+        rb_bug("pthread_getspecific returns NULL");
+    }
+    return ptr;
+}
+
+static inline void
+setspecific(pthread_key_t *key, void *ptr)
+{
+    VM_ASSERT(ptr != NULL);
+    if (UNLIKELY(pthread_setspecific(*key, ptr) != 0)) {
+        rb_bug("pthread_setspecific error");
+    }
+}
+
 static inline rb_execution_context_t *
 rb_current_execution_context(void)
 {
-    return ruby_current_execution_context_ptr;
+    rb_execution_context_t *ec = getspecific(&ruby_current_ec_key);
+    VM_ASSERT(ec != NULL);
+    return ec;
+    // return ruby_current_execution_context_ptr;
 }
 
 static inline rb_thread_t *
@@ -1784,27 +1805,14 @@ rb_current_ractor(void)
 static inline rb_vm_t *
 rb_current_vm(void)
 {
-    VM_ASSERT(ruby_current_vm_ptr == NULL ||
-	      ruby_current_execution_context_ptr == NULL ||
-	      rb_ec_thread_ptr(GET_EC()) == NULL ||
-	      rb_ec_vm_ptr(GET_EC()) == ruby_current_vm_ptr);
     return ruby_current_vm_ptr;
 }
 
 static inline void
-rb_thread_set_current_raw(const rb_thread_t *th)
+rb_ec_set_current_raw(rb_execution_context_t *ec)
 {
-    ruby_current_execution_context_ptr = th->ec;
-}
-
-static inline void
-rb_thread_set_current(rb_thread_t *th)
-{
-    if (th->vm->running_thread != th) {
-        th->running_time_us = 0;
-    }
-    rb_thread_set_current_raw(th);
-    th->vm->running_thread = th;
+    setspecific(&ruby_current_ec_key, ec);
+    // ruby_current_execution_context_ptr = th->ec;
 }
 
 #else
@@ -1815,13 +1823,17 @@ enum {
     TIMER_INTERRUPT_MASK         = 0x01,
     PENDING_INTERRUPT_MASK       = 0x02,
     POSTPONED_JOB_INTERRUPT_MASK = 0x04,
-    TRAP_INTERRUPT_MASK	         = 0x08
+    TRAP_INTERRUPT_MASK	         = 0x08,
+    TERMINATE_INTERRUPT_MASK     = 0x10,
+    VM_BARRIER_INTERRUPT_MASK    = 0x20,
 };
 
 #define RUBY_VM_SET_TIMER_INTERRUPT(ec)		ATOMIC_OR((ec)->interrupt_flag, TIMER_INTERRUPT_MASK)
 #define RUBY_VM_SET_INTERRUPT(ec)		ATOMIC_OR((ec)->interrupt_flag, PENDING_INTERRUPT_MASK)
 #define RUBY_VM_SET_POSTPONED_JOB_INTERRUPT(ec)	ATOMIC_OR((ec)->interrupt_flag, POSTPONED_JOB_INTERRUPT_MASK)
 #define RUBY_VM_SET_TRAP_INTERRUPT(ec)		ATOMIC_OR((ec)->interrupt_flag, TRAP_INTERRUPT_MASK)
+#define RUBY_VM_SET_TERMINATE_INTERRUPT(ec)     ATOMIC_OR((ec)->interrupt_flag, TERMINATE_INTERRUPT_MASK)
+#define RUBY_VM_SET_VM_BARRIER_INTERRUPT(ec)    ATOMIC_OR((ec)->interrupt_flag, VM_BARRIER_INTERRUPT_MASK)
 #define RUBY_VM_INTERRUPTED(ec)			((ec)->interrupt_flag & ~(ec)->interrupt_mask & \
 						 (PENDING_INTERRUPT_MASK|TRAP_INTERRUPT_MASK))
 #define RUBY_VM_INTERRUPTED_ANY(ec)		((ec)->interrupt_flag & ~(ec)->interrupt_mask)

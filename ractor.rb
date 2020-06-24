@@ -46,6 +46,12 @@ class Ractor
     }
   end
 
+  def self.count
+    __builtin_cexpr! %q{
+      ULONG2NUM(GET_VM()->ractor.cnt);
+    }
+  end
+
   # Multiplex multiple Ractor communications.
   #
   # r, obj = Ractor.select(r1, r2)

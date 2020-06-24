@@ -1,23 +1,184 @@
 #include "ruby/ruby.h"
 #include "vm_core.h"
 #include "id_table.h"
+#include "vm_debug.h"
 
 #ifndef RACTOR_CHECK_MODE
-#define RACTOR_CHECK_MODE (1 || RUBY_DEBUG)
+#define RACTOR_CHECK_MODE (0 || VM_CHECK_MODE || RUBY_DEBUG)
 #endif
 
-rb_ractor_t *rb_ractor_main_alloc(void);
-void rb_ractor_main_setup(rb_ractor_t *main_ractor);
+enum rb_ractor_basket_type {
+    basket_type_none,
+    basket_type_shareable,
+    basket_type_copy_marshal,
+    basket_type_copy_custom,
+    basket_type_move,
+    basket_type_exception,
+};
 
+struct rb_ractor_basket {
+    enum rb_ractor_basket_type type;
+    VALUE v;
+    VALUE sender;
+};
+
+struct rb_ractor_queue {
+    struct rb_ractor_basket *baskets;
+    int cnt;
+    int size;
+};
+
+struct rb_ractor_waiting_list {
+    int cnt;
+    int size;
+    rb_ractor_t **ractors;
+};
+
+struct rb_ractor_struct {
+    rb_nativethread_lock_t lock;
+#if RACTOR_CHECK_MODE > 0
+    VALUE locked_by;
+#endif
+
+    struct rb_ractor_queue  incoming_queue;
+
+    bool incoming_port_closed;
+    bool outgoing_port_closed;
+
+    struct rb_ractor_waiting_list taking_ractors;
+
+    struct ractor_wait {
+        enum ractor_wait_status {
+            wait_none     = 0x00,
+            wait_recving  = 0x01,
+            wait_taking   = 0x02,
+            wait_yielding = 0x04,
+        } status;
+
+        enum ractor_wakeup_status {
+            wakeup_none,
+            wakeup_by_send,
+            wakeup_by_yield,
+            wakeup_by_take,
+            wakeup_by_close,
+            wakeup_by_interrupt,
+            wakeup_by_retry,
+        } wakeup_status;
+
+        struct rb_ractor_basket taken_basket;
+        struct rb_ractor_basket yielded_basket;
+
+        rb_nativethread_cond_t cond;
+    } wait;
+
+    rb_nativethread_cond_t barrier_wait_cond;
+
+    // thread management
+    struct {
+        struct list_head set;
+        unsigned int cnt;
+        unsigned int blocking_cnt;
+        unsigned int sleeper;
+        rb_global_vm_lock_t gvl;
+
+        rb_thread_t *running;
+        rb_thread_t *main;
+    } threads;
+    VALUE thgroup_default;
+
+    // identity
+    VALUE self;
+    uint32_t id;
+    VALUE name;
+    VALUE loc;
+
+    struct list_node vmlr_node;
+}; // rb_ractor_t is defined in vm_core.h
+
+rb_ractor_t *rb_ractor_main_alloc(void);
+void rb_ractor_main_setup(rb_ractor_t *main_ractor, rb_thread_t *main_thread);
+int rb_ractor_main_p(void);
 VALUE rb_ractor_self(const rb_ractor_t *g);
 void rb_ractor_atexit(rb_execution_context_t *ec, VALUE result);
 void rb_ractor_atexit_exception(rb_execution_context_t *ec);
+void rb_ractor_teardown(rb_execution_context_t *ec);
 void rb_ractor_recv_parameters(rb_execution_context_t *ec, rb_ractor_t *g, int len, VALUE *ptr);
 void rb_ractor_send_parameters(rb_execution_context_t *ec, rb_ractor_t *g, VALUE args);
 
-int rb_ractor_main_p(void);
 
 VALUE rb_thread_create_ractor(rb_ractor_t *g, VALUE args, VALUE proc); // defined in thread.c
+
+rb_global_vm_lock_t *rb_ractor_gvl(rb_ractor_t *);
+int rb_ractor_living_thread_num(const rb_ractor_t *);
+VALUE rb_ractor_thread_list(rb_ractor_t *r);
+
+void rb_ractor_living_threads_init(rb_ractor_t *r);
+void rb_ractor_living_threads_insert(rb_ractor_t *r, rb_thread_t *th, bool vm_init);
+void rb_ractor_living_threads_remove(rb_ractor_t *r, rb_thread_t *th);
+void rb_ractor_blocking_threads_inc(rb_ractor_t *r, const char *file, int line); // TODO: file, line only for RUBY_DEBUG_LOG
+void rb_ractor_blocking_threads_dec(rb_ractor_t *r, const char *file, int line); // TODO: file, line only for RUBY_DEBUG_LOG
+
+void rb_ractor_vm_barrier_interrupt_running_thread(rb_ractor_t *r);
+void rb_ractor_terminate_interrupt_main_thread(rb_ractor_t *r);
+void rb_ractor_terminate_all(void);
+
+static inline void
+rb_ractor_sleeper_threads_inc(rb_ractor_t *r)
+{
+    r->threads.sleeper++;
+}
+
+static inline void
+rb_ractor_sleeper_threads_dec(rb_ractor_t *r)
+{
+    r->threads.sleeper--;
+}
+
+static inline void
+rb_ractor_sleeper_threads_clear(rb_ractor_t *r)
+{
+    r->threads.sleeper = 0;
+}
+
+static inline int
+rb_ractor_sleeper_thread_num(rb_ractor_t *r)
+{
+    return r->threads.sleeper;
+}
+
+static inline void
+rb_thread_set_current_raw(const rb_thread_t *th)
+{
+    rb_ec_set_current_raw(th->ec);
+}
+
+static inline void
+rb_thread_set_current(rb_thread_t *th)
+{
+    VM_ASSERT(th->ractor == GET_RACTOR());
+
+    if (th->ractor->threads.running != th) {
+        th->running_time_us = 0;
+    }
+    rb_thread_set_current_raw(th);
+    th->ractor->threads.running = th;
+}
+
+static inline void
+rb_vm_ractor_blocking_cnt_inc(rb_vm_t *vm, const char *file, int line)
+{
+    RUBY_DEBUG_LOG2(file, line, "vm->ractor.blocking_cnt:%d++", vm->ractor.blocking_cnt);
+    vm->ractor.blocking_cnt++;
+    VM_ASSERT(vm->ractor.blocking_cnt <= vm->ractor.cnt);
+}
+
+static inline void
+rb_vm_ractor_blocking_cnt_dec(rb_vm_t *vm, const char *file, int line)
+{
+    RUBY_DEBUG_LOG2(file, line, "vm->ractor.blocking_cnt:%d--", vm->ractor.blocking_cnt);
+    VM_ASSERT(vm->ractor.blocking_cnt > 0);
+    vm->ractor.blocking_cnt--;
+}
 
 // TODO: deep frozen
 #define RB_OBJ_SHAREABLE_P(obj) FL_TEST_RAW((obj), RUBY_FL_SHAREABLE)
@@ -38,9 +199,9 @@ rb_ractor_shareable_p(VALUE obj)
     }
 }
 
-#if RACTOR_CHECK_MODE > 0
-
 uint32_t rb_ractor_id(const rb_ractor_t *r);
+
+#if RACTOR_CHECK_MODE > 0
 uint32_t rb_ractor_current_id(void);
 
 static inline void
