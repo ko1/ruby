@@ -520,8 +520,9 @@ ractor_sleep(rb_execution_context_t *ec, rb_ractor_t *cr)
     //                 wait_status_str(cr->wait.status), wakeup_status_str(cr->wait.wakeup_status));
 
     ractor_unlock(cr);
-    rb_thread_call_without_gvl(ractor_sleep_wo_gvl, cr,
-                               ractor_sleep_interrupt, cr);
+    rb_nogvl(ractor_sleep_wo_gvl, cr,
+             ractor_sleep_interrupt, cr,
+             RB_NOGVL_UBF_ASYNC_SAFE);
     ractor_lock(cr);
 }
 
