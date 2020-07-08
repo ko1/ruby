@@ -5872,6 +5872,7 @@ gc.$(OBJEXT): {$(VPATH)}transient_heap.h
 gc.$(OBJEXT): {$(VPATH)}util.h
 gc.$(OBJEXT): {$(VPATH)}vm_callinfo.h
 gc.$(OBJEXT): {$(VPATH)}vm_core.h
+gc.$(OBJEXT): {$(VPATH)}vm_debug.h
 gc.$(OBJEXT): {$(VPATH)}vm_opts.h
 gc.$(OBJEXT): {$(VPATH)}vm_sync.h
 ractor.$(OBJEXT): {$(VPATH)}config.h
