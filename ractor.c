@@ -40,8 +40,9 @@ ASSERT_ractor_locking(rb_ractor_t *r)
 static void
 ractor_lock(rb_ractor_t *r)
 {
-    ASSERT_ractor_unlocking(r);
+    RUBY_DEBUG_LOG("", 0);
 
+    ASSERT_ractor_unlocking(r);
     rb_native_mutex_lock(&r->lock);
 
 #if RACTOR_CHECK_MODE > 0
@@ -52,6 +53,8 @@ ractor_lock(rb_ractor_t *r)
 static void
 ractor_lock_self(rb_ractor_t *cr)
 {
+    RUBY_DEBUG_LOG("", 0);
+
     VM_ASSERT(cr == GET_RACTOR());
     VM_ASSERT(cr->locked_by != cr->self);
     rb_native_mutex_lock(&cr->lock);
@@ -68,6 +71,8 @@ ractor_unlock(rb_ractor_t *r)
     r->locked_by = Qnil;
 #endif
     rb_native_mutex_unlock(&r->lock);
+
+    RUBY_DEBUG_LOG("", 0);
 }
 
 static void
@@ -79,6 +84,8 @@ ractor_unlock_self(rb_ractor_t *cr)
     cr->locked_by = Qnil;
 #endif
     rb_native_mutex_unlock(&cr->lock);
+
+    RUBY_DEBUG_LOG("", 0);
 }
 
 static void
