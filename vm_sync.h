@@ -11,12 +11,13 @@
 #define APPEND_LOCATION_ARGS , const char *file, int line
 #define APPEND_LOCATION_PARAMS , file, line
 #else
-#define LOCATION_ARGS
-#define LOCATION_PARAMS
+#define LOCATION_ARGS void
+#define LOCATION_PARAMS void
 #define APPEND_LOCATION_ARGS
 #define APPEND_LOCATION_PARAMS
 #endif
 
+bool rb_vm_locked_p(void);
 void rb_vm_lock_body(LOCATION_ARGS);
 void rb_vm_unlock_body(LOCATION_ARGS);
 void rb_vm_lock_enter_body(unsigned int *lev APPEND_LOCATION_ARGS);
@@ -72,6 +73,8 @@ rb_vm_lock_leave(unsigned int *lev, const char *file, int line)
         rb_vm_lock_leave_body(lev APPEND_LOCATION_PARAMS);
     }
 }
+
+#define RB_VM_LOCKED_P()   rb_vm_locked_p()
 
 #define RB_VM_LOCK()       rb_vm_lock(__FILE__, __LINE__)
 #define RB_VM_UNLOCK()     rb_vm_unlock(__FILE__, __LINE__)

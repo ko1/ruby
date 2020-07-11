@@ -15,6 +15,8 @@ static VALUE rb_eRactorClosedError;
 static VALUE rb_cRactorMovedObject;
 
 bool ruby_multi_ractor;
+void vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *r, const char *file, int line);
+
 
 static void
 ASSERT_ractor_unlocking(rb_ractor_t *r)
@@ -38,9 +40,9 @@ ASSERT_ractor_locking(rb_ractor_t *r)
 }
 
 static void
-ractor_lock(rb_ractor_t *r)
+ractor_lock(rb_ractor_t *r, const char *file, int line)
 {
-    RUBY_DEBUG_LOG("", 0);
+    RUBY_DEBUG_LOG2(file, line, "r:%u%s", r->id, GET_RACTOR() == r ? " (self)" : "");
 
     ASSERT_ractor_unlocking(r);
     rb_native_mutex_lock(&r->lock);
@@ -51,9 +53,9 @@ ractor_lock(rb_ractor_t *r)
 }
 
 static void
-ractor_lock_self(rb_ractor_t *cr)
+ractor_lock_self(rb_ractor_t *cr, const char *file, int line)
 {
-    RUBY_DEBUG_LOG("", 0);
+    RUBY_DEBUG_LOG2(file, line, "", 0);
 
     VM_ASSERT(cr == GET_RACTOR());
     VM_ASSERT(cr->locked_by != cr->self);
@@ -64,7 +66,7 @@ ractor_lock_self(rb_ractor_t *cr)
 }
 
 static void
-ractor_unlock(rb_ractor_t *r)
+ractor_unlock(rb_ractor_t *r, const char *file, int line)
 {
     ASSERT_ractor_locking(r);
 #if RACTOR_CHECK_MODE > 0
@@ -72,7 +74,7 @@ ractor_unlock(rb_ractor_t *r)
 #endif
     rb_native_mutex_unlock(&r->lock);
 
-    RUBY_DEBUG_LOG("", 0);
+    RUBY_DEBUG_LOG2(file, line, "r:%u%s", r->id, GET_RACTOR() == r ? " (self)" : "");
 }
 
 static void
@@ -88,6 +90,10 @@ ractor_unlock_self(rb_ractor_t *cr)
     RUBY_DEBUG_LOG("", 0);
 }
 
+#define RACTOR_LOCK(r) ractor_lock(r, __FILE__, __LINE__)
+#define RACTOR_LOCK_SELF(r) ractor_lock_self(r, __FILE__, __LINE__)
+#define RACTOR_UNLOCK(r) ractor_unlock(r, __FILE__, __LINE__)
+
 static void
 ractor_cond_wait(rb_ractor_t *r)
 {
@@ -100,6 +106,55 @@ ractor_cond_wait(rb_ractor_t *r)
 #if RACTOR_CHECK_MODE > 0
     r->locked_by = locked_by;
 #endif
+}
+
+static const char *
+ractor_status_str(enum ractor_status status)
+{
+    switch (status) {
+      case ractor_created: return "created";
+      case ractor_running: return "running";
+      case ractor_blocking: return "blocking";
+      case ractor_terminated: return "terminated";
+    }
+    rb_bug("unreachable");
+}
+
+static void
+ractor_status_set(rb_ractor_t *r, enum ractor_status status)
+{
+    RUBY_DEBUG_LOG("r:%u [%s]->[%s]", r->id, ractor_status_str(r->status_), ractor_status_str(status));
+
+    // check 1
+    if (r->status_ != ractor_created) {
+        VM_ASSERT(r == GET_RACTOR()); // only self-modification is allowed.
+        ASSERT_vm_locking();
+    }
+
+    // check2: transition check. assume it will be vanished on non-debug build.
+    switch (r->status_) {
+      case ractor_created:
+        VM_ASSERT(status == ractor_blocking);
+        break;
+      case ractor_running:
+        VM_ASSERT(status == ractor_blocking||
+                  status == ractor_terminated);
+        break;
+      case ractor_blocking:
+        VM_ASSERT(status == ractor_running);
+        break;
+      case ractor_terminated:
+        VM_ASSERT(0); // unreachable
+        break;
+    }
+
+    r->status_ = status;
+}
+
+static bool
+ractor_status_p(rb_ractor_t *r, enum ractor_status status)
+{
+    return rb_ractor_status_p(r, status);
 }
 
 static void
@@ -249,7 +304,7 @@ ractor_queue_deq(rb_ractor_t *r, struct rb_ractor_queue *rq, struct rb_ractor_ba
 {
     bool b;
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     {
         if (!ractor_queue_empty_p(r, rq)) {
             // TODO: use good Queue data structure
@@ -264,7 +319,7 @@ ractor_queue_deq(rb_ractor_t *r, struct rb_ractor_queue *rq, struct rb_ractor_ba
             b = false;
         }
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
 
     return b;
 }
@@ -464,7 +519,7 @@ static void *
 ractor_sleep_wo_gvl(void *ptr)
 {
     rb_ractor_t *cr = ptr;
-    ractor_lock_self(cr);
+    RACTOR_LOCK_SELF(cr);
     VM_ASSERT(cr->wait.status != wait_none);
     if (cr->wait.wakeup_status == wakeup_none) {
         ractor_cond_wait(cr);
@@ -479,12 +534,12 @@ ractor_sleep_interrupt(void *ptr)
 {
     rb_ractor_t *r = ptr;
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     if (r->wait.wakeup_status == wakeup_none) {
         r->wait.wakeup_status = wakeup_by_interrupt;
         rb_native_cond_signal(&r->wait.cond);
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
 }
 
 const char *
@@ -526,11 +581,11 @@ ractor_sleep(rb_execution_context_t *ec, rb_ractor_t *cr)
     // fprintf(stderr, "%s  r:%p status:%s, wakeup_status:%s\n", __func__, cr,
     //                 wait_status_str(cr->wait.status), wakeup_status_str(cr->wait.wakeup_status));
 
-    ractor_unlock(cr);
+    RACTOR_UNLOCK(cr);
     rb_nogvl(ractor_sleep_wo_gvl, cr,
              ractor_sleep_interrupt, cr,
              RB_NOGVL_UBF_ASYNC_SAFE);
-    ractor_lock(cr);
+    RACTOR_LOCK(cr);
 }
 
 static bool
@@ -564,7 +619,7 @@ ractor_register_taking(rb_ractor_t *r, rb_ractor_t *cr)
     VM_ASSERT(cr == GET_RACTOR());
     bool retry_try = false;
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     {
         if (ractor_sleeping_by(r, wait_yielding)) {
             // already waiting for yielding. retry try_take.
@@ -593,10 +648,10 @@ ractor_register_taking(rb_ractor_t *r, rb_ractor_t *cr)
             wl->ractors[wl->cnt++] = cr;
         }
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
 
     if (retry_try) {
-        ractor_lock(cr);
+        RACTOR_LOCK(cr);
         {
             if (cr->wait.wakeup_status == wakeup_none) {
                 VM_ASSERT(cr->wait.status != wait_none);
@@ -605,14 +660,14 @@ ractor_register_taking(rb_ractor_t *r, rb_ractor_t *cr)
                 cr->wait.status = wait_none;
             }
         }
-        ractor_unlock(cr);
+        RACTOR_UNLOCK(cr);
     }
 }
 
 static void
 ractor_waiting_list_del(rb_ractor_t *r, struct rb_ractor_waiting_list *wl, rb_ractor_t *wr)
 {
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     {
         int pos = -1;
         for (int i=0; i<wl->cnt; i++) {
@@ -628,7 +683,7 @@ ractor_waiting_list_del(rb_ractor_t *r, struct rb_ractor_waiting_list *wl, rb_ra
             }
         }
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
 }
 
 static rb_ractor_t *
@@ -657,7 +712,7 @@ ractor_recv(rb_execution_context_t *ec, rb_ractor_t *r)
     VALUE v;
 
     while ((v = ractor_try_recv(ec, r)) == Qundef) {
-        ractor_lock(r);
+        RACTOR_LOCK(r);
         {
             if (ractor_queue_empty_p(r, &r->incoming_queue)) {
                 VM_ASSERT(r->wait.status == wait_none);
@@ -669,7 +724,7 @@ ractor_recv(rb_execution_context_t *ec, rb_ractor_t *r)
                 r->wait.wakeup_status = wakeup_none;
             }
         }
-        ractor_unlock(r);
+        RACTOR_UNLOCK(r);
     }
 
     return v;
@@ -681,7 +736,7 @@ ractor_send_basket(rb_execution_context_t *ec, rb_ractor_t *r, struct rb_ractor_
     bool closed = false;
     struct rb_ractor_queue *rq = &r->incoming_queue;
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     {
         if (r->incoming_port_closed) {
             closed = true;
@@ -693,7 +748,7 @@ ractor_send_basket(rb_execution_context_t *ec, rb_ractor_t *r, struct rb_ractor_
             }
         }
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
 
     if (closed) {
         rb_raise(rb_eRactorClosedError, "The incoming-port is already closed");
@@ -734,7 +789,7 @@ ractor_try_take(rb_execution_context_t *ec, rb_ractor_t *r)
     };
     bool closed = false;
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     {
         if (ractor_wakeup(r, wait_yielding, wakeup_by_take)) {
             VM_ASSERT(r->wait.yielded_basket.type != basket_type_none);
@@ -749,7 +804,7 @@ ractor_try_take(rb_execution_context_t *ec, rb_ractor_t *r)
             // not reached.
         }
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
 
     if (basket.type == basket_type_none) {
         if (closed) {
@@ -773,16 +828,16 @@ ractor_try_yield(rb_execution_context_t *ec, rb_ractor_t *cr, struct rb_ractor_b
     rb_ractor_t *r;
 
   retry_shift:
-    ractor_lock(cr);
+    RACTOR_LOCK(cr);
     {
         r = ractor_waiting_list_shift(cr, &cr->taking_ractors);
     }
-    ractor_unlock(cr);
+    RACTOR_UNLOCK(cr);
 
     if (r) {
         bool retry_shift = false;
 
-        ractor_lock(r);
+        RACTOR_LOCK(r);
         {
             if (ractor_wakeup(r, wait_taking, wakeup_by_yield)) {
                 VM_ASSERT(r->wait.taken_basket.type == basket_type_none);
@@ -792,7 +847,7 @@ ractor_try_yield(rb_execution_context_t *ec, rb_ractor_t *cr, struct rb_ractor_b
                 retry_shift = true;
             }
         }
-        ractor_unlock(r);
+        RACTOR_UNLOCK(r);
 
         if (retry_shift) {
             // get candidate take-waiting ractor, but already woke up by another reason.
@@ -915,13 +970,13 @@ ractor_select(rb_execution_context_t *ec, const VALUE *rs, int alen, VALUE yield
         }
 
         // setup waiting status
-        ractor_lock(cr);
+        RACTOR_LOCK(cr);
         {
             VM_ASSERT(cr->wait.status == wait_none);
             VM_ASSERT(cr->wait.wakeup_status == wakeup_none);
             cr->wait.status = wait_status;
         }
-        ractor_unlock(cr);
+        RACTOR_UNLOCK(cr);
 
         // prepare waiting
         for (i=0; i<alen; i++) {
@@ -938,7 +993,7 @@ ractor_select(rb_execution_context_t *ec, const VALUE *rs, int alen, VALUE yield
         }
 
         // wait
-        ractor_lock(cr);
+        RACTOR_LOCK(cr);
         {
             if (cr->wait.wakeup_status == wakeup_none) {
                 VM_ASSERT(cr->wait.status != wait_none);
@@ -952,7 +1007,7 @@ ractor_select(rb_execution_context_t *ec, const VALUE *rs, int alen, VALUE yield
                 cr->wait.status = wait_none;
             }
         }
-        ractor_unlock(cr);
+        RACTOR_UNLOCK(cr);
 
         // cleanup waiting
         for (i=0; i<alen; i++) {
@@ -1043,7 +1098,7 @@ ractor_close_incoming(rb_execution_context_t *ec, rb_ractor_t *r)
 {
     VALUE prev;
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     {
         if (!r->incoming_port_closed) {
             prev = Qfalse;
@@ -1056,7 +1111,7 @@ ractor_close_incoming(rb_execution_context_t *ec, rb_ractor_t *r)
             prev = Qtrue;
         }
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
     return prev;
 }
 
@@ -1065,7 +1120,7 @@ ractor_close_outgoing(rb_execution_context_t *ec, rb_ractor_t *cr)
 {
     VALUE prev;
 
-    ractor_lock(cr);
+    RACTOR_LOCK(cr);
     {
         if (!cr->outgoing_port_closed) {
             prev = Qfalse;
@@ -1078,12 +1133,12 @@ ractor_close_outgoing(rb_execution_context_t *ec, rb_ractor_t *cr)
         // wakeup all taking ractors
         rb_ractor_t *taking_ractor;
         while ((taking_ractor = ractor_waiting_list_shift(cr, &cr->taking_ractors)) != NULL) {
-            ractor_lock(taking_ractor);
+            RACTOR_LOCK(taking_ractor);
             ractor_wakeup(taking_ractor, wait_taking, wakeup_by_close);
-            ractor_unlock(taking_ractor);
+            RACTOR_UNLOCK(taking_ractor);
         }
     }
-    ractor_unlock(cr);
+    RACTOR_UNLOCK(cr);
     return prev;
 }
 
@@ -1096,71 +1151,83 @@ ractor_next_id(void)
     return ++ractor_last_id;
 }
 
-void rb_gvl_init(rb_global_vm_lock_t *gvl);
-
-void
-rb_ractor_living_threads_init(rb_ractor_t *r)
-{
-    list_head_init(&r->threads.set);
-    r->threads.cnt = 0;
-}
-
 static void
-ractor_setup0(rb_ractor_t *r, rb_vm_t *vm)
+vm_insert_ractor0(rb_vm_t *vm, rb_ractor_t *r)
 {
+    RUBY_DEBUG_LOG("r:%u ractor.cnt:%u++", r->id, vm->ractor.cnt);
+    VM_ASSERT(!rb_multi_ractor_p() || RB_VM_LOCKED_P());
+
     list_add_tail(&vm->ractor.set, &r->vmlr_node);
-    RUBY_DEBUG_LOG("ractor.cnt:%u++", vm->ractor.cnt);
     vm->ractor.cnt++;
-
-    // start with blocking
-    rb_vm_ractor_blocking_cnt_inc(vm, __FILE__, __LINE__);
-    r->threads.blocking_cnt++;
 }
 
 static void
-ractor_setup(rb_ractor_t *r)
+vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
 {
-    ractor_queue_setup(&r->incoming_queue);
-    rb_native_mutex_initialize(&r->lock);
-    rb_native_cond_initialize(&r->wait.cond);
-    rb_native_cond_initialize(&r->barrier_wait_cond);
-
-    // thread management
-    rb_gvl_init(&r->threads.gvl);
-    rb_ractor_living_threads_init(r);
-
-    rb_vm_t *vm = GET_VM();
+    VM_ASSERT(ractor_status_p(r, ractor_created));
 
     if (rb_multi_ractor_p()) {
         RB_VM_LOCK();
         {
-            ractor_setup0(r, vm);
+            vm_insert_ractor0(vm, r);
+            vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
         }
         RB_VM_UNLOCK();
     }
     else {
-        ractor_setup0(r, vm);
+        vm_insert_ractor0(vm, r);
 
-        // enable multi-ractor mode
-        if (!ruby_multi_ractor && vm->ractor.cnt > 1) {
+        if (vm->ractor.cnt == 1) {
+            // main ractor
+            ractor_status_set(r, ractor_blocking);
+            ractor_status_set(r, ractor_running);
+        }
+        else {
+            vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
+
+            // enable multi-ractor mode
             ruby_multi_ractor = true;
         }
     }
 }
 
+static void
+vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *r)
+{
+    VM_ASSERT(ractor_status_p(r, ractor_running));
+    VM_ASSERT(vm->ractor.cnt > 1);
+
+    RB_VM_LOCK();
+    {
+        RUBY_DEBUG_LOG("ractor.cnt:%u-- terminate_waiting:%d",
+                       vm->ractor.cnt,  vm->ractor.sync.terminate_waiting);
+
+        VM_ASSERT(vm->ractor.cnt > 0);
+        list_del(&r->vmlr_node);
+
+        if (vm->ractor.cnt <= 2 && vm->ractor.sync.terminate_waiting) {
+            rb_native_cond_signal(&vm->ractor.sync.terminate_cond);
+        }
+        vm->ractor.cnt--;
+
+        ractor_status_set(r, ractor_terminated);
+    }
+    RB_VM_UNLOCK();
+}
+
 static VALUE
-ractor_alloc(VALUE klass)
+ractor_alloc(VALUE klass, VALUE name, VALUE loc)
 {
     rb_ractor_t *r;
     VALUE rv = TypedData_Make_Struct(klass, rb_ractor_t, &ractor_data_type, r);
     FL_SET_RAW(rv, RUBY_FL_SHAREABLE);
 
-    // namig
+    // naming
     r->id = ractor_next_id();
-    r->loc = Qnil;
-    r->name = Qnil;
+    r->name = name;
+    r->loc = loc;
     r->self = rv;
-    ractor_setup(r);
+    VM_ASSERT(ractor_status_p(r, ractor_created));
     return rv;
 }
 
@@ -1180,39 +1247,49 @@ rb_ractor_main_alloc(void)
     return r;
 }
 
+void rb_gvl_init(rb_global_vm_lock_t *gvl);
+
 void
-rb_ractor_main_setup(rb_ractor_t *r, rb_thread_t *th)
+rb_ractor_living_threads_init(rb_ractor_t *r)
+{
+    list_head_init(&r->threads.set);
+    r->threads.cnt = 0;
+}
+
+static void
+ractor_init(rb_ractor_t *r)
+{
+    ractor_queue_setup(&r->incoming_queue);
+    rb_native_mutex_initialize(&r->lock);
+    rb_native_cond_initialize(&r->wait.cond);
+    rb_native_cond_initialize(&r->barrier_wait_cond);
+
+    // thread management
+    rb_gvl_init(&r->threads.gvl);
+    rb_ractor_living_threads_init(r);
+}
+
+void
+rb_ractor_main_setup(rb_vm_t *vm, rb_ractor_t *r, rb_thread_t *th)
 {
     r->self = TypedData_Wrap_Struct(rb_cRactor, &ractor_data_type, r);
     FL_SET_RAW(r->self, RUBY_FL_SHAREABLE);
-    ractor_setup(r);
-    rb_vm_ractor_blocking_cnt_dec(GET_VM(), __FILE__, __LINE__);
-    r->threads.blocking_cnt--;
+    ractor_init(r);
     r->threads.main = th;
-}
 
-VALUE
-rb_ractor_self(const rb_ractor_t *r)
-{
-    return r->self;
-}
-
-MJIT_FUNC_EXPORTED int
-rb_ractor_main_p(void)
-{
-    rb_execution_context_t *ec = GET_EC();
-    return rb_ec_ractor_ptr(ec) == rb_ec_vm_ptr(ec)->ractor.main_ractor;
+    rb_ractor_living_threads_insert(r, th);
 }
 
 static VALUE
-ractor_create(rb_execution_context_t *ec, VALUE self,
-             VALUE args, VALUE block, VALUE loc, VALUE name)
+ractor_create(rb_execution_context_t *ec, VALUE self, VALUE loc, VALUE name, VALUE args, VALUE block)
 {
-    VALUE rv = ractor_alloc(self);
+    VALUE rv = ractor_alloc(self, name, loc);
     rb_ractor_t *r = RACTOR_PTR(rv);
+    ractor_init(r);
+
+    RUBY_DEBUG_LOG("r:%u", r->id);
+
     rb_thread_create_ractor(r, args, block);
-    r->loc = loc;
-    r->name = name;
     return rv;
 }
 
@@ -1230,7 +1307,7 @@ ractor_atexit_yield(rb_execution_context_t *ec, rb_ractor_t *cr, VALUE v, bool e
     }
     else {
         bool retry = false;
-        ractor_lock(cr);
+        RACTOR_LOCK(cr);
         {
             if (cr->taking_ractors.cnt == 0) {
                 cr->wait.yielded_basket = basket;
@@ -1242,7 +1319,7 @@ ractor_atexit_yield(rb_execution_context_t *ec, rb_ractor_t *cr, VALUE v, bool e
                 retry = true; // another ractor is waiting for the yield.
             }
         }
-        ractor_unlock(cr);
+        RACTOR_UNLOCK(cr);
 
         if (retry) goto retry;
     }
@@ -1251,25 +1328,9 @@ ractor_atexit_yield(rb_execution_context_t *ec, rb_ractor_t *cr, VALUE v, bool e
 void
 rb_ractor_teardown(rb_execution_context_t *ec)
 {
-    rb_vm_t *vm = rb_ec_vm_ptr(ec);
     rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
-
     ractor_close_incoming(ec, cr);
     ractor_close_outgoing(ec, cr);
-
-    RB_VM_LOCK();
-    {
-        RUBY_DEBUG_LOG("ractor.cnt:%u-- terminate_waiting:%d",
-                       vm->ractor.cnt,  vm->ractor.sync.terminate_waiting);
-        VM_ASSERT(vm->ractor.cnt > 0);
-        list_del(&cr->vmlr_node);
-
-        if (vm->ractor.cnt <= 2 && vm->ractor.sync.terminate_waiting) {
-            rb_native_cond_signal(&vm->ractor.sync.terminate_cond);
-        }
-        vm->ractor.cnt--;
-    }
-    RB_VM_UNLOCK();
 }
 
 void
@@ -1303,6 +1364,19 @@ rb_ractor_send_parameters(rb_execution_context_t *ec, rb_ractor_t *r, VALUE args
     }
 }
 
+VALUE
+rb_ractor_self(const rb_ractor_t *r)
+{
+    return r->self;
+}
+
+MJIT_FUNC_EXPORTED int
+rb_ractor_main_p(void)
+{
+    rb_execution_context_t *ec = GET_EC();
+    return rb_ec_ractor_ptr(ec) == rb_ec_vm_ptr(ec)->ractor.main_ractor;
+}
+
 rb_global_vm_lock_t *
 rb_ractor_gvl(rb_ractor_t *r)
 {
@@ -1321,7 +1395,7 @@ rb_ractor_thread_list(rb_ractor_t *r)
     VALUE ary = rb_ary_new();
     rb_thread_t *th = 0;
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     list_for_each(&r->threads.set, th, lt_node) {
         switch (th->status) {
           case THREAD_RUNNABLE:
@@ -1332,22 +1406,60 @@ rb_ractor_thread_list(rb_ractor_t *r)
             break;
         }
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
     return ary;
 }
 
 void
-rb_ractor_living_threads_insert(rb_ractor_t *r, rb_thread_t *th, bool vm_init)
+rb_ractor_living_threads_insert(rb_ractor_t *r, rb_thread_t *th)
 {
     VM_ASSERT(th != NULL);
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     {
         RUBY_DEBUG_LOG("r(%d)->threads.cnt:%d++", r->id, r->threads.cnt);
         list_add_tail(&r->threads.set, &th->lt_node);
         r->threads.cnt++;
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
+
+    // first thread for a ractor
+    if (r->threads.cnt == 1) {
+        VM_ASSERT(ractor_status_p(r, ractor_created));
+        vm_insert_ractor(th->vm, r);
+        r->threads.running = th;
+    }
+}
+
+void
+vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *r, const char *file, int line)
+{
+    ractor_status_set(r, ractor_blocking);
+
+    RUBY_DEBUG_LOG2(file, line, "vm->ractor.blocking_cnt:%d++", vm->ractor.blocking_cnt);
+    vm->ractor.blocking_cnt++;
+    VM_ASSERT(vm->ractor.blocking_cnt <= vm->ractor.cnt);
+}
+
+void
+rb_vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *cr, const char *file, int line)
+{
+    ASSERT_vm_locking();
+    VM_ASSERT(GET_RACTOR() == cr);
+    vm_ractor_blocking_cnt_inc(vm, cr, file, line);
+}
+
+void
+rb_vm_ractor_blocking_cnt_dec(rb_vm_t *vm, rb_ractor_t *cr, const char *file, int line)
+{
+    ASSERT_vm_locking();
+    VM_ASSERT(GET_RACTOR() == cr);
+
+    RUBY_DEBUG_LOG2(file, line, "vm->ractor.blocking_cnt:%d--", vm->ractor.blocking_cnt);
+    VM_ASSERT(vm->ractor.blocking_cnt > 0);
+    vm->ractor.blocking_cnt--;
+
+    ractor_status_set(cr, ractor_running);
 }
 
 static void
@@ -1371,54 +1483,63 @@ ractor_check_blocking(rb_ractor_t *cr, unsigned int remaind_thread_cnt, const ch
 
         RB_VM_LOCK();
         {
-            rb_vm_ractor_blocking_cnt_inc(vm, file, line);
+            rb_vm_ractor_blocking_cnt_inc(vm, cr, file, line);
         }
         RB_VM_UNLOCK();
     }
 }
 
 void
-rb_ractor_living_threads_remove(rb_ractor_t *r, rb_thread_t *th)
+rb_ractor_living_threads_remove(rb_ractor_t *cr, rb_thread_t *th)
 {
-    ractor_lock_self(r);
+    VM_ASSERT(cr == GET_RACTOR());
+    RUBY_DEBUG_LOG("r->threads.cnt:%d--", cr->threads.cnt);
+    ractor_check_blocking(cr, cr->threads.cnt - 1, __FILE__, __LINE__);
+
+    RACTOR_LOCK(cr);
     {
-        RUBY_DEBUG_LOG("r->threads.cnt:%d--", r->threads.cnt);
-        ractor_check_blocking(r, r->threads.cnt - 1, __FILE__, __LINE__);
-
         list_del(&th->lt_node);
-        r->threads.cnt--;
+        cr->threads.cnt--;
     }
-    ractor_unlock_self(r);
+    RACTOR_UNLOCK(cr);
+
+    if (cr->threads.cnt == 0) {
+        vm_remove_ractor(th->vm, cr);
+    }
 }
 
 void
-rb_ractor_blocking_threads_inc(rb_ractor_t *r, const char *file, int line)
+rb_ractor_blocking_threads_inc(rb_ractor_t *cr, const char *file, int line)
 {
-    RUBY_DEBUG_LOG2(file, line, "r->threads.blocking_cnt:%d++", r->threads.blocking_cnt);
-    VM_ASSERT(r->threads.cnt > 0);
+    RUBY_DEBUG_LOG2(file, line, "cr->threads.blocking_cnt:%d++", cr->threads.blocking_cnt);
 
-    ractor_check_blocking(r, r->threads.cnt, __FILE__, __LINE__);
-    r->threads.blocking_cnt++;
+    VM_ASSERT(cr->threads.cnt > 0);
+    VM_ASSERT(cr == GET_RACTOR());
+
+    ractor_check_blocking(cr, cr->threads.cnt, __FILE__, __LINE__);
+    cr->threads.blocking_cnt++;
 }
 
 void
-rb_ractor_blocking_threads_dec(rb_ractor_t *r, const char *file, int line)
+rb_ractor_blocking_threads_dec(rb_ractor_t *cr, const char *file, int line)
 {
     RUBY_DEBUG_LOG2(file, line,
                     "r->threads.blocking_cnt:%d--, r->threads.cnt:%u",
-                    r->threads.blocking_cnt, r->threads.cnt);
+                    cr->threads.blocking_cnt, cr->threads.cnt);
 
-    if (r->threads.cnt == r->threads.blocking_cnt) {
+    VM_ASSERT(cr == GET_RACTOR());
+
+    if (cr->threads.cnt == cr->threads.blocking_cnt) {
         rb_vm_t *vm = GET_VM();
 
         RB_VM_LOCK_ENTER();
         {
-            rb_vm_ractor_blocking_cnt_dec(vm, __FILE__, __LINE__);
+            rb_vm_ractor_blocking_cnt_dec(vm, cr, __FILE__, __LINE__);
         }
         RB_VM_LOCK_LEAVE();
     }
 
-    r->threads.blocking_cnt--;
+    cr->threads.blocking_cnt--;
 }
 
 void
@@ -1428,14 +1549,15 @@ rb_ractor_vm_barrier_interrupt_running_thread(rb_ractor_t *r)
     ASSERT_ractor_unlocking(r);
     ASSERT_vm_locking();
 
-    ractor_lock(r);
+    RACTOR_LOCK(r);
     {
-        rb_thread_t *th = r->threads.running;
-        if (th) {
+        if (ractor_status_p(r, ractor_running)) {
+            rb_thread_t *th = r->threads.running;
+            VM_ASSERT(th != NULL);
             RUBY_VM_SET_VM_BARRIER_INTERRUPT(th->ec);
         }
     }
-    ractor_unlock(r);
+    RACTOR_UNLOCK(r);
 }
 
 void
@@ -1478,7 +1600,9 @@ void
 rb_ractor_terminate_all(void)
 {
     rb_vm_t *vm = GET_VM();
-    VM_ASSERT(vm->ractor.main_ractor == GET_RACTOR()); // only main-ractor's main-thread should kick it.
+    rb_ractor_t *cr = vm->ractor.main_ractor;
+
+    VM_ASSERT(cr == GET_RACTOR()); // only main-ractor's main-thread should kick it.
 
     if (vm->ractor.cnt > 1) {
         RB_VM_LOCK();
@@ -1494,9 +1618,9 @@ rb_ractor_terminate_all(void)
             vm->ractor.sync.terminate_waiting = true;
 
             // wait for 1sec
-            rb_vm_ractor_blocking_cnt_inc(vm, __FILE__, __LINE__);
+            rb_vm_ractor_blocking_cnt_inc(vm, cr, __FILE__, __LINE__);
             rb_vm_cond_timedwait(vm, &vm->ractor.sync.terminate_cond, 1000 /* ms */);
-            rb_vm_ractor_blocking_cnt_dec(vm, __FILE__, __LINE__);
+            rb_vm_ractor_blocking_cnt_dec(vm, cr, __FILE__, __LINE__);
 
             ractor_terminal_interrupt_all(vm);
         }
@@ -1569,4 +1693,17 @@ rb_ractor_shareable_p_continue(VALUE obj)
   shareable:
     FL_SET_RAW(obj, RUBY_FL_SHAREABLE);
     return true;
+}
+
+void
+rb_ractor_dump(void)
+{
+    rb_vm_t *vm = GET_VM();
+    rb_ractor_t *r;
+
+    list_for_each(&vm->ractor.set, r, vmlr_node) {
+        if (r != vm->ractor.main_ractor) {
+            fprintf(stderr, "r:%u (%s)\n", r->id, ractor_status_str(r->status_));
+        }
+    }
 }

@@ -2330,6 +2330,9 @@ rb_vm_mark(void *ptr)
         const VALUE *obj_ary;
 
 	list_for_each(&vm->ractor.set, r, vmlr_node) {
+            // ractor.set only contains blocking or running ractors
+            VM_ASSERT(rb_ractor_status_p(r, ractor_blocking) ||
+                      rb_ractor_status_p(r, ractor_running));
             rb_gc_mark(rb_ractor_self(r));
 	}
 
@@ -3379,7 +3382,7 @@ Init_VM(void)
 	const rb_iseq_t *iseq = rb_iseq_new(0, filename, filename, Qnil, 0, ISEQ_TYPE_TOP);
 
         // Ractor setup
-        rb_ractor_main_setup(th->ractor, th);
+        rb_ractor_main_setup(vm, th->ractor, th);
 
 	/* create vm object */
 	vm->self = TypedData_Wrap_Struct(rb_cRubyVM, &vm_data_type, vm);
@@ -3393,8 +3396,6 @@ Init_VM(void)
 	th->top_self = rb_vm_top_self();
 
 	rb_thread_set_current(th);
-
-        rb_ractor_living_threads_insert(th->ractor, th, true);
 
 	rb_gc_register_mark_object((VALUE)iseq);
 	th->ec->cfp->iseq = iseq;

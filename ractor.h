@@ -35,11 +35,13 @@ struct rb_ractor_waiting_list {
 };
 
 struct rb_ractor_struct {
+    // ractor lock
     rb_nativethread_lock_t lock;
 #if RACTOR_CHECK_MODE > 0
     VALUE locked_by;
 #endif
 
+    // communication
     struct rb_ractor_queue  incoming_queue;
 
     bool incoming_port_closed;
@@ -71,6 +73,7 @@ struct rb_ractor_struct {
         rb_nativethread_cond_t cond;
     } wait;
 
+    // vm wide barrier synchronization
     rb_nativethread_cond_t barrier_wait_cond;
 
     // thread management
@@ -92,11 +95,33 @@ struct rb_ractor_struct {
     VALUE name;
     VALUE loc;
 
+    // created
+    //   | ready to run
+    // ====================== inserted to vm->ractor
+    //   v
+    // blocking <---+ all threads are blocking
+    //   |          |
+    //   v          |
+    // running -----+
+    //   | all threads are terminated.
+    // ====================== removed from vm->ractor
+    //   v
+    // terminated
+    //
+    // status is protected by VM lock (global state)
+
+    enum ractor_status {
+        ractor_created,
+        ractor_running,
+        ractor_blocking,
+        ractor_terminated,
+    } status_;
+
     struct list_node vmlr_node;
 }; // rb_ractor_t is defined in vm_core.h
 
 rb_ractor_t *rb_ractor_main_alloc(void);
-void rb_ractor_main_setup(rb_ractor_t *main_ractor, rb_thread_t *main_thread);
+void rb_ractor_main_setup(rb_vm_t *vm, rb_ractor_t *main_ractor, rb_thread_t *main_thread);
 int rb_ractor_main_p(void);
 VALUE rb_ractor_self(const rb_ractor_t *g);
 void rb_ractor_atexit(rb_execution_context_t *ec, VALUE result);
@@ -113,7 +138,7 @@ int rb_ractor_living_thread_num(const rb_ractor_t *);
 VALUE rb_ractor_thread_list(rb_ractor_t *r);
 
 void rb_ractor_living_threads_init(rb_ractor_t *r);
-void rb_ractor_living_threads_insert(rb_ractor_t *r, rb_thread_t *th, bool vm_init);
+void rb_ractor_living_threads_insert(rb_ractor_t *r, rb_thread_t *th);
 void rb_ractor_living_threads_remove(rb_ractor_t *r, rb_thread_t *th);
 void rb_ractor_blocking_threads_inc(rb_ractor_t *r, const char *file, int line); // TODO: file, line only for RUBY_DEBUG_LOG
 void rb_ractor_blocking_threads_dec(rb_ractor_t *r, const char *file, int line); // TODO: file, line only for RUBY_DEBUG_LOG
@@ -121,6 +146,12 @@ void rb_ractor_blocking_threads_dec(rb_ractor_t *r, const char *file, int line);
 void rb_ractor_vm_barrier_interrupt_running_thread(rb_ractor_t *r);
 void rb_ractor_terminate_interrupt_main_thread(rb_ractor_t *r);
 void rb_ractor_terminate_all(void);
+
+static inline bool
+rb_ractor_status_p(rb_ractor_t *r, enum ractor_status status)
+{
+    return r->status_ == status;
+}
 
 static inline void
 rb_ractor_sleeper_threads_inc(rb_ractor_t *r)
@@ -164,21 +195,8 @@ rb_thread_set_current(rb_thread_t *th)
     th->ractor->threads.running = th;
 }
 
-static inline void
-rb_vm_ractor_blocking_cnt_inc(rb_vm_t *vm, const char *file, int line)
-{
-    RUBY_DEBUG_LOG2(file, line, "vm->ractor.blocking_cnt:%d++", vm->ractor.blocking_cnt);
-    vm->ractor.blocking_cnt++;
-    VM_ASSERT(vm->ractor.blocking_cnt <= vm->ractor.cnt);
-}
-
-static inline void
-rb_vm_ractor_blocking_cnt_dec(rb_vm_t *vm, const char *file, int line)
-{
-    RUBY_DEBUG_LOG2(file, line, "vm->ractor.blocking_cnt:%d--", vm->ractor.blocking_cnt);
-    VM_ASSERT(vm->ractor.blocking_cnt > 0);
-    vm->ractor.blocking_cnt--;
-}
+void rb_vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *cr, const char *file, int line);
+void rb_vm_ractor_blocking_cnt_dec(rb_vm_t *vm, rb_ractor_t *cr, const char *file, int line);
 
 // TODO: deep frozen
 #define RB_OBJ_SHAREABLE_P(obj) FL_TEST_RAW((obj), RUBY_FL_SHAREABLE)

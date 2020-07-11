@@ -34,9 +34,7 @@ class Ractor
     b = block # TODO: builtin bug
     loc = caller_locations(1, 1).first
     loc = "#{loc.path}:#{loc.lineno}"
-    __builtin_cexpr! %q{
-      ractor_create(ec, self, args, b, loc, name)
-    }
+    __builtin_ractor_create(loc, name, args, b)
   end
 
   # return current Ractor

@@ -489,6 +489,7 @@ static void
 rb_threadptr_interrupt_common(rb_thread_t *th, int trap)
 {
     rb_native_mutex_lock(&th->interrupt_lock);
+
     if (trap) {
 	RUBY_VM_SET_TRAP_INTERRUPT(th->ec);
     }
@@ -759,9 +760,7 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     rb_thread_t *ractor_main_th = th->ractor->threads.main;
     VALUE * vm_stack = NULL;
 
-    if (th == th->vm->ractor.main_thread) {
-        rb_bug("thread_start_func_2 must not be used for main thread");
-    }
+    VM_ASSERT(th != th->vm->ractor.main_thread);
 
     thread_debug("thread start: %p\n", (void *)th);
     VM_ASSERT((size * sizeof(VALUE)) <= th->ec->machine.stack_maxsize);
@@ -777,12 +776,10 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     ruby_thread_set_native(th);
     rb_thread_set_current(th);
 
-    if (th->invoke_type == thread_invoke_type_ractor_proc) {
+    if (rb_ractor_status_p(th->ractor, ractor_blocking)) {
         RB_VM_LOCK();
         {
-            // unblock
-            rb_vm_ractor_blocking_cnt_dec(GET_VM(), __FILE__, __LINE__);
-            th->ractor->threads.blocking_cnt--;
+            rb_vm_ractor_blocking_cnt_dec(th->vm, th->ractor, __FILE__, __LINE__);
         }
         RB_VM_UNLOCK();
     }
@@ -925,10 +922,10 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         th->invoke_type = thread_invoke_type_ractor_proc;
         th->ractor = params->g;
         th->ractor->threads.main = th;
-        th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
-        rb_ractor_send_parameters(ec, params->g, params->args);
         th->invoke_arg.proc.proc = rb_proc_isolate_bang(params->proc);
+        th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
+        rb_ractor_send_parameters(ec, params->g, params->args);
         break;
 
       case thread_invoke_type_func:
@@ -950,13 +947,17 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     RBASIC_CLEAR_CLASS(th->pending_interrupt_mask_stack);
 
     rb_native_mutex_initialize(&th->interrupt_lock);
-    rb_ractor_living_threads_insert(th->ractor, th, false);
+
+    RUBY_DEBUG_LOG("r:%u th:%p", th->ractor->id, th);
+
+    rb_ractor_living_threads_insert(th->ractor, th);
 
     /* kick thread */
     err = native_thread_create(th);
     if (err) {
 	th->status = THREAD_KILLED;
-	rb_raise(rb_eThreadError, "can't create Thread: %s", strerror(err));
+        rb_ractor_living_threads_remove(th->ractor, th);
+        rb_raise(rb_eThreadError, "can't create Thread: %s", strerror(err));
     }
     return thval;
 }
@@ -4716,7 +4717,7 @@ rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const r
         }
     }
     rb_ractor_living_threads_init(th->ractor);
-    rb_ractor_living_threads_insert(th->ractor, th, true);
+    rb_ractor_living_threads_insert(th->ractor, th);
 
     /* may be held by MJIT threads in parent */
     rb_native_mutex_initialize(&vm->waitpid_lock);
