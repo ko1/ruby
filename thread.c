@@ -4706,6 +4706,7 @@ rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const r
     rb_ractor_t *r = th->ractor;
     vm->ractor.main_ractor = r;
     vm->ractor.main_thread = th;
+    r->threads.main = th;
     r->status_ = ractor_created;
 
     gvl_atfork(rb_ractor_gvl(th->ractor));
