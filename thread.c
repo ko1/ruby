@@ -4851,15 +4851,14 @@ static VALUE
 thgroup_list(VALUE group)
 {
     VALUE ary = rb_ary_new();
-#if 0
     rb_thread_t *th = 0;
-    // TODO: ractor::living_threads should be protected.
-    list_for_each(&th->ractor->living_threads, th, lt_node) {
+    rb_ractor_t *r = GET_RACTOR();
+
+    list_for_each(&r->threads.set, th, lt_node) {
         if (th->thgroup == group) {
 	    rb_ary_push(ary, th->self);
 	}
     }
-#endif
     return ary;
 }
 
