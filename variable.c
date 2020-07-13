@@ -881,12 +881,19 @@ IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR(ID id)
   }
 
 static inline struct st_table *
-generic_ivtbl(VALUE obj)
+generic_ivtbl0(VALUE obj, bool check_ractor)
 {
-    if (UNLIKELY(rb_ractor_shareable_p(obj) && !rb_ractor_main_p())) {
+    if (check_ractor &&
+        UNLIKELY(rb_ractor_shareable_p(obj) && !rb_ractor_main_p())) {
         rb_raise(rb_eRuntimeError, "can not access instance variables of shareable objects from non-main Ractors");
     }
     return generic_iv_tbl_;
+}
+
+static inline struct st_table *
+generic_ivtbl(VALUE obj)
+{
+    return generic_ivtbl0(obj, true);
 }
 
 MJIT_FUNC_EXPORTED struct st_table *
@@ -896,15 +903,21 @@ rb_ivar_generic_ivtbl(VALUE obj)
 }
 
 static int
-gen_ivtbl_get(VALUE obj, struct gen_ivtbl **ivtbl)
+gen_ivtbl_get0(VALUE obj, struct gen_ivtbl **ivtbl, bool check_ractor)
 {
     st_data_t data;
 
-    if (st_lookup(generic_ivtbl(obj), (st_data_t)obj, &data)) {
+    if (st_lookup(generic_ivtbl0(obj, check_ractor), (st_data_t)obj, &data)) {
 	*ivtbl = (struct gen_ivtbl *)data;
 	return 1;
     }
     return 0;
+}
+
+static int
+gen_ivtbl_get(VALUE obj, struct gen_ivtbl **ivtbl)
+{
+    return gen_ivtbl_get0(obj, ivtbl, true);
 }
 
 static VALUE
@@ -1068,7 +1081,7 @@ rb_mark_generic_ivar(VALUE obj)
 {
     struct gen_ivtbl *ivtbl;
 
-    if (gen_ivtbl_get(obj, &ivtbl)) {
+    if (gen_ivtbl_get0(obj, &ivtbl, false)) {
 	gen_ivtbl_mark(ivtbl);
     }
 }
