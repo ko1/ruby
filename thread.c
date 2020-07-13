@@ -4702,10 +4702,11 @@ static void
 rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const rb_thread_t *))
 {
     rb_thread_t *i = 0;
-    rb_ractor_t *r;
     rb_vm_t *vm = th->vm;
-    vm->ractor.main_ractor = th->ractor;
+    rb_ractor_t *r = th->ractor;
+    vm->ractor.main_ractor = r;
     vm->ractor.main_thread = th;
+    r->status_ = ractor_created;
 
     gvl_atfork(rb_ractor_gvl(th->ractor));
     ubf_list_atfork();
@@ -4716,7 +4717,10 @@ rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const r
             atfork(i, th);
         }
     }
+    list_head_init(&vm->ractor.set);
+    vm->ractor.cnt = 0;
     rb_ractor_living_threads_init(th->ractor);
+
     rb_ractor_living_threads_insert(th->ractor, th);
 
     /* may be held by MJIT threads in parent */
@@ -4729,6 +4733,8 @@ rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const r
     vm->fork_gen++;
     rb_ractor_sleeper_threads_clear(th->ractor);
     rb_clear_coverages();
+
+    VM_ASSERT(vm->ractor.cnt == 1);
 }
 
 static void
