@@ -146,7 +146,12 @@ ruby_thread_set_native(rb_thread_t *th)
 void
 Init_native_thread(rb_thread_t *th)
 {
-    ruby_native_thread_key = TlsAlloc();
+    if ((ruby_current_ec_key = TlsAlloc()) == TLS_OUT_OF_INDEXES) {
+        rb_bug("TlsAlloc() for ruby_current_ec_key fails");
+    }
+    if ((ruby_native_thread_key = TlsAlloc()) == TLS_OUT_OF_INDEXES) {
+        rb_bug("TlsAlloc() for ruby_native_thread_key fails");
+    }
     ruby_thread_set_native(th);
     DuplicateHandle(GetCurrentProcess(),
 		    GetCurrentThread(),

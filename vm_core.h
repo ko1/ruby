@@ -1720,7 +1720,7 @@ RUBY_EXTERN rb_event_flag_t ruby_vm_event_flags;
 RUBY_EXTERN rb_event_flag_t ruby_vm_event_enabled_global_flags;
 RUBY_EXTERN unsigned int    ruby_vm_event_local_num;
 
-RUBY_EXTERN pthread_key_t ruby_current_ec_key;
+RUBY_EXTERN native_tls_key_t ruby_current_ec_key;
 
 RUBY_SYMBOL_EXPORT_END
 
@@ -1760,32 +1760,12 @@ rb_ec_vm_ptr(const rb_execution_context_t *ec)
     }
 }
 
-static inline void *
-getspecific(pthread_key_t *key)
-{
-    void *ptr = pthread_getspecific(*key);
-    if (UNLIKELY(ptr == NULL)) {
-        rb_bug("pthread_getspecific returns NULL");
-    }
-    return ptr;
-}
-
-static inline void
-setspecific(pthread_key_t *key, void *ptr)
-{
-    VM_ASSERT(ptr != NULL);
-    if (UNLIKELY(pthread_setspecific(*key, ptr) != 0)) {
-        rb_bug("pthread_setspecific error");
-    }
-}
-
 static inline rb_execution_context_t *
 rb_current_execution_context(void)
 {
-    rb_execution_context_t *ec = getspecific(&ruby_current_ec_key);
+    rb_execution_context_t *ec = native_tls_get(ruby_current_ec_key);
     VM_ASSERT(ec != NULL);
     return ec;
-    // return ruby_current_execution_context_ptr;
 }
 
 static inline rb_thread_t *
@@ -1811,8 +1791,7 @@ rb_current_vm(void)
 static inline void
 rb_ec_set_current_raw(rb_execution_context_t *ec)
 {
-    setspecific(&ruby_current_ec_key, ec);
-    // ruby_current_execution_context_ptr = th->ec;
+    native_tls_set(ruby_current_ec_key, ec);
 }
 
 #else

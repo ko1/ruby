@@ -32,4 +32,25 @@ typedef struct rb_global_vm_lock_struct {
     HANDLE lock;
 } rb_global_vm_lock_t;
 
+typedef DWORD native_tls_key_t; // TLS index
+
+static inline void *
+native_tls_get(native_tls_key_t key)
+{
+    void *ptr = TlsGetValue(key);
+    if (UNLIKELY(ptr == NULL)) {
+        rb_bug("TlsGetValue() returns NULL");
+    }
+    return ptr;
+}
+
+static inline void
+native_tls_set(native_tls_key_t key, void *ptr)
+{
+    VM_ASSERT(ptr != NULL);
+    if (UNLIKELY(TlsSetValue(key, ptr) == 0)) {
+        rb_bug("TlsSetValue() error");
+    }
+}
+
 #endif /* RUBY_THREAD_WIN32_H */
