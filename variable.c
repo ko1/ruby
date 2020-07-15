@@ -492,7 +492,6 @@ rb_gc_mark_global_tbl(void)
     }
 }
 
-#if 0 // TODO
 static enum rb_id_table_iterator_result
 update_global_entry(VALUE v, void *ignored)
 {
@@ -504,13 +503,12 @@ update_global_entry(VALUE v, void *ignored)
 }
 
 void
-rb_guild_update_global_tbl(struct rb_id_table *tbl)
+rb_gc_update_global_tbl(void)
 {
-    if (tbl) {
-        rb_id_table_foreach_values(tbl, update_global_entry, 0);
+    if (rb_global_tbl) {
+        rb_id_table_foreach_values(rb_global_tbl, update_global_entry, 0);
     }
 }
-#endif
 
 static ID
 global_id(const char *name)
