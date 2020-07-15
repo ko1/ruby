@@ -1254,6 +1254,7 @@ rb_ractor_living_threads_init(rb_ractor_t *r)
 {
     list_head_init(&r->threads.set);
     r->threads.cnt = 0;
+    r->threads.blocking_cnt = 0;
 }
 
 static void
