@@ -80,7 +80,6 @@ static const char* rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th);
 
 #define mutex_mark ((void(*)(void*))0)
 
-#if 0 // TODO: temporary unused
 static size_t
 rb_mutex_num_waiting(rb_mutex_t *mutex)
 {
@@ -93,7 +92,6 @@ rb_mutex_num_waiting(rb_mutex_t *mutex)
 
     return n;
 }
-#endif
 
 static void
 mutex_free(void *ptr)
@@ -291,7 +289,7 @@ do_mutex_lock(VALUE self, int interruptible_p)
 
 	    th->locking_mutex = Qfalse;
 	    if (mutex->th && timeout && !RUBY_VM_INTERRUPTED(th->ec)) {
-		rb_check_deadlock(th->vm);
+		rb_check_deadlock(th->ractor);
 	    }
 	    if (th->status == THREAD_STOPPED_FOREVER) {
 		th->status = prev_status;

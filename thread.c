@@ -136,7 +136,7 @@ static void sleep_hrtime(rb_thread_t *, rb_hrtime_t, unsigned int fl);
 static void sleep_forever(rb_thread_t *th, unsigned int fl);
 static void rb_thread_sleep_deadly_allow_spurious_wakeup(void);
 static int rb_threadptr_dead(rb_thread_t *th);
-static void rb_check_deadlock(rb_vm_t *vm);
+static void rb_check_deadlock(rb_ractor_t *r);
 static int rb_threadptr_pending_interrupt_empty_p(const rb_thread_t *th);
 static const char *thread_status_name(rb_thread_t *th, int detail);
 static int hrtime_update_expire(rb_hrtime_t *, const rb_hrtime_t);
@@ -847,9 +847,6 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 		   (void *)th, th->locking_mutex);
 	}
 
-	/* delete self other than main thread from living_threads */
-	rb_ractor_living_threads_remove(th->ractor, th);
-
         if (ractor_main_th->status == THREAD_KILLED && rb_thread_alone()) {
 	    /* I'm last thread. wake up main thread from rb_thread_terminate_all */
             rb_threadptr_interrupt(ractor_main_th);
@@ -868,7 +865,10 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 	}
 
 	rb_threadptr_unlock_all_locking_mutexes(th);
-	rb_check_deadlock(th->vm);
+	rb_check_deadlock(th->ractor);
+
+	/* delete self other than main thread from living_threads */
+	rb_ractor_living_threads_remove(th->ractor, th);
 
         rb_fiber_close(th->ec->fiber_ptr);
     }
@@ -1130,7 +1130,7 @@ thread_join_sleep(VALUE arg)
 	if (!p->limit) {
 	    th->status = THREAD_STOPPED_FOREVER;
             rb_ractor_sleeper_threads_inc(th->ractor);
-	    rb_check_deadlock(th->vm);
+	    rb_check_deadlock(th->ractor);
 	    native_sleep(th, 0);
             rb_ractor_sleeper_threads_dec(th->ractor);
 	}
@@ -1377,7 +1377,7 @@ sleep_forever(rb_thread_t *th, unsigned int fl)
     while (th->status == status) {
 	if (fl & SLEEP_DEADLOCKABLE) {
             rb_ractor_sleeper_threads_inc(th->ractor);
-	    rb_check_deadlock(th->vm);
+	    rb_check_deadlock(th->ractor);
 	}
 	native_sleep(th, 0);
 	if (fl & SLEEP_DEADLOCKABLE) {
@@ -5523,54 +5523,45 @@ ruby_native_thread_p(void)
     return th != 0;
 }
 
-#if 0 // TODO
 static void
-debug_deadlock_check(rb_vm_t *vm, VALUE msg)
+debug_deadlock_check(rb_ractor_t *r, VALUE msg)
 {
     rb_thread_t *th = 0;
-    rb_ractor_t *r = GET_RACTOR();
     VALUE sep = rb_str_new_cstr("\n   ");
 
     rb_str_catf(msg, "\n%d threads, %d sleeps current:%p main thread:%p\n",
 		rb_ractor_living_thread_num(r), rb_ractor_sleeper_thread_num(r),
-                (void *)GET_THREAD(), (void *)vm->main_thread);
+                (void *)GET_THREAD(), (void *)r->threads.main);
 
-    RB_VM_LOCK();
-    list_for_each(&vm->living_ractors, r, vmlr_node) {
-        list_for_each(&r->threads.set, th, lt_node) {
-            rb_str_catf(msg, "* %+"PRIsVALUE"\n   rb_thread_t:%p "
-                        "native:%"PRI_THREAD_ID" int:%u",
-                        th->self, (void *)th, thread_id_str(th), th->ec->interrupt_flag);
-            if (th->locking_mutex) {
-                rb_mutex_t *mutex = mutex_ptr(th->locking_mutex);
-                rb_str_catf(msg, " mutex:%p cond:%"PRIuSIZE,
-                            (void *)mutex->th, rb_mutex_num_waiting(mutex));
-            }
-            {
-                rb_thread_list_t *list = th->join_list;
-                while (list) {
-                    rb_str_catf(msg, "\n    depended by: tb_thread_id:%p", (void *)list->th);
-                    list = list->next;
-                }
-            }
-            rb_str_catf(msg, "\n   ");
-            rb_str_concat(msg, rb_ary_join(rb_ec_backtrace_str_ary(th->ec, 0, 0), sep));
-            rb_str_catf(msg, "\n");
+    list_for_each(&r->threads.set, th, lt_node) {
+        rb_str_catf(msg, "* %+"PRIsVALUE"\n   rb_thread_t:%p "
+                    "native:%"PRI_THREAD_ID" int:%u",
+                    th->self, (void *)th, thread_id_str(th), th->ec->interrupt_flag);
+
+        if (th->locking_mutex) {
+            rb_mutex_t *mutex = mutex_ptr(th->locking_mutex);
+            rb_str_catf(msg, " mutex:%p cond:%"PRIuSIZE,
+                        (void *)mutex->th, rb_mutex_num_waiting(mutex));
         }
+
+        {
+            rb_thread_list_t *list = th->join_list;
+            while (list) {
+                rb_str_catf(msg, "\n    depended by: tb_thread_id:%p", (void *)list->th);
+                list = list->next;
+            }
+        }
+        rb_str_catf(msg, "\n   ");
+        rb_str_concat(msg, rb_ary_join(rb_ec_backtrace_str_ary(th->ec, 0, 0), sep));
+        rb_str_catf(msg, "\n");
     }
-    RB_VM_UNLOCK();
 }
-#endif
 
 static void
-rb_check_deadlock(rb_vm_t *vm)
+rb_check_deadlock(rb_ractor_t *r)
 {
-    return; // TODO: deadlock detection algorithm
-
-#if 0 // TODO
     int found = 0;
-    rb_thread_t *th = 0;
-    rb_ractor_t *r = GET_RACTOR();
+    rb_thread_t *th;
     int sleeper_num = rb_ractor_sleeper_thread_num(r);
     int ltnum = rb_ractor_living_thread_num(r);
 
@@ -5597,11 +5588,10 @@ rb_check_deadlock(rb_vm_t *vm)
 	VALUE argv[2];
 	argv[0] = rb_eFatal;
 	argv[1] = rb_str_new2("No live threads left. Deadlock?");
-	debug_deadlock_check(vm, argv[1]);
+	debug_deadlock_check(r, argv[1]);
         rb_ractor_sleeper_threads_dec(GET_RACTOR());
-	rb_threadptr_raise(vm->main_thread, 2, argv);
+	rb_threadptr_raise(r->threads.main, 2, argv);
     }
-#endif
 }
 
 static void
