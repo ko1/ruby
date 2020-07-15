@@ -1144,7 +1144,7 @@ ractor_close_outgoing(rb_execution_context_t *ec, rb_ractor_t *cr)
 
 // creation/termination
 
-static VALUE
+static uint32_t
 ractor_next_id(void)
 {
     // TODO: lock

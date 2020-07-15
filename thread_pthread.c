@@ -168,7 +168,7 @@ static const void *const condattr_monotonic = NULL;
 #define TIME_QUANTUM_NSEC (TIME_QUANTUM_USEC * 1000)
 
 static rb_hrtime_t native_cond_timeout(rb_nativethread_cond_t *, rb_hrtime_t);
-static rb_hrtime_t native_cond_timedwait(rb_nativethread_cond_t *cond, pthread_mutex_t *mutex, const rb_hrtime_t *abs);
+static int native_cond_timedwait(rb_nativethread_cond_t *cond, pthread_mutex_t *mutex, const rb_hrtime_t *abs);
 
 /*
  * Designate the next gvl.timer thread, favor the last thread in
@@ -502,7 +502,7 @@ rb_native_cond_wait(rb_nativethread_cond_t *cond, pthread_mutex_t *mutex)
     }
 }
 
-static rb_hrtime_t
+static int
 native_cond_timedwait(rb_nativethread_cond_t *cond, pthread_mutex_t *mutex, const rb_hrtime_t *abs)
 {
     int r;
