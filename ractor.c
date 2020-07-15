@@ -15,7 +15,7 @@ static VALUE rb_eRactorClosedError;
 static VALUE rb_cRactorMovedObject;
 
 bool ruby_multi_ractor;
-void vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *r, const char *file, int line);
+static void vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *r, const char *file, int line);
 
 
 static void
@@ -542,7 +542,8 @@ ractor_sleep_interrupt(void *ptr)
     RACTOR_UNLOCK(r);
 }
 
-const char *
+#if USE_RUBY_DEBUG_LOG
+static const char *
 wait_status_str(enum ractor_wait_status wait_status)
 {
     switch ((int)wait_status) {
@@ -558,7 +559,7 @@ wait_status_str(enum ractor_wait_status wait_status)
     rb_bug("unrechable");
 }
 
-const char *
+static const char *
 wakeup_status_str(enum ractor_wakeup_status wakeup_status)
 {
     switch (wakeup_status) {
@@ -572,6 +573,7 @@ wakeup_status_str(enum ractor_wakeup_status wakeup_status)
     }
     rb_bug("unrechable");
 }
+#endif // USE_RUBY_DEBUG_LOG
 
 static void
 ractor_sleep(rb_execution_context_t *ec, rb_ractor_t *cr)
@@ -1432,7 +1434,7 @@ rb_ractor_living_threads_insert(rb_ractor_t *r, rb_thread_t *th)
     }
 }
 
-void
+static void
 vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *r, const char *file, int line)
 {
     ractor_status_set(r, ractor_blocking);
@@ -1583,7 +1585,7 @@ rb_ractor_terminate_interrupt_main_thread(rb_ractor_t *r)
 
 void rb_thread_terminate_all(void); // thread.c
 
-void
+static void
 ractor_terminal_interrupt_all(rb_vm_t *vm)
 {
     if (vm->ractor.cnt > 1) {

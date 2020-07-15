@@ -155,7 +155,7 @@ rb_vm_unlock_body(LOCATION_ARGS)
     vm_lock_leave(vm, &vm->ractor.sync.lock_rec APPEND_LOCATION_PARAMS);
 }
 
-void
+static void
 vm_cond_wait(rb_vm_t *vm, rb_nativethread_cond_t *cond, unsigned long msec)
 {
     ASSERT_vm_locking();
