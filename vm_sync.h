@@ -12,7 +12,7 @@
 #define APPEND_LOCATION_PARAMS , file, line
 #else
 #define LOCATION_ARGS void
-#define LOCATION_PARAMS void
+#define LOCATION_PARAMS
 #define APPEND_LOCATION_ARGS
 #define APPEND_LOCATION_PARAMS
 #endif

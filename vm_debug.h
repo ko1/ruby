@@ -32,7 +32,7 @@ RUBY_SYMBOL_EXPORT_END
 
 #if RUBY_DEVEL
 #ifndef USE_RUBY_DEBUG_LOG
-#define USE_RUBY_DEBUG_LOG 1
+#define USE_RUBY_DEBUG_LOG 0
 #endif
 #else
 // disable on !RUBY_DEVEL

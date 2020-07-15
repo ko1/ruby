@@ -847,7 +847,8 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 		   (void *)th, th->locking_mutex);
 	}
 
-        if (ractor_main_th->status == THREAD_KILLED && rb_thread_alone()) {
+        if (ractor_main_th->status == THREAD_KILLED &&
+            th->ractor->threads.cnt <= 2 /* main thread and this thread */) {
 	    /* I'm last thread. wake up main thread from rb_thread_terminate_all */
             rb_threadptr_interrupt(ractor_main_th);
 	}
