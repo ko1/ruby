@@ -180,7 +180,7 @@ rb_ractor_thread_switch(rb_ractor_t *cr, rb_thread_t *th)
 {
   if (cr->threads.running_ec != th->ec) {
         if (0) fprintf(stderr, "rb_ractor_thread_switch ec:%p->%p\n",
-                       cr->threads.running_ec, th->ec);
+                       (void *)cr->threads.running_ec, (void *)th->ec);
     }
     else {
         return;
@@ -202,7 +202,7 @@ rb_ractor_set_current_ec(rb_ractor_t *cr, rb_execution_context_t *ec)
 
     if (cr->threads.running_ec != ec) {
         if (0) fprintf(stderr, "rb_ractor_set_current_ec ec:%p->%p\n",
-                       cr->threads.running_ec, ec);
+                       (void *)cr->threads.running_ec, (void *)ec);
     }
     else {
         VM_ASSERT(0); // should be different
