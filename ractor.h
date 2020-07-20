@@ -83,8 +83,7 @@ struct rb_ractor_struct {
         unsigned int blocking_cnt;
         unsigned int sleeper;
         rb_global_vm_lock_t gvl;
-
-        rb_thread_t *running;
+        rb_execution_context_t *running_ec;
         rb_thread_t *main;
     } threads;
     VALUE thgroup_default;
@@ -129,7 +128,6 @@ void rb_ractor_atexit_exception(rb_execution_context_t *ec);
 void rb_ractor_teardown(rb_execution_context_t *ec);
 void rb_ractor_recv_parameters(rb_execution_context_t *ec, rb_ractor_t *g, int len, VALUE *ptr);
 void rb_ractor_send_parameters(rb_execution_context_t *ec, rb_ractor_t *g, VALUE args);
-
 
 VALUE rb_thread_create_ractor(rb_ractor_t *g, VALUE args, VALUE proc); // defined in thread.c
 
@@ -178,21 +176,39 @@ rb_ractor_sleeper_thread_num(rb_ractor_t *r)
 }
 
 static inline void
-rb_thread_set_current_raw(const rb_thread_t *th)
+rb_ractor_thread_switch(rb_ractor_t *cr, rb_thread_t *th)
 {
-    rb_ec_set_current_raw(th->ec);
+  if (cr->threads.running_ec != th->ec) {
+        if (0) fprintf(stderr, "rb_ractor_thread_switch ec:%p->%p\n",
+                       cr->threads.running_ec, th->ec);
+    }
+    else {
+        return;
+    }
+
+    if (cr->threads.running_ec != th->ec) {
+        th->running_time_us = 0;
+    }
+
+    cr->threads.running_ec = th->ec;
+
+    VM_ASSERT(cr == GET_RACTOR());
 }
 
 static inline void
-rb_thread_set_current(rb_thread_t *th)
+rb_ractor_set_current_ec(rb_ractor_t *cr, rb_execution_context_t *ec)
 {
-    VM_ASSERT(th->ractor == GET_RACTOR());
+    native_tls_set(ruby_current_ec_key, ec);
 
-    if (th->ractor->threads.running != th) {
-        th->running_time_us = 0;
+    if (cr->threads.running_ec != ec) {
+        if (0) fprintf(stderr, "rb_ractor_set_current_ec ec:%p->%p\n",
+                       cr->threads.running_ec, ec);
     }
-    rb_thread_set_current_raw(th);
-    th->ractor->threads.running = th;
+    else {
+        VM_ASSERT(0); // should be different
+    }
+
+    cr->threads.running_ec = ec;
 }
 
 void rb_vm_ractor_blocking_cnt_inc(rb_vm_t *vm, rb_ractor_t *cr, const char *file, int line);

@@ -3395,9 +3395,7 @@ Init_VM(void)
 	th->top_wrapper = 0;
 	th->top_self = rb_vm_top_self();
 
-	rb_thread_set_current(th);
-
-	rb_gc_register_mark_object((VALUE)iseq);
+        rb_gc_register_mark_object((VALUE)iseq);
 	th->ec->cfp->iseq = iseq;
 	th->ec->cfp->pc = iseq->body->iseq_encoded;
 	th->ec->cfp->self = th->top_self;
@@ -3453,10 +3451,9 @@ Init_BareVM(void)
     Init_native_thread(th);
     th->vm = vm;
     th_init(th, 0);
-    rb_thread_set_current_raw(th);
-    ruby_thread_init_stack(th);
-
     vm->ractor.main_ractor = th->ractor = rb_ractor_main_alloc();
+    rb_ractor_set_current_ec(th->ractor, th->ec);
+    ruby_thread_init_stack(th);
 
     rb_native_mutex_initialize(&vm->ractor.sync.lock);
     rb_native_cond_initialize(&vm->ractor.sync.barrier_cond);

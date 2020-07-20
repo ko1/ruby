@@ -223,7 +223,7 @@ do_gvl_timer(rb_global_vm_lock_t *gvl, rb_thread_t *th)
      * Timeslice.  Warning: the process may fork while this
      * thread is contending for GVL:
      */
-    if (gvl->owner) timer_thread_function(gvl);
+    if (gvl->owner) timer_thread_function(gvl->owner->ec);
     gvl->timer = 0;
 }
 
@@ -568,7 +568,7 @@ static int
 ruby_thread_set_native(rb_thread_t *th)
 {
     if (th && th->ec) {
-        rb_ec_set_current_raw(th->ec);
+        rb_ractor_set_current_ec(th->ractor, th->ec);
     }
     return pthread_setspecific(ruby_native_thread_key, th) == 0;
 }
@@ -594,6 +594,7 @@ Init_native_thread(rb_thread_t *th)
         rb_bug("pthread_key_create failed (ruby_current_ec_key)");
     }
     th->thread_id = pthread_self();
+    ruby_thread_set_native(th);
     fill_thread_id_str(th);
     native_thread_init(th);
     posix_signal(SIGVTALRM, null_func);
@@ -610,7 +611,6 @@ native_thread_init(rb_thread_t *th)
     rb_native_cond_initialize(&nd->cond.gvlq);
     if (&nd->cond.gvlq != &nd->cond.intr)
         rb_native_cond_initialize(&nd->cond.intr);
-    ruby_thread_set_native(th);
 }
 
 #ifndef USE_THREAD_CACHE

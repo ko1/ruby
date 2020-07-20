@@ -1788,12 +1788,6 @@ rb_current_vm(void)
     return ruby_current_vm_ptr;
 }
 
-static inline void
-rb_ec_set_current_raw(rb_execution_context_t *ec)
-{
-    native_tls_set(ruby_current_ec_key, ec);
-}
-
 #else
 #error "unsupported thread model"
 #endif

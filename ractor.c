@@ -1430,7 +1430,6 @@ rb_ractor_living_threads_insert(rb_ractor_t *r, rb_thread_t *th)
     if (r->threads.cnt == 1) {
         VM_ASSERT(ractor_status_p(r, ractor_created));
         vm_insert_ractor(th->vm, r);
-        r->threads.running = th;
     }
 }
 
@@ -1555,9 +1554,10 @@ rb_ractor_vm_barrier_interrupt_running_thread(rb_ractor_t *r)
     RACTOR_LOCK(r);
     {
         if (ractor_status_p(r, ractor_running)) {
-            rb_thread_t *th = r->threads.running;
-            VM_ASSERT(th != NULL);
-            RUBY_VM_SET_VM_BARRIER_INTERRUPT(th->ec);
+            rb_execution_context_t *ec = r->threads.running_ec;
+            if (ec) {
+                RUBY_VM_SET_VM_BARRIER_INTERRUPT(ec);
+            }
         }
     }
     RACTOR_UNLOCK(r);

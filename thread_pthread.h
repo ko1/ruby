@@ -98,7 +98,6 @@ native_tls_get(native_tls_key_t key)
 static inline void
 native_tls_set(native_tls_key_t key, void *ptr)
 {
-    VM_ASSERT(ptr != NULL);
     if (UNLIKELY(pthread_setspecific(key, ptr) != 0)) {
         rb_bug("pthread_setspecific error");
     }

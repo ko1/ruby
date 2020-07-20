@@ -47,10 +47,11 @@ native_tls_get(native_tls_key_t key)
 static inline void
 native_tls_set(native_tls_key_t key, void *ptr)
 {
-    VM_ASSERT(ptr != NULL);
     if (UNLIKELY(TlsSetValue(key, ptr) == 0)) {
         rb_bug("TlsSetValue() error");
     }
 }
+
+void rb_native_cond_timedwait(rb_nativethread_cond_t *cond, rb_nativethread_lock_t *mutex, unsigned long msec);
 
 #endif /* RUBY_THREAD_WIN32_H */

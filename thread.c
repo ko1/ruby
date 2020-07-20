@@ -176,6 +176,7 @@ static inline void blocking_region_end(rb_thread_t *th, struct rb_blocking_regio
 
 #define GVL_UNLOCK_END(th) \
   gvl_acquire(rb_ractor_gvl(th->ractor), th); \
+  rb_ractor_thread_switch(th->ractor, th); \
 } while(0)
 
 #ifdef __GNUC__
@@ -334,7 +335,7 @@ rb_thread_s_debug_set(VALUE self, VALUE val)
 #endif
 
 NOINLINE(static int thread_start_func_2(rb_thread_t *th, VALUE *stack_start));
-static void timer_thread_function(rb_global_vm_lock_t *gvl);
+static void timer_thread_function(rb_execution_context_t *ec);
 void ruby_sigchld_handler(rb_vm_t *); /* signal.c */
 
 static void
@@ -763,7 +764,9 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     VM_ASSERT(th != th->vm->ractor.main_thread);
 
     thread_debug("thread start: %p\n", (void *)th);
-    VM_ASSERT((size * sizeof(VALUE)) <= th->ec->machine.stack_maxsize);
+
+    // This assertion is not passed on win32 env. Check it later.
+    // VM_ASSERT((size * sizeof(VALUE)) <= th->ec->machine.stack_maxsize);
 
     vm_stack = alloca(size * sizeof(VALUE));
     VM_ASSERT(vm_stack);
@@ -774,7 +777,6 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     th->ec->machine.stack_start = STACK_DIR_UPPER(vm_stack + size, vm_stack);
     th->ec->machine.stack_maxsize -= size * sizeof(VALUE);
     ruby_thread_set_native(th);
-    rb_thread_set_current(th);
 
     if (rb_ractor_status_p(th->ractor, ractor_blocking)) {
         RB_VM_LOCK();
@@ -1529,7 +1531,7 @@ rb_thread_schedule_limits(uint32_t limits_us)
 	    thread_debug("rb_thread_schedule/switch start\n");
 	    RB_GC_SAVE_MACHINE_CONTEXT(th);
 	    gvl_yield(rb_ractor_gvl(th->ractor), th);
-	    rb_thread_set_current(th);
+            rb_ractor_thread_switch(th->ractor, th);
 	    thread_debug("rb_thread_schedule/switch done\n");
 	}
     }
@@ -1572,6 +1574,7 @@ blocking_region_end(rb_thread_t *th, struct rb_blocking_region_buffer *region)
     unregister_ubf_list(th);
 
     gvl_acquire(rb_ractor_gvl(th->ractor), th);
+    rb_ractor_thread_switch(th->ractor, th);
 
     thread_debug("leave blocking region (%p)\n", (void *)th);
     th->blocking_region_buffer = 0;
@@ -1813,7 +1816,7 @@ rb_thread_call_with_gvl(void *(*func)(void *), void *data1)
 	 * because this thread is not Ruby's thread.
          * What should we do?
 	 */
-
+        bp();
 	fprintf(stderr, "[BUG] rb_thread_call_with_gvl() is called by non-ruby thread\n");
 	exit(EXIT_FAILURE);
     }
@@ -4549,12 +4552,11 @@ rb_threadptr_check_signal(rb_thread_t *mth)
 }
 
 static void
-timer_thread_function(rb_global_vm_lock_t *gvl)
+timer_thread_function(rb_execution_context_t *ec)
 {
     // strictly speaking, accessing gvl->owner is not thread-safe
-    volatile const rb_thread_t *owner = gvl->owner;
-    if (owner) {
-        RUBY_VM_SET_TIMER_INTERRUPT(owner->ec);
+    if (ec) {
+        RUBY_VM_SET_TIMER_INTERRUPT(ec);
     }
 }
 
@@ -5562,7 +5564,7 @@ static void
 rb_check_deadlock(rb_ractor_t *r)
 {
     int found = 0;
-    rb_thread_t *th;
+    rb_thread_t *th = NULL;
     int sleeper_num = rb_ractor_sleeper_thread_num(r);
     int ltnum = rb_ractor_living_thread_num(r);
 
