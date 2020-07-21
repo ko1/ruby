@@ -19,12 +19,12 @@ You can make multiple Ractors and they run in parallel.
 
 Ractors don't share everything, unlike threads.
 
-* Most of objects are *Unshareable objects*, so you don't need to care about thread-safty problem which is caused by sharing.
+* Most of objects are *Unshareable objects*, so you don't need to care about thread-safety problem which is caused by sharing.
 * Some objects are *Shareable objects*.
   * Immutable objects: frozen object which doesn't refer unshareable-objcts.
     * `i = 123`: `i` is an immutable object.
     * `s = "str".freeze`: `s` is an immutable object.
-    * `a = [1, [2], 3].freeze`: `a` is not an immuable object because `a` refer unshareable-object `[2]` (which is not frozen).
+    * `a = [1, [2], 3].freeze`: `a` is not an immutable object because `a` refer unshareable-object `[2]` (which is not frozen).
   * Class/Module objects
   * Special shareable objects
     * Ractor object itself.
@@ -32,17 +32,17 @@ Ractors don't share everything, unlike threads.
 
 ### Two-types communication between Ractors
 
-Ractors communicate each other and synchronize the execution by message exchanging between Ractors. There are two message exchagne protocol: push type (message passing) and pull type.
+Ractors communicate each other and synchronize the execution by message exchanging between Ractors. There are two message exchange protocol: push type (message passing) and pull type.
 
 * Push type message passing: `Ractor#send(obj)` and `Ractor.receive()` pair.
   * Sender ractor passes the `obj` to receiver Ractor.
-  * Sender knowns a destination Ractor (the receiver of `r.send(obj)`) and receiver does not know the sender (accept all message from any ractors).
+  * Sender knows a destination Ractor (the receiver of `r.send(obj)`) and receiver does not know the sender (accept all message from any ractors).
   * Receiver has infinite queue and sender enqueues the message. Sender doesn't block to put message.
   * This type is based on actor model
 * Pull type communication: `Ractor.yield(obj)` and `Ractor#take()` pair.
   * Sender ractor declare to yield the `obj` and receiver Ractor take it.
   * Sender doesn't know a destination Ractor and receiver knows the sender (the receiver of `r.take`).
-  * Sender or receiver will block if there is no another side.
+  * Sender or receiver will block if there is no other side.
 
 ### Copy & Move semantics to send messages
 
@@ -67,7 +67,7 @@ Ractor helps to write a thread-safe program, but we can make thread-unsafe progr
   * There are several blocking operations (waiting send, waiting yield and waiting take) so you can make a program which has dead-lock and live-lock issues.
   * Some kind of shareable objects can introduce transactions (STM, for example). However, misusing transactions will genearte inconsistent state.
 
-Without Ractor, we need to trace all of state-mutations to debug thread-safty issue.
+Without Ractor, we need to trace all of state-mutations to debug thread-safety issues.
 With Ractor, you can concentrate to suspicious 
 
 ## Creation and termination
@@ -121,7 +121,7 @@ end
 r.take == self.object_id #=> false
 ```
 
-Passed arguments to `Ractor.new()` becomes block parameters for the given block. Howver, an interpreter does not pass the parameter object references, but send as messages (see bellow for details).
+Passed arguments to `Ractor.new()` becomes block parameters for the given block. However, an interpreter does not pass the parameter object references, but send as messages (see bellow for details).
 
 ```ruby
 r = Ractor.new 'ok' do |msg|
@@ -187,11 +187,11 @@ Communication between Ractors is achieved by message passing and shareable-objec
 Users can control blocking on (1), but should not control on (2) (only manage as critical section).
 
 * (1-1) send/recv (push type)
-  * `Ractor#sned(obj)` (`Ractor#<<(obj)` is an aliase) send a message to the Ractor's incoming port. Incoming port is connected to the infinite size incoming queue so `Ractor#send` will never block.
+  * `Ractor#send(obj)` (`Ractor#<<(obj)` is an aliase) send a message to the Ractor's incoming port. Incoming port is connected to the infinite size incoming queue so `Ractor#send` will never block.
   * `Ractor.recv` dequeue a message from own incoming queue. If the incoming queue is empty, `Ractor.recv` calling will block.
 * (1-2) yield/take (pull type)
   * `Ractor.yield(obj)` send an message to a Ractor which are calling `Ractor#take` via outgoing port . If no Ractors are waiting for it, the `Ractor.yield(obj)` will block. If multiple Ractors are waiting for `Ractor.yield(obj)`, only one Ractor can receive the message.
-  * `Ractor#take` receives a message which is waiting by `Ractor.yield(obj)` method from the specified Ractor. If the Ractor does not call `Ractor.yieeld` yet, the `Ractor#take` call will block.
+  * `Ractor#take` receives a message which is waiting by `Ractor.yield(obj)` method from the specified Ractor. If the Ractor does not call `Ractor.yield` yet, the `Ractor#take` call will block.
 * `Ractor.select()` can wait for the success of `take`, `yield` and `recv`.
 * You can close the incoming port or outgoing port.
   * You can close then with `Ractor#close_incoming` and `Ractor#close_outgoing`.
@@ -199,9 +199,9 @@ Users can control blocking on (1), but should not control on (2) (only manage as
   * If the outgoing port is closed for a Ractor, you can't call `Ractor#take` and `Ractor.yield` on the Ractor. If `Ractor#take` is blocked for the Ractor, then it will raise an exception.
   * When a Ractor is terminated, the Ractor's ports are closed.
 * There are 3 methods to send an object as a message
-  * (1) Send a reference: Send a shareable object, send only a refenrece to the object (fast)
-  * (2) Copy an object: Send an unshareable object by copying deeply and send copied object (slow). Note that you can not send an object which is not support deep copy. Current implemntation uses Marshal protocol to get deep copy.
-  * (3) Move an object: Send an unsarable object reference with a membership. Sender Ractor can not access moved objects anymore (raise an exception). Current implementation makes new object as a moved object for receiver Ractor and copy references of sending object to moved object.
+  * (1) Send a reference: Send a shareable object, send only a reference to the object (fast)
+  * (2) Copy an object: Send an unshareable object by copying deeply and send copied object (slow). Note that you can not send an object which is not support deep copy. Current implementation uses Marshal protocol to get deep copy.
+  * (3) Move an object: Send an unshareable object reference with a membership. Sender Ractor can not access moved objects anymore (raise an exception). Current implementation makes new object as a moved object for receiver Ractor and copy references of sending object to moved object.
   * You can choose "Copy" and "Send" as a keyword for `Ractor#send(obj)` and `Ractor.yield(obj)` (default is "Copy").
 
 ### Sending/Receiving ports
@@ -278,7 +278,7 @@ r, obj = Ractor.select(r1)
 r == r1 and obj == 'r1' #=> true
 ```
 
-Wait for two ractos:
+Wait for two ractors:
 
 ```ruby
 r1 = Ractor.new{'r1'}
@@ -286,7 +286,7 @@ r2 = Ractor.new{'r2'}
 rs = [r1, r2]
 as = []
 
-# Wiat for r1 or r2's Ractor.yield
+# Wait for r1 or r2's Ractor.yield
 r, obj = Ractor.select(*rs)
 rs.delete(r)
 as << obj
@@ -398,7 +398,7 @@ Example (try to send to closed (terminated) Ractor):
   end
 ```
 
-When multiple Ractors waiting for `Ractor.yield()`, `Ractor#close_outgoing` will cancel all blokcing by raise an exception (`ClosedError`).
+When multiple Ractors waiting for `Ractor.yield()`, `Ractor#close_outgoing` will cancel all blocking by raise an exception (`ClosedError`).
 
 ### Send a message by copying
 
@@ -432,7 +432,7 @@ end
 ## Send a message by moving
 
 `Ractor#send(obj, move: true)` or `Ractor.yield(obj, move: true)` move `obj` to the destination Ractor.
-If the source Ractor touchs the moved object (for example, call the method like `obj.foo()`), it will be an error.
+If the source Ractor touches the moved object (for example, call the method like `obj.foo()`), it will be an error.
 
 ```ruby
 # move with Ractor#send
@@ -473,13 +473,13 @@ end
   end
 ```
 
-Now only `T_FILE`, `T_STRING` and `T_ARRAY` objets are supported.
+Now only `T_FILE`, `T_STRING` and `T_ARRAY` objects are supported.
 
 * `T_FILE` (`IO`, `File`): support to send accepted socket etc.
 * `T_STRING` (`String`): suppport to send a huge string without copying (fast).
 * `T_ARRAY` (`Array'): support to send a huge Array without re-allocating the array's buffer. However, all of referred objects from the array should be moved, so it is not so fast.
 
-To achive the access prohibition for moved objects, _class replacement_ technique is used to implement it. 
+To achieve the access prohibition for moved objects, _class replacement_ technique is used to implement it. 
 
 ### shareable objects
 
@@ -491,7 +491,7 @@ The following objects are shareable.
     * Numeric objects: `Float`, `Complex`, `Rational`, big integers (`T_BIGNUM` in internal)
     * All Symbols.
   * Frozen `String` and `Regexp` objects (which does not have instance variables)
-  * In future, "Immutable" objects (frozen and only refer shareable objects) will be supported (TODO: introduce an `immutable` falg for objects?)
+  * In future, "Immutable" objects (frozen and only refer shareable objects) will be supported (TODO: introduce an `immutable` flag for objects?)
 * Class, Module objects (`T_CLASS`, `T_MODULE` and `T_ICLASS` in internal)
 * `Ractor` and other objects which care about synchronization.
 
@@ -524,7 +524,7 @@ Implementation: Now shareable objects (`RVALUE`) have `FL_SHAREABLE` flag. This 
   #+> "[[\"mutable str\", false], [[:array], false], [{:hash=>true}, false]]]"
 ```
 
-## Language changes to isolate unshaable objects between Ractors
+## Language changes to isolate unshareable objects between Ractors
 
 To isolate unshareable objects between Ractors, we introduced additional language semantics on multi-Ractor.
 
