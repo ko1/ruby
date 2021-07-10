@@ -9153,6 +9153,7 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
     mjit_gc_start_hook();
 
     during_gc = TRUE;
+    fprintf(stderr, "gc_enter: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     RUBY_DEBUG_LOG("%s (%s)",gc_enter_event_cstr(event), gc_current_status(objspace));
     gc_report(1, objspace, "gc_enter: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     gc_record(objspace, 0, gc_enter_event_cstr(event));
@@ -9169,7 +9170,7 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
     RUBY_DEBUG_LOG("%s (%s)", gc_enter_event_cstr(event), gc_current_status(objspace));
     gc_report(1, objspace, "gc_exit: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     during_gc = FALSE;
-
+    fprintf(stderr, "gc_exit: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     mjit_gc_exit_hook();
     RB_VM_LOCK_LEAVE_LEV(lock_lev);
 }
