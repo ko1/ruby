@@ -3615,3 +3615,9 @@ class TestArraySubclass < TestArray
     assert_equal(Array, @cls[*(1..100)][1..99].class) #not embedded
   end
 end
+
+class Array
+  def compact
+    self
+  end
+end
