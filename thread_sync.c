@@ -235,23 +235,19 @@ rb_mutex_trylock(VALUE self)
     rb_mutex_t *mutex = mutex_ptr(self);
 
     if (mutex->fiber == 0) {
-        rb_fiber_t *fiber = GET_EC()->fiber_ptr;
-        rb_thread_t *th = GET_THREAD();
-        mutex->fiber = fiber;
+        RUBY_DEBUG_LOG("%p ok", mutex);
+	rb_fiber_t *fiber = GET_EC()->fiber_ptr;
+	rb_thread_t *th = GET_THREAD();
+	mutex->fiber = fiber;
 
         mutex_locked(th, self);
         return Qtrue;
     }
-
-    return Qfalse;
+    else {
+        RUBY_DEBUG_LOG("%p ng", mutex);
+        return Qfalse;
+    }
 }
-
-/*
- * At maximum, only one thread can use cond_timedwait and watch deadlock
- * periodically. Multiple polling thread (i.e. concurrent deadlock check)
- * introduces new race conditions. [Bug #6278] [ruby-core:44275]
- */
-static const rb_thread_t *patrol_thread = NULL;
 
 static VALUE
 mutex_owned_p(rb_fiber_t *fiber, rb_mutex_t *mutex)
@@ -311,51 +307,17 @@ do_mutex_lock(VALUE self, int interruptible_p)
                 }
             }
             else {
-                enum rb_thread_status prev_status = th->status;
-                rb_hrtime_t *timeout = 0;
-                rb_hrtime_t rel = rb_msec2hrtime(100);
-
-                th->status = THREAD_STOPPED_FOREVER;
-                th->locking_mutex = self;
-                rb_ractor_sleeper_threads_inc(th->ractor);
-                /*
-                 * Carefully! while some contended threads are in native_sleep(),
-                 * ractor->sleeper is unstable value. we have to avoid both deadlock
-                 * and busy loop.
-                 */
-                if ((rb_ractor_living_thread_num(th->ractor) == rb_ractor_sleeper_thread_num(th->ractor)) &&
-                    !patrol_thread) {
-                    timeout = &rel;
-                    patrol_thread = th;
-                }
-
                 struct sync_waiter sync_waiter = {
                     .self = self,
                     .th = th,
-                    .fiber = fiber
+                    .fiber = fiber,
                 };
 
+                RUBY_DEBUG_LOG("%p wait", mutex);
                 ccan_list_add_tail(&mutex->waitq, &sync_waiter.node);
-
-                native_sleep(th, timeout); /* release GVL */
-
+                thread_sched_to_waiting_until_wakeup(TH_SCHED(th), th);
                 ccan_list_del(&sync_waiter.node);
-
-                if (!mutex->fiber) {
-                    mutex->fiber = fiber;
-                }
-
-                if (patrol_thread == th)
-                    patrol_thread = NULL;
-
-                th->locking_mutex = Qfalse;
-                if (mutex->fiber && timeout && !RUBY_VM_INTERRUPTED(th->ec)) {
-                    rb_check_deadlock(th->ractor);
-                }
-                if (th->status == THREAD_STOPPED_FOREVER) {
-                    th->status = prev_status;
-                }
-                rb_ractor_sleeper_threads_dec(th->ractor);
+                RUBY_DEBUG_LOG("%p wakeup", mutex);
             }
 
             if (interruptible_p) {
@@ -438,7 +400,7 @@ rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th, rb_fiber_t *fiber)
                 switch (cur->th->status) {
                   case THREAD_RUNNABLE: /* from someone else calling Thread#run */
                   case THREAD_STOPPED_FOREVER: /* likely (rb_mutex_lock) */
-                    rb_threadptr_interrupt(cur->th);
+                    thread_sched_wakeup(TH_SCHED(cur->th), cur->th);
                     goto found;
                   case THREAD_STOPPED: /* probably impossible */
                     rb_bug("unexpected THREAD_STOPPED");

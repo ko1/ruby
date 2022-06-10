@@ -651,6 +651,19 @@ typedef struct rb_vm_struct {
             rb_nativethread_cond_t terminate_cond;
             bool terminate_waiting;
         } sync;
+
+        // ractor scheduling
+        struct {
+            rb_nativethread_lock_t lock;
+            rb_nativethread_cond_t cond; // GRQ
+            unsigned int snt_cnt; // count of shared NTs
+            unsigned int dnt_cnt; // count of dedicated NTs
+            struct ccan_list_head grq; // // Global Ready Queue
+            unsigned int grq_cnt;
+
+            // threads which switch context by timeslice
+            struct ccan_list_head timeslice_threads;
+        } sched;
     } ractor;
 
 #ifdef USE_SIGALTSTACK
@@ -1024,7 +1037,7 @@ typedef struct rb_thread_struct {
 
     BITFIELD(enum rb_thread_status, status, 2);
     /* bit flags */
-    unsigned int locking_native_thread : 1;
+    unsigned int pinning_nt : 1;
     unsigned int to_kill : 1;
     unsigned int abort_on_exception: 1;
     unsigned int report_on_exception: 1;

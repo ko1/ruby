@@ -171,7 +171,7 @@ static inline void blocking_region_end(rb_thread_t *th, struct rb_blocking_regio
 #define THREAD_BLOCKING_BEGIN(th) do { \
   struct rb_thread_sched * const sched = TH_SCHED(th); \
   RB_GC_SAVE_MACHINE_CONTEXT(th); \
-  thread_sched_to_waiting(sched);
+  thread_sched_to_waiting(sched, (th));
 
 #define THREAD_BLOCKING_END(th) \
   thread_sched_to_running(sched, th); \
@@ -631,26 +631,22 @@ thread_do_start(rb_thread_t *th)
 }
 
 void rb_ec_clear_current_thread_trace_func(const rb_execution_context_t *ec);
-#define thread_sched_to_dead thread_sched_to_waiting
 
 static int
 thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 {
+    // VM_ASSERT(th is already running here)
+    RUBY_DEBUG_LOG("th:%u", rb_th_serial(th));
+    VM_ASSERT(th != th->vm->ractor.main_thread);
+
     STACK_GROW_DIR_DETECTION;
     enum ruby_tag_type state;
     VALUE errinfo = Qnil;
     size_t size = th->vm->default_params.thread_vm_stack_size / sizeof(VALUE);
+    // TODO
+    size = (TMP_MAX_STACK / sizeof(VALUE)) / 2;
     rb_thread_t *ractor_main_th = th->ractor->threads.main;
     VALUE * vm_stack = NULL;
-
-    VM_ASSERT(th != th->vm->ractor.main_thread);
-    RUBY_DEBUG_LOG("th:%u", rb_th_serial(th));
-
-    // setup native thread
-    thread_sched_to_running(TH_SCHED(th), th);
-    ruby_thread_set_native(th);
-
-    RUBY_DEBUG_LOG("got lock. th:%u", rb_th_serial(th));
 
     // setup ractor
     if (rb_ractor_status_p(th->ractor, ractor_blocking)) {
@@ -772,12 +768,12 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
         // after rb_ractor_living_threads_remove()
         // GC will happen anytime and this ractor can be collected (and destroy GVL).
         // So gvl_release() should be before it.
-        thread_sched_to_dead(TH_SCHED(th));
+        thread_sched_to_dead(TH_SCHED(th), th);
         rb_ractor_living_threads_remove(th->ractor, th);
     }
     else {
         rb_ractor_living_threads_remove(th->ractor, th);
-        thread_sched_to_dead(TH_SCHED(th));
+        thread_sched_to_dead(TH_SCHED(th), th);
     }
 
     return 0;
@@ -856,6 +852,7 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
 
     /* kick thread */
     err = native_thread_create(th);
+
     if (err) {
         th->status = THREAD_KILLED;
         rb_ractor_living_threads_remove(th->ractor, th);
@@ -1457,7 +1454,7 @@ blocking_region_begin(rb_thread_t *th, struct rb_blocking_region_buffer *region,
         RUBY_DEBUG_LOG("%s", "");
 
         RB_GC_SAVE_MACHINE_CONTEXT(th);
-        thread_sched_to_waiting(TH_SCHED(th));
+        thread_sched_to_waiting(TH_SCHED(th), th);
         return TRUE;
     }
     else {
@@ -4442,7 +4439,7 @@ consume_communication_pipe(int fd)
      * We can disarm it because this thread is now processing signals
      * and we do not want unnecessary SIGVTALRM
      */
-    ubf_timer_disarm();
+    //TODO: ubf_timer_disarm();
 
     while (1) {
         result = read(fd, buff, sizeof(buff));
@@ -5350,7 +5347,15 @@ Init_Thread(void)
         {
             /* acquire global vm lock */
             struct rb_thread_sched *sched = TH_SCHED(th);
-            thread_sched_to_running(sched, th);
+            VM_ASSERT(sched->running == th);
+
+            // thread_sched_to_running() should not be called because
+            // it assumes blocked by thread_sched_to_waiting().
+            // thread_sched_to_running(sched, th);
+
+#ifdef RB_INTERNAL_THREAD_HOOK
+            RB_INTERNAL_THREAD_HOOK(RUBY_INTERNAL_THREAD_EVENT_RESUMED);
+#endif
 
             th->pending_interrupt_queue = rb_ary_tmp_new(0);
             th->pending_interrupt_queue_checked = 0;
@@ -5423,7 +5428,6 @@ rb_check_deadlock(rb_ractor_t *r)
 
     if (ltnum > sleeper_num) return;
     if (ltnum < sleeper_num) rb_bug("sleeper must not be more than vm_living_thread_num(vm)");
-    if (patrol_thread && patrol_thread != GET_THREAD()) return;
 
     ccan_list_for_each(&r->threads.set, th, lt_node) {
         if (th->status != THREAD_STOPPED_FOREVER || RUBY_VM_INTERRUPTED(th->ec)) {

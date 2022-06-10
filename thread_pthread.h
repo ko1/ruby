@@ -14,19 +14,31 @@
 #include <pthread_np.h>
 #endif
 
+#include COROUTINE_H
+
 #define RB_NATIVETHREAD_LOCK_INIT PTHREAD_MUTEX_INITIALIZER
 #define RB_NATIVETHREAD_COND_INIT PTHREAD_COND_INITIALIZER
 
 // per-Thead scheduler helper data
 struct rb_thread_sched_item {
-    union {
+    struct {
         struct ccan_list_node ubf;
-        struct ccan_list_node readyq; // protected by sched->lock
+
+        // connected to ractor->threads.sched.reqdyq
+        // locked by ractor->threads.sched.lock
+        struct ccan_list_node readyq;
+
+        // connected to vm->ractor.sched.running_nt
+        // locked by vm->ractor.sched.lock
+        struct ccan_list_node timeslice_threads;
     } node;
+
+    struct coroutine_context context;
 };
 
 struct rb_native_thread {
-    int id;
+    rb_atomic_t serial;
+    struct rb_vm_struct *vm;
 
     rb_nativethread_id_t thread_id;
 
@@ -54,6 +66,9 @@ struct rb_native_thread {
 #ifdef USE_SIGALTSTACK
     void *altstack;
 #endif
+
+    struct coroutine_context nt_context;
+    int dedicated;
 };
 
 #undef except
@@ -63,10 +78,9 @@ struct rb_native_thread {
 
 // per-Ractor
 struct rb_thread_sched {
-    /* fast path */
-
-    const struct rb_thread_struct *running; // running thread or NULL
     rb_nativethread_lock_t lock;
+    struct rb_thread_struct *running; // running thread or NULL
+    bool running_is_timeslice_thread;
 
     /*
      * slow path, protected by ractor->thread_sched->lock
@@ -80,6 +94,8 @@ struct rb_thread_sched {
      *   timer.
      */
     struct ccan_list_head readyq;
+    int readyq_cnt;
+
     const struct rb_thread_struct *timer;
     int timer_err;
 
@@ -88,6 +104,9 @@ struct rb_thread_sched {
     rb_nativethread_cond_t switch_wait_cond;
     int need_yield;
     int wait_yield;
+
+    // ractor scheduling
+    struct ccan_list_node grq_node;
 };
 
 #if __STDC_VERSION__ >= 201112
@@ -123,6 +142,8 @@ RUBY_SYMBOL_EXPORT_BEGIN
     void rb_current_ec_set(struct rb_execution_context_struct *);
   #else
     RUBY_EXTERN RB_THREAD_LOCAL_SPECIFIER struct rb_execution_context_struct *ruby_current_ec;
+      RUBY_EXTERN RB_THREAD_LOCAL_SPECIFIER rb_atomic_t ruby_nt_serial;
+      #define RUBY_NT_SERIAL 1
   #endif
 #else
   RUBY_EXTERN native_tls_key_t ruby_current_ec_key;

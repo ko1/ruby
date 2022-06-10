@@ -531,6 +531,14 @@ ruby_debug_log(const char *file, int line, const char *func_name, const char *fm
         len += r;
     }
 
+#ifdef RUBY_NT_SERIAL
+    if (len < MAX_DEBUG_LOG_MESSAGE_LEN) {
+        r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tnt:%d", ruby_nt_serial);
+        if (r < 0) rb_bug("ruby_debug_log returns %d\n", r);
+        len += r;
+    }
+#endif
+
     if (rb_current_execution_context(false)) {
         // Ruby location
         int ruby_line;
