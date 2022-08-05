@@ -438,6 +438,9 @@ thread_sched_standby(struct rb_thread_sched *sched, rb_thread_t *th)
             RUBY_DEBUG_LOG("(nt) sleep th:%d running:%d", th_serial(th), th_serial(sched->running));
             rb_native_cond_wait(&th->nt->cond.readyq, &sched->lock);
             RUBY_DEBUG_LOG("(nt) wakeup %s", sched->running == th ? "success" : "failed");
+            if (th == sched->running) {
+                rb_ractor_thread_switch(th->ractor, th);
+            }
         }
         else {
             // search another ready ractor
@@ -618,9 +621,9 @@ thread_sched_switch0(struct coroutine_context *current_cont, rb_thread_t *next_t
     VM_ASSERT(!nt->dedicated);
     VM_ASSERT(next_th->nt == NULL);
 
-    ruby_thread_set_native(next_th);
+    RUBY_DEBUG_LOG("next_th:%d", th_serial(next_th));
 
-    RUBY_DEBUG_LOG("next_th:%d", next_th->serial);
+    ruby_thread_set_native(next_th);
 
     native_thread_assign(nt, next_th);
     coroutine_transfer(current_cont, &next_th->sched.context);

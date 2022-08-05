@@ -3171,7 +3171,8 @@ thread_free(void *ptr)
         RUBY_GC_INFO("MRI main thread\n");
     }
     else {
-        ruby_xfree(th->nt); // TODO
+        // ruby_xfree(th->nt);
+        // TODO: MN system collect nt, but without MN system it should be freed here.
         ruby_xfree(th);
     }
 

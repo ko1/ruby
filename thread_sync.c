@@ -416,6 +416,8 @@ rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th, rb_fiber_t *fiber)
         thread_mutex_remove(th, mutex);
     }
 
+    RUBY_DEBUG_LOG("err:%s", err);
+
     return err;
 }
 

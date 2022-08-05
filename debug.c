@@ -568,7 +568,17 @@ ruby_debug_log(const char *file, int line, const char *func_name, const char *fm
         // thread information
         const rb_thread_t *th = GET_THREAD();
         if (r && len < MAX_DEBUG_LOG_MESSAGE_LEN) {
-            r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tth:%u", rb_th_serial(th));
+            rb_execution_context_t *rec = th->ractor->threads.running_ec;
+            rb_thread_t *rth = rec ? rec->thread_ptr : NULL;
+            rb_thread_t *sth = th->ractor->threads.sched.running;
+            if (rth != th || sth != th) {
+                // ractor recognize another thread is running (another thread has GVL).
+                r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tth:%u (rth:%d,sth:%d)",
+                             rb_th_serial(th), rth ? (int)rb_th_serial(rth) : -1, sth ? (int)rb_th_serial(sth) : -1);
+            }
+            else {
+                r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tth:%u", rb_th_serial(th));
+            }
             if (r < 0) rb_bug("ruby_debug_log returns %d\n", r);
             len += r;
         }
