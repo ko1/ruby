@@ -58,6 +58,7 @@ struct rb_thread_sched_item {
         struct ccan_list_node node;
     } waiting_reason;
 
+    void *context_stack;
     struct coroutine_context context;
 };
 

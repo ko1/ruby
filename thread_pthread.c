@@ -1721,17 +1721,25 @@ native_thread_check_and_create_shared(rb_vm_t *vm)
     }
 }
 
+void
+rb_threadptr_sched_free(rb_thread_t *th)
+{
+    xfree(th->sched.context_stack);
+}
+
 #define TMP_MAX_STACK (1024 * 128)
 
 static int
 native_thread_create_shared(rb_thread_t *th)
 {
     // setup coroutine
-    void *stack = malloc(TMP_MAX_STACK);
-    coroutine_initialize(&th->sched.context, co_func, stack, TMP_MAX_STACK);
+    size_t stack_size = TMP_MAX_STACK; // TODO
+    void *stack = malloc(stack_size); // TODO: correct thread allocation
+    coroutine_initialize(&th->sched.context, co_func, stack, stack_size);
     th->sched.context.argument = th;
+    th->sched.context_stack = stack;
 
-    RUBY_DEBUG_LOG("stack:%p size:%d", stack, TMP_MAX_STACK);
+    RUBY_DEBUG_LOG("stack:%p size:%d", stack, stack_size);
     thread_sched_to_ready(TH_SCHED(th), th, true);
 
     // setup nt

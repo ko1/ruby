@@ -3152,11 +3152,15 @@ thread_mark(void *ptr)
     RUBY_MARK_LEAVE("thread");
 }
 
+void rb_threadptr_sched_free(rb_thread_t *th); // thread_*.c
+
 static void
 thread_free(void *ptr)
 {
     rb_thread_t *th = ptr;
     RUBY_FREE_ENTER("thread");
+
+    rb_threadptr_sched_free(th);
 
     if (th->locking_mutex != Qfalse) {
         rb_bug("thread_free: locking_mutex must be NULL (%p:%p)", (void *)th, (void *)th->locking_mutex);
