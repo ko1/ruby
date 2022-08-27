@@ -1070,13 +1070,15 @@ pst_wcoredump(VALUE st)
 static rb_pid_t
 do_waitpid(rb_pid_t pid, int *st, int flags)
 {
+    rb_pid_t ret;
 #if defined HAVE_WAITPID
-    return waitpid(pid, st, flags);
+    ret = waitpid(pid, st, flags);
 #elif defined HAVE_WAIT4
-    return wait4(pid, st, flags, NULL);
+    ret = wait4(pid, st, flags, NULL);
 #else
 #  error waitpid or wait4 is required.
 #endif
+    return ret;
 }
 
 #define WAITPID_LOCK_ONLY ((struct waitpid_state *)-1)
@@ -1092,9 +1094,6 @@ struct waitpid_state {
     int errnum;
 };
 
-int rb_sigwait_fd_get(const rb_thread_t *);
-void rb_sigwait_sleep(const rb_thread_t *, int fd, const rb_hrtime_t *);
-void rb_sigwait_fd_put(const rb_thread_t *, int fd);
 void rb_thread_sleep_interruptible(void);
 
 #if USE_MJIT
@@ -1110,7 +1109,8 @@ static int
 waitpid_signal(struct waitpid_state *w)
 {
     if (w->ec) { /* rb_waitpid */
-        rb_threadptr_interrupt(rb_ec_thread_ptr(w->ec));
+        rb_thread_t *th = rb_ec_thread_ptr(w->ec);
+        rb_threadptr_interrupt(th);
         return TRUE;
     }
 #if USE_MJIT
@@ -1138,32 +1138,6 @@ rb_vm_memsize_waiting_list(struct ccan_list_head *waiting_list)
     return size;
 }
 
-/*
- * When a thread is done using sigwait_fd and there are other threads
- * sleeping on waitpid, we must kick one of the threads out of
- * rb_native_cond_wait so it can switch to rb_sigwait_sleep
- */
-static void
-sigwait_fd_migrate_sleeper(rb_vm_t *vm)
-{
-    struct waitpid_state *w = 0;
-
-    ccan_list_for_each(&vm->waiting_pids, w, wnode) {
-        if (waitpid_signal(w)) return;
-    }
-    ccan_list_for_each(&vm->waiting_grps, w, wnode) {
-        if (waitpid_signal(w)) return;
-    }
-}
-
-void
-rb_sigwait_fd_migrate(rb_vm_t *vm)
-{
-    rb_native_mutex_lock(&vm->waitpid_lock);
-    sigwait_fd_migrate_sleeper(vm);
-    rb_native_mutex_unlock(&vm->waitpid_lock);
-}
-
 #if RUBY_SIGCHLD
 extern volatile unsigned int ruby_nocldwait; /* signal.c */
 /* called by timer thread or thread which acquired sigwait_fd */
@@ -1174,7 +1148,6 @@ waitpid_each(struct ccan_list_head *head)
 
     ccan_list_for_each_safe(head, w, next, wnode) {
         rb_pid_t ret = do_waitpid(w->pid, &w->status, w->options | WNOHANG);
-
         if (!ret) continue;
         if (ret == -1) w->errnum = errno;
 
@@ -1291,7 +1264,6 @@ waitpid_wait(struct waitpid_state *w)
         /* order matters, favor specified PIDs rather than -1 or 0 */
         ccan_list_add(w->pid > 0 ? &vm->waiting_pids : &vm->waiting_grps, &w->wnode);
     }
-
     rb_native_mutex_unlock(&vm->waitpid_lock);
 
     if (need_sleep) {
@@ -1748,22 +1720,24 @@ before_exec(void)
 
 /* This function should be async-signal-safe.  Actually it is. */
 static void
-after_exec_async_signal_safe(void)
+after_exec_async_signal_safe(bool is_parent)
 {
 }
 
 static void
-after_exec_non_async_signal_safe(void)
+after_exec_non_async_signal_safe(bool is_parent)
 {
-    rb_thread_reset_timer_thread();
-    rb_thread_start_timer_thread();
+    if (is_parent) {
+        rb_thread_reset_timer_thread();
+        rb_thread_start_timer_thread();
+    }
 }
 
 static void
-after_exec(void)
+after_exec(bool is_parent)
 {
-    after_exec_async_signal_safe();
-    after_exec_non_async_signal_safe();
+    after_exec_async_signal_safe(is_parent);
+    after_exec_non_async_signal_safe(is_parent);
 }
 
 #if defined HAVE_WORKING_FORK || defined HAVE_DAEMON
@@ -1774,10 +1748,10 @@ before_fork_ruby(void)
 }
 
 static void
-after_fork_ruby(void)
+after_fork_ruby(bool is_parent)
 {
     rb_threadptr_pending_interrupt_clear(GET_THREAD());
-    after_exec();
+    after_exec(is_parent);
 }
 #endif
 
@@ -1874,7 +1848,7 @@ rb_proc_exec(const char *str)
     int ret;
     before_exec();
     ret = proc_exec_sh(str, Qfalse);
-    after_exec();
+    after_exec(true);
     errno = ret;
     return -1;
 }
@@ -3102,14 +3076,14 @@ rb_f_exec(int argc, const VALUE *argv)
     rb_protect(rb_execarg_parent_start1, execarg_obj, &state);
     if (state) {
         execarg_parent_end(execarg_obj);
-        after_exec(); /* restart timer thread */
+        after_exec(true); /* restart timer thread */
         rb_jump_tag(state);
     }
 
     fail_str = eargp->use_shell ? eargp->invoke.sh.shell_script : eargp->invoke.cmd.command_name;
 
     err = exec_async_signal_safe(eargp, errmsg, sizeof(errmsg));
-    after_exec(); /* restart timer thread */
+    after_exec(true); /* restart timer thread */
 
     rb_exec_fail(eargp, err, errmsg);
     RB_GC_GUARD(execarg_obj);
@@ -4303,7 +4277,7 @@ rb_fork_ruby2(struct rb_process_status *status)
             status->pid = pid;
             status->error = err;
         }
-        after_fork_ruby();
+        after_fork_ruby(pid != 0);
         disable_child_handler_fork_parent(&old); /* yes, bad name */
 
         if (mjit_enabled && pid > 0) mjit_resume(); /* child (pid == 0) is cared by rb_thread_atfork */
@@ -7064,7 +7038,7 @@ rb_daemon(int nochdir, int noclose)
     if (mjit_enabled) mjit_pause(false); // Don't leave locked mutex to child.
     before_fork_ruby();
     err = daemon(nochdir, noclose);
-    after_fork_ruby();
+    after_fork_ruby(false);
     rb_thread_atfork(); /* calls mjit_resume() */
 #else
     int n;

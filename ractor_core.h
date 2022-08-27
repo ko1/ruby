@@ -240,8 +240,8 @@ rb_ractor_sleeper_thread_num(rb_ractor_t *r)
 static inline void
 rb_ractor_thread_switch(rb_ractor_t *cr, rb_thread_t *th)
 {
-    RUBY_DEBUG_LOG("th:%u->%u%s", rb_th_serial(cr->threads.running_ec->thread_ptr), rb_th_serial(th),
-                   cr->threads.running_ec == th->ec ? " same" : "");
+    RUBY_DEBUG_LOG("th:%d->%d%s", cr->threads.running_ec ? (int)rb_th_serial(cr->threads.running_ec->thread_ptr) : -1,
+                   rb_th_serial(th), cr->threads.running_ec == th->ec ? " same" : "");
 
     if (cr->threads.running_ec != th->ec) {
         if (0) {
@@ -277,7 +277,7 @@ rb_ractor_set_current_ec_(rb_ractor_t *cr, rb_execution_context_t *ec, const cha
     native_tls_set(ruby_current_ec_key, ec);
 #endif
     RUBY_DEBUG_LOG2(file, line, "ec:%p->%p", cr->threads.running_ec, ec);
-    VM_ASSERT(cr->threads.running_ec != ec);
+    VM_ASSERT(!ec || cr->threads.running_ec != ec);
     cr->threads.running_ec = ec;
 }
 

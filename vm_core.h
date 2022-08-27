@@ -658,11 +658,14 @@ typedef struct rb_vm_struct {
             rb_nativethread_cond_t cond; // GRQ
             unsigned int snt_cnt; // count of shared NTs
             unsigned int dnt_cnt; // count of dedicated NTs
+            unsigned int max_proc;
             struct ccan_list_head grq; // // Global Ready Queue
             unsigned int grq_cnt;
 
             // threads which switch context by timeslice
             struct ccan_list_head timeslice_threads;
+            // true if timeslice timer is not enable
+            bool timeslice_wait_inf;
         } sched;
     } ractor;
 
@@ -1903,15 +1906,21 @@ rb_current_thread(void)
 }
 
 static inline rb_ractor_t *
-rb_current_ractor(void)
+rb_current_ractor_raw(bool expect)
 {
     if (ruby_single_main_ractor) {
         return ruby_single_main_ractor;
     }
     else {
-        const rb_execution_context_t *ec = GET_EC();
-        return rb_ec_ractor_ptr(ec);
+        const rb_execution_context_t *ec = rb_current_execution_context(expect);
+        return (expect || ec) ? rb_ec_ractor_ptr(ec) : NULL;
     }
+}
+
+static inline rb_ractor_t *
+rb_current_ractor(void)
+{
+    return rb_current_ractor_raw(true);
 }
 
 static inline rb_vm_t *

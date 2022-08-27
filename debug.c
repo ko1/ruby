@@ -539,7 +539,9 @@ ruby_debug_log(const char *file, int line, const char *func_name, const char *fm
     }
 #endif
 
-    if (rb_current_execution_context(false)) {
+    rb_execution_context_t *ec = rb_current_execution_context(false);
+
+    if (ec) {
         // Ruby location
         int ruby_line;
         const char *ruby_file = rb_source_location_cstr(&ruby_line);
@@ -554,33 +556,37 @@ ruby_debug_log(const char *file, int line, const char *func_name, const char *fm
             len += r;
         }
 
+        rb_thread_t *th = ec ? rb_ec_thread_ptr(ec) : NULL;
+
         // ractor information
         if (ruby_single_main_ractor == NULL) {
-            rb_ractor_t *cr = GET_RACTOR();
+            rb_ractor_t *cr = th ? th->ractor : NULL;
+
             if (r && len < MAX_DEBUG_LOG_MESSAGE_LEN) {
-                r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tr:#%u/%u",
-                             (unsigned int)rb_ractor_id(cr), GET_VM()->ractor.cnt);
+                r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tr:#%d/%u",
+                             cr ? (int)rb_ractor_id(cr) : -1, GET_VM()->ractor.cnt);
                 if (r < 0) rb_bug("ruby_debug_log returns %d\n", r);
                 len += r;
             }
         }
 
         // thread information
-        const rb_thread_t *th = GET_THREAD();
-        if (r && len < MAX_DEBUG_LOG_MESSAGE_LEN) {
-            rb_execution_context_t *rec = th->ractor->threads.running_ec;
-            rb_thread_t *rth = rec ? rec->thread_ptr : NULL;
-            rb_thread_t *sth = th->ractor->threads.sched.running;
-            if (rth != th || sth != th) {
-                // ractor recognize another thread is running (another thread has GVL).
-                r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tth:%u (rth:%d,sth:%d)",
-                             rb_th_serial(th), rth ? (int)rb_th_serial(rth) : -1, sth ? (int)rb_th_serial(sth) : -1);
+        if (th) {
+            if (r && len < MAX_DEBUG_LOG_MESSAGE_LEN) {
+                rb_execution_context_t *rec = th->ractor ? th->ractor->threads.running_ec : NULL;
+                rb_thread_t *rth = rec ? rec->thread_ptr : NULL;
+                rb_thread_t *sth = th->ractor ? th->ractor->threads.sched.running : NULL;
+                if (rth != th || sth != th) {
+                    // ractor recognize another thread is running (another thread has GVL).
+                    r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tth:%u (rth:%d,sth:%d)",
+                                 rb_th_serial(th), rth ? (int)rb_th_serial(rth) : -1, sth ? (int)rb_th_serial(sth) : -1);
+                }
+                else {
+                    r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tth:%u", rb_th_serial(th));
+                }
+                if (r < 0) rb_bug("ruby_debug_log returns %d\n", r);
+                len += r;
             }
-            else {
-                r = snprintf(buff + len, MAX_DEBUG_LOG_MESSAGE_LEN - len, "\tth:%u", rb_th_serial(th));
-            }
-            if (r < 0) rb_bug("ruby_debug_log returns %d\n", r);
-            len += r;
         }
     }
 

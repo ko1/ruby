@@ -40,8 +40,13 @@ VALUE rb_exec_recursive_outer_mid(VALUE (*f)(VALUE g, VALUE h, int r), VALUE g, 
 int rb_thread_wait_for_single_fd(int fd, int events, struct timeval * timeout);
 
 RUBY_SYMBOL_EXPORT_BEGIN
-/* Temporary.  This API will be removed (renamed). */
+
+// obsolete. use `rb_thread_io_blocking_call`
 VALUE rb_thread_io_blocking_region(rb_blocking_function_t *func, void *data1, int fd);
+
+// events is `rb_io_event_t` in ruby/io.h
+VALUE rb_thread_io_blocking_call(rb_blocking_function_t *func, void *data1, int fd, int events);
+
 
 /* thread.c (export) */
 int ruby_thread_has_gvl_p(void); /* for ext/fiddle/closure.c */

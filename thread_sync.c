@@ -312,11 +312,32 @@ do_mutex_lock(VALUE self, int interruptible_p)
                     .th = th,
                     .fiber = fiber,
                 };
-
                 RUBY_DEBUG_LOG("%p wait", mutex);
+
+                // similar code with `sleep_forever`, but
+                // sleep_forever(SLEEP_DEADLOCKABLE) raises an exception.
+                // Ensure clause is needed like but `rb_ensure` a bit slow.
+                // 
+                //   begin
+                //     sleep_forever(th, SLEEP_DEADLOCKABLE);
+                //   ensure
+                //     ccan_list_del(&sync_waiter.node);
+                //   end
+                enum rb_thread_status prev_status = th->status;
+                th->status = THREAD_STOPPED_FOREVER;
+                rb_ractor_sleeper_threads_inc(th->ractor);
+                rb_check_deadlock(th->ractor);
+
+                th->locking_mutex = self;
+
                 ccan_list_add_tail(&mutex->waitq, &sync_waiter.node);
-                thread_sched_to_waiting_until_wakeup(TH_SCHED(th), th);
+                native_sleep(th, NULL);
                 ccan_list_del(&sync_waiter.node);
+
+                rb_ractor_sleeper_threads_dec(th->ractor);
+                th->status = prev_status;
+                th->locking_mutex = Qfalse;
+
                 RUBY_DEBUG_LOG("%p wakeup", mutex);
             }
 
@@ -400,7 +421,8 @@ rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th, rb_fiber_t *fiber)
                 switch (cur->th->status) {
                   case THREAD_RUNNABLE: /* from someone else calling Thread#run */
                   case THREAD_STOPPED_FOREVER: /* likely (rb_mutex_lock) */
-                    thread_sched_wakeup(TH_SCHED(cur->th), cur->th);
+                    RUBY_DEBUG_LOG("wakeup th:%d", th_serial(cur->th));
+                    rb_threadptr_interrupt(cur->th);
                     goto found;
                   case THREAD_STOPPED: /* probably impossible */
                     rb_bug("unexpected THREAD_STOPPED");

@@ -19,6 +19,13 @@
 #define RB_NATIVETHREAD_LOCK_INIT PTHREAD_MUTEX_INITIALIZER
 #define RB_NATIVETHREAD_COND_INIT PTHREAD_COND_INITIALIZER
 
+// copy from hrtime.h
+#ifdef MY_RUBY_BUILD_MAY_TIME_TRAVEL
+typedef int128_t rb_hrtime_t;
+#else
+typedef uint64_t rb_hrtime_t;
+#endif
+
 // per-Thead scheduler helper data
 struct rb_thread_sched_item {
     struct {
@@ -32,6 +39,24 @@ struct rb_thread_sched_item {
         // locked by vm->ractor.sched.lock
         struct ccan_list_node timeslice_threads;
     } node;
+
+    struct {
+        enum thread_sched_waiting_flag {
+            thread_sched_waiting_none     = 0x00,
+            thread_sched_waiting_timeout  = 0x01,
+            thread_sched_waiting_io_read  = 0x02,
+            thread_sched_waiting_io_write = 0x08,
+        } flags;
+
+        struct {
+            rb_hrtime_t timeout;
+            int fd; // -1 for timeout only
+            int result;
+        } data;
+
+        // connected to timer_th.waiting
+        struct ccan_list_node node;
+    } waiting_reason;
 
     struct coroutine_context context;
 };
@@ -78,7 +103,10 @@ struct rb_native_thread {
 
 // per-Ractor
 struct rb_thread_sched {
-    rb_nativethread_lock_t lock;
+    rb_nativethread_lock_t lock_;
+#if VM_CHECK_MODE
+    struct rb_thread_struct *lock_owner;
+#endif
     struct rb_thread_struct *running; // running thread or NULL
     bool running_is_timeslice_thread;
 

@@ -1143,7 +1143,7 @@ rb_read_internal(rb_io_t *fptr, void *buf, size_t count)
         .capa = count
     };
 
-    return (ssize_t)rb_thread_io_blocking_region(internal_read_func, &iis, fptr->fd);
+    return (ssize_t)rb_thread_io_blocking_call(internal_read_func, &iis, fptr->fd, RB_WAITFD_IN);
 }
 
 static ssize_t
@@ -1164,7 +1164,7 @@ rb_write_internal(rb_io_t *fptr, const void *buf, size_t count)
         .capa = count
     };
 
-    return (ssize_t)rb_thread_io_blocking_region(internal_write_func, &iis, fptr->fd);
+    return (ssize_t)rb_thread_io_blocking_call(internal_write_func, &iis, fptr->fd, RB_WAITFD_OUT);
 }
 
 #ifdef HAVE_WRITEV

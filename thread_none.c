@@ -233,28 +233,6 @@ rb_nativethread_self(void)
     return NULL;
 }
 
-// Do nothing for sigwait things because of no signal assumption
-// Q(katei): is this correct description?
-int
-rb_sigwait_fd_get(const rb_thread_t *th)
-{
-    return -1;
-}
-
-NORETURN(void rb_sigwait_fd_put(rb_thread_t *, int));
-void
-rb_sigwait_fd_put(rb_thread_t *th, int fd)
-{
-    rb_bug("not implemented, should not be called rb_sigwait_fd_put");
-}
-
-NORETURN(void rb_sigwait_sleep(const rb_thread_t *, int, const rb_hrtime_t *));
-void
-rb_sigwait_sleep(const rb_thread_t *th, int sigwait_fd, const rb_hrtime_t *rel)
-{
-    rb_bug("not implemented, should not be called rb_sigwait_sleep");
-}
-
 static void
 native_sleep(rb_thread_t *th, rb_hrtime_t *rel)
 {
