@@ -712,24 +712,23 @@ static void
 thread_sched_to_waiting_until_wakeup(struct rb_thread_sched *sched, rb_thread_t *th)
 {
     RUBY_DEBUG_LOG("th:%d", rb_th_serial(th));
-    RB_GC_SAVE_MACHINE_CONTEXT(th);
-
-    setup_ubf(th, ubf_ready, (void *)th);
 
     if (!RUBY_VM_INTERRUPTED(th->ec)) {
+        RB_GC_SAVE_MACHINE_CONTEXT(th);
+        setup_ubf(th, ubf_ready, (void *)th);
+
         thread_sched_lock(sched, th);;
         {
             thread_sched_wakeup_next_thread(sched, th);
             thread_sched_wait_running_turn(sched, th);
         }
         thread_sched_unlock(sched, th);
-
-        VM_ASSERT(th->unblock.func == NULL);
     }
     else {
         RUBY_DEBUG_LOG("th:%d interrupted", th_serial(th));
-        setup_ubf(th, NULL, NULL);
     }
+
+    VM_ASSERT(th->unblock.func == NULL);
 }
 
 static void
@@ -1739,7 +1738,7 @@ native_thread_create_shared(rb_thread_t *th)
     th->sched.context.argument = th;
     th->sched.context_stack = stack;
 
-    RUBY_DEBUG_LOG("stack:%p size:%d", stack, stack_size);
+    RUBY_DEBUG_LOG("stack:%p size:%ld", stack, stack_size);
     thread_sched_to_ready(TH_SCHED(th), th, true);
 
     // setup nt

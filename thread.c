@@ -343,8 +343,8 @@ rb_threadptr_interrupt_common(rb_thread_t *th, int trap)
         else {
             /* none */
         }
-        rb_native_mutex_unlock(&th->interrupt_lock);
     }
+    rb_native_mutex_unlock(&th->interrupt_lock);
 
     if (trap) {
         RUBY_VM_SET_TRAP_INTERRUPT(th->ec);

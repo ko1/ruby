@@ -24,6 +24,8 @@ struct sync_waiter {
 static void
 sync_wakeup(struct ccan_list_head *head, long max)
 {
+    RUBY_DEBUG_LOG("max:%ld", max);
+
     struct sync_waiter *cur = 0, *next;
 
     ccan_list_for_each_safe(head, cur, next, node) {
@@ -35,6 +37,7 @@ sync_wakeup(struct ccan_list_head *head, long max)
                 rb_fiber_scheduler_unblock(cur->th->scheduler, cur->self, rb_fiberptr_self(cur->fiber));
             }
             else {
+                RUBY_DEBUG_LOG("target_th:%d", th_serial(cur->th));
                 rb_threadptr_interrupt(cur->th);
                 cur->th->status = THREAD_RUNNABLE;
             }
@@ -270,6 +273,8 @@ delete_from_waitq(VALUE value)
     return Qnil;
 }
 
+static inline rb_atomic_t threadptr_get_interrupts(rb_thread_t *th);
+
 static VALUE
 do_mutex_lock(VALUE self, int interruptible_p)
 {
@@ -277,6 +282,7 @@ do_mutex_lock(VALUE self, int interruptible_p)
     rb_thread_t *th = ec->thread_ptr;
     rb_fiber_t *fiber = ec->fiber_ptr;
     rb_mutex_t *mutex = mutex_ptr(self);
+    rb_atomic_t saved_ints = 0;
 
     /* When running trap handler */
     if (!FL_TEST_RAW(self, MUTEX_ALLOW_TRAP) &&
@@ -290,6 +296,8 @@ do_mutex_lock(VALUE self, int interruptible_p)
         }
 
         while (mutex->fiber != fiber) {
+            VM_ASSERT(mutex->fiber != NULL);
+
             VALUE scheduler = rb_fiber_scheduler_current();
             if (scheduler != Qnil) {
                 struct sync_waiter sync_waiter = {
@@ -331,8 +339,15 @@ do_mutex_lock(VALUE self, int interruptible_p)
                 th->locking_mutex = self;
 
                 ccan_list_add_tail(&mutex->waitq, &sync_waiter.node);
-                native_sleep(th, NULL);
+                {
+                    native_sleep(th, NULL);
+                }
                 ccan_list_del(&sync_waiter.node);
+
+                // unlocked by another thread while sleeping
+                if (!mutex->fiber) {
+                    mutex->fiber = fiber;
+                }
 
                 rb_ractor_sleeper_threads_dec(th->ractor);
                 th->status = prev_status;
@@ -350,10 +365,26 @@ do_mutex_lock(VALUE self, int interruptible_p)
                     mutex->fiber = fiber;
                 }
             }
+            else {
+                // clear interrupt information
+                if (RUBY_VM_INTERRUPTED(th->ec)) {
+                    // reset interrupts
+                    if (saved_ints == 0) {
+                        saved_ints = threadptr_get_interrupts(th);
+                    }
+                    else {
+                        // ignore additional interrupts
+                        threadptr_get_interrupts(th);
+                    }
+                }
+            }
         }
 
+        if (saved_ints) th->ec->interrupt_flag = saved_ints;
         if (mutex->fiber == fiber) mutex_locked(th, self);
     }
+
+    RUBY_DEBUG_LOG("%p locked", mutex);
 
     // assertion
     if (mutex_owned_p(fiber, mutex) == Qfalse) rb_bug("do_mutex_lock: mutex is not owned.");
@@ -399,6 +430,8 @@ static const char *
 rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th, rb_fiber_t *fiber)
 {
     const char *err = NULL;
+
+    RUBY_DEBUG_LOG("%p", mutex);
 
     if (mutex->fiber == 0) {
         err = "Attempt to unlock a mutex which is not locked";
