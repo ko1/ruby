@@ -2348,7 +2348,7 @@ rb_threadptr_execute_interrupts(rb_thread_t *th, int blocking_timing)
                 limits_us >>= -th->priority;
 
             if (th->status == THREAD_RUNNABLE)
-                th->running_time_us += TIME_QUANTUM_USEC;
+                th->running_time_us += 10 * 1000; // 10ms = 10_000us // TODO: use macro
 
             VM_ASSERT(th->ec->cfp);
             EXEC_EVENT_HOOK(th->ec, RUBY_INTERNAL_EVENT_SWITCH, th->ec->cfp->self,
@@ -5349,13 +5349,15 @@ static void
 rb_check_deadlock(rb_ractor_t *r)
 {
     if (GET_THREAD()->vm->thread_ignore_deadlock) return;
-    int found = 0;
-    rb_thread_t *th = NULL;
+    if (r->threads.sched.readyq_cnt > 0) return;
+
     int sleeper_num = rb_ractor_sleeper_thread_num(r);
     int ltnum = rb_ractor_living_thread_num(r);
-
     if (ltnum > sleeper_num) return;
     if (ltnum < sleeper_num) rb_bug("sleeper must not be more than vm_living_thread_num(vm)");
+
+    int found = 0;
+    rb_thread_t *th = NULL;
 
     ccan_list_for_each(&r->threads.set, th, lt_node) {
         if (th->status != THREAD_STOPPED_FOREVER || RUBY_VM_INTERRUPTED(th->ec)) {
