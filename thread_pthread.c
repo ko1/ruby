@@ -238,11 +238,13 @@ thread_sched_lock_(struct rb_thread_sched *sched, rb_thread_t *th, const char *f
 {
     rb_native_mutex_lock(&sched->lock_);
 
+#if VM_CHECK_MODE
     RUBY_DEBUG_LOG2(file, line, "th:%d prev_owner:%d", th_serial(th), th_serial(sched->lock_owner));
 
-#if VM_CHECK_MODE
     VM_ASSERT(sched->lock_owner == NULL);
     sched->lock_owner = th;
+#else
+    RUBY_DEBUG_LOG2(file, line, "th:%d", th_serial(th));
 #endif
 }
 
@@ -790,7 +792,6 @@ thread_sched_switch0(struct coroutine_context *current_cont, rb_thread_t *next_t
     RUBY_DEBUG_LOG("next_th:%d", th_serial(next_th));
 
     ruby_thread_set_native(next_th);
-
     native_thread_assign(nt, next_th);
     coroutine_transfer(current_cont, &next_th->sched.context);
 }
@@ -1153,7 +1154,7 @@ Init_native_thread(rb_thread_t *main_th)
     ccan_list_head_init(&vm->ractor.sched.grq);
     vm->ractor.sched.dnt_cnt++;
     ccan_list_head_init(&vm->ractor.sched.timeslice_threads);
-    vm->ractor.sched.max_proc = 4; // TODO: Configuable
+    vm->ractor.sched.max_proc = 16; // TODO: Configuable
 
     // setup main thread
     main_th->nt->thread_id = pthread_self();
@@ -1482,6 +1483,7 @@ native_thread_init_stack(rb_thread_t *th)
     }
     else {
 #ifdef STACKADDR_AVAILABLE
+#if 0 //TODO
         void *start;
         size_t size;
 
@@ -1490,11 +1492,11 @@ native_thread_init_stack(rb_thread_t *th)
             th->ec->machine.stack_start = (VALUE *)&curr;
             th->ec->machine.stack_maxsize = size - diff;
         }
+#endif
 #else
         rb_raise(rb_eNotImpError, "ruby engine can initialize only in the main thread");
 #endif
     }
-
     return 0;
 }
 
@@ -1578,7 +1580,6 @@ static void
 call_thread_start_func_2(rb_thread_t *th)
 {
     RB_INTERNAL_THREAD_HOOK(RUBY_INTERNAL_THREAD_EVENT_STARTED);
-
 #if defined USE_NATIVE_THREAD_INIT
     native_thread_init_stack(th);
     thread_start_func_2(th, th->ec->machine.stack_start);
@@ -1626,7 +1627,7 @@ co_func(struct coroutine_context *from, struct coroutine_context *self)
     VM_ASSERT(th->nt != NULL);
     VM_ASSERT(th == sched->running);
 
-    RUBY_DEBUG_LOG("th:%d", (int)th->serial);
+    // RUBY_DEBUG_LOG("th:%d", (int)th->serial);
 
     thread_sched_unlock(sched, NULL);
     {
@@ -1700,7 +1701,7 @@ native_thread_check_and_create_shared(rb_vm_t *vm)
             vm->ractor.sched.snt_cnt++;
             need_to_make = true;
 
-            fprintf(stderr, "dnt:%u snt:%u\n",
+            if (0) fprintf(stderr, "dnt:%u snt:%u\n",
                     vm->ractor.sched.dnt_cnt,
                     vm->ractor.sched.snt_cnt);
         }
@@ -1720,25 +1721,239 @@ native_thread_check_and_create_shared(rb_vm_t *vm)
     }
 }
 
+#define MSTACK_CHUNK_SIZE (512 * 1024 * 1024) // 512MB
+#define MSTACK_PAGE_SIZE 4096
+#define MSTACK_CHUNK_PAGE_NUM (MSTACK_CHUNK_SIZE / MSTACK_PAGE_SIZE - 1) // 1 is start redzone
+
+// 512MB chunk
+// 131,072 pages (> 65,536)
+// 0th page is Redzone. Start from 1st page.
+
+/*
+ *            <--> machine stack + vm stack
+ * ----------------------------------
+ * |HD...|RZ| ... |RZ| ...   ... |RZ|
+ * <------------- 512MB ------------->
+ */
+struct nt_stack_chunk_header {
+    struct nt_stack_chunk_header *prev_chunk;
+    struct nt_stack_chunk_header *prev_free_chunk;
+
+    uint16_t start_page;
+    uint16_t stack_count;
+    uint16_t uninitialized_stack_count;
+
+    uint16_t free_stack_pos;
+    uint16_t free_stack[];
+} *nt_stack_chunks = NULL,
+  *nt_free_stack_chunks = NULL;
+
+struct nt_machine_stack_footer {
+    struct nt_stack_chunk_header *ch;
+    size_t index;
+};
+
+rb_nativethread_lock_t nt_machine_stack_lock = RB_NATIVETHREAD_LOCK_INIT;
+
+#include <sys/mman.h>
+
+// vm_stack_size + machine_stack_size + 1 * (guard page size)
+static inline size_t
+nt_therad_stack_size(void)
+{
+    static size_t msz;
+    if (LIKELY(msz > 0)) return msz;
+
+    rb_vm_t *vm = GET_VM();
+    int sz = vm->default_params.thread_vm_stack_size + vm->default_params.thread_machine_stack_size + MSTACK_PAGE_SIZE;
+    int page_num = (sz + MSTACK_PAGE_SIZE - 1) / MSTACK_PAGE_SIZE;
+    msz = page_num * MSTACK_PAGE_SIZE;
+    return msz;
+}
+
+static struct nt_stack_chunk_header *
+nt_alloc_thread_stack_chunk(struct nt_stack_chunk_header *prev_ch)
+{
+    const char *m = (void *)mmap(NULL, MSTACK_CHUNK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK, -1, 0);
+    if (m == MAP_FAILED) {
+      rb_bug("mmap failed errno:%d", errno); // TODO: raise
+    }
+
+    size_t msz = nt_therad_stack_size();
+    int header_page_cnt = 1;
+    int stack_count = ((MSTACK_CHUNK_PAGE_NUM - header_page_cnt) * MSTACK_PAGE_SIZE) / msz;
+    int ch_size = sizeof(struct nt_stack_chunk_header) + sizeof(uint16_t) * stack_count;
+
+    if (ch_size > MSTACK_PAGE_SIZE * header_page_cnt) {
+        header_page_cnt = (ch_size + MSTACK_PAGE_SIZE - 1) / MSTACK_PAGE_SIZE;
+        stack_count = ((MSTACK_CHUNK_PAGE_NUM - header_page_cnt) * MSTACK_PAGE_SIZE) / msz;
+    }
+
+    VM_ASSERT(stack_count <= UINT16_MAX);
+
+    struct nt_stack_chunk_header *ch = (struct nt_stack_chunk_header *)m;
+
+    ch->start_page = header_page_cnt;
+    ch->prev_chunk = prev_ch;
+    ch->prev_free_chunk = NULL;
+    ch->uninitialized_stack_count = ch->stack_count = (uint16_t)stack_count;
+    ch->free_stack_pos = 0;
+
+    RUBY_DEBUG_LOG("ch:%p start_page:%d stack_cnt:%d stack_size:%d", ch, (int)ch->start_page, (int)ch->stack_count, (int)msz);
+
+    return ch;
+}
+
+static void *
+nt_stack_chunk_get_stack_start(struct nt_stack_chunk_header *ch, size_t idx)
+{
+    const char *m = (char *)ch;
+    return (void *)(m + ch->start_page * MSTACK_PAGE_SIZE + idx * nt_therad_stack_size());
+}
+
+static struct nt_machine_stack_footer *
+nt_stack_chunk_get_msf(const rb_vm_t *vm, const char *mstack)
+{
+    // TODO: stack direction
+    const size_t msz = vm->default_params.thread_machine_stack_size;
+    return (struct nt_machine_stack_footer *)&mstack[msz - sizeof(struct nt_machine_stack_footer)];
+}
+
+static void *
+nt_stack_chunk_get_stack(const rb_vm_t *vm, struct nt_stack_chunk_header *ch, size_t idx, void **vm_stack, void **machine_stack)
+{
+    // TODO: only support stack going down
+    // [VM ... <GUARD> machine stack ...]
+
+    const char *vstack, *mstack;
+    const char *guard_page;
+    vstack = nt_stack_chunk_get_stack_start(ch, idx);
+    guard_page = vstack + vm->default_params.thread_vm_stack_size;
+    mstack = guard_page + MSTACK_PAGE_SIZE;
+
+    struct nt_machine_stack_footer *msf = nt_stack_chunk_get_msf(vm, mstack);
+    msf->ch = ch;
+    msf->index = idx;
+
+    RUBY_DEBUG_LOG("msf:%p vstack:%p-%p guard_page:%p-%p mstack:%p-%p", msf,
+                   vstack, (void *)(guard_page-1),
+                   guard_page, (void *)(mstack-1),
+                   mstack, (void *)(msf));
+
+    *vm_stack = (void *)vstack;
+    *machine_stack = (void *)mstack;
+
+    return (void *)guard_page;
+}
+
+static void
+nt_guard_page(const char *p, size_t len)
+{
+    int r = mprotect((void *)p, len, PROT_NONE);
+
+    if (r != 0) {
+        rb_bug("mprotect errno:%d", errno); // TODO: raise
+    }
+}
+
+static void
+nt_alloc_stack(rb_vm_t *vm, void **vm_stack, void **machine_stack)
+{
+    rb_native_mutex_lock(&nt_machine_stack_lock);
+    {
+      retry:
+        if (nt_free_stack_chunks) {
+            struct nt_stack_chunk_header *ch = nt_free_stack_chunks;
+            if (ch->free_stack_pos > 0) {
+                RUBY_DEBUG_LOG("free_stack_pos:%d", ch->free_stack_pos);
+                nt_stack_chunk_get_stack(vm, ch, ch->free_stack[--ch->free_stack_pos], vm_stack, machine_stack);
+            }
+            else if (ch->uninitialized_stack_count > 0) {
+                RUBY_DEBUG_LOG("uninitialized_stack_count:%d", ch->uninitialized_stack_count);
+
+                size_t idx = ch->stack_count - ch->uninitialized_stack_count--;
+                void *guard_page = nt_stack_chunk_get_stack(vm, ch, idx, vm_stack, machine_stack);
+                nt_guard_page(guard_page, MSTACK_PAGE_SIZE);
+            }
+            else {
+                nt_free_stack_chunks = ch->prev_free_chunk;
+                ch->prev_free_chunk = NULL;
+                goto retry;
+            }
+        }
+        else {
+            nt_free_stack_chunks = nt_stack_chunks = nt_alloc_thread_stack_chunk(nt_stack_chunks);
+            goto retry;
+        }
+    }
+    rb_native_mutex_unlock(&nt_machine_stack_lock);
+}
+
+static void
+nt_free_stack(void *mstack)
+{
+    if (!mstack) return;
+
+    rb_native_mutex_lock(&nt_machine_stack_lock);
+    {
+        struct nt_machine_stack_footer *msf = nt_stack_chunk_get_msf(GET_VM(), mstack);
+        struct nt_stack_chunk_header *ch = msf->ch;
+        int idx = msf->index;
+        void *stack = nt_stack_chunk_get_stack_start(ch, idx);
+
+        RUBY_DEBUG_LOG("stack:%p mstack:%p ch:%p index:%d", stack, mstack, ch, idx);
+
+        if (ch->uninitialized_stack_count == 0 &&
+            ch->free_stack_pos == 0) {
+            ch->prev_free_chunk = nt_free_stack_chunks;
+            nt_free_stack_chunks = ch;
+        }
+
+        ch->free_stack[ch->free_stack_pos++] = idx;
+
+        // clear the stack pages
+#if defined(MADV_FREE)
+        int r = madvise(stack, nt_therad_stack_size(), MADV_FREE);
+#elif defined(MADV_DONTNEED)
+        int r = madvise(stack, nt_therad_stack_size(), MADV_DONTNEED);
+#else
+        int r = 0;
+#endif
+        if (r != 0) rb_bug("madvise errno:%d", errno);
+    }
+    rb_native_mutex_unlock(&nt_machine_stack_lock);
+}
+
 void
 rb_threadptr_sched_free(rb_thread_t *th)
 {
-    xfree(th->sched.context_stack);
+    nt_free_stack(th->sched.context_stack);
 }
-
-#define TMP_MAX_STACK (1024 * 128)
 
 static int
 native_thread_create_shared(rb_thread_t *th)
 {
     // setup coroutine
-    size_t stack_size = TMP_MAX_STACK; // TODO
-    void *stack = malloc(stack_size); // TODO: correct thread allocation
-    coroutine_initialize(&th->sched.context, co_func, stack, stack_size);
-    th->sched.context.argument = th;
-    th->sched.context_stack = stack;
+    rb_vm_t *vm = th->vm;
+    void *vm_stack, *machine_stack;
+    nt_alloc_stack(vm, &vm_stack, &machine_stack);
 
-    RUBY_DEBUG_LOG("stack:%p size:%ld", stack, stack_size);
+    VM_ASSERT(vm_stack < machine_stack);
+
+    // setup vm stack
+    size_t vm_stack_words = th->vm->default_params.thread_vm_stack_size/sizeof(VALUE);
+    rb_ec_initialize_vm_stack(th->ec, vm_stack, vm_stack_words);
+
+    // setup machine stack
+    size_t machine_stack_size = vm->default_params.thread_machine_stack_size - sizeof(struct nt_machine_stack_footer);
+    coroutine_initialize(&th->sched.context, co_func, machine_stack, machine_stack_size);
+    th->ec->machine.stack_start = (void *)((uintptr_t)machine_stack + machine_stack_size);
+    th->ec->machine.stack_maxsize = machine_stack_size; // TODO
+
+    th->sched.context_stack = machine_stack;
+    th->sched.context.argument = th;
+
+    RUBY_DEBUG_LOG("th:%d vm_stack:%p machine_stack:%p", th_serial(th), vm_stack, machine_stack);
     thread_sched_to_ready(TH_SCHED(th), th, true);
 
     // setup nt
@@ -2224,6 +2439,8 @@ timer_thread_set_timeout(rb_vm_t *vm)
     }
 
     RUBY_DEBUG_LOG("timeout:%d", timeout);
+
+    // fprintf(stderr, "timeout:%d\n", timeout);
     return timeout;
 #endif
 }

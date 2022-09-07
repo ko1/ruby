@@ -3304,6 +3304,9 @@ VALUE
 rb_thread_alloc(VALUE klass)
 {
     VALUE self = thread_alloc(klass);
+
+    VM_ASSERT(RB_TYPE_P(self, T_DATA));
+
     rb_thread_t *target_th = rb_thread_ptr(self);
     target_th->ractor = GET_RACTOR();
     th_init(target_th, self, target_th->vm = GET_VM());

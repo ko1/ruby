@@ -640,11 +640,7 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
     STACK_GROW_DIR_DETECTION;
     enum ruby_tag_type state;
     VALUE errinfo = Qnil;
-    size_t size = th->vm->default_params.thread_vm_stack_size / sizeof(VALUE);
-    // TODO
-    size = (TMP_MAX_STACK / sizeof(VALUE)) / 2;
     rb_thread_t *ractor_main_th = th->ractor->threads.main;
-    VALUE * vm_stack = NULL;
 
     // setup ractor
     if (rb_ractor_status_p(th->ractor, ractor_blocking)) {
@@ -661,14 +657,8 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
 
     // This assertion is not passed on win32 env. Check it later.
     // VM_ASSERT((size * sizeof(VALUE)) <= th->ec->machine.stack_maxsize);
-
-    // setup VM and machine stack
-    vm_stack = alloca(size * sizeof(VALUE));
-    VM_ASSERT(vm_stack);
-
-    rb_ec_initialize_vm_stack(th->ec, vm_stack, size);
-    th->ec->machine.stack_start = STACK_DIR_UPPER(vm_stack + size, vm_stack);
-    th->ec->machine.stack_maxsize -= size * sizeof(VALUE);
+    // bp();
+    // th->ec->machine.stack_start = STACK_DIR_UPPER(vm_stack + size, vm_stack);
 
     // Ensure that we are not joinable.
     VM_ASSERT(th->value == Qundef);
@@ -2445,9 +2435,9 @@ rb_ec_reset_raised(rb_execution_context_t *ec)
 int
 rb_notify_fd_close(int fd, struct ccan_list_head *busy)
 {
+#if 0
     rb_vm_t *vm = GET_THREAD()->vm;
     struct waiting_fd *wfd = 0, *next;
-
     RB_VM_LOCK_ENTER();
     {
         ccan_list_for_each_safe(&vm->waiting_fds, wfd, next, wfd_node) {
@@ -2465,7 +2455,7 @@ rb_notify_fd_close(int fd, struct ccan_list_head *busy)
         }
     }
     RB_VM_LOCK_LEAVE();
-
+#endif
     return !ccan_list_empty(busy);
 }
 
