@@ -6864,10 +6864,10 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
     if (RGENGC_CHECK_MODE >= 3) gc_verify_internal_consistency(objspace);
 
     during_gc = TRUE;
+    fprintf(stderr, "gc_enter: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     RUBY_DEBUG_LOG("%s (%s)",gc_enter_event_cstr(event), gc_current_status(objspace));
     gc_report(1, objspace, "gc_enter: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     gc_record(objspace, 0, gc_enter_event_cstr(event));
-
     rb_gc_event_hook(0, RUBY_INTERNAL_EVENT_GC_ENTER);
 }
 
@@ -6882,6 +6882,7 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
     RUBY_DEBUG_LOG("%s (%s)", gc_enter_event_cstr(event), gc_current_status(objspace));
     gc_report(1, objspace, "gc_exit: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     during_gc = FALSE;
+    fprintf(stderr, "gc_exit: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
 
     rb_gc_vm_unlock(*lock_lev);
 }
