@@ -192,7 +192,8 @@ skip して use-after-free していた。
 **sweep の pin ガード** (`gc_sweep_plane`):
 ```c
 if (objspace->local && RB_OBJ_SHAREABLE_P(vp) && !rlgc_global_gc_active) break; /* ローカルは shareable 不解放 */
-if (rlgc_has_local && RB_OBJ_SHAREABLE_P(vp) && T_IMEMO && (callcache|callinfo|ment)) break; /* cc/cme/ci ピン(§5.1) */
+if (rlgc_has_local && !rlgc_global_gc_active && RB_OBJ_SHAREABLE_P(vp) && T_IMEMO && (callcache|callinfo|ment)) break;
+                                                              /* cc/cme/ci ピン。global GC では guard を外す(§5.1): dead クラスと一緒に回収 */
 ```
 
 ### 3.5 lock-free allocation
@@ -353,34 +354,38 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
 
 ## 5. 残存課題
 
-### 5.1 【最重要・未解決】cc/cme・メッセージコピーの cross-objspace 寿命
-**統一した根**: 「**ピン(または再コピー)で生き残った構造が、confined GC に解放された cross-objspace の子を
-strong 参照して dangling する**」。複数の症状が同一系統:
+### 5.1 mark-T_NONE 並行族 — shareable VM インフラの解放が並行 GC と非整合
+2026-05-31 の徹底ストレス(36 シナリオ)で判明した最大の残存系統。「**生き残った構造が、別 objspace で
+解放されたオブジェクトを参照して dangling**」が共通根で、多数の症状を生む。
 
-- **cc/cme(メソッドエントリ)** [最小再現あり]: 匿名クラス k(unshareable, local)のメソッドの cme(shareable)は
-  cc/cme pin(§3.4)で全 GC でピンされるが、k は confined GC が解放する → cme の strong 参照
-  owner/defined_class/def-body(iseq)が解放済み k を指す → 後の global GC の `mark_and_move_method_entry`
-  (imemo.c)で `try to mark T_NONE`、または method 探索の `rb_id_table_lookup`(`vm_populate_cc`)で garbage class。
-  ```ruby
-  8.times.map { Ractor.new { 200.times {
-    2000.times { k = Class.new { def m = 1; def n(x) = x }; o = k.new; o.m; o.n(3) }
-    GC.start(full_mark: false)
-  } } }.each(&:value)   # ~4/20 crash
-  ```
-- **メッセージコピー** (§3.10 残存): 受信側 `ractor_copy` が並行 global GC 下で破損クローンを生成(破損
-  ヘッダ len:150 capa:1 が解放済み要素を参照)。極限ストレスで ~7.5%。
+**この系統の中で修正できた個別インスタンス（コミット済み）**:
+- **③ confined GC が他 Ractor の fiber/EC を歩く**(§3.11) ── commit a19485dfc。
+- **cc/cme dangling**(commit e94190497): **クラスは全て shareable**(`Ractor.shareable?(Class.new)==true`)
+  なので、匿名クラス k は confined GC では解放されず **global GC が到達性で回収**する。バグは cc/cme pin が
+  **全 GC（global 含む）**で効き、dead クラスが global GC に回収されるのに cme が pin で生き残って owner を
+  dangling 参照していたこと。pin を `!rlgc_global_gc_active` でゲート(shareable pin と同じく global GC では
+  guard を外す)→ r4 4/20→**0/40**、s2 2/12→**0/15**。live クラスは m_tbl/cc_tbl から cc/cme を強くマーク
+  するので生存、dead クラスは subtree ごと回収される。
+- **GC.compact / verify_compaction_references**(move は per-Ractor objspace と非互換): RLGC 時は non-move
+  full GC にゲート ── commit b134827c5。
 
-**確定した性質**:
-- AUDIT の s→u WB-miss は **0** ＝ WB/shared_bits 系**ではない**。§3.10 の機構と同様、global GC が
-  shared_bit をクリアし、cme/コピーは weak inline cache 経由でしか辿れず未マークで `gc_shared_relation`
-  が再ピンしない。
-- **単純パッチは効かない(実証)**: 「unshareable クラスの cc/cme を pin しない」案を実装し実測 → r4 が
-  **4/20→8/20 と悪化**(dangling する子が owner→def-body→inline-cache へ移るだけ)。本質的トレードオフ
-  (**pin する↔子が dangling / pin しない↔inline cache・cc が dangling**)。
+**未解決の残存（極限ストレスでのみ顕在、通常〜型多様ワークロードは 0）**: 署名でクラスタ化すると概ね:
+- **`gc_mark_shared_roots` → T_NONE**(stale shared_bits) と **`VM/cc_table` → T_NONE cc**(class の
+  call-cache table が freed cc を参照): shareable な VM インフラ(shared_bits remset / class cc_table)が
+  並行 GC 下で解放と非整合になる。`GC.stress=true`(全 alloc を GC 化)+4-8 Ractor 並行で顕在。
+- **message :b 配列 → T_NONE 要素**(§3.10 残存, ~7.5%): 受信側 ractor_copy が並行 global GC 下で破損
+  クローンを生成。
 
-**必要な対応 = main-routing の再設計**(default.c の cc/cme pin コメントが予告する follow-up):
-cc/cme/ment を main objspace で標準管理し、死んだローカルクラスの cme を標準機構で回収(＝inline cache も
-標準どおり無効化)する。関数追加では済まない設計変更。**本セッション未着手。**
+**重要(再試行不要)**:
+- **pre-existing**(cc/cme 修正の有無に関わらず発生 ── maximize_confined 2/5 w/o fix)。本セッションの修正は
+  回帰ではない。
+- **投機的修正は4連敗**: (a) cc_table マークに NON_BARRIER ロック → 効果なし(クラッシュは
+  cc_table-mark-vs-populate ではなく `gc_mark_shared_roots` だった)。(b) free 時に shared_bit クリア →
+  効果なし(free 点の計測で「shared-bit オブジェクトは sweep で解放されていない」＝stale bit は free 経路
+  起因でない)。(c) holder(§A.3) (d) don't-pin(§A.4)。**rapid-patch では割れない。**
+
+**必要な対応**: ASAN/デバッガ級の精密診断(freed オブジェクトの alloc/free/use 特定)。これは RLGC
+プロトタイプの並行 GC 堅牢性の根の課題で、静的解析・投機パッチでは閉じない。**本セッション未クローズ。**
 
 ### 5.2 未監査で原理的に残るカテゴリ
 1. **ユーザ定義 T_DATA の `dmark`/`dfree`** — confined ローカル GC 中に任意の C 拡張コードが走り任意の共有 C
