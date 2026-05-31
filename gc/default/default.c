@@ -4008,7 +4008,11 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                      * pinned in EVERY GC once any local objspace exists — not just the global GC —
                      * to close both holes. They are bounded; reclaiming them needs the main-routing
                      * follow-up. Narrow ON PURPOSE: pinning all shareables would keep dead objects
-                     * (e.g. a collected Ractor) alive while their unshareable children are freed. */
+                     * (e.g. a collected Ractor) alive while their unshareable children are freed.
+                     * KNOWN BUG (RACTOR_LOCAL_GC_DESIGN.md 7.4): a cc/cme for an unshareable local
+                     * class is pinned past the class's death -> its strong owner/def references
+                     * dangle. Narrowing the pin to shareable-class cc/cme does NOT fix it (just moves
+                     * the dangling child owner->def-body->inline-cache); needs the main-routing redesign. */
                     break;
                 }
 #endif

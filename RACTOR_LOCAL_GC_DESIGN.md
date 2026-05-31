@@ -693,3 +693,27 @@ cont オブジェクトと thread 参照は生かす）。所有判定 = `cont->
 - **残存#3（メソッドテーブル/inline cache レース）**: ③ 修正後の s2 confined で稀に(1/12)別 SEGV ──
   GC ではなく**メソッド探索中**(`rb_id_table_lookup` id_table.c:230 ← `vm_populate_cc`)。共有メソッド
   テーブル/cc/cme の並行レース（cc/cme/id_table の NON_BARRIER ロック/pin の残穴の疑い）。別系統。
+
+### 7.4 残存#3 の深掘り — cc/cme の cross-objspace 寿命（= 既知の main-routing 問題、未解決）
+**最小再現 r4（~4/20 crash、ネスト/メインスレッド不要）**:
+```ruby
+8.times.map { Ractor.new {
+  200.times {
+    2000.times { k = Class.new { def m = 1; def n(x) = x }; o = k.new; o.m; o.n(3) }
+    GC.start(full_mark: false)
+  }
+}}.each(&:value)
+```
+**根本原因**: 匿名クラス k(unshareable, local)のメソッドの cme(shareable)は cc/cme pin で**全 GC で pin**
+されるが、k は confined GC が解放する → cme の **strong 参照** owner/defined_class/def-body(iseq) が
+**解放済み k を指す dangling** → 後の global GC の `mark_and_move_method_entry`(imemo.c:338/347)で
+`try to mark T_NONE`、または method 探索の `rb_id_table_lookup`(s2 #3)で garbage class。AUDIT で
+**s→u WB ミス 0** ＝ WB 系ではない（§5.0 同様、global GC が shared_bit をクリアし、cme は weak inline
+cache 経由でしか辿れず未マーク → `gc_shared_relation` が再ピンせず → k が解放される）。
+**試した修正と棄却（実証）**: 「unshareable クラスの cc/cme は pin しない」を実装し実測 → r4 が
+**4/20 → 8/20 と悪化**（dangling する子が owner→def-body→inline-cache へ移るだけ）。これは
+**「pin する↔子が dangling」「pin しない↔inline cache/cc が dangling」の本質的トレードオフ**で、単純
+パッチでは解けない。default.c:4000 のコメントが言う **"main-routing follow-up"**（cc/cme/ment を main
+objspace で標準管理し、dead local class の cme を標準機構で正しく回収＝inline cache も標準どおり無効化）
+が必要な**構造的課題**と確定。② のメッセージ slot 破損も同系統（pin/再コピーされた構造が freed
+cross-objspace 子を参照）の可能性が高い。**この層は本セッションでは未クローズ（要 RLGC 設計対応）。**
