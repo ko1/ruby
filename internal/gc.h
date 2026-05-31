@@ -211,6 +211,7 @@ void *rb_gc_ractor_cache_alloc_on_main(rb_ractor_t *ractor);
 void rb_gc_mark_ractor_local_roots(rb_ractor_t *ractor);
 bool rb_gc_rlgc_enabled(void);
 bool rb_gc_object_in_current_objspace_p(VALUE obj);
+bool rb_gc_confined_foreign_ractor_p(const rb_ractor_t *owner);
 
 bool rb_gc_size_allocatable_p(size_t size);
 size_t *rb_gc_heap_sizes(void);

@@ -4028,6 +4028,16 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
 #undef CHECK
 #endif
 
+#if RACTOR_LOCAL_GC_AUDIT
+                /* u->s liveness invariant: a confined per-Ractor local GC must NEVER free a shareable
+                 * object (a shareable may still be referenced from another objspace; it stays pinned
+                 * until a global GC -- see the sweep pin above). Reaching the free path with a
+                 * shareable means that pin was bypassed -> its unshareable children would dangle. */
+                if (objspace->local && !rlgc_global_gc_active && RB_OBJ_SHAREABLE_P(vp)) {
+                    rb_bug("RLGC-AUDIT: confined local GC freeing a shareable object: %s", rb_obj_info(vp));
+                }
+#endif
+
                 if (!rb_gc_obj_needs_cleanup_p(vp)) {
                     (void)VALGRIND_MAKE_MEM_UNDEFINED((void*)p, slot_size);
                     heap_page_add_freeobj(objspace, sweep_page, vp);

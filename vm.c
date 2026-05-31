@@ -3697,6 +3697,12 @@ mark_local_storage_i(VALUE local, void *data)
 void
 rb_execution_context_mark(const rb_execution_context_t *ec)
 {
+    /* Ractor-local GC invariant: a confined local GC must only ever walk an EC belonging to its OWN
+     * Ractor. Walking a foreign (concurrently running) Ractor's EC races on its live control frames
+     * and crashes. Callers (cont_mark, the per-Ractor root path) are responsible for skipping
+     * foreign ECs; this catches any path that forgets. */
+    VM_ASSERT(ec->thread_ptr == NULL || !rb_gc_confined_foreign_ractor_p(ec->thread_ptr->ractor));
+
     /* mark VM stack */
     if (ec->vm_stack) {
         VM_ASSERT(ec->cfp);

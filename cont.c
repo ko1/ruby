@@ -1152,6 +1152,18 @@ cont_mark(void *ptr)
     }
     rb_gc_mark_movable(cont->value);
 
+    /* Ractor-local GC: a continuation/fiber owned by ANOTHER Ractor can be physically resident in
+     * this (the GC driver's) objspace -- e.g. a child Ractor's root fiber, allocated on the parent
+     * thread during Ractor.new. During a confined local GC that other Ractor runs concurrently, so
+     * walking its saved EC / VM stack / machine stack races on live frames -> SEGV. Keep the cont
+     * object and its thread reference alive, but skip the running state: the owner Ractor's own GC
+     * marks its EC. (During a global STW GC every Ractor is stopped, so this never skips.) */
+    if (rb_gc_confined_foreign_ractor_p(cont->saved_ec.thread_ptr->ractor)) {
+        rb_gc_mark(cont_thread_value(cont));
+        RUBY_MARK_LEAVE("cont");
+        return;
+    }
+
     rb_execution_context_mark(&cont->saved_ec);
     rb_gc_mark(cont_thread_value(cont));
 

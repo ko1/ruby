@@ -651,3 +651,45 @@ global GC の並行性堅牢性(スロット破損)で、s2(下記)と同系統�
 **結論:** コア修正(materialize-on-receive, holder 無し)は §5.0 を解消し、現実的・型多様なワークロードで
 クラッシュ無し。極限並行ストレスで露呈した残存①②は RLGC 並行 GC の深層堅牢性課題で、本修正の単純な追補
 では閉じない（holder は無効と実証）。
+
+## 7. confined GC が他 Ractor の fiber/EC を歩くバグ（修正済）＋ confinement アサーション
+
+### 7.1 バグ（修正済・2026-05-31）
+**症状**: 子を生成した親 Ractor の confined GC 中に SEGV（`rb_execution_context_mark` vm.c:3730 →
+`cont_mark` cont.c:1156 → `fiber_mark`）。**最小再現(5行・決定的・10/10 crash)**:
+```ruby
+parent = Ractor.new do
+  child = Ractor.new { 200_000.times { [Object.new, "s" * 5] }; :child }
+  300.times { GC.start(full_mark: false); 300.times { "x" * 50 } }
+  child.value; :done
+end
+parent.value
+```
+**根本原因**: `Ractor.new` は親スレッド上で子の root fiber を確保するため、**子の fiber オブジェクトが
+物理的に親の objspace に在住**する（メッセージ所有権バグと同型）。親の confined GC がそれをマーク →
+`fiber_mark`→`cont_mark`→`rb_execution_context_mark` が**子の並行実行中のフレームスタック**を歩く →
+壊れた EP で SEGV。二分で確定: GLOBAL_GC=0/LOCKFREE=0 でも発生（confined GC 固有）、RLGC OFF で消滅。
+
+**修正**: `cont_mark`(cont.c) で、confined local GC 中に **別 Ractor 所有**の cont/fiber は
+saved_ec/VM スタック/machine スタックの走査を**スキップ**（その Ractor 自身の GC が自分の EC をマーク；
+cont オブジェクトと thread 参照は生かす）。所有判定 = `cont->saved_ec.thread_ptr->ractor` を新ヘルパー
+`rb_gc_confined_foreign_ractor_p(owner)`(gc.c: confined GC 中かつ owner≠driver で true、global STW 中は
+常に false)で判定。検証: 最小再現 **0/30**、s2 GLOBAL_GC=0 **5/5→0/12**、btest 159/161(既存 Tempfile のみ)。
+
+### 7.2 confinement アサーション（ご要望: s→u / u→s）
+- **N1 EC-confinement**(vm.c `rb_execution_context_mark` 先頭, `VM_ASSERT`): confined GC は自 Ractor の
+  EC のみ歩く（`ec->thread_ptr==NULL || !rb_gc_confined_foreign_ractor_p(ec->thread_ptr->ractor)`）。
+  §7.1 バグ種別を捕捉。
+- **N3 u→s liveness**(default.c sweep, `RACTOR_LOCAL_GC_AUDIT`, rb_bug): confined local GC は shareable を
+  決して free しない（pin 迂回検出）。
+- **s→u**(既存 `gc_shared_wb_miss`, `RACTOR_LOCAL_GC_AUDIT`): shareable→unshareable で shared_bit 未記録の
+  WB ミスを報告。
+- 検証: VM_CHECK_MODE=1 + AUDIT=1 でコンパイル成功・正常系 3 種で**誤発火 0**。
+
+### 7.3 残存（ストレスで判明、未解決）
+- **残存②（メッセージ slot 破損）**: §6.10 の通り。AUDIT(s→u WB ミス検出)で **WB ミス 0** ＝ s→u/shared_bits
+  系**ではない**。AUDIT が shared_bits クリアを止めても s1 はクラッシュ ＝ より深い並行 GC のスロット破損
+  （破損ヘッダ len:150 capa:1）。要 RLGC 深層対応。
+- **残存#3（メソッドテーブル/inline cache レース）**: ③ 修正後の s2 confined で稀に(1/12)別 SEGV ──
+  GC ではなく**メソッド探索中**(`rb_id_table_lookup` id_table.c:230 ← `vm_populate_cc`)。共有メソッド
+  テーブル/cc/cme の並行レース（cc/cme/id_table の NON_BARRIER ロック/pin の残穴の疑い）。別系統。

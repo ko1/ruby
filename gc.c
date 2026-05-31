@@ -3540,6 +3540,19 @@ rb_gc_during_confined_local_gc_p(void)
     return rlgc_has_local && !rlgc_global_gc_active;
 }
 
+/* During a confined per-Ractor local GC, true iff `owner` is NOT the Ractor whose GC is running.
+ * A foreign Ractor executes concurrently, so its threads'/fibers' control frames and machine stacks
+ * are unstable -- a confined GC must not walk them (the read races -> SEGV). Those objects are kept
+ * alive shallowly by the normal object mark; their running execution state is marked by the owner
+ * Ractor's own GC. Always false during a global STW GC (all Ractors stopped, walking any EC is
+ * safe) and when no local objspace exists. */
+bool
+rb_gc_confined_foreign_ractor_p(const rb_ractor_t *owner)
+{
+    if (!rb_gc_during_confined_local_gc_p()) return false;
+    return owner != rb_ec_ractor_ptr(rb_gc_get_ec());
+}
+
 /* Pin an in-flight Ractor message payload in its (the SENDER's) objspace via the shared_bits
  * remset, so the sender's confined local GC roots it and never frees it locally. An in-flight copy
  * lives in the sender's objspace but is referenced ONLY from the receiver's basket queue -- a
