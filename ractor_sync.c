@@ -649,12 +649,25 @@ ractor_sync_mark(rb_ractor_t *r)
 {
     rb_gc_mark(r->sync.default_port_value);
 
-    if (r->sync.ports) {
-        ractor_queue_mark(r->sync.recv_queue);
-        st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
+    /* recv_queue / ports / monitors are mutated by FOREIGN Ractors (senders, port (de)register,
+     * monitors) while holding this Ractor's per-Ractor mutex r->sync.lock (== RACTOR_LOCK(r), e.g.
+     * ractor_send_basket's ccan_list_add_tail into recv_queue). A confined per-Ractor LOCAL GC
+     * marks them lock-free and concurrently with those senders, so a list splice / st rehash seen
+     * mid-update marks a half-linked or uninitialized basket -> "mark T_NONE" / SEGV. Take the SAME
+     * per-Ractor mutex (raw rb_native_mutex_lock, NOT RACTOR_LOCK -- that sets malloc_gc_disabled /
+     * locked_by bookkeeping inappropriate for the GC) only during a confined local GC: in a STW
+     * global GC all Ractors are stopped and no sender runs. No self-deadlock: RACTOR_LOCK sets
+     * malloc_gc_disabled, so a GC never triggers while we (or anyone) already holds this lock. */
+    const bool sync_lock = rb_gc_during_confined_local_gc_p();
+    if (sync_lock) rb_native_mutex_lock(&r->sync.lock);
+    {
+        if (r->sync.ports) {
+            ractor_queue_mark(r->sync.recv_queue);
+            st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
+        }
+        ractor_mark_monitors(r);
     }
-
-    ractor_mark_monitors(r);
+    if (sync_lock) rb_native_mutex_unlock(&r->sync.lock);
 }
 
 static int
@@ -793,6 +806,13 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
 {
     VALUE v = ractor_prepare_payload(ec, obj, &type);
 
+    /* A copied/moved payload lives in THIS (sender) Ractor's objspace but will be referenced only
+     * from the receiver's basket queue -- a cross-objspace edge both confined local GCs skip. Pin
+     * it in the sender's objspace so the sender's local GC keeps it alive while in flight. */
+    if (type == basket_type_copy || type == basket_type_move) {
+        rb_gc_pin_in_flight_message(v);
+    }
+
     struct ractor_basket *b = ractor_basket_alloc();
     b->type = type;
     b->p.v = v;
@@ -822,14 +842,30 @@ static VALUE
 ractor_basket_accept(struct ractor_basket *b)
 {
     VALUE v = ractor_basket_value(b);
+    const enum ractor_basket_type type = b->type;
+    const bool exception = b->p.exception;
+    const VALUE sender = b->sender;
 
-    if (b->p.exception) {
-        VALUE err = ractor_make_remote_exception(v, b->sender);
-        ractor_basket_free(b);
-        rb_exc_raise(err);
+    /* The basket node is no longer queued; free it now so a raise below cannot leak it. This frees
+     * only the basket struct, never the payload object v. */
+    ractor_basket_free(b);
+
+    /* Ractor-local GC: a copy/move payload was allocated in the SENDER's objspace (ractor_copy /
+     * ractor_move run on the sender thread) but is now owned by this receiving Ractor. Re-clone it
+     * into the receiver's OWN objspace -- running on the receiver thread, so ractor_copy allocates
+     * through the receiver's lock-free newobj path -- so the object lives in its owner's heap.
+     * Otherwise it stays physically in the sender, whose confined local GC would reclaim it once
+     * the in-flight pin is dropped, while we still reference it (RACTOR_LOCAL_GC_DESIGN.md 5.0/6).
+     * No-op when v already lives here: self-send, or non-RLGC builds with a single shared objspace. */
+    if ((type == basket_type_copy || type == basket_type_move) &&
+        !rb_gc_object_in_current_objspace_p(v)) {
+        v = ractor_copy(v);
     }
 
-    ractor_basket_free(b);
+    if (exception) {
+        rb_exc_raise(ractor_make_remote_exception(v, sender));
+    }
+
     return v;
 }
 

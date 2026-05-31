@@ -106,6 +106,15 @@ struct rb_ractor_struct {
     bool malloc_gc_disabled;
     bool main_ractor;
     void *newobj_cache;
+
+    /* Ractor-local GC: this Ractor's own objspace (work in progress).
+     * Currently aliases the VM-wide objspace (no behavior change); will become a
+     * per-Ractor objspace so each Ractor collects its own heap without a STW barrier. */
+    void *local_gc_objspace;
+    /* newobj cache on the MAIN objspace, used by a non-main Ractor to allocate shared VM
+     * infrastructure (method/inline caches, class extensions) into the main objspace without
+     * racing on the main Ractor's own cache. */
+    void *main_newobj_cache;
 }; // rb_ractor_t is defined in vm_core.h
 
 enum ractor_wakeup_status {

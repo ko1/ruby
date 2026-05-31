@@ -3759,6 +3759,17 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     rb_gc_mark(ec->private_const_reference);
 
     rb_gc_mark_movable(ec->storage);
+
+    /* The generic-ivar fast-path cache {obj, fields_obj} is a STRONG (movable) root, not a weak
+     * reference: the cached fields_obj (an imemo_fields) is referenced from here and from the
+     * generic_fields_tbl only, so if it were not marked a sweep could free it while this EC still
+     * holds it -- and a later rb_mark_generic_ivar would mark a freed (T_NONE) imemo_fields. That
+     * was a flaky crash once Ractor-local GCs run concurrently (lock-free alloc): the live EC's
+     * cache was never weak-cleared (only cont/fiber saved_ecs are). Keeping it alive while cached
+     * costs at most one extra GC cycle of float (freed when the cache is next overwritten); the
+     * compaction pass above (ec->gen_fields_cache update) already treats these slots as movable. */
+    rb_gc_mark_movable(ec->gen_fields_cache.obj);
+    rb_gc_mark_movable(ec->gen_fields_cache.fields_obj);
 }
 
 void rb_fiber_mark_self(rb_fiber_t *fib);
@@ -3819,6 +3830,21 @@ thread_mark(void *ptr)
     rb_threadptr_interrupt_exec_task_mark(th);
 
     RUBY_MARK_LEAVE("thread");
+}
+
+/* Mark a thread's own roots (VM/machine stacks, thread-local state) directly. A per-Ractor local
+ * GC needs this because the rb_thread_t's wrapper object (th->self) may live in the main objspace
+ * — foreign to the Ractor's local objspace — so the confined mark skips th->self and would
+ * otherwise never run thread_mark to reach the thread's roots that DO live in this objspace.
+ *
+ * thread_mark() reaches the execution context's VM stack only through the fiber WRAPPER object
+ * (rb_fiber_mark_self); that wrapper may also be foreign and get skipped, so we additionally mark
+ * the running ec directly — that is the stack holding the Ractor's live local variables. */
+void
+rb_gc_mark_thread_roots(rb_thread_t *th)
+{
+    thread_mark((void *)th);
+    if (th->ec) rb_execution_context_mark(th->ec);
 }
 
 void rb_threadptr_sched_free(rb_thread_t *th); // thread_*.c

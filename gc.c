@@ -241,6 +241,13 @@ rb_gc_event_hook(VALUE obj, rb_event_flag_t event)
 void *
 rb_gc_get_objspace(void)
 {
+    /* Ractor-local GC: route to the current Ractor's own objspace when it has one.
+     * Falls back to the VM-wide objspace during early boot (before the main Ractor
+     * exists) and for threads with no current Ractor. */
+    rb_ractor_t *cr = rb_current_ractor_raw(false);
+    if (cr != NULL && cr->local_gc_objspace != NULL) {
+        return cr->local_gc_objspace;
+    }
     return GET_VM()->gc.objspace;
 }
 
@@ -259,6 +266,61 @@ rb_gc_ractor_newobj_cache_foreach(void (*func)(void *cache, void *data), void *d
     }
     else {
         ccan_list_for_each(&GET_VM()->ractor.set, r, vmlr_node) {
+            /* A Ractor being created is already on the list but may not have its newobj cache
+             * yet (a GC can trigger during cache/objspace setup). Skip it. */
+            if (r->newobj_cache != NULL) {
+                func(r->newobj_cache, data);
+            }
+        }
+    }
+}
+
+/* For a per-Ractor local GC: apply func ONLY to the current Ractor's newobj cache (the only
+ * cache that allocates into this Ractor's objspace). Iterating all Ractors' caches would
+ * mis-handle other Ractors' freelists, which point into their own objspaces. */
+void
+rb_gc_ractor_newobj_current_cache_foreach(void (*func)(void *cache, void *data), void *data)
+{
+    rb_ractor_t *cr = rb_current_ractor_raw(false);
+    if (cr != NULL && cr->newobj_cache != NULL) {
+        func(cr->newobj_cache, data);
+    }
+}
+
+/* Apply func to EVERY live objspace: the main objspace plus each (non-main) Ractor's own
+ * objspace. Used by the GLOBAL GC to clear/sweep across all objspaces. Callers must hold the
+ * VM barrier (all Ractors stopped) so the Ractor set is stable. */
+void
+rb_gc_foreach_objspace(void (*func)(void *objspace, void *data), void *data)
+{
+    rb_vm_t *vm = GET_VM();
+    void *main_objspace = vm->gc.objspace;
+
+    func(main_objspace, data);
+
+    if (!ruby_single_main_ractor) {
+        rb_ractor_t *r = NULL;
+        ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+            if (r->local_gc_objspace != NULL && r->local_gc_objspace != main_objspace) {
+                func(r->local_gc_objspace, data);
+            }
+        }
+    }
+}
+
+/* Apply func to the newobj cache of every Ractor that allocates into `target_objspace` (a Ractor
+ * allocates into its own local_gc_objspace, or the main objspace if it has none). Used by the
+ * GLOBAL GC to flush each cache only into the objspace it belongs to. Caller holds the barrier. */
+void
+rb_gc_ractor_newobj_cache_foreach_for_objspace(void *target_objspace, void (*func)(void *cache, void *data), void *data)
+{
+    rb_vm_t *vm = GET_VM();
+    void *main_objspace = vm->gc.objspace;
+    rb_ractor_t *r = NULL;
+    ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+        if (r->newobj_cache == NULL) continue;
+        void *os = r->local_gc_objspace ? r->local_gc_objspace : main_objspace;
+        if (os == target_objspace) {
             func(r->newobj_cache, data);
         }
     }
@@ -2319,7 +2381,15 @@ obj_free_object_id(VALUE obj)
         if (RB_UNLIKELY(obj_id)) {
             RUBY_ASSERT(FIXNUM_P(obj_id) || RB_TYPE_P(obj_id, T_BIGNUM));
 
-            if (!st_delete(id2ref_tbl, (st_data_t *)&obj_id, NULL)) {
+            /* id2ref_tbl is VM-global; object_id assignment st_inserts under the VM lock. This
+             * runs during a (possibly Ractor-local, lock-free) GC sweep, so take the SAME lock,
+             * NON-BARRIER (a sweep is not at a safepoint and must not join a global-GC barrier
+             * mid-collection). */
+            int id2ref_deleted;
+            RB_VM_LOCKING_NO_BARRIER() {
+                id2ref_deleted = st_delete(id2ref_tbl, (st_data_t *)&obj_id, NULL);
+            }
+            if (!id2ref_deleted) {
                 // The the object is a T_IMEMO/fields, then it's possible the actual object
                 // has been garbage collected already.
                 if (!RB_TYPE_P(obj, T_IMEMO)) {
@@ -2866,8 +2936,15 @@ ruby_stack_check(void)
 #define RB_GC_MARK_OR_TRAVERSE(func, obj_or_ptr, obj, check_obj) do { \
     if (!RB_SPECIAL_CONST_P(obj)) { \
         rb_vm_t *vm = GET_VM(); \
-        void *objspace = vm->gc.objspace; \
-        if (LIKELY(vm->gc.mark_func_data == NULL)) { \
+        void *objspace = rb_gc_get_objspace(); \
+        /* mark_func_data redirects marking to a callback (ObjectSpace.reachable_objects_from / the \
+         * Ractor shareability check) and is VM-GLOBAL. With lock-free per-Ractor GCs, one Ractor \
+         * may set it (while NOT in a GC) concurrently with ANOTHER Ractor's real local GC -- which \
+         * would hijack that GC's marking to the foreign callback (it then allocates -> corruption / \
+         * "allocation during GC"). A real GC always has during_gc set on the current objspace, so \
+         * gate on it: a real GC actually-marks regardless of a foreign mark_func_data. Hot path \
+         * (mark_func_data == NULL) short-circuits, so during_gc_p is only checked when redirecting. */ \
+        if (LIKELY(vm->gc.mark_func_data == NULL) || rb_gc_impl_during_gc_p(objspace)) { \
             GC_ASSERT(rb_gc_impl_during_gc_p(objspace)); \
             (func)(objspace, (obj_or_ptr)); \
         } \
@@ -3271,6 +3348,47 @@ rb_gc_get_ec(void)
     }
 }
 
+#if RACTOR_LOCAL_GC
+/* Resolve an arbitrary (possibly-garbage) pointer to the objspace that owns its page, or NULL.
+ * Uses each objspace's own safe sorted-array membership test (rb_gc_impl_pointer_to_heap_p); it
+ * never dereferences the candidate word, so it is safe for conservative stack scanning where a
+ * word may point into an unmapped gap between page bodies. Callers must hold the VM barrier
+ * (global GC) so the Ractor set and every objspace's page set are stable. Defined after the GC
+ * impl include so rb_gc_impl_pointer_to_heap_p is visible (static in the embedded build). */
+void *
+rb_gc_conservative_owner(const void *ptr)
+{
+    rb_vm_t *vm = GET_VM();
+    void *main_objspace = vm->gc.objspace;
+    if (rb_gc_impl_pointer_to_heap_p(main_objspace, ptr)) return main_objspace;
+
+    if (!ruby_single_main_ractor) {
+        rb_ractor_t *r = NULL;
+        ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+            if (r->local_gc_objspace != NULL && r->local_gc_objspace != main_objspace) {
+                if (rb_gc_impl_pointer_to_heap_p(r->local_gc_objspace, ptr)) {
+                    return r->local_gc_objspace;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+/* True if obj lives in the CURRENT Ractor's objspace (or is a special const / immediate). Inspects
+ * only the current objspace's own page set -- which is stable on the calling (owning) thread -- so,
+ * unlike rb_gc_conservative_owner(), it needs no VM barrier. Used by the Ractor receive path to
+ * decide whether a copied/moved message must be re-materialized into the receiver's own heap
+ * (see RACTOR_LOCAL_GC_DESIGN.md section 6). In non-RLGC builds every object lives in the single
+ * objspace, so this is always true and the re-materialization is correctly skipped. */
+bool
+rb_gc_object_in_current_objspace_p(VALUE obj)
+{
+    if (SPECIAL_CONST_P(obj)) return true;
+    return rb_gc_impl_pointer_to_heap_p(rb_gc_get_objspace(), (const void *)obj);
+}
+#endif
+
 void
 rb_gc_mark_roots(void *objspace, const char **categoryp)
 {
@@ -3280,6 +3398,34 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
 #define MARK_CHECKPOINT(category) do { \
     if (categoryp) *categoryp = category; \
 } while (0)
+
+#if RACTOR_LOCAL_GC
+    if (objspace != vm->gc.objspace && !rlgc_global_gc_active) {
+        /* Ractor-local GC: mark ONLY the current Ractor's own execution roots. We must not
+         * touch other Ractors (they keep running) nor the VM-global tables (those live in the
+         * main objspace and are kept alive by the main Ractor's GC). Marking is confined to
+         * this objspace, so refs into other objspaces are skipped as live leaves. */
+        rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
+
+        /* This Ractor's own internal state: received messages, local storage, std IO, and its
+         * threads (whose ecs/vm-stacks are marked via the Ractor's thread list). */
+        MARK_CHECKPOINT("local_ractor");
+        rb_gc_mark_ractor_local_roots(cr);
+
+        /* Conservative machine stack of the current (GC-triggering) thread. */
+        MARK_CHECKPOINT("machine_context");
+        mark_current_machine_context(ec);
+
+        /* This Ractor's OWN event hooks (user TracePoints — connect_non_targeted_event_hook routes
+         * non-internal events to the ractor-local list r->pub.hooks) are already marked by
+         * rb_gc_mark_ractor_local_roots -> ractor_mark above. We must NOT mark the VM-GLOBAL
+         * vm->global_hooks here: it is a shared list (only internal OBJSPACE-event hooks, whose data
+         * is kept alive by the main objspace) that foreign Ractors mutate lock-free (hook_list_connect)
+         * -- a confined local GC iterating it races that writer. The STW global/main GC marks it
+         * (rb_vm_mark -> rb_hook_list_mark(&vm->global_hooks)). */
+        return;
+    }
+#endif
 
     MARK_CHECKPOINT("vm");
     rb_vm_mark(vm);
@@ -3375,11 +3521,69 @@ gc_mark_classext_iclass(rb_classext_t *ext, bool prime, VALUE box_value, void *a
 
 #define TYPED_DATA_REFS_OFFSET_LIST(d) (size_t *)(uintptr_t)RTYPEDDATA_TYPE(d)->function.dmark
 
+/* Writers mutate the VM-global generic_fields_tbl_ under the VM lock (which may rehash/realloc the
+ * shared st_table). With Ractor-local GC, a Ractor marks its own objspace WITHOUT the STW VM lock,
+ * concurrently with other Ractors' writers, so its lock-free st_lookup can read a bucket that a
+ * writer is moving -> a torn read marking a freed slot. Take the VM lock around the lookup to make
+ * it mutually exclusive with writers. Skip it when no local objspace exists (single-Ractor, or a
+ * non-default GC impl such as MMTk: rlgc_has_local stays false) and during the STW global GC
+ * (rlgc_global_gc_active: all Ractors stopped, no writer can run, and the lock is already held). */
+#if RACTOR_LOCAL_GC
+/* True while a confined per-Ractor LOCAL GC is running (not a STW global GC, and some local
+ * objspace exists). VM-global-but-per-Ractor structures that such a GC walks WITHOUT the VM
+ * barrier -- e.g. a Ractor's own message ports / recv_queue / monitors, mutated by FOREIGN senders
+ * under that Ractor's per-Ractor lock -- consult this to decide whether to take that per-Ractor
+ * lock around the traversal (during a global GC all Ractors are stopped, so no lock is needed). */
+bool
+rb_gc_during_confined_local_gc_p(void)
+{
+    return rlgc_has_local && !rlgc_global_gc_active;
+}
+
+/* Pin an in-flight Ractor message payload in its (the SENDER's) objspace via the shared_bits
+ * remset, so the sender's confined local GC roots it and never frees it locally. An in-flight copy
+ * lives in the sender's objspace but is referenced ONLY from the receiver's basket queue -- a
+ * cross-objspace edge the confined GC skips on BOTH sides, so without this the sender's local GC
+ * frees it while it is queued -> dangling basket -> "mark T_NONE"/SEGV (test_ractor.rb:1651). The
+ * sender calls this on its own freshly-created object, so there is no cross-objspace race; a global
+ * GC later recomputes shared_bits and reclaims it once it is no longer referenced. */
+void
+rb_gc_pin_in_flight_message(VALUE obj)
+{
+    if (!rlgc_has_local) return;
+    if (SPECIAL_CONST_P(obj) || RB_OBJ_SHAREABLE_P(obj)) return;
+    MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj);
+    GET_HEAP_PAGE(obj)->flags.has_shared_objects = TRUE;
+}
+#endif
+
+static inline void
+gc_mark_generic_ivar_sync(VALUE obj)
+{
+#if RACTOR_LOCAL_GC
+    if (rlgc_has_local && !rlgc_global_gc_active) {
+        /* Use the NON-BARRIER lock: this runs inside a confined local GC, which is not at a
+         * safepoint and cannot yield to a global-GC barrier. A barrier-aware RB_VM_LOCKING would,
+         * if a global GC is pending, JOIN the barrier here -- mid-mark -- leaving the objspace
+         * half-collected for the global GC to walk (a stale generic_fields_tbl entry whose
+         * imemo_fields was already swept -> "mark T_NONE"). The non-barrier lock still gives mutual
+         * exclusion with concurrent writers and other local GCs (all serialize on vm->ractor.sync),
+         * and the barrier initiator has released that mutex while waiting, so there is no deadlock;
+         * this Ractor joins the barrier at its next safepoint, after the local GC finishes. */
+        RB_VM_LOCKING_NO_BARRIER() {
+            rb_mark_generic_ivar(obj);
+        }
+        return;
+    }
+#endif
+    rb_mark_generic_ivar(obj);
+}
+
 void
 rb_gc_move_obj_during_marking(VALUE from, VALUE to)
 {
     if (rb_obj_using_gen_fields_table_p(to)) {
-        rb_mark_generic_ivar(from);
+        gc_mark_generic_ivar_sync(from);
     }
 }
 
@@ -3389,7 +3593,7 @@ rb_gc_mark_children(void *objspace, VALUE obj)
     struct gc_mark_classext_foreach_arg foreach_args;
 
     if (rb_obj_using_gen_fields_table_p(obj)) {
-        rb_mark_generic_ivar(obj);
+        gc_mark_generic_ivar_sync(obj);
     }
 
     switch (BUILTIN_TYPE(obj)) {
@@ -3690,14 +3894,59 @@ rb_gc_object_metadata(VALUE obj)
 void *
 rb_gc_ractor_cache_alloc(rb_ractor_t *ractor)
 {
-    return rb_gc_impl_ractor_cache_alloc(rb_gc_get_objspace(), ractor);
+    /* Allocate the newobj cache on the Ractor's own objspace when it has one
+     * (per-Ractor local GC), so the cache pulls pages from that Ractor's heap. */
+    void *objspace = ractor->local_gc_objspace ? ractor->local_gc_objspace : rb_gc_get_objspace();
+    return rb_gc_impl_ractor_cache_alloc(objspace, ractor);
 }
 
 void
-rb_gc_ractor_cache_free(void *cache)
+rb_gc_ractor_cache_free(rb_ractor_t *r)
 {
-    rb_gc_impl_ractor_cache_free(rb_gc_get_objspace(), cache);
+    /* Free the cache against the objspace it allocates into (the Ractor's own), so its pending
+     * freelist slots are returned to the right heap — not whatever objspace happens to be
+     * current on the thread doing the teardown. */
+    void *objspace = r->local_gc_objspace ? r->local_gc_objspace : rb_gc_get_objspace();
+    rb_gc_impl_ractor_cache_free(objspace, r->newobj_cache);
 }
+
+#if RACTOR_LOCAL_GC
+/* Allocate a fresh per-Ractor objspace (does NOT become the VM-wide objspace). */
+void *
+rb_gc_objspace_alloc_local(void)
+{
+    void *objspace = rb_gc_impl_objspace_alloc();
+    rb_gc_impl_objspace_init(objspace);
+    rb_gc_impl_stress_set(objspace, initial_stress);
+    return objspace;
+}
+
+void
+rb_gc_objspace_free_local(void *objspace)
+{
+    rb_gc_impl_objspace_free(objspace);
+}
+
+/* Allocate a newobj cache bound to the MAIN (VM-wide) objspace, for a non-main Ractor to
+ * allocate shared VM infrastructure into the main objspace. */
+void *
+rb_gc_ractor_cache_alloc_on_main(rb_ractor_t *ractor)
+{
+    return rb_gc_impl_ractor_cache_alloc(GET_VM()->gc.objspace, ractor);
+}
+
+/* Runtime toggle for the experimental per-Ractor objspace local GC. */
+bool
+rb_gc_rlgc_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RUBY_RACTOR_LOCAL_GC");
+        enabled = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return enabled != 0;
+}
+#endif
 
 void
 rb_gc_register_mark_object(VALUE obj)
@@ -3814,6 +4063,26 @@ void
 rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *data)
 {
     rb_gc_impl_each_objects(rb_gc_get_objspace(), callback, data);
+}
+
+/* Like rb_objspace_each_objects but walks EVERY objspace (the main one plus each Ractor's local
+ * objspace), not just the caller's. Needed for VM-global sweeps that must reach every heap-resident
+ * iseq/callcache regardless of which Ractor allocated it (e.g. enabling a TracePoint must patch all
+ * iseqs). The caller MUST hold the VM barrier (all Ractors stopped) so the object sets are stable. */
+void
+rb_objspace_each_objects_all_ractors(int (*callback)(void *, void *, size_t, void *), void *data)
+{
+    rb_vm_t *vm = GET_VM();
+    rb_gc_impl_each_objects(vm->gc.objspace, callback, data);
+
+    if (!ruby_single_main_ractor) {
+        rb_ractor_t *r = NULL;
+        ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+            if (r->local_gc_objspace != NULL && r->local_gc_objspace != vm->gc.objspace) {
+                rb_gc_impl_each_objects(r->local_gc_objspace, callback, data);
+            }
+        }
+    }
 }
 
 static void

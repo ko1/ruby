@@ -257,6 +257,21 @@ static ruby_gc_params_t gc_params = {
 #define GC_DEBUG 0
 #endif
 
+/* Ractor-local GC (work in progress).
+ * RACTOR_LOCAL_GC:       build the "shared_bits" infrastructure (boundary remset of
+ *                        unshareable objects directly referenced by a shareable object).
+ *                        Currently maintained but not yet used to change collection.
+ * RACTOR_LOCAL_GC_AUDIT: verify write-barrier completeness. Skips the en-masse clear and,
+ *                        during the full mark, reports every shareable->unshareable edge
+ *                        whose boundary object was NOT already recorded by the write barrier
+ *                        (i.e. a missing s->u write-barrier path). */
+#ifndef RACTOR_LOCAL_GC
+#define RACTOR_LOCAL_GC 1
+#endif
+#ifndef RACTOR_LOCAL_GC_AUDIT
+#define RACTOR_LOCAL_GC_AUDIT 0
+#endif
+
 /* RGENGC_DEBUG:
  * 1: basic information
  * 2: remember set operation
@@ -535,6 +550,11 @@ typedef struct rb_objspace {
         bool full_mark;
     } gc_config;
 
+#if RACTOR_LOCAL_GC
+    /* true for a per-Ractor (non-main) objspace: collected locally without a STW barrier. */
+    bool local;
+#endif
+
     struct {
         unsigned int mode : 2;
         unsigned int immediate_sweep : 1;
@@ -547,6 +567,16 @@ typedef struct rb_objspace {
         unsigned int during_minor_gc : 1;
         unsigned int during_incremental_marking : 1;
         unsigned int measure_gc : 1;
+#if RACTOR_LOCAL_GC
+        /* set while this objspace is being collected in confined per-Ractor local mode:
+         * marking is restricted to this objspace's own objects (refs into other objspaces
+         * are treated as live leaves and not traversed). */
+        unsigned int local_gc : 1;
+        /* set while a GLOBAL (all-Ractor stop-the-world) GC is in progress: a full/major
+         * collection takes the VM barrier so it does not run concurrently with other Ractors'
+         * (or each other's) collections. */
+        unsigned int global_gc : 1;
+#endif
     } flags;
 
     rb_event_flag_t hook_events;
@@ -571,6 +601,18 @@ typedef struct rb_objspace {
         size_t freeable_pages;
 
         size_t allocatable_bytes;
+
+#if RACTOR_LOCAL_GC
+        /* Per-objspace page-body arena allocator. Each non-main Ractor allocates heap-page bodies
+         * concurrently; doing a per-page mmap()+munmap() (for 64KiB alignment) serialized every
+         * Ractor on the kernel's process-wide mmap_lock. Instead carve page bodies out of large
+         * mmap'd, alignment-trimmed arenas owned by THIS objspace (so no shared lock), and recycle
+         * freed bodies into a free list rather than munmap()ing each. */
+        struct rlgc_page_arena *arenas;        /* list of mmap'd arenas, for munmap at objspace free */
+        char *arena_cursor;                    /* bump pointer for the next un-carved body */
+        char *arena_end;
+        struct heap_page_body *arena_freelist; /* recycled bodies (next ptr stored in the body itself) */
+#endif
 
         /* final */
         VALUE deferred_final;
@@ -831,9 +873,19 @@ struct heap_page {
         unsigned int before_sweep : 1;
         unsigned int has_remembered_objects : 1;
         unsigned int has_uncollectible_wb_unprotected_objects : 1;
+#if RACTOR_LOCAL_GC
+        /* set if this page has any "shared" object: an unshareable object directly
+         * referenced by a shareable object (a shareable->unshareable boundary). */
+        unsigned int has_shared_objects : 1;
+#endif
     } flags;
 
     rb_heap_t *heap;
+#if RACTOR_LOCAL_GC
+    /* Owning objspace. With per-Ractor objspaces, lets a local GC tell its own objects
+     * from objects living in another Ractor's (or the main) objspace. */
+    rb_objspace_t *objspace;
+#endif
 
     struct heap_page *free_next;
     struct heap_page_body *body;
@@ -846,6 +898,13 @@ struct heap_page {
     bits_t marking_bits[HEAP_PAGE_BITMAP_LIMIT];
 
     bits_t remembered_bits[HEAP_PAGE_BITMAP_LIMIT];
+
+#if RACTOR_LOCAL_GC
+    /* Ractor-local GC boundary remset: set for an unshareable object that is directly
+     * referenced by a shareable object. Cleared en masse at (global) full GC and
+     * recomputed during the full mark; maintained by the write barrier in between. */
+    bits_t shared_bits[HEAP_PAGE_BITMAP_LIMIT];
+#endif
 
     /* If set, the object is not movable */
     bits_t pinned_bits[HEAP_PAGE_BITMAP_LIMIT];
@@ -921,6 +980,10 @@ slot_index_for_offset(size_t offset, uint64_t reciprocal)
 #define GET_HEAP_UNCOLLECTIBLE_BITS(x)  (&GET_HEAP_PAGE(x)->uncollectible_bits[0])
 #define GET_HEAP_WB_UNPROTECTED_BITS(x) (&GET_HEAP_PAGE(x)->wb_unprotected_bits[0])
 #define GET_HEAP_MARKING_BITS(x)        (&GET_HEAP_PAGE(x)->marking_bits[0])
+#if RACTOR_LOCAL_GC
+#define GET_HEAP_SHARED_BITS(x)         (&GET_HEAP_PAGE(x)->shared_bits[0])
+#define GET_HEAP_OBJSPACE(x)            (GET_HEAP_PAGE(x)->objspace)
+#endif
 
 static int
 RVALUE_AGE_GET(VALUE obj)
@@ -1076,6 +1139,9 @@ gc_malloc_counters_snapshot(rb_objspace_t *objspace, struct gc_malloc_bytes *c)
 #define heaps              objspace->heaps
 #define during_gc		objspace->flags.during_gc
 #define finalizing		objspace->atomic_flags.finalizing
+/* Accessor for ANOTHER objspace's finalizer_table — must be defined BEFORE the macro below, which
+ * rewrites the bare token `finalizer_table` to `objspace->finalizer_table`. */
+static inline st_table *rlgc_finalizer_table(rb_objspace_t *os) { return os->finalizer_table; }
 #define finalizer_table 	objspace->finalizer_table
 #define ruby_gc_stressful	objspace->flags.gc_stressful
 #define ruby_gc_stress_mode     objspace->gc_stress_mode
@@ -1446,6 +1512,100 @@ RVALUE_UNCOLLECTIBLE(rb_objspace_t *objspace, VALUE obj)
 static int rgengc_remember(rb_objspace_t *objspace, VALUE obj);
 static void rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap);
 static void rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap);
+#if RACTOR_LOCAL_GC
+static void gc_mark_shared_roots(rb_objspace_t *objspace);
+static size_t rlgc_wb_shared_sets = 0;
+static size_t rlgc_wb_local_sets = 0;
+static rb_objspace_t *rlgc_main_objspace = NULL;
+static bool rlgc_has_local = false;       /* true once any per-Ractor local objspace exists */
+static bool rlgc_global_gc_active = false; /* true while a GLOBAL (all-objspace STW) GC runs */
+/* VM-global span covering EVERY objspace's heap pages, for resolving a heap pointer to its
+ * page (and so its owning objspace) by alignment, with no per-objspace sorted-array lookup.
+ * Grow-only and updated lock-free (Ractors grow their own arenas concurrently with no global
+ * lock), so the min/max updates use atomic CAS loops to avoid lost updates; reads are racy but
+ * benign (aligned word loads are atomic, the span only grows, and it is stable during the STW
+ * global GC where it actually gates marking). size_t == uintptr_t on LP64 for the CAS macros. */
+static size_t rlgc_global_lomem = 0;
+static size_t rlgc_global_himem = 0;
+
+/* Atomically grow [rlgc_global_lomem, rlgc_global_himem) to cover [lo, hi). Called rarely (once
+ * per arena grow) and harmlessly often (once per page, already covered -> just two atomic reads). */
+static inline void
+rlgc_span_extend(uintptr_t lo, uintptr_t hi)
+{
+    size_t cur;
+    while ((cur = rlgc_global_lomem) == 0 || lo < cur) {
+        if (RUBY_ATOMIC_SIZE_CAS(rlgc_global_lomem, cur, (size_t)lo) == cur) break;
+    }
+    while ((cur = rlgc_global_himem) < hi) {
+        if (RUBY_ATOMIC_SIZE_CAS(rlgc_global_himem, cur, (size_t)hi) == cur) break;
+    }
+}
+/* Parallelism instrumentation (RLGC_STATS=1 prints at VM shutdown): how many Ractor-local GCs run
+ * truly concurrently. max_concurrent > 1 proves local GCs overlap in wall time across cores. */
+static rb_atomic_t rlgc_local_gc_count = 0;
+static rb_atomic_t rlgc_concurrent_local_gc = 0;
+static rb_atomic_t rlgc_max_concurrent_local_gc = 0;
+static rb_atomic_t rlgc_global_gc_count = 0;
+/* Defined in gc.c (textually before this #include). Resolve an arbitrary word to its owning
+ * objspace via safe per-objspace bsearch (no dereference of the candidate). */
+void *rb_gc_conservative_owner(const void *ptr);
+void rb_gc_foreach_objspace(void (*func)(void *objspace, void *data), void *data);
+void rb_gc_ractor_newobj_current_cache_foreach(void (*func)(void *cache, void *data), void *data);
+void rb_gc_ractor_newobj_cache_foreach_for_objspace(void *target_objspace, void (*func)(void *cache, void *data), void *data);
+
+/* True if `obj` (a known-real object reference, e.g. one reached while walking the object graph)
+ * points into SOME live heap page, resolved by alignment alone. Unlike rb_gc_conservative_owner
+ * this does not depend on the Ractor set, so it also recognises objects in an objspace that is no
+ * longer tracked there (e.g. a finished Ractor's not-yet-reclaimed objspace). Only safe for real
+ * object pointers (it dereferences the aligned page body), not arbitrary words. */
+static inline bool
+rlgc_obj_in_any_heap(VALUE obj)
+{
+    const uintptr_t p = (uintptr_t)obj;
+    if (p % sizeof(VALUE) != 0) return false;
+    const uintptr_t body = (uintptr_t)GET_PAGE_BODY(p);
+    if (body < rlgc_global_lomem || p >= rlgc_global_himem) return false;
+    struct heap_page *const page = GET_HEAP_PAGE(p);
+    return page != NULL && (uintptr_t)page->body == body; /* page back-pointer round-trips */
+}
+
+/* The GLOBAL GC (STW, unified mark/sweep across all objspaces, reclaiming dead shareables) is a
+ * layer on top of the parallel per-Ractor local GC, ON BY DEFAULT once any local objspace exists.
+ * Set RUBY_RACTOR_GLOBAL_GC=0 to disable it (full/major collections then run as confined local
+ * GCs and shareables stay pinned for the objspace's lifetime, never reclaimed). */
+static bool
+rlgc_global_gc_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *const e = getenv("RUBY_RACTOR_GLOBAL_GC");
+        enabled = (e != NULL && e[0] == '0') ? 0 : 1; /* default ON; only "0" disables */
+    }
+    return enabled != 0;
+}
+
+/* Lock-free allocation for per-Ractor (local) objspaces (DEFAULT ON; RUBY_RACTOR_LOCAL_GC_LOCKFREE=0
+ * disables). Taking the single VM-global vm->ractor.sync.lock on EVERY newobj cache miss was THE
+ * scaling bottleneck -- it serialized all Ractors' allocation. With this on, grabbing an
+ * already-free page (the common cache miss) touches only the Ractor's private heap and takes no
+ * lock, so allocation runs fully in parallel. A cache miss that must run a GC still takes the
+ * barrier-aware VM lock (see newobj_cache_miss), so the collection keeps exclusive access to the
+ * VM-global structures it walks -- this is what makes it correct/problem-free by default. (Letting
+ * the local GCs themselves run lock-free/concurrently too would additionally need every such
+ * shared structure -- generic_fields_tbl, id2ref, Ractor ports, ... -- made Ractor-GC-safe; the
+ * generic_fields_tbl path is already done via non-barrier locking as the template.) */
+static bool
+rlgc_lockfree_alloc_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *const e = getenv("RUBY_RACTOR_LOCAL_GC_LOCKFREE");
+        enabled = (e != NULL && e[0] == '0') ? 0 : 1; /* default ON; only "0" disables */
+    }
+    return enabled != 0;
+}
+#endif
 
 static int
 check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int terminate)
@@ -1458,6 +1618,13 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
             fprintf(stderr, "check_rvalue_consistency: %p is a special const.\n", (void *)obj);
             err++;
         }
+#if RACTOR_LOCAL_GC
+        else if (!is_pointer_to_heap(objspace, (void *)obj) && rlgc_obj_in_any_heap(obj)) {
+            /* A valid object that lives in ANOTHER objspace (a cross-objspace reference, e.g. a
+             * Ractor's thgroup/IO reached from the shareable Ractor object). It is not this
+             * objspace's responsibility to verify it, and it is not an error. */
+        }
+#endif
         else if (!is_pointer_to_heap(objspace, (void *)obj)) {
             struct heap_page *empty_page = objspace->empty_pages;
             while (empty_page) {
@@ -1905,17 +2072,95 @@ gc_aligned_free(void *ptr, size_t size)
 #endif
 }
 
+#if RACTOR_LOCAL_GC && defined(HAVE_MMAP)
+/* ~4 MiB arena (64 page bodies) reserved with a SINGLE mmap, so per-Ractor page-body allocation no
+ * longer serializes every Ractor on the kernel's process-wide mmap_lock (one mmap per ~64 pages,
+ * not one mmap + two munmap per page). Arenas are per-objspace -> lock-free under per-Ractor GC. */
+#define RLGC_PAGE_ARENA_BODIES 256           /* 16 MiB of 64 KiB bodies carved per mmap */
+struct rlgc_page_arena {
+    char *mmap_base;                     /* full reservation, for munmap at objspace free */
+    size_t mmap_size;
+    struct rlgc_page_arena *next;
+};
+
+/* Align arenas to 2 MiB and ask for transparent huge pages: a 64 KiB body would otherwise take 16
+ * separate 4 KiB page faults to first-touch, and the kernel's anonymous-fault rate (~400k/s here)
+ * — not mmap, not memory bandwidth — was the real parallelism ceiling. A 2 MiB THP-backed arena
+ * first-touches in ONE fault per 2 MiB (512x fewer), letting the per-Ractor allocators run on more
+ * cores. Bodies stay 64 KiB-aligned because 2 MiB is a multiple of HEAP_PAGE_ALIGN. */
+#define RLGC_ARENA_ALIGN (2u * 1024 * 1024)
+
+/* Reserve a fresh arena for `objspace` and aim the bump cursor at it. Returns false on OOM. */
+static bool
+rlgc_page_arena_grow(rb_objspace_t *objspace)
+{
+    const size_t arena_size = (size_t)RLGC_PAGE_ARENA_BODIES * HEAP_PAGE_SIZE;
+    const size_t mmap_size = arena_size + RLGC_ARENA_ALIGN;
+    char *const ptr = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) return false;
+#if defined(HAVE_SYS_PRCTL_H) && defined(PR_SET_VMA) && defined(PR_SET_VMA_ANON_NAME)
+    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ptr, mmap_size, "Ruby:GC:default:heap_arena");
+    errno = 0;
+#endif
+    /* DON'T munmap the alignment slack: each munmap takes the process-wide mmap_lock for WRITE
+     * (plus a TLB shootdown), which stalls every other Ractor's page faults (it disables the
+     * kernel's per-VMA lock-free fault fast path). The slack stays reserved-but-untouched (no
+     * physical memory) and is reclaimed with the whole reservation at objspace free. */
+    char *aligned = ptr + RLGC_ARENA_ALIGN;
+    aligned -= ((uintptr_t)aligned & (RLGC_ARENA_ALIGN - 1));
+#ifdef MADV_HUGEPAGE
+    madvise(aligned, arena_size, MADV_HUGEPAGE); /* opportunistic 2 MiB pages -> fewer first-touch faults */
+#endif
+
+    struct rlgc_page_arena *const a = malloc(sizeof(struct rlgc_page_arena));
+    if (a == NULL) { munmap(ptr, mmap_size); return false; }
+    a->mmap_base = ptr;
+    a->mmap_size = mmap_size;
+    a->next = objspace->heap_pages.arenas;
+    objspace->heap_pages.arenas = a;
+    objspace->heap_pages.arena_cursor = aligned;
+    objspace->heap_pages.arena_end = aligned + arena_size;
+
+    /* Cover the whole arena in the grow-only VM-global heap span (atomic: Ractors grow concurrently). */
+    rlgc_span_extend((uintptr_t)aligned, (uintptr_t)aligned + arena_size);
+    return true;
+}
+
+/* munmap every arena owned by `objspace` (called when the objspace itself is reclaimed). */
 static void
-heap_page_body_free(struct heap_page_body *page_body)
+rlgc_page_arenas_free(rb_objspace_t *objspace)
+{
+    struct rlgc_page_arena *a = objspace->heap_pages.arenas;
+    while (a) {
+        struct rlgc_page_arena *next = a->next;
+        munmap(a->mmap_base, a->mmap_size);
+        free(a);
+        a = next;
+    }
+    objspace->heap_pages.arenas = NULL;
+    objspace->heap_pages.arena_cursor = objspace->heap_pages.arena_end = NULL;
+    objspace->heap_pages.arena_freelist = NULL;
+}
+#endif
+
+static void
+heap_page_body_free(rb_objspace_t *objspace, struct heap_page_body *page_body)
 {
     GC_ASSERT((uintptr_t)page_body % HEAP_PAGE_ALIGN == 0);
 
     if (HEAP_PAGE_ALLOC_USE_MMAP) {
 #ifdef HAVE_MMAP
+#if RACTOR_LOCAL_GC
+        /* Recycle into this objspace's arena free list (the body's own memory holds the link).
+         * Physical memory returns to the OS when the whole objspace's arenas are freed. */
+        *(struct heap_page_body **)page_body = objspace->heap_pages.arena_freelist;
+        objspace->heap_pages.arena_freelist = page_body;
+#else
         GC_ASSERT(HEAP_PAGE_SIZE % sysconf(_SC_PAGE_SIZE) == 0);
         if (munmap(page_body, HEAP_PAGE_SIZE)) {
             rb_bug("heap_page_body_free: munmap failed");
         }
+#endif
 #endif
     }
     else {
@@ -1927,7 +2172,7 @@ static void
 heap_page_free(rb_objspace_t *objspace, struct heap_page *page)
 {
     objspace->heap_pages.freed_pages++;
-    heap_page_body_free(page->body);
+    heap_page_body_free(objspace, page->body);
     free(page);
 }
 
@@ -2011,12 +2256,27 @@ gc_aligned_malloc(size_t alignment, size_t size)
 }
 
 static struct heap_page_body *
-heap_page_body_allocate(void)
+heap_page_body_allocate(rb_objspace_t *objspace)
 {
     struct heap_page_body *page_body;
 
     if (HEAP_PAGE_ALLOC_USE_MMAP) {
 #ifdef HAVE_MMAP
+#if RACTOR_LOCAL_GC
+        /* Carve a body out of this objspace's arena (one mmap per RLGC_PAGE_ARENA_BODIES bodies)
+         * instead of mmap()ing every 64 KiB page individually. */
+        if (objspace->heap_pages.arena_freelist != NULL) {
+            page_body = objspace->heap_pages.arena_freelist;
+            objspace->heap_pages.arena_freelist = *(struct heap_page_body **)page_body;
+        }
+        else {
+            if (objspace->heap_pages.arena_cursor + HEAP_PAGE_SIZE > objspace->heap_pages.arena_end) {
+                if (!rlgc_page_arena_grow(objspace)) return NULL;
+            }
+            page_body = (struct heap_page_body *)objspace->heap_pages.arena_cursor;
+            objspace->heap_pages.arena_cursor += HEAP_PAGE_SIZE;
+        }
+#else
         GC_ASSERT(HEAP_PAGE_ALIGN % sysconf(_SC_PAGE_SIZE) == 0);
 
         size_t mmap_size = HEAP_PAGE_ALIGN + HEAP_PAGE_SIZE;
@@ -2059,6 +2319,7 @@ heap_page_body_allocate(void)
 
         page_body = (struct heap_page_body *)aligned;
 #endif
+#endif
     }
     else {
         page_body = gc_aligned_malloc(HEAP_PAGE_ALIGN, HEAP_PAGE_SIZE);
@@ -2089,14 +2350,14 @@ heap_page_resurrect(rb_objspace_t *objspace)
 static struct heap_page *
 heap_page_allocate(rb_objspace_t *objspace)
 {
-    struct heap_page_body *page_body = heap_page_body_allocate();
+    struct heap_page_body *page_body = heap_page_body_allocate(objspace);
     if (page_body == 0) {
         rb_memerror();
     }
 
     struct heap_page *page = calloc1(sizeof(struct heap_page));
     if (page == 0) {
-        heap_page_body_free(page_body);
+        heap_page_body_free(objspace, page_body);
         rb_memerror();
     }
 
@@ -2125,9 +2386,19 @@ heap_page_allocate(rb_objspace_t *objspace)
 
     if (heap_pages_lomem == 0 || heap_pages_lomem > start) heap_pages_lomem = start;
     if (heap_pages_himem < end) heap_pages_himem = end;
+#if RACTOR_LOCAL_GC
+    /* Grow-only VM-global bounds. Low bound is the lowest page-BODY base (not start): a pointer
+     * masked down to its aligned body can be below `start`, and we range-check the masked body
+     * before dereferencing it. With the arena allocator the enclosing arena already covers this
+     * page, so this is normally a no-op (two atomic reads); kept for any non-arena page path. */
+    rlgc_span_extend((uintptr_t)page_body, end);
+#endif
 
     page->body = page_body;
     page_body->header.page = page;
+#if RACTOR_LOCAL_GC
+    page->objspace = objspace;
+#endif
 
     objspace->heap_pages.allocated_pages++;
 
@@ -2332,6 +2603,16 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
     GC_ASSERT(BUILTIN_TYPE(obj) == T_NONE);
     GC_ASSERT((flags & FL_WB_PROTECTED) == 0);
     RBASIC(obj)->flags = flags;
+#if RACTOR_LOCAL_GC
+    if (RB_UNLIKELY(flags & FL_SHAREABLE)) {
+        /* A born-shareable object may be referenced from other Ractors (e.g. a callcache or
+         * cc-table reached through a shared inline cache). Record it so the owning Ractor's
+         * local GC roots it and its subtree, and never frees it locally (shareables are pinned
+         * until the global GC). */
+        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj);
+        GET_HEAP_PAGE(obj)->flags.has_shared_objects = TRUE;
+    }
+#endif
     *((VALUE *)&RBASIC(obj)->klass) = klass;
 #if RBASIC_SHAPE_ID_FIELD
     RBASIC(obj)->shape_id = 0;
@@ -2556,7 +2837,26 @@ newobj_cache_miss(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *cache, size
     unsigned int lev = 0;
     bool unlock_vm = false;
 
-    if (!vm_locked) {
+    /* Lock-free allocation for a per-Ractor (local) objspace. The objspace is private to one
+     * Ractor: grabbing an already-free page (the common cache miss) touches only this Ractor's own
+     * heap/free-list and so needs NO VM-global lock -- and the single vm->ractor.sync.lock taken on
+     * EVERY cache miss was the dominant scaling bottleneck (it serialized all Ractors' allocation).
+     *
+     * But a cache miss that has to REFILL -- grow the heap or run a GC (free_pages == NULL) -- does
+     * take the barrier-aware VM lock: a GC reads/writes VM-GLOBAL structures (generic_fields_tbl,
+     * the gen_fields_cache / weak-ref machinery, id2ref, finalizer/symbol tables) that other
+     * Ractors mutate, so it must run with the same EXCLUSIVE access the per-allocation lock used to
+     * give -- now paid only when actually collecting, not on every allocation. RB_GC_CR_LOCK is
+     * barrier-aware (joins a pending global-GC barrier), and after acquiring it heap_prepare
+     * re-checks free_pages, so a global GC that freed slots during the join avoids a redundant
+     * local GC. The shared main objspace always locks (multiple Ractors allocate into it). */
+    /* Fully lock-free for a per-Ractor (local) objspace: neither the page grab NOR the local GC it
+     * triggers takes the VM-global lock, so Ractors allocate AND collect in parallel. Correctness
+     * requires every VM-GLOBAL mutable structure a confined local GC touches to be Ractor-GC-safe:
+     * accessed under a NON-BARRIER lock (so the GC never joins a concurrent global-GC barrier
+     * mid-collection) shared with that structure's mutators -- see gc_mark_generic_ivar_sync /
+     * rb_free_generic_ivar / obj_free_object_id. The shared main objspace always locks. */
+    if (!vm_locked && !(objspace->local && rlgc_lockfree_alloc_enabled())) {
         lev = RB_GC_CR_LOCK();
         unlock_vm = true;
     }
@@ -2608,8 +2908,11 @@ static inline VALUE
 newobj_slowpath(VALUE klass, VALUE flags, rb_objspace_t *objspace, rb_ractor_newobj_cache_t *cache, int wb_protected, size_t heap_idx)
 {
     VALUE obj;
-    unsigned int lev;
+    unsigned int lev = 0;
 
+    /* The slow path (during_gc bug-check / GC.stress / unprotected objects) is rare; always take
+     * the barrier-aware VM lock so its explicit GC and the during_gc check run with exclusive
+     * access. The lock-free fast path is newobj_cache_miss (page grab), not here. */
     lev = RB_GC_CR_LOCK();
     {
         if (RB_UNLIKELY(during_gc || ruby_gc_stressful)) {
@@ -3001,17 +3304,28 @@ rb_gc_impl_undefine_finalizer(void *objspace_ptr, VALUE obj)
 void
 rb_gc_impl_copy_finalizer(void *objspace_ptr, VALUE dest, VALUE obj)
 {
-    rb_objspace_t *objspace = objspace_ptr;
     VALUE table;
     st_data_t data;
 
     if (!FL_TEST(obj, FL_FINALIZE)) return;
 
+#if RACTOR_LOCAL_GC
+    /* obj and dest may live in DIFFERENT objspaces (e.g. a Ractor cloning a shareable object that
+     * lives in the main objspace): the source finalizer entry is in obj's objspace's table, while
+     * the copy must be registered in dest's objspace's table so dest's owner finalizes it. The
+     * finalizer_table macro (= objspace_ptr->finalizer_table) would be wrong for both. */
+    rb_objspace_t *const src_objspace = GET_HEAP_OBJSPACE(obj);
+    rb_objspace_t *const dest_objspace = GET_HEAP_OBJSPACE(dest);
+#else
+    rb_objspace_t *const src_objspace = objspace_ptr;
+    rb_objspace_t *const dest_objspace = objspace_ptr;
+#endif
+
     int lev = RB_GC_VM_LOCK();
-    if (RB_LIKELY(st_lookup(finalizer_table, obj, &data))) {
+    if (RB_LIKELY(st_lookup(rlgc_finalizer_table(src_objspace), obj, &data))) {
         table = rb_ary_dup((VALUE)data);
         RARRAY_ASET(table, 0, rb_obj_id(dest));
-        st_insert(finalizer_table, dest, table);
+        st_insert(rlgc_finalizer_table(dest_objspace), dest, table);
         FL_SET(dest, FL_FINALIZE);
     }
     else {
@@ -3671,6 +3985,33 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 break;
 
               default:
+#if RACTOR_LOCAL_GC
+                if (objspace->local && RB_OBJ_SHAREABLE_P(vp) && !rlgc_global_gc_active) {
+                    /* A confined per-Ractor LOCAL GC cannot tell whether a shareable object is
+                     * still referenced from another objspace (a class callcache table, the shape
+                     * tree's edge tables, an inline cache, the Ractor object, ...), so it must
+                     * never free shareables — they stay pinned until a GLOBAL GC. The GLOBAL GC's
+                     * unified mark DOES establish true reachability across all objspaces, so there
+                     * the guard is lifted: an unmarked shareable is genuinely dead and is reclaimed
+                     * together with its now-dead subtree (pinning it would instead leave its freed
+                     * unshareable children dangling). */
+                    break;
+                }
+                if (rlgc_has_local && RB_OBJ_SHAREABLE_P(vp) && BUILTIN_TYPE(vp) == T_IMEMO &&
+                    (imemo_type(vp) == imemo_callcache || imemo_type(vp) == imemo_callinfo ||
+                     imemo_type(vp) == imemo_ment)) {
+                    /* Callcache / callinfo / method-entry imemo are shared VM infrastructure reached
+                     * cross-Ractor through paths the GC cannot reliably trace under per-Ractor
+                     * objspaces: WEAK inline caches (cd->cc in shareable iseqs, never marked), and
+                     * a class callcache table living in one objspace whose cross-objspace remember
+                     * bit (set barrier-free by another Ractor) can race a minor GC. So keep them
+                     * pinned in EVERY GC once any local objspace exists — not just the global GC —
+                     * to close both holes. They are bounded; reclaiming them needs the main-routing
+                     * follow-up. Narrow ON PURPOSE: pinning all shareables would keep dead objects
+                     * (e.g. a collected Ractor) alive while their unshareable children are freed. */
+                    break;
+                }
+#endif
 #if RGENGC_CHECK_MODE
                 if (!is_full_marking(objspace)) {
                     if (RVALUE_OLD_P(objspace, vp)) rb_bug("page_sweep: %p - old while minor GC.", (void *)p);
@@ -3887,10 +4228,14 @@ static void gc_sort_heap_by_compare_func(rb_objspace_t *objspace, gc_compact_com
 static int compare_pinned_slots(const void *left, const void *right, void *d);
 #endif
 
+/* Flush a Ractor's newobj cache (its in-progress page + freelist) back into the heaps of the
+ * objspace passed as `data`. That objspace MUST be the one the cache allocates into, else the
+ * freelist (slots living in the cache's own objspace) would be appended to a foreign heap and
+ * corrupt both. The global GC therefore flushes each cache only into its owning objspace. */
 static void
 gc_ractor_newobj_cache_clear(void *c, void *data)
 {
-    rb_objspace_t *objspace = rb_gc_get_objspace();
+    rb_objspace_t *objspace = (rb_objspace_t *)data;
     rb_ractor_newobj_cache_t *newobj_cache = c;
 
     newobj_cache->incremental_mark_step_allocated_slots = 0;
@@ -4001,7 +4346,23 @@ gc_sweep_start(rb_objspace_t *objspace)
         }
     }
 
-    rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_clear, NULL);
+#if RACTOR_LOCAL_GC
+    if (rlgc_global_gc_active) {
+        /* GLOBAL GC sweeps every objspace in turn; flush exactly the caches that allocate into
+         * THIS objspace (others are flushed when their own objspace is swept). */
+        rb_gc_ractor_newobj_cache_foreach_for_objspace(objspace, gc_ractor_newobj_cache_clear, objspace);
+    }
+    else if (objspace->local) {
+        /* A per-Ractor local GC must flush ONLY its owning Ractor's newobj cache; flushing other
+         * Ractors' caches would append their freelists (slots in their own objspaces) to this
+         * heap and corrupt both. */
+        rb_gc_ractor_newobj_current_cache_foreach(gc_ractor_newobj_cache_clear, objspace);
+    }
+    else
+#endif
+    {
+        rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_clear, objspace);
+    }
 }
 
 static void
@@ -4377,6 +4738,42 @@ gc_sweep(rb_objspace_t *objspace)
     gc_sweeping_exit(objspace);
 }
 
+#if RACTOR_LOCAL_GC
+/* Sweep ONE objspace as part of a GLOBAL GC (called for every objspace under the STW barrier).
+ * The driver objspace was already set up by gc_enter/gc_marks (during_gc, gc_mode_marking); a
+ * non-driver objspace was only touched by the unified mark (its pages' mark bits set) and is in
+ * gc_mode_none, so transition it into a full, immediate, non-compacting sweep here. The mark
+ * bits on each page already encode liveness for the whole VM, so each objspace can be swept
+ * independently. */
+static void
+gc_global_sweep_one(void *objspace_ptr, void *driver_ptr)
+{
+    rb_objspace_t *const objspace = objspace_ptr; /* the objspace being swept (macros use this name) */
+    const rb_objspace_t *const driver = driver_ptr;
+
+    if (objspace == driver) {
+        gc_sweep(objspace);
+        return;
+    }
+
+    during_gc = TRUE;                          /* macro: objspace->flags.during_gc */
+    objspace->flags.immediate_sweep = TRUE;
+    objspace->flags.during_compacting = FALSE;
+    objspace->flags.during_minor_gc = FALSE;
+    gc_mode_transition(objspace, gc_mode_marking); /* none -> marking (conceptually marked by the unified mark) */
+    gc_sweep(objspace);                            /* marking -> sweeping -> none (immediate) */
+    during_gc = FALSE;
+}
+
+/* Sweep EVERY objspace after a unified global mark, reclaiming dead shareables and dead local
+ * objects in all Ractors at once. */
+static void
+gc_global_sweep(rb_objspace_t *driver)
+{
+    rb_gc_foreach_objspace(gc_global_sweep_one, driver);
+}
+#endif
+
 /* Marking - Marking stack */
 
 static stack_chunk_t *
@@ -4584,6 +4981,44 @@ rgengc_check_relation(rb_objspace_t *objspace, VALUE obj)
     }
 }
 
+#if RACTOR_LOCAL_GC
+#if RACTOR_LOCAL_GC_AUDIT
+static size_t ractor_local_gc_wb_miss_count = 0;
+
+static void
+gc_shared_wb_miss(rb_objspace_t *objspace, VALUE parent, VALUE obj)
+{
+    ractor_local_gc_wb_miss_count++;
+    if (ractor_local_gc_wb_miss_count <= 50) {
+        fprintf(stderr, "[RLGC-AUDIT] s->u write-barrier miss #%"PRIuSIZE": parent=%s -> obj=%s\n",
+                ractor_local_gc_wb_miss_count, rb_obj_info(parent), rb_obj_info(obj));
+    }
+}
+#endif
+
+/* Called for every edge traversed during marking (parent = objspace->rgengc.parent_object,
+ * obj = the child being marked). If the parent is shareable and the child is unshareable, the
+ * child is a "shared" boundary object that the owner's local GC must root. This recomputes
+ * shared_bits during the (global) full mark and, in audit mode, flags any such edge the write
+ * barrier failed to record. */
+static inline void
+gc_shared_relation(rb_objspace_t *objspace, VALUE obj)
+{
+    VALUE parent = objspace->rgengc.parent_object;
+    if (!SPECIAL_CONST_P(parent) &&
+        RB_OBJ_SHAREABLE_P(parent) &&
+        !RB_OBJ_SHAREABLE_P(obj)) {
+#if RACTOR_LOCAL_GC_AUDIT
+        if (!MARKED_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj)) {
+            gc_shared_wb_miss(objspace, parent, obj);
+        }
+#endif
+        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj);
+        GET_HEAP_PAGE(obj)->flags.has_shared_objects = TRUE;
+    }
+}
+#endif
+
 static inline int
 gc_mark_set(rb_objspace_t *objspace, VALUE obj)
 {
@@ -4673,7 +5108,20 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(during_gc);
     GC_ASSERT(!objspace->flags.during_reference_updating);
 
+#if RACTOR_LOCAL_GC
+    /* Confined local GC: skip objects owned by another objspace (another Ractor's, or the
+     * main objspace's shareables). They are not ours to mark or sweep, and we must not read
+     * their contents (they may be mutated concurrently). They stay alive via their own
+     * objspace's roots. */
+    if (objspace->flags.local_gc && GET_HEAP_OBJSPACE(obj) != objspace) {
+        return;
+    }
+#endif
+
     rgengc_check_relation(objspace, obj);
+#if RACTOR_LOCAL_GC
+    gc_shared_relation(objspace, obj);
+#endif
     if (!gc_mark_set(objspace, obj)) return; /* already marked */
 
     if (0) { // for debug GC marking miss
@@ -4752,6 +5200,29 @@ rb_gc_impl_mark_maybe(void *objspace_ptr, VALUE obj)
 
     (void)VALGRIND_MAKE_MEM_DEFINED(&obj, sizeof(obj));
 
+#if RACTOR_LOCAL_GC
+    if (rlgc_global_gc_active) {
+        /* GLOBAL GC: a conservatively-scanned word (any stopped Ractor's stack/registers) may
+         * point into ANY objspace. Validate membership across all objspaces via safe bsearch
+         * (never dereferences a wild word). Then pin through the DRIVER objspace so the object
+         * lands on the unified mark stack; the mark bit itself is set on the object's own page,
+         * so attribution to the page's true owner is preserved. */
+        if (rb_gc_conservative_owner((void *)obj) != NULL) {
+            asan_unpoisoning_object(obj) {
+                switch (BUILTIN_TYPE(obj)) {
+                  case T_ZOMBIE:
+                  case T_NONE:
+                    break;
+                  default:
+                    gc_mark_and_pin(objspace, obj);
+                    break;
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     if (is_pointer_to_heap(objspace, (void *)obj)) {
         asan_unpoisoning_object(obj) {
             /* Garbage can live on the stack, so do not mark or pin */
@@ -4815,6 +5286,23 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
 
     rb_gc_save_machine_context();
     rb_gc_mark_roots(objspace, categoryp);
+
+#if RACTOR_LOCAL_GC
+    /* Root the "shared" set (shareables + their unshareable boundary) for any objspace once
+     * per-Ractor objspaces exist: a shareable in this objspace may be referenced only from
+     * ANOTHER objspace's structure (e.g. a callcache/cme reached via a cross-Ractor inline
+     * cache), which this objspace's normal roots do not reach. */
+    if ((objspace->local || rlgc_has_local) && !rlgc_global_gc_active) {
+        MARK_CHECKPOINT("shared_roots");
+        gc_mark_set_parent_raw(objspace, Qundef, false);
+        gc_mark_shared_roots(objspace);
+    }
+    /* During a GLOBAL GC we deliberately do NOT root shareables via shared_bits: the unified mark
+     * (full VM roots + unconfined cross-objspace tracing) determines shareable liveness by
+     * reachability so dead shareables can finally be reclaimed, and gc_shared_relation rebuilds
+     * shared_bits from scratch as it marks (shared_bits were cleared at gc_marks_start). */
+#endif
+
     gc_mark_set_parent_invalid(objspace);
 }
 
@@ -5727,7 +6215,18 @@ gc_marks_finish(rb_objspace_t *objspace)
     }
 
     // TODO: refactor so we don't need to call this
+#if RACTOR_LOCAL_GC
+    /* rb_ractor_finish_marking() frees + clears the VM-GLOBAL freed_ractor_local_keys array (writer
+     * rb_ractor_local_storage_delkey appends under the VM lock). A confined local GC runs lock-free
+     * and concurrently, so two of them would double-free/clobber it -- a confinement violation. Run
+     * it only in an STW collection (the shared main objspace's GC, or a global GC); a confined local
+     * GC defers it (the freed keys harmlessly accumulate until the next STW collection). */
+    if (!objspace->local || objspace->flags.global_gc) {
+        rb_ractor_finish_marking();
+    }
+#else
     rb_ractor_finish_marking();
+#endif
 
     rb_gc_event_hook(0, RUBY_INTERNAL_EVENT_GC_END_MARK);
 }
@@ -5960,6 +6459,39 @@ gc_marks_continue(rb_objspace_t *objspace, rb_heap_t *heap)
     return marking_finished;
 }
 
+/* Reset the full-mark state (counters + per-page mark/old/remembered/shared bits) of ONE
+ * objspace. Factored out of gc_marks_start so a GLOBAL GC can apply it to every objspace before
+ * the unified mark repopulates them. */
+static void
+gc_full_mark_clear_objspace(rb_objspace_t *objspace) /* param named objspace: the `heaps` macro uses it */
+{
+    objspace->rgengc.uncollectible_wb_unprotected_objects = 0;
+    objspace->rgengc.old_objects = 0;
+    objspace->rgengc.last_major_gc = objspace->profile.count;
+    objspace->marked_slots = 0;
+
+    for (int i = 0; i < HEAP_COUNT; i++) {
+        rb_heap_t *heap = &heaps[i];
+        rgengc_mark_and_rememberset_clear(objspace, heap);
+        heap_move_pooled_pages_to_free_pages(heap);
+
+        if (objspace->flags.during_compacting) {
+            struct heap_page *page = NULL;
+            ccan_list_for_each(&heap->pages, page, page_node) {
+                page->pinned_slots = 0;
+            }
+        }
+    }
+}
+
+#if RACTOR_LOCAL_GC
+static void
+gc_full_mark_clear_thunk(void *os, void *data)
+{
+    gc_full_mark_clear_objspace((rb_objspace_t *)os);
+}
+#endif
+
 static void
 gc_marks_start(rb_objspace_t *objspace, int full_mark)
 {
@@ -5980,23 +6512,16 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
             objspace->flags.during_compacting |= TRUE;
         }
         objspace->profile.major_gc_count++;
-        objspace->rgengc.uncollectible_wb_unprotected_objects = 0;
-        objspace->rgengc.old_objects = 0;
-        objspace->rgengc.last_major_gc = objspace->profile.count;
-        objspace->marked_slots = 0;
-
-        for (int i = 0; i < HEAP_COUNT; i++) {
-            rb_heap_t *heap = &heaps[i];
-            rgengc_mark_and_rememberset_clear(objspace, heap);
-            heap_move_pooled_pages_to_free_pages(heap);
-
-            if (objspace->flags.during_compacting) {
-                struct heap_page *page = NULL;
-
-                ccan_list_for_each(&heap->pages, page, page_node) {
-                    page->pinned_slots = 0;
-                }
-            }
+#if RACTOR_LOCAL_GC
+        if (rlgc_global_gc_active) {
+            /* GLOBAL GC: the unified mark below repopulates mark/old/remembered/shared bits and
+             * counters across EVERY objspace, so clear them everywhere first. */
+            rb_gc_foreach_objspace(gc_full_mark_clear_thunk, NULL);
+        }
+        else
+#endif
+        {
+            gc_full_mark_clear_objspace(objspace);
         }
     }
     else {
@@ -6150,6 +6675,58 @@ rgengc_rememberset_mark_plane(rb_objspace_t *objspace, uintptr_t p, bits_t bitse
 }
 
 static void
+gc_mark_shared_roots(rb_objspace_t *objspace)
+{
+    /* Ractor-local GC root pass: mark every "shared" boundary object (an unshareable
+     * object directly referenced by a shareable parent, recorded in shared_bits) in this
+     * objspace, plus its transitive unshareable subtree. This keeps alive objects that are
+     * reachable only through a shareable object living in another objspace (e.g. a class's
+     * method/constant caches), which this Ractor's roots do not otherwise reach. */
+    size_t marked = 0;
+    for (int i = 0; i < HEAP_COUNT; i++) {
+        rb_heap_t *heap = &heaps[i];
+        struct heap_page *page = 0;
+        ccan_list_for_each(&heap->pages, page, page_node) {
+            if (!page->flags.has_shared_objects) continue;
+
+            uintptr_t p = page->start;
+            short slot_size = page->slot_size;
+            int total_slots = page->total_slots;
+            int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
+            bits_t *shared_bits = page->shared_bits;
+
+            for (int j = 0; j < bitmap_plane_count; j++) {
+                bits_t bitset = shared_bits[j];
+                uintptr_t pp = p;
+                while (bitset) {
+                    if (bitset & 1) {
+                        gc_mark(objspace, (VALUE)pp);
+                        marked++;
+                    }
+                    pp += slot_size;
+                    bitset >>= 1;
+                }
+                p += BITS_BITLENGTH * slot_size;
+            }
+        }
+    }
+    if (getenv("RLGC_DEBUG")) fprintf(stderr, "[RLGC] shared_roots marked=%zu (wb_sets=%zu local_sets=%zu) objspace=%p main=%p\n", marked, rlgc_wb_shared_sets, rlgc_wb_local_sets, (void*)objspace, (void*)rlgc_main_objspace);
+}
+
+#if RACTOR_LOCAL_GC
+/* Pin an object as "shared" in its own objspace: the owner's local GC will keep it alive
+ * (via gc_mark_shared_roots) and never free it. Used for VM-internal infrastructure a Ractor
+ * creates under the VM lock (method/inline caches, class extensions) which is reachable only
+ * through shareable objects the local GC never traverses. */
+void
+rb_gc_impl_pin_shared(VALUE obj)
+{
+    MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj);
+    GET_HEAP_PAGE(obj)->flags.has_shared_objects = TRUE;
+}
+#endif
+
+static void
 rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
 {
     size_t j;
@@ -6210,6 +6787,17 @@ rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
         memset(&page->marking_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->remembered_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->pinned_bits[0],     0, HEAP_PAGE_BITMAP_SIZE);
+#if RACTOR_LOCAL_GC && !RACTOR_LOCAL_GC_AUDIT
+        /* shared_bits (the shareable->unshareable boundary remset) may only be cleared+recomputed
+         * when ALL shareable parents are visible: either the pure single-objspace case, or a
+         * GLOBAL all-objspace GC. In both, gc_shared_relation rebuilds the set as the (unified)
+         * mark proceeds. A per-Ractor LOCAL GC must NOT clear it (it cannot see foreign parents),
+         * so shareables stay pinned until the next global GC. */
+        if (!rlgc_has_local || rlgc_global_gc_active) {
+            memset(&page->shared_bits[0],     0, HEAP_PAGE_BITMAP_SIZE);
+            page->flags.has_shared_objects = FALSE;
+        }
+#endif
         page->flags.has_uncollectible_wb_unprotected_objects = FALSE;
         page->flags.has_remembered_objects = FALSE;
     }
@@ -6299,6 +6887,31 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
     GC_ASSERT(RB_BUILTIN_TYPE(b) != T_NONE);
     GC_ASSERT(RB_BUILTIN_TYPE(b) != T_MOVED);
     GC_ASSERT(RB_BUILTIN_TYPE(b) != T_ZOMBIE);
+
+#if RACTOR_LOCAL_GC
+    /* Record the shareable->unshareable boundary: b becomes a "shared" object that b's owner's
+     * local GC must treat as a root. The store can only be performed by b's owner (isolation
+     * forbids holding a cross-Ractor unshareable reference), so we always set the bit on our
+     * own object; a (the shareable) may live in another Ractor's space and is not touched. */
+    if (RB_OBJ_SHAREABLE_P(b)) {
+        /* b is shareable: it may be referenced from another Ractor (e.g. a callcache shared
+         * through an inline cache in a shareable iseq). Its owner's local GC must keep it (and
+         * its subtree) alive — shareables are pinned until the global GC — so record it as a
+         * local-GC root via shared_bits. */
+        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(b), b);
+        GET_HEAP_PAGE(b)->flags.has_shared_objects = TRUE;
+    }
+    else if (RB_OBJ_SHAREABLE_P(a) || MARKED_IN_BITMAP(GET_HEAP_SHARED_BITS(a), a)) {
+        /* b (unshareable) is reachable from a shareable object (directly, or transitively via
+         * another "shared" object such as a class's per-Ractor classext). Mark b as shared so
+         * the owner's local GC keeps it alive; the shareable referrer may live in another
+         * objspace that the local GC never traverses. */
+        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(b), b);
+        GET_HEAP_PAGE(b)->flags.has_shared_objects = TRUE;
+        rlgc_wb_shared_sets++;
+        if (GET_HEAP_OBJSPACE(b) != rlgc_main_objspace) rlgc_wb_local_sets++;
+    }
+#endif
 
   retry:
     if (!is_incremental_marking(objspace)) {
@@ -6478,7 +7091,7 @@ rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache)
     rb_objspace_t *objspace = objspace_ptr;
 
     objspace->live_ractor_cache_count--;
-    gc_ractor_newobj_cache_clear(cache, NULL);
+    gc_ractor_newobj_cache_clear(cache, objspace);
     free(cache);
 }
 
@@ -6618,6 +7231,28 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     GC_ASSERT(!is_lazy_sweeping(objspace));
     GC_ASSERT(!is_incremental_marking(objspace));
 
+#if RACTOR_LOCAL_GC
+    /* A full/major collection becomes a GLOBAL GC: an STW barrier (all Ractors stopped), a
+     * unified mark across every objspace (so cross-Ractor references and shareables are traced
+     * by reachability rather than pinned), and a sweep of every objspace that reclaims dead
+     * shareables. Minor collections stay confined to one objspace (the parallel local-GC fast
+     * path). We must decide this BEFORE gc_enter (which takes the barrier for a global GC), so
+     * predict do_full_mark from the same inputs the finalization below uses. */
+    if (rlgc_has_local && rlgc_global_gc_enabled()) {
+        bool will_full_mark = do_full_mark;
+        if (ruby_gc_stressful) {
+            int flag = FIXNUM_P(ruby_gc_stress_mode) ? FIX2INT(ruby_gc_stress_mode) : 0;
+            if ((flag & (1 << gc_stress_no_major)) == 0) will_full_mark = TRUE;
+        }
+        if (gc_needs_major_flags) will_full_mark = TRUE;
+        if (!gc_config_full_mark_val) will_full_mark = FALSE;
+        objspace->flags.global_gc = will_full_mark;
+    }
+    else {
+        objspace->flags.global_gc = false;
+    }
+#endif
+
     unsigned int lock_lev;
     gc_enter(objspace, gc_enter_event_start, &lock_lev);
 
@@ -6717,9 +7352,29 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
 
     gc_prof_timer_start(objspace);
     {
+#if RACTOR_LOCAL_GC
+        /* GLOBAL GC: drive a single unified mark across ALL objspaces (the VM barrier has stopped
+         * every Ractor). rb_gc_mark_roots then uses the full VM roots and marking is unconfined. */
+        rlgc_global_gc_active = objspace->flags.global_gc;
+        if (objspace->flags.global_gc) RUBY_ATOMIC_FETCH_ADD(rlgc_global_gc_count, 1);
+#endif
         if (gc_marks(objspace, do_full_mark)) {
-            gc_sweep(objspace);
+#if RACTOR_LOCAL_GC
+            if (objspace->flags.global_gc) {
+                /* Unified mark done across all objspaces: now sweep them all (reclaims dead
+                 * shareables too). rlgc_global_gc_active stays TRUE so each objspace's sweep
+                 * flushes its own caches and frees unmarked shareables. */
+                gc_global_sweep(objspace);
+            }
+            else
+#endif
+            {
+                gc_sweep(objspace);
+            }
         }
+#if RACTOR_LOCAL_GC
+        rlgc_global_gc_active = false;
+#endif
     }
     gc_prof_timer_stop(objspace);
 
@@ -6885,17 +7540,37 @@ gc_clock_end(struct timespec *ts)
 static inline void
 gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_lev)
 {
-    *lock_lev = RB_GC_VM_LOCK();
+#if RACTOR_LOCAL_GC
+    if (objspace->local && !objspace->flags.global_gc) {
+        /* Ractor-local MINOR GC: this objspace is private to one Ractor. Do NOT take the VM
+         * lock and do NOT stop other Ractors; marking is confined to this objspace so other
+         * Ractors keep running and collecting in parallel. */
+        *lock_lev = 0;
+        objspace->flags.local_gc = TRUE;
+        {
+            rb_atomic_t cur = RUBY_ATOMIC_FETCH_ADD(rlgc_concurrent_local_gc, 1) + 1;
+            if (cur > rlgc_max_concurrent_local_gc) rlgc_max_concurrent_local_gc = cur; /* relaxed */
+            RUBY_ATOMIC_FETCH_ADD(rlgc_local_gc_count, 1);
+        }
+    }
+    else
+#endif
+    {
+        *lock_lev = RB_GC_VM_LOCK();
 
-    switch (event) {
-      case gc_enter_event_rest:
-      case gc_enter_event_start:
-      case gc_enter_event_continue:
-        // stop other ractors
-        rb_gc_vm_barrier();
-        break;
-      default:
-        break;
+        switch (event) {
+          case gc_enter_event_rest:
+          case gc_enter_event_start:
+          case gc_enter_event_continue:
+            // stop other ractors
+            rb_gc_vm_barrier();
+            break;
+          default:
+            break;
+        }
+        /* GLOBAL (full/major) GC and the main objspace's GC run UNCONFINED: marking follows
+         * references into every Ractor's objspace (the VM barrier has stopped them all), so a
+         * single unified mark covers all live objects across all objspaces. */
     }
 
     gc_enter_count(event);
@@ -6922,7 +7597,21 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
     gc_report(1, objspace, "gc_exit: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     during_gc = FALSE;
 
-    RB_GC_VM_UNLOCK(*lock_lev);
+#if RACTOR_LOCAL_GC
+    if (objspace->local && !objspace->flags.global_gc) {
+        /* local minor GC: confined, no barrier was taken */
+        objspace->flags.local_gc = FALSE;
+        RUBY_ATOMIC_FETCH_SUB(rlgc_concurrent_local_gc, 1);
+    }
+    else
+#endif
+    {
+#if RACTOR_LOCAL_GC
+        objspace->flags.local_gc = FALSE;
+        objspace->flags.global_gc = FALSE;
+#endif
+        RB_GC_VM_UNLOCK(*lock_lev);
+    }
 }
 
 #ifndef MEASURE_GC
@@ -7172,12 +7861,18 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
     uncollectible = RVALUE_UNCOLLECTIBLE(objspace, src);
     bool remembered = RVALUE_REMEMBERED(objspace, src);
     age = RVALUE_AGE_GET(src);
+#if RACTOR_LOCAL_GC
+    bool shared = MARKED_IN_BITMAP(GET_HEAP_SHARED_BITS(src), src) != 0;
+#endif
 
     /* Clear bits for eventual T_MOVED */
     CLEAR_IN_BITMAP(GET_HEAP_MARK_BITS(src), src);
     CLEAR_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(src), src);
     CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(src), src);
     CLEAR_IN_BITMAP(GET_HEAP_PAGE(src)->remembered_bits, src);
+#if RACTOR_LOCAL_GC
+    CLEAR_IN_BITMAP(GET_HEAP_SHARED_BITS(src), src);
+#endif
 
     /* Move the object */
     memcpy((void *)dest, (void *)src, MIN(src_slot_size, slot_size));
@@ -7203,6 +7898,16 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
     else {
         CLEAR_IN_BITMAP(GET_HEAP_PAGE(dest)->remembered_bits, dest);
     }
+
+#if RACTOR_LOCAL_GC
+    if (shared) {
+        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(dest), dest);
+        GET_HEAP_PAGE(dest)->flags.has_shared_objects = TRUE;
+    }
+    else {
+        CLEAR_IN_BITMAP(GET_HEAP_SHARED_BITS(dest), dest);
+    }
+#endif
 
     if (marked) {
         MARK_IN_BITMAP(GET_HEAP_MARK_BITS(dest), dest);
@@ -9602,6 +10307,14 @@ rb_gc_impl_objspace_free(void *objspace_ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
+#if RACTOR_LOCAL_GC
+    if (objspace == rlgc_main_objspace && getenv("RLGC_STATS")) {
+        fprintf(stderr, "[RLGC] local GCs: %u (max %u ran concurrently across Ractors), global GCs: %u\n",
+                (unsigned)rlgc_local_gc_count, (unsigned)rlgc_max_concurrent_local_gc,
+                (unsigned)rlgc_global_gc_count);
+    }
+#endif
+
     if (is_lazy_sweeping(objspace))
         rb_bug("lazy sweeping underway when freeing object space");
 
@@ -9614,6 +10327,9 @@ rb_gc_impl_objspace_free(void *objspace_ptr)
     rb_darray_free_without_gc(objspace->heap_pages.sorted);
     heap_pages_lomem = 0;
     heap_pages_himem = 0;
+#if RACTOR_LOCAL_GC && defined(HAVE_MMAP)
+    if (HEAP_PAGE_ALLOC_USE_MMAP) rlgc_page_arenas_free(objspace); /* munmap the page arenas */
+#endif
 
     for (int i = 0; i < HEAP_COUNT; i++) {
         rb_heap_t *heap = &heaps[i];
@@ -9676,6 +10392,14 @@ rb_gc_impl_before_fork(void *objspace_ptr)
     rb_gc_vm_barrier();
 }
 
+#if RACTOR_LOCAL_GC
+static void
+gc_after_fork_flush_objspace(void *os, void *data)
+{
+    rb_gc_ractor_newobj_cache_foreach_for_objspace(os, gc_ractor_newobj_cache_clear, os);
+}
+#endif
+
 void
 rb_gc_impl_after_fork(void *objspace_ptr, rb_pid_t pid)
 {
@@ -9685,7 +10409,18 @@ rb_gc_impl_after_fork(void *objspace_ptr, rb_pid_t pid)
     objspace->fork_vm_lock_lev = 0;
 
     if (pid == 0) { /* child process */
-        rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_clear, NULL);
+#if RACTOR_LOCAL_GC
+        if (rlgc_has_local) {
+            /* Flush each Ractor's newobj cache into ITS OWN objspace; flushing them all into the
+             * main objspace (as the single-objspace path does) would add other objspaces'
+             * allocation counts to the main objspace and corrupt its live-slot accounting. */
+            rb_gc_foreach_objspace(gc_after_fork_flush_objspace, NULL);
+        }
+        else
+#endif
+        {
+            rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_clear, objspace);
+        }
     }
 }
 
@@ -9755,6 +10490,32 @@ void
 rb_gc_impl_objspace_init(void *objspace_ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
+
+#if RACTOR_LOCAL_GC
+    if (rlgc_main_objspace == NULL) {
+        rlgc_main_objspace = objspace;
+    }
+    else {
+        objspace->local = TRUE;
+        /* A per-Ractor local GC runs concurrently with other Ractors (no STW barrier).
+         * Disable incremental marking AND lazy sweep (dont_incremental implies immediate
+         * sweep, see gc_start) so each local GC is a single self-contained stop-mark-sweep
+         * with no GC state left live across mutator/other-Ractor execution. */
+        objspace->flags.dont_incremental = TRUE;
+
+        if (!rlgc_has_local) {
+            /* First per-Ractor objspace: from now on a full/major GC of any objspace is a GLOBAL
+             * STW GC. For its barrier to never catch the MAIN objspace mid-collection (which the
+             * unified mark/sweep could not tolerate), make main GCs atomic too — no incremental
+             * mark, no lazy sweep. We are on the main Ractor here (the first non-main Ractor is
+             * always created by main) with no other Ractor running, so finishing any in-flight
+             * main collection now is safe. */
+            gc_rest(rlgc_main_objspace);
+            rlgc_main_objspace->flags.dont_incremental = TRUE;
+        }
+        rlgc_has_local = true;
+    }
+#endif
 
     gc_config_full_mark_set(TRUE);
 

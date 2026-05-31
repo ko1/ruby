@@ -1336,7 +1336,11 @@ rb_free_generic_ivar(VALUE obj)
                     ec->gen_fields_cache.obj = Qundef;
                     ec->gen_fields_cache.fields_obj = Qundef;
                 }
-                RB_VM_LOCKING() {
+                /* NON-BARRIER: this runs during a (possibly Ractor-local, lock-free) GC sweep,
+                 * which is not at a safepoint. A barrier-aware lock here could join a pending
+                 * global-GC barrier mid-sweep, leaving the objspace half-swept for the global GC to
+                 * mark. The non-barrier lock still serializes with concurrent table accessors. */
+                RB_VM_LOCKING_NO_BARRIER() {
                     if (!st_delete(generic_fields_tbl_no_ractor_check(), &key, &value)) {
                         rb_bug("Object is missing entry in generic_fields_tbl");
                     }

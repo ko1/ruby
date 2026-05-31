@@ -263,6 +263,31 @@ ractor_mark(void *ptr)
     }
 }
 
+void rb_gc_mark_thread_roots(rb_thread_t *th); /* vm.c */
+
+/* Mark a Ractor's own internal state (received messages, local storage, std IO, threads)
+ * as roots. Used by the per-Ractor local GC: this state lives in the Ractor's own objspace
+ * but is referenced from the shareable Ractor object (cross-objspace, set via raw C without a
+ * write barrier), so the Ractor's local roots — not the GC of the objspace holding the Ractor
+ * object — must keep it alive. */
+void
+rb_gc_mark_ractor_local_roots(rb_ractor_t *r)
+{
+    ractor_mark((void *)r);
+
+    /* ractor_mark() marks each thread's wrapper object (th->self), but that object may live in
+     * the main objspace — foreign to this Ractor's local objspace — so the confined local mark
+     * skips it and never reaches the thread's own roots (its VM/machine stacks and thread-local
+     * state, which DO live in this objspace). Mark those roots directly. The confined mark still
+     * skips any foreign objects they reference. */
+    if (r->threads.cnt > 0) {
+        rb_thread_t *th = NULL;
+        ccan_list_for_each(&r->threads.set, th, lt_node) {
+            rb_gc_mark_thread_roots(th);
+        }
+    }
+}
+
 static int
 free_targeted_hook_lists(st_data_t key, st_data_t val, st_data_t _arg)
 {
@@ -294,7 +319,7 @@ ractor_free(void *ptr)
     if (r->newobj_cache) {
         RUBY_ASSERT(r == ruby_single_main_ractor);
 
-        rb_gc_ractor_cache_free(r->newobj_cache);
+        rb_gc_ractor_cache_free(r);
         r->newobj_cache = NULL;
     }
 
@@ -386,6 +411,11 @@ vm_insert_ractor0(rb_vm_t *vm, rb_ractor_t *r, bool single_ractor_mode)
         VM_ASSERT(r == ruby_single_main_ractor);
     }
     else {
+        /* Ractor-local GC (experimental): give a non-main Ractor its own objspace so it
+         * allocates into and collects its own heap without a stop-the-world barrier. */
+        if (rb_gc_rlgc_enabled() && r != ruby_single_main_ractor) {
+            r->local_gc_objspace = rb_gc_objspace_alloc_local();
+        }
         r->newobj_cache = rb_gc_ractor_cache_alloc(r);
     }
 }
@@ -448,7 +478,7 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         }
         vm->ractor.cnt--;
 
-        rb_gc_ractor_cache_free(cr->newobj_cache);
+        rb_gc_ractor_cache_free(cr);
         cr->newobj_cache = NULL;
 
         ractor_status_set(cr, ractor_terminated);
@@ -481,6 +511,8 @@ rb_ractor_t *
 rb_ractor_main_alloc(void)
 {
     rb_ractor_t *r = &_main_ractor;
+    /* Ractor-local GC: the main Ractor's local objspace is the VM-wide objspace. */
+    r->local_gc_objspace = GET_VM()->gc.objspace;
     r->newobj_cache = rb_gc_ractor_cache_alloc(r);
     ruby_single_main_ractor = r;
 
@@ -509,7 +541,7 @@ rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th)
 void
 rb_ractor_terminate_atfork(rb_vm_t *vm, rb_ractor_t *r)
 {
-    rb_gc_ractor_cache_free(r->newobj_cache);
+    rb_gc_ractor_cache_free(r);
     r->newobj_cache = NULL;
     r->status_ = ractor_terminated;
     ractor_sync_terminate_atfork(vm, r);

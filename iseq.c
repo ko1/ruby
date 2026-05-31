@@ -4263,7 +4263,7 @@ rb_clear_attr_ccs(void)
 {
     RB_VM_LOCKING() {
         rb_vm_barrier();
-        rb_objspace_each_objects(clear_attr_ccs_i, NULL);
+        rb_objspace_each_objects_all_ractors(clear_attr_ccs_i, NULL);
     }
 }
 
@@ -4284,7 +4284,7 @@ void
 rb_clear_bf_ccs(void)
 {
     ASSERT_vm_locking_with_barrier();
-    rb_objspace_each_objects(clear_bf_ccs_i, NULL);
+    rb_objspace_each_objects_all_ractors(clear_bf_ccs_i, NULL);
 }
 
 static int
@@ -4315,7 +4315,7 @@ rb_iseq_trace_set_all(rb_event_flag_t turnon_events)
 {
     RB_VM_LOCKING() {
         rb_vm_barrier();
-        rb_objspace_each_objects(trace_set_i, &turnon_events);
+        rb_objspace_each_objects_all_ractors(trace_set_i, &turnon_events);
     }
 }
 

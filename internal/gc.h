@@ -202,7 +202,15 @@ void rb_gc_register_pinning_obj(VALUE obj);
 rb_execution_context_t *rb_gc_get_ec(void);
 
 void *rb_gc_ractor_cache_alloc(rb_ractor_t *ractor);
-void rb_gc_ractor_cache_free(void *cache);
+void rb_gc_ractor_cache_free(rb_ractor_t *r);
+
+/* Ractor-local GC (experimental): per-Ractor objspace lifecycle + runtime toggle. */
+void *rb_gc_objspace_alloc_local(void);
+void rb_gc_objspace_free_local(void *objspace);
+void *rb_gc_ractor_cache_alloc_on_main(rb_ractor_t *ractor);
+void rb_gc_mark_ractor_local_roots(rb_ractor_t *ractor);
+bool rb_gc_rlgc_enabled(void);
+bool rb_gc_object_in_current_objspace_p(VALUE obj);
 
 bool rb_gc_size_allocatable_p(size_t size);
 size_t *rb_gc_heap_sizes(void);
@@ -237,6 +245,17 @@ bool rb_gc_pointer_to_heap_p(VALUE obj);
 void rb_objspace_each_objects(
     int (*callback)(void *start, void *end, size_t stride, void *data),
     void *data);
+/* Walk objects in EVERY objspace (main + each Ractor's). Caller must hold the VM barrier. */
+void rb_objspace_each_objects_all_ractors(
+    int (*callback)(void *start, void *end, size_t stride, void *data),
+    void *data);
+/* True while a confined per-Ractor local GC (not a STW global GC) is running. Per-Ractor structures
+ * a local GC walks lock-free (e.g. Ractor message ports) take their per-Ractor lock when this is
+ * true to exclude concurrent foreign mutators. */
+bool rb_gc_during_confined_local_gc_p(void);
+/* Pin an in-flight Ractor message payload in the sender's objspace (it is referenced only from the
+ * receiver's basket queue, a cross-objspace edge both confined GCs skip). No-op without local GC. */
+void rb_gc_pin_in_flight_message(VALUE obj);
 
 size_t rb_gc_obj_slot_size(VALUE obj);
 

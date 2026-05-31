@@ -2664,3 +2664,47 @@ assert_equal 'ok', %q{
 
   :ok
 }
+
+# Ractor-local GC: a copied message is allocated in the SENDER's objspace but owned by the
+# receiver, so it must be re-materialized into the receiver's own objspace on receive. Deterministic
+# regression for that use-after-free (RACTOR_LOCAL_GC_DESIGN.md 5.0/6): the sender sends a deep
+# unshareable graph then blocks; main receives it, holds it from a long-lived root, and runs a
+# GLOBAL GC (clearing the in-flight pin while the copy is still young); main then releases the
+# sender, which runs a CONFINED MINOR GC (GC.start(full_mark: false)) and reuses the freed slots
+# with same-shaped junk. Without the fix the sender's local GC reclaims the copy main still holds
+# -> "[BUG] try to mark T_NONE" on the next global GC. Meaningful under RUBY_RACTOR_LOCAL_GC=1; a
+# no-op (single shared objspace) otherwise.
+assert_equal 'ok', %q{
+  data = Ractor::Port.new
+  sender = Ractor.new(data) do |data|
+    tick = Ractor::Port.new
+    data << tick
+    30.times do
+      obj = { a: "x" * 4000, b: (1..200).map { |i| "s#{i}" }, c: [Object.new, Object.new] }
+      data << obj
+      obj = nil
+      tick.receive                 # main has received the copy and cleared its in-flight pin
+      GC.start(full_mark: false)   # confined MINOR GC of the sender objspace
+      junk = []
+      2000.times { junk << { a: "z" * 4000, b: (1..200).map { |i| "z#{i}" }, c: [Object.new, Object.new] } }
+      GC.start(full_mark: false)   # reuse any freed slots with same-shaped junk
+      junk = nil
+    end
+    :done
+  end
+
+  tick = data.receive
+  recv = []
+  30.times do
+    msg = data.receive             # with the bug: the copy stays in the sender's objspace
+    recv << msg                    # hold it long-term from a main (unshareable) root
+    GC.start                       # GLOBAL GC: clears the in-flight pin; the copy is still young
+    tick << :go                    # let the sender run its confined minor GC + clobber
+  end
+  sender.join
+  GC.start
+
+  bad = recv.reject { |m| Hash === m && String === m[:a] && m[:a].length == 4000 &&
+                          m[:a].start_with?("x") && m[:b].length == 200 && m[:c].length == 2 }
+  bad.empty? ? 'ok' : 'corrupt'
+}
