@@ -3997,22 +3997,24 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                      * unshareable children dangling). */
                     break;
                 }
-                if (rlgc_has_local && RB_OBJ_SHAREABLE_P(vp) && BUILTIN_TYPE(vp) == T_IMEMO &&
+                if (rlgc_has_local && !rlgc_global_gc_active && RB_OBJ_SHAREABLE_P(vp) &&
+                    BUILTIN_TYPE(vp) == T_IMEMO &&
                     (imemo_type(vp) == imemo_callcache || imemo_type(vp) == imemo_callinfo ||
                      imemo_type(vp) == imemo_ment)) {
                     /* Callcache / callinfo / method-entry imemo are shared VM infrastructure reached
-                     * cross-Ractor through paths the GC cannot reliably trace under per-Ractor
-                     * objspaces: WEAK inline caches (cd->cc in shareable iseqs, never marked), and
-                     * a class callcache table living in one objspace whose cross-objspace remember
-                     * bit (set barrier-free by another Ractor) can race a minor GC. So keep them
-                     * pinned in EVERY GC once any local objspace exists — not just the global GC —
-                     * to close both holes. They are bounded; reclaiming them needs the main-routing
-                     * follow-up. Narrow ON PURPOSE: pinning all shareables would keep dead objects
-                     * (e.g. a collected Ractor) alive while their unshareable children are freed.
-                     * KNOWN BUG (RACTOR_LOCAL_GC_DESIGN.md 7.4): a cc/cme for an unshareable local
-                     * class is pinned past the class's death -> its strong owner/def references
-                     * dangle. Narrowing the pin to shareable-class cc/cme does NOT fix it (just moves
-                     * the dangling child owner->def-body->inline-cache); needs the main-routing redesign. */
+                     * cross-Ractor through paths a CONFINED GC cannot reliably trace under per-Ractor
+                     * objspaces: WEAK inline caches (cd->cc in shareable iseqs, never marked), and a
+                     * class callcache table living in one objspace whose cross-objspace remember bit
+                     * (set barrier-free by another Ractor) can race a minor GC. So a confined local
+                     * GC (and a main minor GC) keeps them pinned -- but, exactly like the shareable
+                     * pin above, the GLOBAL GC LIFTS the guard (`!rlgc_global_gc_active`): its unified
+                     * STW mark establishes true cross-objspace reachability, so an unmarked cc/cme is
+                     * genuinely dead and is reclaimed together with its now-dead class subtree. Pinning
+                     * them through the global GC instead is a BUG: classes are shareable, so a dead
+                     * class is collected by the global GC, but a pinned cc/cme would survive holding a
+                     * strong owner/def reference to that freed class -> dangling (RACTOR_LOCAL_GC_DESIGN.md
+                     * 5.1). A live class keeps its own cc/cme reachable via its m_tbl/cc_tbl, so they
+                     * survive the global mark normally. */
                     break;
                 }
 #endif
