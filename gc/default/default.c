@@ -10170,8 +10170,15 @@ gc_compact(VALUE self)
     int full_marking_p = gc_config_full_mark_val;
     gc_config_full_mark_set(TRUE);
 
-    /* Run GC with compaction enabled */
-    rb_gc_impl_start(rb_gc_get_objspace(), true, true, true, true);
+    /* Run GC with compaction enabled. Ractor-local GC: compaction MOVES objects, which is
+     * incompatible with per-Ractor objspaces -- cross-objspace references, the shared_bits remset,
+     * and the no-move invariant for shareables. When any local objspace exists, run a normal full
+     * GC WITHOUT moving instead (GC.compact then just collects; latest_compact_info shows 0 moved). */
+    bool compact = true;
+#if RACTOR_LOCAL_GC
+    if (rlgc_has_local) compact = false;
+#endif
+    rb_gc_impl_start(objspace, true, true, true, compact);
     gc_config_full_mark_set(full_marking_p);
 
     return gc_compact_stats(self);
@@ -10243,6 +10250,17 @@ gc_verify_compaction_references(int argc, VALUE* argv, VALUE self)
     bool expand_heap = (kwarg_count > 1 && RTEST(arguments[1])) || (kwarg_count > 2 && RTEST(arguments[2]));
 
     rb_objspace_t *objspace = rb_gc_get_objspace();
+
+#if RACTOR_LOCAL_GC
+    /* Compaction is incompatible with per-Ractor objspaces (see gc_compact): it moves objects, which
+     * breaks cross-objspace references, the shared_bits remset, and the no-move shareable invariant.
+     * Under a local objspace, run a non-moving full GC and report no moves rather than forcing a
+     * crashing compaction + move-verification. */
+    if (rlgc_has_local) {
+        rb_gc_impl_start(objspace, true, true, true, false);
+        return gc_compact_stats(self);
+    }
+#endif
 
     /* Clear the heap. */
     rb_gc_impl_start(objspace, true, true, true, false);
