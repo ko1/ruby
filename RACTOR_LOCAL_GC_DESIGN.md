@@ -575,13 +575,23 @@ re-pin は cross-objspace data race で不健全」と判断していたが、�
 
 **回帰**: btest **2051/2051**、btest_ractor **161/161**、警告なし。
 
-**別の pre-existing クラッシュバグ(本修正と独立, 調査中)**: `fiber_transfer_coroutine_hammer` が ~6% で
-`[BUG] try to mark T_NONE (obj: out-of-heap, parent: fiber/Fiber)`。backtrace = `cont_mark`(cont.c:1145)→
-`rb_execution_context_mark`(vm.c:3715, suspended fiber の VM スタック `p[i]` マーク中)。**コミット状態
-(§3.10/finalizer 修正を stash)でも 3/50 再現 → 本修正とは無関係**。機構: worker の suspended fiber の
-saved EC/VM スタックが参照する worker オブジェクトが、worker の local GC に解放され、後続 global GC が
-EC マークで T_NONE 検出。`cont_mark` の `rb_gc_local_gc_foreign_ractor_p` 判定 / fiber の save-restore ×
-RLGC 局所マークの境界が容疑。次に追跡。
+### 6.4 root fiber の saved stack が local GC で未マーク(解決, pre-existing)
+`fiber_transfer_coroutine_hammer` が ~6% で `[BUG] try to mark T_NONE (obj: out-of-heap, parent:
+fiber/Fiber)`(`cont_mark` cont.c:1145 → `rb_execution_context_mark` vm.c:3715, suspended fiber の VM
+スタック `p[i]` マーク中)。**§3.10/finalizer 修正を stash したコミット状態でも 3/50 再現 → 別の独立バグ**。
+**根本原因**: child Ractor の **root fiber の wrapper オブジェクトは親(main)スレッドで `Ractor.new` 時に生成
+され main objspace に在住**(cont.c:1155-1160 のコメント既述)。worker の **非 root fiber が走行中**に
+worker が local GC すると、`rb_gc_mark_thread_roots`(vm.c)は走行中 fiber(`th->ec`)を直接マークするが、
+root fiber は wrapper 経由でしか辿られず、その wrapper は foreign(main)なので `gc_mark`(default.c:5088)で
+skip → `cont_mark` 未実行 → **root fiber の saved stack 未マーク** → そこにしか無い worker オブジェクトを
+worker local GC が解放 → 後続 global GC が root fiber をマーク(global では skip 無し)して T_NONE 検出。
+**修正**: `rb_gc_mark_thread_roots` で、root fiber が suspended(`th->root_fiber != th->ec->fiber_ptr`)の
+とき、その cont を **直接マーク**(`rb_gc_mark_fiber_saved_context` → `cont_mark`)。`cont_mark` の owner
+ベース foreign 判定(owner=worker=marker)は通るので正しくマークされ、fiber グラフ全体が再 root 化される。
+→ `fiber_transfer_coroutine_hammer` 3/50→**0/80**、fiber 系全シナリオ 0、test_fiber/test_gc/test_gc_compact
+/test_thread/ractor(`-j1`)0 failures、btest 2051/btest_ractor 161 維持。
+（注: `make test-all -j`(並列ワーカー)では Ractor-local storage builtin 解決の pre-existing な並列レースで
+`uninitialized constant Ractor::Primitive` が散発。`-j1` で消える=テストハーネス側の別問題、本修正と無関係。）
 
 **残課題(設計判断が要る別件、クラッシュではない)**: handoff(#2)を阻む終了 Ractor の T_ZOMBIE(未実行
 deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)。

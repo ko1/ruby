@@ -1273,6 +1273,21 @@ rb_fiber_mark_self(const rb_fiber_t *fiber)
     rb_gc_mark_movable(fiber->cont.self);
 }
 
+/* Mark a fiber's saved execution context (VM/machine stacks) directly, exactly as cont_mark does
+ * when the fiber is reached through its (markable) wrapper object. The per-Ractor local GC uses this
+ * for its thread's ROOT fiber: that fiber's wrapper object is created on the PARENT thread during
+ * Ractor.new and so lives in the parent (e.g. main) objspace -- foreign to this Ractor's local
+ * objspace -- which the local mark skips, so cont_mark would otherwise never run for it and the root
+ * fiber's saved stack (holding this Ractor's top-level locals, which re-root its whole fiber graph)
+ * would be left unmarked whenever a non-root fiber is running. cont_mark's own owner-based foreign
+ * guard still skips a genuinely foreign fiber. The caller must pass a SUSPENDED fiber (not the
+ * running th->ec, whose saved context is stale). */
+void
+rb_gc_mark_fiber_saved_context(rb_fiber_t *fiber)
+{
+    cont_mark(&fiber->cont);
+}
+
 static void
 fiber_compact(void *ptr)
 {

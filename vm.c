@@ -3779,6 +3779,7 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
 }
 
 void rb_fiber_mark_self(rb_fiber_t *fib);
+void rb_gc_mark_fiber_saved_context(rb_fiber_t *fib);
 void rb_fiber_update_self(rb_fiber_t *fib);
 void rb_threadptr_root_fiber_setup(rb_thread_t *th);
 void rb_root_fiber_obj_setup(rb_thread_t *th);
@@ -3851,6 +3852,18 @@ rb_gc_mark_thread_roots(rb_thread_t *th)
 {
     thread_mark((void *)th);
     if (th->ec) rb_execution_context_mark(th->ec);
+
+    /* thread_mark() reaches a suspended fiber's saved stack only through its wrapper object
+     * (rb_fiber_mark_self). The ROOT fiber's wrapper is created on the PARENT thread during
+     * Ractor.new, so it lives in the parent (e.g. main) objspace -- foreign to this Ractor's local
+     * objspace -- and the local mark skips it, leaving the root fiber's saved stack unmarked while a
+     * non-root fiber runs. That stack holds this Ractor's top-level locals and re-roots its whole
+     * fiber graph, so a local GC would free objects a later global GC then marks ("mark T_NONE",
+     * parent fiber/Fiber). Mark the suspended root fiber's saved context directly; if it is the
+     * running fiber it is already covered by th->ec above (and its saved context would be stale). */
+    if (th->ec && th->root_fiber && th->root_fiber != th->ec->fiber_ptr) {
+        rb_gc_mark_fiber_saved_context(th->root_fiber);
+    }
 }
 
 void rb_threadptr_sched_free(rb_thread_t *th); // thread_*.c
