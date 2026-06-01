@@ -551,9 +551,22 @@ pin / T_NONE guard 等は妥当な防御だが根本解ではない(特に inlin
   不変条件違反 + cross-objspace ビットマップ data race(#7 と同根)で**不健全**。健全策 = 送信側 in-flight pin
   を **global GC を跨いで durable に**(in-flight registry を STW 中に再 stamp)+ materialize 完了まで
   sender 側 root を維持。= message ownership 設計(#3)と一体で決める。≈4% 再現。
-- **finalizer × RLGC**: `d_finalizer_churn` 10/10 SEGV、`d_objectspace_each_object` 10/10
-  "try to mark T_NONE (parent T_UNDEF)"(root mark)。`ObjectSpace.define_finalizer` + `each_object` +
-  per-Ractor objspace。finalizer table / deferred finalizer / each_object の cross-objspace 寿命(#4/#5 領域)。
-  ※ `ObjectSpace.each_object` は `rb_objspace_each_objects`(current objspace)経由で、orphan 修正とは別系統。
-  要 ASAN 追跡。**#2 の handoff と同根**: 終了 Ractor に残る T_ZOMBIE(未実行 deferred finalizer / dfree)が
-  孤児を空にできなくしている — finalizer の実行主体を RLGC でどう決めるかが両者の鍵。
+- **finalizer × RLGC(ASAN 確定, root + fix 判明。だが §3.10 と一体で要同時修正)**: `d_finalizer_churn`
+  10/10 SEGV、`d_objectspace_each_object` 10/10 "try to mark T_NONE (parent T_UNDEF)" は**同一根**。
+  `finalizer_table` は **per-objspace**。worker が `define_finalizer` すると隠し値 Array `[obj_id,proc]` が
+  worker の table からのみ到達可能。global GC は `gc_marks_start` で**全 objspace の mark ビットをクリア**
+  (`rb_gc_foreach_objspace(gc_full_mark_clear_thunk)` default.c:6491)し `gc_global_sweep_one` で**全 objspace を
+  sweep** するのに、**root mark は driver の finalizer_table しか辿らない**(mark_roots:5253、`rb_gc_mark_roots`
+  は per-objspace finalizer table を辿らない)→ worker の値 Array が未 mark で sweep → table がダングリング →
+  (A) `run_final` が解放済み Array を読む UAF /(B) worker の次の local GC の mark_roots→pin_value が T_NONE。
+  **クリーンなローカル修正(判明・検証済)**: global GC 時に全 objspace の finalizer_table を driver 文脈で mark
+  (`rb_gc_foreach_objspace` で各 os の table を pin_value)→ d_finalizer/each_object とも **10/10→0/12**。
+  **★ただし重大な落とし穴**: この修正を入れると **btest #161(§3.10 受信クローン回帰テスト)が 0→~100% で壊れる**。
+  原因は機能バグでなく**タイミング**: #161 に finalizer は無く foreach は空テーブル反復(マークゼロ)だが、global GC
+  中に objspace を数個反復する僅かな遅延だけで **§3.10 のレースが常に負ける**。= **§3.10 が極端に timing-fragile
+  で 0/20 PASS は運**(深刻な潜在バグ)。∴ **finalizer 修正と §3.10 修正は一体で入れる必要**があり、§3.10 の
+  message-ownership(#3)を先に固めるまで finalizer 修正は保留(本セッションでは未コミット=btest を緑に維持)。
+  ※ `ObjectSpace.each_object` は `rb_objspace_each_objects`(current objspace)経由で orphan 修正とは別系統。
+  別の同根課題: 終了 Ractor の T_ZOMBIE(未実行 deferred finalizer/dfree)が孤児を空にできず handoff(#2)を阻む。
+  → finalizer の **(i) 全 objspace table の root mark(liveness)** と **(ii) 終了 Ractor の deferred 実行主体**
+  の両方を、#2 handoff・#3 message と合わせて設計決定する。
