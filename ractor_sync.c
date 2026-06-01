@@ -212,6 +212,21 @@ static void
 ractor_basket_mark(const struct ractor_basket *b)
 {
     rb_gc_mark(b->p.v);
+
+    /* Ractor-local GC: a copy/move payload lives in the SENDER's objspace, kept alive there only by
+     * the send-time in-flight pin (its shared bit -- see ractor_basket_new). A GLOBAL GC clears every
+     * shared bit up front and rebuilds the remset solely from shareable->unshareable edges; an
+     * in-flight message, reachable only through this receiver queue, is not such an edge, so its pin
+     * would be lost. The SENDER's next local GC does not scan this (foreign) receiver queue and would
+     * then reclaim a still-queued message, leaving us to dequeue a freed object (UAF /
+     * mark-T_NONE -- RACTOR_LOCAL_GC_DESIGN.md 6.3). Re-stamp the pin so it survives the global GC.
+     * Only the global STW GC may do this: every Ractor is stopped, so writing another objspace's
+     * shared-bits bitmap races nothing. A local GC must never write a foreign objspace's bitmap, and
+     * rb_gc_during_local_gc_p() is false exactly during the global GC (and in non-RLGC builds, where
+     * rb_gc_pin_in_flight_message is itself a no-op). */
+    if (!rb_gc_during_local_gc_p()) {
+        rb_gc_pin_in_flight_message(b->p.v);
+    }
 }
 
 static void
@@ -649,6 +664,15 @@ ractor_sync_mark(rb_ractor_t *r)
 {
     rb_gc_mark(r->sync.default_port_value);
 
+    /* A copy/move message being cloned into r right now (ractor_basket_accept) is in no queue; keep
+     * it alive and, during the global STW GC, re-pin it in its sender objspace -- same rationale and
+     * same global-GC-only guard as ractor_basket_mark. r owns this field and only writes it on its
+     * own thread, so it is read race-free here (r's own local GC, or a global GC with all stopped). */
+    rb_gc_mark(r->sync.in_flight_materializing);
+    if (!rb_gc_during_local_gc_p()) {
+        rb_gc_pin_in_flight_message(r->sync.in_flight_materializing);
+    }
+
     /* recv_queue / ports / monitors are mutated by FOREIGN Ractors (senders, port (de)register,
      * monitors) while holding this Ractor's per-Ractor mutex r->sync.lock (== RACTOR_LOCK(r), e.g.
      * ractor_send_basket's ccan_list_add_tail into recv_queue). A per-Ractor LOCAL GC
@@ -720,6 +744,7 @@ ractor_sync_init(rb_ractor_t *r)
 
     // receiving queue
     r->sync.recv_queue = ractor_queue_new();
+    r->sync.in_flight_materializing = 0; // no copy/move message is being materialized yet
 
     // ports
     r->sync.ports = st_init_numtable();
@@ -859,7 +884,16 @@ ractor_basket_accept(struct ractor_basket *b)
      * No-op when v already lives here: self-send, or non-RLGC builds with a single shared objspace. */
     if ((type == basket_type_copy || type == basket_type_move) &&
         !rb_gc_object_in_current_objspace_p(v)) {
+        /* v has left the receiver queue, so ractor_basket_mark no longer re-pins it across a global
+         * GC. Publish it in this Ractor's materialize slot (marked + re-pinned by ractor_sync_mark)
+         * so a global GC firing inside ractor_copy -- which allocates -- cannot strand v unpinned in
+         * the sender objspace for the sender's next local GC to reclaim mid-clone. Save/restore the
+         * slot to tolerate any re-entry. (RACTOR_LOCAL_GC_DESIGN.md 6.3) */
+        rb_ractor_t *const cr = GET_RACTOR();
+        const VALUE prev = cr->sync.in_flight_materializing;
+        cr->sync.in_flight_materializing = v;
         v = ractor_copy(v);
+        cr->sync.in_flight_materializing = prev;
     }
 
     if (exception) {

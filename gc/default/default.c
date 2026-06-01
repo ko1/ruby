@@ -5294,6 +5294,26 @@ gc_mark_set_parent_invalid(rb_objspace_t *objspace)
     asan_poison_memory_region(&objspace->rgengc.parent_object_old_p, sizeof(objspace->rgengc.parent_object_old_p));
 }
 
+#if RACTOR_LOCAL_GC
+/* rb_gc_foreach_objspace thunk: during a GLOBAL GC, pin every OTHER objspace's finalizer_table
+ * entries into the driver's unified mark. finalizer_table is per-objspace and a global GC clears
+ * then sweeps every objspace, but mark_roots reaches only the driver's table -- so a worker's hidden
+ * [obj_id, proc] finalizer array (live only via that worker's table) would be swept, dangling the
+ * table (UAF in run_final / "mark T_NONE" at the worker's next local GC). Marking with the driver
+ * objspace is safe cross-objspace here: rlgc_global_gc_active lifts the foreign-skip and pinning
+ * targets the value's own page. (RACTOR_LOCAL_GC_DESIGN.md 6.3) */
+static void
+gc_mark_other_objspace_finalizer_table_i(void *os_ptr, void *driver_ptr)
+{
+    rb_objspace_t *const os = os_ptr;
+    if (os == driver_ptr) return; // the driver's own table is marked by mark_roots
+    st_table *const ft = rlgc_finalizer_table(os);
+    if (ft != NULL) {
+        st_foreach(ft, pin_value, (st_data_t)driver_ptr);
+    }
+}
+#endif
+
 static void
 mark_roots(rb_objspace_t *objspace, const char **categoryp)
 {
@@ -5307,6 +5327,14 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
     if (finalizer_table != NULL) {
         st_foreach(finalizer_table, pin_value, (st_data_t)objspace);
     }
+
+#if RACTOR_LOCAL_GC
+    /* A global GC sweeps every objspace, so it must also root every OTHER objspace's finalizer
+     * arrays, not just the driver's marked just above. (RACTOR_LOCAL_GC_DESIGN.md 6.3) */
+    if (rlgc_global_gc_active) {
+        rb_gc_foreach_objspace(gc_mark_other_objspace_finalizer_table_i, objspace);
+    }
+#endif
 
     if (stress_to_class) rb_gc_mark(stress_to_class);
 

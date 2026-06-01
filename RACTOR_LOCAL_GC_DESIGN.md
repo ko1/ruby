@@ -540,33 +540,48 @@ pin / T_NONE guard 等は妥当な防御だが根本解ではない(特に inlin
    clone-move / generic ivar / classext / managed id table / shape tree / JIT pointer update 等の**非 WB
    経路**で監査(現状は Ruby レベル隔離規則に依拠、C 実装全体の監査は不足)。
 
-### 6.3 本セッションで判明した open バグ(上記設計領域に属す)
-- **§3.10 受信クローン UAF(ASAN 確定, high-confidence)**: in-flight copy `v`(送信側 objspace 在住)が、
-  送信時 `rb_gc_pin_in_flight_message` の shared_bit を**途中の global GC が全クリア**→ v の唯一の到達性が
-  receiver の basket-queue root mark(`parent=Qundef`, 非 shareable-parent)なので `gc_shared_relation` が
-  再 stamp しない → さらに `ractor_basket_accept` が `ractor_copy(v)` の前に basket を dequeue+free →
-  materialize 中 v は受信スレッドの C ローカルのみが参照(送信側 local GC は走査しない)→ 送信側 confined
-  local GC が sweep → SEGV(`object.c:497`, `class.c:1055/1061`)。free スタック=
-  `gc_sweep`→`heap_page_add_freeobj`。**健全修正の難所**: 受信側で v を re-pin するのは shared_bits 所有権
-  不変条件違反 + cross-objspace ビットマップ data race(#7 と同根)で**不健全**。健全策 = 送信側 in-flight pin
-  を **global GC を跨いで durable に**(in-flight registry を STW 中に再 stamp)+ materialize 完了まで
-  sender 側 root を維持。= message ownership 設計(#3)と一体で決める。≈4% 再現。
-- **finalizer × RLGC(ASAN 確定, root + fix 判明。だが §3.10 と一体で要同時修正)**: `d_finalizer_churn`
-  10/10 SEGV、`d_objectspace_each_object` 10/10 "try to mark T_NONE (parent T_UNDEF)" は**同一根**。
-  `finalizer_table` は **per-objspace**。worker が `define_finalizer` すると隠し値 Array `[obj_id,proc]` が
-  worker の table からのみ到達可能。global GC は `gc_marks_start` で**全 objspace の mark ビットをクリア**
-  (`rb_gc_foreach_objspace(gc_full_mark_clear_thunk)` default.c:6491)し `gc_global_sweep_one` で**全 objspace を
-  sweep** するのに、**root mark は driver の finalizer_table しか辿らない**(mark_roots:5253、`rb_gc_mark_roots`
-  は per-objspace finalizer table を辿らない)→ worker の値 Array が未 mark で sweep → table がダングリング →
-  (A) `run_final` が解放済み Array を読む UAF /(B) worker の次の local GC の mark_roots→pin_value が T_NONE。
-  **クリーンなローカル修正(判明・検証済)**: global GC 時に全 objspace の finalizer_table を driver 文脈で mark
-  (`rb_gc_foreach_objspace` で各 os の table を pin_value)→ d_finalizer/each_object とも **10/10→0/12**。
-  **★ただし重大な落とし穴**: この修正を入れると **btest #161(§3.10 受信クローン回帰テスト)が 0→~100% で壊れる**。
-  原因は機能バグでなく**タイミング**: #161 に finalizer は無く foreach は空テーブル反復(マークゼロ)だが、global GC
-  中に objspace を数個反復する僅かな遅延だけで **§3.10 のレースが常に負ける**。= **§3.10 が極端に timing-fragile
-  で 0/20 PASS は運**(深刻な潜在バグ)。∴ **finalizer 修正と §3.10 修正は一体で入れる必要**があり、§3.10 の
-  message-ownership(#3)を先に固めるまで finalizer 修正は保留(本セッションでは未コミット=btest を緑に維持)。
-  ※ `ObjectSpace.each_object` は `rb_objspace_each_objects`(current objspace)経由で orphan 修正とは別系統。
-  別の同根課題: 終了 Ractor の T_ZOMBIE(未実行 deferred finalizer/dfree)が孤児を空にできず handoff(#2)を阻む。
-  → finalizer の **(i) 全 objspace table の root mark(liveness)** と **(ii) 終了 Ractor の deferred 実行主体**
-  の両方を、#2 handoff・#3 message と合わせて設計決定する。
+### 6.3 本セッションで判明し**修正完了**したバグ(設計判断不要・ローカル健全修正)
+3つとも「**global GC は全 objspace を clear+sweep するのに root mark が driver 分しか辿らない**」という
+**単一の根**の別現れだった。共通の健全修正パターン = 各 per-objspace root を **global GC(STW)中に**辿る/
+再 pin する。STW なので他 objspace のビットマップへ書いても**並行 writer が居らず race しない**(従来「受信側
+re-pin は cross-objspace data race で不健全」と判断していたが、それは**local GC 中**の話。global GC 限定なら健全、
+が突破口だった)。判定は `rb_gc_during_local_gc_p()`(global GC のとき false)。
+
+- **§3.10 受信クローン UAF(解決)**: in-flight copy `v`(送信側 objspace 在住)の送信時 pin(shared_bit)を
+  途中の global GC が全クリアし、`gc_shared_relation` の再 stamp 対象でもないため、v が **queued のまま** unpin
+  になる。送信側 local GC は受信側 queue を走査しないので、unpin かつ送信側 root でない v を sweep →
+  受信側が解放済み v を dequeue → `ractor_copy(v)` で SEGV(`ractor.c:2156`←`ractor_basket_accept`)。
+  **修正(2層, 両方 global GC 限定で re-pin = race-free)**:
+  - **A. queued 窓**: `ractor_basket_mark`(ractor_sync.c)で `!rb_gc_during_local_gc_p()` のとき
+    `rb_gc_pin_in_flight_message(b->p.v)` を再 stamp → 全ての in-flight メッセージの pin が global GC を跨いで
+    恒久化。
+  - **B. gap 窓(dequeue 後〜`ractor_copy` 完了)**: queue 外なので A が効かない。受信側 Ractor に
+    `sync.in_flight_materializing` スロットを追加し(`ractor_core.h`)、`ractor_basket_accept` が `ractor_copy`
+    の前後で set/restore、`ractor_sync_mark` がこれを mark + (global GC 限定で) 再 pin。→ `ractor_copy` 中に
+    global GC が来ても v が再 pin され、続く送信側 local GC が解放できない。
+  - 検証: `d_frozen_in_unfrozen_compact` 1/10→**0/60**、#161/fiber_heavy/fanin/deep_graph/move 等 §3.10 系
+    **全て 0**。
+- **finalizer × RLGC(解決)**: `finalizer_table` は **per-objspace**。worker が `define_finalizer` すると
+  隠し値 Array `[obj_id,proc]` が worker の table からのみ到達可能。global GC は全 objspace を clear+sweep する
+  のに root mark は driver の table しか辿らない(`mark_roots` default.c)→ worker の値 Array が sweep されて
+  table がダングリング →(A) `run_final` の UAF /(B) worker の次の local GC で `pin_value` が T_NONE を mark。
+  **修正**: `mark_roots` 内で `rlgc_global_gc_active` のとき `rb_gc_foreach_objspace` で**全 objspace の
+  finalizer_table を driver 文脈で `pin_value`**(`gc_mark_other_objspace_finalizer_table_i`)。pin は値自身の
+  ページに付くので cross-objspace でも健全。→ `d_finalizer_churn` 10/10→**0/20**、`d_objectspace_each_object`
+  10/10→**0/20**。
+- **§3.10 と finalizer の絡み(解消)**: かつて finalizer 修正単体を入れると #161 が 0→~100% で壊れた。これは
+  finalizer 修正の僅かな timing 摂動が §3.10 の脆弱なレースを常に負けさせていたため。§3.10 を A/B で堅牢化した
+  今は **両修正を同時に入れても #161=0/40・btest_ractor 161/161・btest 2051/2051**。entanglement は解消。
+
+**回帰**: btest **2051/2051**、btest_ractor **161/161**、警告なし。
+
+**別の pre-existing クラッシュバグ(本修正と独立, 調査中)**: `fiber_transfer_coroutine_hammer` が ~6% で
+`[BUG] try to mark T_NONE (obj: out-of-heap, parent: fiber/Fiber)`。backtrace = `cont_mark`(cont.c:1145)→
+`rb_execution_context_mark`(vm.c:3715, suspended fiber の VM スタック `p[i]` マーク中)。**コミット状態
+(§3.10/finalizer 修正を stash)でも 3/50 再現 → 本修正とは無関係**。機構: worker の suspended fiber の
+saved EC/VM スタックが参照する worker オブジェクトが、worker の local GC に解放され、後続 global GC が
+EC マークで T_NONE 検出。`cont_mark` の `rb_gc_local_gc_foreign_ractor_p` 判定 / fiber の save-restore ×
+RLGC 局所マークの境界が容疑。次に追跡。
+
+**残課題(設計判断が要る別件、クラッシュではない)**: handoff(#2)を阻む終了 Ractor の T_ZOMBIE(未実行
+deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)。

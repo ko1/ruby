@@ -27,6 +27,12 @@ struct rb_ractor_sync {
     // incoming messages
     struct ractor_queue *recv_queue;
 
+    // Ractor-local GC: a copy/move message currently being materialized (cloned) into this Ractor
+    // by ractor_basket_accept. It has left the receiver queue, so the queue walk that re-pins
+    // in-flight messages across a global GC (ractor_basket_mark) no longer covers it; ractor_sync_mark
+    // re-pins this slot instead. 0 when not materializing. (RACTOR_LOCAL_GC_DESIGN.md 6.3)
+    VALUE in_flight_materializing;
+
     // waiting threads for receiving
     struct ccan_list_head waiters;
 
