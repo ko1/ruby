@@ -2209,15 +2209,22 @@ heap_pages_free_unused_pages(rb_objspace_t *objspace)
         rb_darray_pop(objspace->heap_pages.sorted, i - j);
         GC_ASSERT(rb_darray_size(objspace->heap_pages.sorted) == j);
 
-        struct heap_page *hipage = rb_darray_get(objspace->heap_pages.sorted, rb_darray_size(objspace->heap_pages.sorted) - 1);
-        uintptr_t himem = (uintptr_t)hipage->body + HEAP_PAGE_SIZE;
-        GC_ASSERT(himem <= heap_pages_himem);
-        heap_pages_himem = himem;
+        /* An objspace can legitimately have ZERO pages here under Ractor-local GC: an orphaned
+         * (terminated-Ractor) objspace whose last live object has been reclaimed by the global GC
+         * ends up with an empty sorted array. rb_darray_get(sorted, -1) would then read out of
+         * bounds and deref a NULL page. Only recompute the heap mem bounds when pages remain.
+         * (RACTOR_LOCAL_GC_DESIGN.md 5.4 -- freeing the empty orphan shell is a separate follow-up.) */
+        if (rb_darray_size(objspace->heap_pages.sorted) > 0) {
+            struct heap_page *hipage = rb_darray_get(objspace->heap_pages.sorted, rb_darray_size(objspace->heap_pages.sorted) - 1);
+            uintptr_t himem = (uintptr_t)hipage->body + HEAP_PAGE_SIZE;
+            GC_ASSERT(himem <= heap_pages_himem);
+            heap_pages_himem = himem;
 
-        struct heap_page *lopage = rb_darray_get(objspace->heap_pages.sorted, 0);
-        uintptr_t lomem = (uintptr_t)lopage->body + sizeof(struct heap_page_header);
-        GC_ASSERT(lomem >= heap_pages_lomem);
-        heap_pages_lomem = lomem;
+            struct heap_page *lopage = rb_darray_get(objspace->heap_pages.sorted, 0);
+            uintptr_t lomem = (uintptr_t)lopage->body + sizeof(struct heap_page_header);
+            GC_ASSERT(lomem >= heap_pages_lomem);
+            heap_pages_lomem = lomem;
+        }
     }
 }
 
