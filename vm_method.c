@@ -29,37 +29,6 @@ mark_cc_entry_i(VALUE ccs_ptr, void *data)
 
     VM_ASSERT(vm_ccs_p(ccs));
 
-    /* Ractor-local-GC cache-consistency guard. A callcache / method-entry is shareable VM
-     * infrastructure that a per-Ractor local GC keeps pinned and only the global GC reclaims (by
-     * cross-objspace reachability). Under the lock-free, copy-on-write cc table (rb_vm_cc_table_dup
-     * memcpy's raw cc/cme pointers across table versions; below) a reclaimed cc/cme can transiently
-     * linger in a still-reachable ccs as a DANGLING pointer (its slot is now T_NONE). Marking it
-     * would "try to mark T_NONE". The cc table is a reconstructable cache, so drop the whole stale
-     * ccs -- it is rebuilt on the next call -- exactly the treatment the invalidated-cme branch below
-     * gives an entry whose method has gone away. (RACTOR_LOCAL_GC_DESIGN.md 5.1, cc-table cluster.)
-     * Only reachable under multi-Ractor (the only configuration with local GCs and the COW table);
-     * single-Ractor never reclaims a referenced cc, so the scan never triggers there. Reads are safe:
-     * mark runs inside a GC, so the heap is quiescent and these slots stay mapped. */
-    if (rb_multi_ractor_p()) {
-        bool dangling = RB_BUILTIN_TYPE((VALUE)ccs->cme) == T_NONE;
-        for (int i = 0; !dangling && i < ccs->len; i++) {
-            dangling = RB_BUILTIN_TYPE((VALUE)ccs->entries[i].cc) == T_NONE;
-        }
-        if (dangling) {
-            /* Invalidate the still-live siblings before detaching, so any weak inline cache
-             * (cds[].cc in a shareable iseq) that still points at one re-resolves instead of
-             * dereferencing a cc we are about to orphan -- mirrors the invalidated-cme branch. */
-            for (int i = 0; i < ccs->len; i++) {
-                const struct rb_callcache *cc = ccs->entries[i].cc;
-                if (RB_BUILTIN_TYPE((VALUE)cc) != T_NONE && cc->klass != Qundef) {
-                    vm_cc_invalidate(cc);
-                }
-            }
-            ruby_xfree_sized(ccs, vm_ccs_alloc_size(ccs->capa));
-            return ID_TABLE_DELETE;
-        }
-    }
-
     if (METHOD_ENTRY_INVALIDATED(ccs->cme)) {
         /* Before detaching the CCs from this class, we need to invalidate the cc
          * since we will no longer be marking the cme on their behalf.
@@ -185,19 +154,6 @@ vm_cc_table_dup_i(ID key, VALUE old_ccs_ptr, void *data)
         // Invalidated CME. This entry will be removed from the old table on
         // the next GC mark, so it's unsafe (and undesirable) to copy
         return ID_TABLE_CONTINUE;
-    }
-
-    /* Ractor-local GC: never copy a ccs that already holds a reclaimed (T_NONE) cc/cme into the new
-     * table -- doing so would propagate a dangling cache entry into a freshly reachable table, where
-     * the next GC mark would "try to mark T_NONE" (see mark_cc_entry_i). Drop it; it rebuilds on
-     * demand. Safe to read: the dup holds the VM lock, so no global GC can be reclaiming these slots.
-     * This path is already multi-Ractor only (its sole caller is gated on rb_multi_ractor_p()). */
-    {
-        bool dangling = RB_BUILTIN_TYPE((VALUE)old_ccs->cme) == T_NONE;
-        for (int i = 0; !dangling && i < old_ccs->len; i++) {
-            dangling = RB_BUILTIN_TYPE((VALUE)old_ccs->entries[i].cc) == T_NONE;
-        }
-        if (dangling) return ID_TABLE_CONTINUE;
     }
 
     size_t memsize = vm_ccs_alloc_size(old_ccs->capa);

@@ -6905,38 +6905,27 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
     GC_ASSERT(RB_BUILTIN_TYPE(b) != T_ZOMBIE);
 
 #if RACTOR_LOCAL_GC
-    /* A FREED slot (T_NONE) must never be stamped into the shared_bits remset. A still-live shareable
-     * in ANOTHER objspace can dangle a WEAK reference -- a subclasses imemo (push_subclass_entry_to_list)
-     * or an inline-cache cc (vm_search_method_slowpath0's RB_OBJ_WRITTEN) -- onto a shareable object
-     * (a class / cc / cme) that the GLOBAL GC just reclaimed; that dangling pointer reaches this write
-     * barrier as `b`. Stamping its shared_bit creates a stale remset entry naming a T_NONE slot, which a
-     * later local-GC gc_mark_shared_roots dereferences -> "[BUG] try to mark T_NONE". A check build
-     * catches this via the GC_ASSERT(RB_BUILTIN_TYPE(b) != T_NONE) above; an -O3 build compiles that
-     * out, so guard explicitly. (WB-side defense; the dangling weak ref itself is the deeper
-     * cross-objspace-liveness issue -- RACTOR_LOCAL_GC_DESIGN.md 5.1.) */
-    if (RB_BUILTIN_TYPE(b) != T_NONE) {
-        /* Record the shareable->unshareable boundary: b becomes a "shared" object that b's owner's
-         * local GC must treat as a root. The store can only be performed by b's owner (isolation
-         * forbids holding a cross-Ractor unshareable reference), so we always set the bit on our
-         * own object; a (the shareable) may live in another Ractor's space and is not touched. */
-        if (RB_OBJ_SHAREABLE_P(b)) {
-            /* b is shareable: it may be referenced from another Ractor (e.g. a callcache shared
-             * through an inline cache in a shareable iseq). Its owner's local GC must keep it (and
-             * its subtree) alive — shareables are pinned until the global GC — so record it as a
-             * local-GC root via shared_bits. */
-            MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(b), b);
-            GET_HEAP_PAGE(b)->flags.has_shared_objects = TRUE;
-        }
-        else if (RB_OBJ_SHAREABLE_P(a) || MARKED_IN_BITMAP(GET_HEAP_SHARED_BITS(a), a)) {
-            /* b (unshareable) is reachable from a shareable object (directly, or transitively via
-             * another "shared" object such as a class's per-Ractor classext). Mark b as shared so
-             * the owner's local GC keeps it alive; the shareable referrer may live in another
-             * objspace that the local GC never traverses. */
-            MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(b), b);
-            GET_HEAP_PAGE(b)->flags.has_shared_objects = TRUE;
-            rlgc_wb_shared_sets++;
-            if (GET_HEAP_OBJSPACE(b) != rlgc_main_objspace) rlgc_wb_local_sets++;
-        }
+    /* Record the shareable->unshareable boundary: b becomes a "shared" object that b's owner's
+     * local GC must treat as a root. The store can only be performed by b's owner (isolation
+     * forbids holding a cross-Ractor unshareable reference), so we always set the bit on our
+     * own object; a (the shareable) may live in another Ractor's space and is not touched. */
+    if (RB_OBJ_SHAREABLE_P(b)) {
+        /* b is shareable: it may be referenced from another Ractor (e.g. a callcache shared
+         * through an inline cache in a shareable iseq). Its owner's local GC must keep it (and
+         * its subtree) alive — shareables are pinned until the global GC — so record it as a
+         * local-GC root via shared_bits. */
+        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(b), b);
+        GET_HEAP_PAGE(b)->flags.has_shared_objects = TRUE;
+    }
+    else if (RB_OBJ_SHAREABLE_P(a) || MARKED_IN_BITMAP(GET_HEAP_SHARED_BITS(a), a)) {
+        /* b (unshareable) is reachable from a shareable object (directly, or transitively via
+         * another "shared" object such as a class's per-Ractor classext). Mark b as shared so
+         * the owner's local GC keeps it alive; the shareable referrer may live in another
+         * objspace that the local GC never traverses. */
+        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(b), b);
+        GET_HEAP_PAGE(b)->flags.has_shared_objects = TRUE;
+        rlgc_wb_shared_sets++;
+        if (GET_HEAP_OBJSPACE(b) != rlgc_main_objspace) rlgc_wb_local_sets++;
     }
 #endif
 

@@ -391,7 +391,9 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
   vm_cc_table_dup_i)を入れたが、いずれも**症状(witness)を叩くだけで根治せず**(fanin は 12/12 のまま、cc-table
   ガードはむしろ NULL deref を誘発)。自作の "ccs free-ring" も malloc アドレス再利用で交絡し site を誤指した。
   **ASAN が「解放されるのは ccs ではなく cc_tbl の items バッファ」「freed by = global sweep」を確定**して初めて
-  孤児 objspace に辿り着いた。Layer-1 / cc-table ガードは根治後は不要(別途撤去/防御として整理)。
+  孤児 objspace に辿り着いた。Layer-1(WB の T_NONE ガード)/ cc-table ガードは孤児修正後は**冗長と実測で確認し
+  撤去済み**(orphan-only で fanin/gc_stress/maximize_global/longheld すべて 0/15、btest 161/161)。症状叩きの
+  ガードを残すと将来のバグを隠すため、根治を入れたら撤去するのが正。
 
 - **GC.compact / verify_compaction_references**(move は per-Ractor objspace と非互換): RLGC 時は non-move
   full GC にゲート ── commit b134827c5。
