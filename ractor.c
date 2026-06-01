@@ -481,6 +481,14 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         rb_gc_ractor_cache_free(cr);
         cr->newobj_cache = NULL;
 
+        /* Ractor-local GC: this Ractor's local objspace is NOT freed here, but it may still hold
+         * shareable objects referenced from other objspaces. Keep it visible to the global GC via
+         * the orphan list so its mark bits keep being cleared/marked/swept; otherwise a class living
+         * in it retains a stale mark bit and the global mark skips it, leaving its cc_tbl unmarked
+         * and swept while still installed -> UAF (RACTOR_LOCAL_GC_DESIGN.md 5.1/5.4). */
+        rb_gc_orphan_local_objspace(cr->local_gc_objspace);
+        cr->local_gc_objspace = NULL;
+
         ractor_status_set(cr, ractor_terminated);
     }
     RB_VM_UNLOCK();

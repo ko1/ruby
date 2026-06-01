@@ -10,8 +10,9 @@ CRuby の GC を **Ractor ごとに独立した objspace** へ分割し、各 Ra
 - 性能: bench.rb N=8 で **~4.7 実効コア**(直列ベースライン比 4.75倍)、最大8個のローカル GC が同時実行。
 - 正しさ: `make test-all` env-on **34849 / 0 failures**、env-off 0 failures。`make btest`
   `test_ractor.rb` **159/161**(残り2は miniruby/Tempfile の既存環境要因で本実装と無関係)。
-- 既知の未解決課題: **cc/cme・メッセージコピーの cross-objspace 寿命**(§5.1)。極限並行ストレスでのみ
-  顕在化する UAF で、RLGC の設計レベルの対応(main-routing)が必要。通常〜型多様ワークロードはクラッシュ無し。
+- 既知の課題: 極限並行ストレスの主要 UAF は **孤児 objspace(終了 Ractor の local objspace が global GC 非巡回)**
+  が真因と判明し、孤児を GC 巡回に含める**ローカル修正で解決**(§5.1; main-routing 不要)。残存は ~4% の稀な系統
+  (§3.10 message コピー等)+空孤児 objspace 殻のリーク(§5.4)。通常〜型多様ワークロードはクラッシュ無し。
 
 ---
 
@@ -368,43 +369,43 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
   するので生存、dead クラスは subtree ごと回収される。
 - **GC.compact / verify_compaction_references**(move は per-Ractor objspace と非互換): RLGC 時は non-move
   full GC にゲート ── commit b134827c5。
-- **WB が freed slot に shared_bit をスタンプ(Layer-1)**: 別 objspace の生きた shareable が、global GC が
-  回収した shareable(class / cc / cme)への WEAK 参照(subclasses imemo / inline-cache cc)を dangling させ、
-  その死んだポインタが `b` として WB に届く。`-O3` は `GC_ASSERT(b != T_NONE)` を消すので stale shared_bit を
-  スタンプ → 後で `gc_mark_shared_roots` が T_NONE を mark。WB の両 shared-bit 分岐を `RB_BUILTIN_TYPE(b) !=
-  T_NONE` でガード(コンパイルアウトされたアサートのランタイム版)。→ maximize_global / longheld_slot_reuse が
-  10+/10 → **0/10**。workflow で根因確証(9/20→0/50)。
-- **cc-table が freed cc を強参照(cc-table cluster の近接機構)**: 計測で確定 ── `vm_cc_table_dup_i` の
-  `memcpy(new_ccs, old_ccs)` が **同一 objspace 内**で「valid cme かつ **T_NONE cc**」の ccs を新テーブルに伝播
-  (`RLGC-CCDUP` で確認; cur_os_cc/cme/tbl 全=1)。クラッシュは常に **global GC 中**(`local_gc=0,
-  global_active=1`)で、cc は global GC が回収(ローカル GC は shareable cc を pin)。cc-table は再構築可能な
-  キャッシュなので、**collected(T_NONE)cc/cme を持つ ccs は drop**(mark_cc_entry_i = invalidated-cme と同じ
-  扱い+生存 sibling を invalidate、vm_cc_table_dup_i = コピーせずスキップ)。→ `VM/cc_table → T_NONE cc`
-  アサートは解消、maximize_confined 12/12 → ~3-7/12。
+- **★真の根本原因 = 孤児 objspace(ASAN 実証, commit 予定)**: ストレス群(fanin / gc_stress_everywhere /
+  maximize_confined …)の SEGV はすべてこれ。**`rb_gc_objspace_free_local`(gc.c)は呼び出し元ゼロ**で、worker
+  Ractor 終了時 `vm_remove_ractor`(ractor.c)が `vm->ractor.set` から外すだけで local objspace を解放も併合も
+  しない=**孤児化**。`rb_gc_foreach_objspace`(gc.c)は main + `vm->ractor.set` のみ巡回するので孤児 objspace は
+  **mark ビットがクリアされない**。そこに住む shareable クラス C(worker で生成 → make_shareable → main の
+  held[] が保持)は**前回 GC の mark ビットが stale のまま**残る。次の global GC: 統一 mark は held[] 経由で C に
+  到達するが(global GC では foreign-skip しない)、`gc_mark_set` が「既に marked(stale)」で 0 を返し
+  **`gc_mark_children(C)` をスキップ → `RCLASSEXT_CC_TBL` を mark しない**。cc_tbl は main objspace 在住で mark
+  ビットはクリア済 → unmarked → sweep で解放、なのに `RCLASS_WRITABLE_CC_TBL(C)` はまだそれを指す → 次の
+  **lock-free cc lookup(`vm_lookup_cc`→`rb_id_table_lookup`)が解放済み `items` バッファを読む UAF**。ASAN の
+  free スタック(`gc_global_sweep_one`→`vm_cc_table_free`→`rb_id_table_free_items`→`xfree(items)`)が地の真実。
+  **修正(ローカル, main 不使用)**: 孤児 objspace を VM レベルのリストに保持し、`rb_gc_foreach_objspace` /
+  `rb_gc_conservative_owner` / `rb_objspace_each_objects_all_ractors` がそれも巡回(`vm_remove_ractor` で
+  `rb_gc_orphan_local_objspace` に渡す)。→ 次の global GC が孤児の mark ビットをクリア(C の stale ビット解消)→
+  統一 mark が C を辿り cc_tbl を mark、sweep も巡回。**fanin/gc_stress/maximize_confined 12/12 → 0/12、
+  btest_ractor 161/161、r4/③/msg 0**。これは §5.4 の「終了 objspace リーク」そのものだった。
 
-**未解決の残存（極限ストレスでのみ顕在、通常〜型多様ワークロードは 0）**:
-- **inline-cache cross-objspace dangling → SEGV(本系統の深部）**: cc-table アサートを潰すと、同じ dangling が
-  **メソッド呼び出し時の SEGV** として顕在(fanin / gc_stress_everywhere 12/12, NULL deref)。shareable iseq の
-  WEAK な `cd->cc`(iseq.c:391 `cc_is_active` で active のみ強マーク、それ以外は empty_cc にリセット)が、別
-  objspace で global GC に回収された cc を指して dangling。キャッシュ層のガードでは塞げない(回収済み cc の
-  inline-cache を mark 時に直せない)。**本筋の修正は §5.4 の cc/cme/cc_tbl の main objspace ルーティング**
-  (cc の寿命を shareable iseq と一致させる)。Ractor 終了時の per-box classext→dead objspace ダングリング
-  (§5.4 の objspace ハンドオフ)も同系。
-- **`gc_mark_shared_roots` → T_NONE / out-of-heap(parent T_UNDEF)**: 直前 global GC で回収され page も解放
-  された shareable を root が dangling 参照。Layer-1 で減ったが残存。同じ cross-objspace 寿命の根。
-- **message :b 配列 → T_NONE 要素**(§3.10 残存, ~7.5%): 受信側 ractor_copy が並行 global GC 下で破損クローン。
+  *誤診の記録(教訓)*: この系統を当初「cc/cme/inline-cache の cross-objspace dangling」「cc-table が freed cc を
+  伝播」と読み、WB の T_NONE ガード(Layer-1)や cc-table の T_NONE-drop/skip ガード(mark_cc_entry_i /
+  vm_cc_table_dup_i)を入れたが、いずれも**症状(witness)を叩くだけで根治せず**(fanin は 12/12 のまま、cc-table
+  ガードはむしろ NULL deref を誘発)。自作の "ccs free-ring" も malloc アドレス再利用で交絡し site を誤指した。
+  **ASAN が「解放されるのは ccs ではなく cc_tbl の items バッファ」「freed by = global sweep」を確定**して初めて
+  孤児 objspace に辿り着いた。Layer-1 / cc-table ガードは根治後は不要(別途撤去/防御として整理)。
+
+- **GC.compact / verify_compaction_references**(move は per-Ractor objspace と非互換): RLGC 時は non-move
+  full GC にゲート ── commit b134827c5。
+
+**残存(極小, 孤児修正後 ~4%: 75 run 中 3)**: nested_workers / 内部 GC の稀な SEGV。別系統(§3.10 message :b の
+ractor_copy 破損 ~7.5% など)か、孤児修正のエッジ(孤児化と進行中 global GC のタイミング、空孤児の未解放)を
+要追跡。通常〜型多様ワークロードは 0。
 
 **重要(再試行不要)**:
-- **pre-existing**(cc/cme 修正の有無に関わらず発生 ── maximize_confined 2/5 w/o fix)。本セッションの修正は
-  回帰ではない(btest_ractor 161/161、RLGC 有無とも)。
-- **投機的修正は5連敗**: (a) cc_table マークに NON_BARRIER ロック → 効果なし。(b) free 時に shared_bit クリア
-  → 効果なし(stale bit は free 経路起因でない)。(c) holder(§A.3) (d) don't-pin(§A.4)。(e) ローカル GC の
-  foreign weak-ref を `handle_weak_references_alive_p` でスキップ(foreign は alive 扱い)→ **効果なし**(残存は
-  弱参照解決でなく cc-table 強参照経路だった)。**rapid-patch では割れない**。計測駆動(free-ring で世代相関 +
-  dup で伝播確認)が機能した。
-
-**必要な対応**: 残るは cross-objspace **寿命**の構造課題(inline-cache cc / 終了 objspace の classext)。WB/
-mark 層のガードでは閉じない。**§5.4 の main-objspace ルーティング(+ 終了 objspace ハンドオフ)が本筋**。
+- 真因特定は **ASAN(または VM_CHECK_MODE+RGENGC debug)が決定打**。推論・アドレス交絡リングでは閉じない。
+- **WB/mark/キャッシュ層のガードは全て症状叩きで失敗**(5連敗+Layer-1/cc-table)。根治は GC の objspace 巡回の
+  カバレッジ(孤児を含める)であって、shareable の寿命判定や cc キャッシュ整合ではなかった。
+- 孤児 objspace の**完全解放**(空になったら `rb_gc_objspace_free_local`)は未実装=objspace 殻はリーク継続
+  (中身は回収される)。§5.4。
 
 ### 5.2 未監査で原理的に残るカテゴリ
 1. **ユーザ定義 T_DATA の `dmark`/`dfree`** — ローカル GC 中に任意の C 拡張コードが走り任意の共有 C
@@ -420,10 +421,13 @@ mark 層のガードでは閉じない。**§5.4 の main-objspace ルーティ�
   インフラ新設が要る大作業)。
 
 ### 5.4 機能の follow-up
-- **cc/cme/cc_tbl/shape-edge の main objspace ルーティング**(足場=`main_newobj_cache` は現状未配線・休眠で、
-  `rb_gc_ractor_cache_alloc_on_main` も呼び出し元ゼロ。誤った前提で使われないよう注意)。これは §5.1 の本筋。
-- **Ractor 終了時の objspace ハンドオフ/解放**: 現状 objspace は終了時にリーク。設計案「終了 Ractor の
-  ローカルヒープは最初に join した Ractor が継承(no-move)」。
+- **Ractor 終了時の objspace ハンドオフ/解放**: §5.1 の真因。**部分対応済み**: 終了 Ractor の local objspace は
+  孤児リストに移し global GC が巡回(mark-clear/mark/sweep)するので、中身の死オブジェクトは回収され stale mark
+  ビットも消える(UAF 解消)。**残: 空になった孤児 objspace 殻の解放**(`rb_gc_objspace_free_local` を空検出時に
+  呼ぶ)は未実装で殻はリーク継続。設計案「最初に join した Ractor が継承(no-move)」は更に先。
+- **cc/cme/cc_tbl/shape-edge の main objspace ルーティング**(足場=`main_newobj_cache` は未配線・休眠、
+  `rb_gc_ractor_cache_alloc_on_main` 呼び出し元ゼロ)。これは **§5.1 の UAF の修正には不要**(孤児巡回で解決)で、
+  純粋な**最適化/高速化**の選択肢として後回し。
 - **`GC.stat`/`GC.total_time`** の per-objspace 集計未実装。
 - make_shareable したユーザ shareable はローカル objspace に pin-while-live、グローバル GC でのみ回収。
 

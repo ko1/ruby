@@ -207,6 +207,7 @@ void rb_gc_ractor_cache_free(rb_ractor_t *r);
 /* Ractor-local GC (experimental): per-Ractor objspace lifecycle + runtime toggle. */
 void *rb_gc_objspace_alloc_local(void);
 void rb_gc_objspace_free_local(void *objspace);
+void rb_gc_orphan_local_objspace(void *objspace);
 void *rb_gc_ractor_cache_alloc_on_main(rb_ractor_t *ractor);
 void rb_gc_mark_ractor_local_roots(rb_ractor_t *ractor);
 bool rb_gc_rlgc_enabled(void);

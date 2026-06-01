@@ -287,9 +287,38 @@ rb_gc_ractor_newobj_current_cache_foreach(void (*func)(void *cache, void *data),
     }
 }
 
-/* Apply func to EVERY live objspace: the main objspace plus each (non-main) Ractor's own
- * objspace. Used by the GLOBAL GC to clear/sweep across all objspaces. Callers must hold the
- * VM barrier (all Ractors stopped) so the Ractor set is stable. */
+/* Ractor-local GC: when a Ractor terminates, vm_remove_ractor drops it from vm->ractor.set but its
+ * local objspace is NOT freed (rb_gc_objspace_free_local is unused) -- it can still hold shareable
+ * objects referenced from other objspaces (e.g. a class sent to main). Such an "orphaned" objspace
+ * must remain visible to the GLOBAL GC: otherwise rb_gc_foreach_objspace skips it, its mark bits are
+ * never cleared, a class living in it keeps a STALE mark bit, the unified global mark short-circuits
+ * on that already-"marked" class and never marks its (main-objspace) cc_tbl, and the global sweep
+ * then frees the still-installed cc_tbl -> use-after-free in the next method-cache lookup
+ * (RACTOR_LOCAL_GC_DESIGN.md 5.1/5.4). We keep orphaned objspaces in this list so the global GC
+ * clears/marks/sweeps them like any other objspace. (Freeing a fully-empty orphan is a future
+ * optimization; for now its dead objects are reclaimed but the objspace shell persists.) */
+struct rb_orphan_objspace_entry {
+    void *objspace;
+    struct ccan_list_node node;
+};
+static CCAN_LIST_HEAD(rb_gc_orphaned_objspaces);
+
+/* Hand a terminated Ractor's local objspace to the orphan list (called from vm_remove_ractor under
+ * the VM lock; iterated only under the global-GC barrier, so no extra locking is needed here beyond
+ * the VM lock the caller holds). Uses a plain malloc so it cannot trigger a GC mid-teardown. */
+void
+rb_gc_orphan_local_objspace(void *objspace)
+{
+    if (objspace == NULL || objspace == GET_VM()->gc.objspace) return;
+    struct rb_orphan_objspace_entry *e = malloc(sizeof(struct rb_orphan_objspace_entry));
+    if (e == NULL) return; /* out of memory: leave it as before (unwalked); extremely unlikely */
+    e->objspace = objspace;
+    ccan_list_add_tail(&rb_gc_orphaned_objspaces, &e->node);
+}
+
+/* Apply func to EVERY live objspace: the main objspace, each (non-main) Ractor's own objspace, plus
+ * every orphaned (terminated-Ractor) objspace. Used by the GLOBAL GC to clear/sweep across all
+ * objspaces. Callers must hold the VM barrier (all Ractors stopped) so the Ractor set is stable. */
 void
 rb_gc_foreach_objspace(void (*func)(void *objspace, void *data), void *data)
 {
@@ -305,6 +334,11 @@ rb_gc_foreach_objspace(void (*func)(void *objspace, void *data), void *data)
                 func(r->local_gc_objspace, data);
             }
         }
+    }
+
+    struct rb_orphan_objspace_entry *e = NULL;
+    ccan_list_for_each(&rb_gc_orphaned_objspaces, e, node) {
+        func(e->objspace, data);
     }
 }
 
@@ -3372,6 +3406,13 @@ rb_gc_conservative_owner(const void *ptr)
             }
         }
     }
+
+    struct rb_orphan_objspace_entry *e = NULL;
+    ccan_list_for_each(&rb_gc_orphaned_objspaces, e, node) {
+        if (rb_gc_impl_pointer_to_heap_p(e->objspace, ptr)) {
+            return e->objspace;
+        }
+    }
     return NULL;
 }
 
@@ -4095,6 +4136,11 @@ rb_objspace_each_objects_all_ractors(int (*callback)(void *, void *, size_t, voi
                 rb_gc_impl_each_objects(r->local_gc_objspace, callback, data);
             }
         }
+    }
+
+    struct rb_orphan_objspace_entry *e = NULL;
+    ccan_list_for_each(&rb_gc_orphaned_objspaces, e, node) {
+        rb_gc_impl_each_objects(e->objspace, callback, data);
     }
 }
 
