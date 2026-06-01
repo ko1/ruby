@@ -2152,7 +2152,10 @@ heap_page_body_free(rb_objspace_t *objspace, struct heap_page_body *page_body)
 #ifdef HAVE_MMAP
 #if RACTOR_LOCAL_GC
         /* Recycle into this objspace's arena free list (the body's own memory holds the link).
-         * Physical memory returns to the OS when the whole objspace's arenas are freed. */
+         * Physical memory returns to the OS when the whole objspace's arenas are freed.
+         * The body's slot memory may be ASAN-poisoned (swept page); unpoison the header word
+         * we are about to overwrite with the freelist link. */
+        asan_unpoison_memory_region(page_body, sizeof(struct heap_page_body *), false);
         *(struct heap_page_body **)page_body = objspace->heap_pages.arena_freelist;
         objspace->heap_pages.arena_freelist = page_body;
 #else
