@@ -3606,7 +3606,7 @@ rb_gc_pin_in_flight_message(VALUE obj)
 {
     if (!rlgc_has_local) return;
     if (SPECIAL_CONST_P(obj) || RB_OBJ_SHAREABLE_P(obj)) return;
-    MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj);
+    MARK_IN_BITMAP_ATOMIC(GET_HEAP_SHARED_BITS(obj), obj); // sender mutator sets concurrently with other Ractors
     GET_HEAP_PAGE(obj)->flags.has_shared_objects = TRUE;
 }
 #endif

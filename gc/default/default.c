@@ -983,6 +983,31 @@ slot_index_for_offset(size_t offset, uint64_t reciprocal)
 #if RACTOR_LOCAL_GC
 #define GET_HEAP_SHARED_BITS(x)         (&GET_HEAP_PAGE(x)->shared_bits[0])
 #define GET_HEAP_OBJSPACE(x)            (GET_HEAP_PAGE(x)->objspace)
+
+/* Atomic `bitmap word |= bit` for page bitmaps that the LOCK-FREE write barrier and CONCURRENT local
+ * GCs set from several Ractor threads at once -- shared_bits and remembered_bits. A plain MARK_IN_BITMAP
+ * is a non-atomic read-modify-write, and since one bits_t word covers BITS_BITLENGTH slots, two
+ * concurrent sets to the same word lose one update -- dropping the remembered/shared bit of a DIFFERENT
+ * object that happens to share the word. A dropped remembered bit means a still-referenced young object
+ * is not marked by the next minor GC and is freed (ThreadSanitizer-confirmed; the load-dependent
+ * fibers_escaping "mark T_NONE"). bits_t is pointer-width, so a size_t CAS operates on the whole word. */
+/* Returns true iff this call set the bit (it was previously clear). Starts from old=0 so the ONLY
+ * access to the word is the atomic CAS itself -- no separate non-atomic load to race a concurrent
+ * setter (a spurious first CAS miss just reloads the real value the CAS observed atomically). */
+static inline bool
+gc_bitmap_atomic_set(bits_t *bits, const struct heap_page *page, VALUE obj)
+{
+    volatile size_t *const word = (volatile size_t *)&bits[SLOT_BITMAP_INDEX(page, obj)];
+    const size_t mask = (size_t)SLOT_BITMAP_BIT(page, obj);
+    size_t old = 0;
+    while ((old & mask) != mask) {
+        const size_t prev = RUBY_ATOMIC_SIZE_CAS(*word, old, old | mask);
+        if (prev == old) return true;
+        old = prev;
+    }
+    return false;
+}
+#define MARK_IN_BITMAP_ATOMIC(bits, p)  gc_bitmap_atomic_set((bits), GET_HEAP_PAGE(p), (p))
 #endif
 
 static int
@@ -2627,7 +2652,7 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
          * cc-table reached through a shared inline cache). Record it so the owning Ractor's
          * local GC roots it and its subtree, and never frees it locally (shareables are pinned
          * until the global GC). */
-        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj);
+        MARK_IN_BITMAP_ATOMIC(GET_HEAP_SHARED_BITS(obj), obj);
         GET_HEAP_PAGE(obj)->flags.has_shared_objects = TRUE;
     }
 #endif
@@ -5043,7 +5068,7 @@ gc_shared_relation(rb_objspace_t *objspace, VALUE obj)
             gc_shared_wb_miss(objspace, parent, obj);
         }
 #endif
-        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj);
+        MARK_IN_BITMAP_ATOMIC(GET_HEAP_SHARED_BITS(obj), obj);
         GET_HEAP_PAGE(obj)->flags.has_shared_objects = TRUE;
     }
 }
@@ -6711,14 +6736,14 @@ rgengc_remembersetbits_set(rb_objspace_t *objspace, VALUE obj)
     struct heap_page *page = GET_HEAP_PAGE(obj);
     bits_t *bits = &page->remembered_bits[0];
 
-    if (MARKED_IN_BITMAP(bits, obj)) {
-        return FALSE;
-    }
-    else {
-        page->flags.has_remembered_objects = TRUE;
-        MARK_IN_BITMAP(bits, obj);
-        return TRUE;
-    }
+    /* Atomic set: a lock-free write barrier and concurrent local GCs all set remembered_bits, so the
+     * RMW must not lose updates (the prior non-atomic MARKED_IN_BITMAP test + |= dropped bits of other
+     * objects sharing the word). Set the bit FIRST, then the page flag, so a concurrent
+     * rgengc_rememberset_mark (which clears the flag before draining the bits) leaves the page to be
+     * rescanned rather than skipping a freshly-remembered object. */
+    const bool newly = gc_bitmap_atomic_set(bits, page, obj);
+    page->flags.has_remembered_objects = TRUE;
+    return newly ? TRUE : FALSE;
 }
 
 /* wb, etc */
@@ -6824,7 +6849,7 @@ gc_mark_shared_roots(rb_objspace_t *objspace)
 void
 rb_gc_impl_pin_shared(VALUE obj)
 {
-    MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(obj), obj);
+    MARK_IN_BITMAP_ATOMIC(GET_HEAP_SHARED_BITS(obj), obj);
     GET_HEAP_PAGE(obj)->flags.has_shared_objects = TRUE;
 }
 #endif
@@ -6854,11 +6879,21 @@ rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             else if (page->flags.has_remembered_objects) has_old++;
             else if (page->flags.has_uncollectible_wb_unprotected_objects) has_shady++;
 #endif
-            for (j=0; j < (size_t)bitmap_plane_count; j++) {
-                bits[j] = remembered_bits[j] | (uncollectible_bits[j] & wb_unprotected_bits[j]);
-                remembered_bits[j] = 0;
-            }
+            /* Clear has_remembered_objects BEFORE draining the bits: a concurrent lock-free write
+             * barrier (another Ractor remembering a shareable object on this page) sets the flag
+             * AFTER setting its bit, so clearing the flag first keeps it TRUE if such a set races in,
+             * leaving the page to be rescanned. The per-word drain uses an atomic read-and-clear so a
+             * racing MARK_IN_BITMAP_ATOMIC is never lost (it lands on the zeroed word). */
             page->flags.has_remembered_objects = FALSE;
+            for (j=0; j < (size_t)bitmap_plane_count; j++) {
+#if RACTOR_LOCAL_GC
+                const bits_t rem = (bits_t)RUBY_ATOMIC_SIZE_EXCHANGE(*(volatile size_t *)&remembered_bits[j], 0);
+#else
+                const bits_t rem = remembered_bits[j];
+                remembered_bits[j] = 0;
+#endif
+                bits[j] = rem | (uncollectible_bits[j] & wb_unprotected_bits[j]);
+            }
 
             for (j=0; j < (size_t)bitmap_plane_count; j++) {
                 bitset = bits[j];
@@ -7001,7 +7036,7 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
          * through an inline cache in a shareable iseq). Its owner's local GC must keep it (and
          * its subtree) alive — shareables are pinned until the global GC — so record it as a
          * local-GC root via shared_bits. */
-        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(b), b);
+        MARK_IN_BITMAP_ATOMIC(GET_HEAP_SHARED_BITS(b), b);
         GET_HEAP_PAGE(b)->flags.has_shared_objects = TRUE;
     }
     else if (RB_OBJ_SHAREABLE_P(a) || MARKED_IN_BITMAP(GET_HEAP_SHARED_BITS(a), a)) {
@@ -7009,7 +7044,7 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
          * another "shared" object such as a class's per-Ractor classext). Mark b as shared so
          * the owner's local GC keeps it alive; the shareable referrer may live in another
          * objspace that the local GC never traverses. */
-        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(b), b);
+        MARK_IN_BITMAP_ATOMIC(GET_HEAP_SHARED_BITS(b), b);
         GET_HEAP_PAGE(b)->flags.has_shared_objects = TRUE;
         rlgc_wb_shared_sets++;
         if (GET_HEAP_OBJSPACE(b) != rlgc_main_objspace) rlgc_wb_local_sets++;
@@ -8002,7 +8037,7 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
 
 #if RACTOR_LOCAL_GC
     if (shared) {
-        MARK_IN_BITMAP(GET_HEAP_SHARED_BITS(dest), dest);
+        MARK_IN_BITMAP_ATOMIC(GET_HEAP_SHARED_BITS(dest), dest);
         GET_HEAP_PAGE(dest)->flags.has_shared_objects = TRUE;
     }
     else {
