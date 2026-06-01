@@ -513,10 +513,17 @@ pin / T_NONE guard 等は妥当な防御だが根本解ではない(特に inlin
    後回し選択肢)**。→ 「main に頼らず寿命を揃える機構」をどう設計するかが核心の論点。
 2. **Ractor 終了時 objspace handoff 【ユーザ決定済】**: join した Ractor が継承 / 未 join のまま Ractor が
    GC されたら main が継承。**未実装**(現状は orphan-list で global GC が回収するが objspace 殻はリーク継続)。
-   実装上の壁: `rb_gc_impl_objspace_free`(default.c)は VM shutdown 前提で `heap_pages_lomem/himem=0` 等
-   グローバル状態をリセットするため **mid-run の単一 objspace 解放に使えない** → 安全な mid-run teardown/併合
-   パスの新設が必要。サブ判断: (a) ページ併合(no-move で joiner の objspace に吸収=joiner の local GC が回収)
-   vs (b) adopt(別 objspace のまま joiner/main が所有、global GC のみ回収、空で解放)。
+   - `rb_gc_impl_objspace_free` の `heap_pages_lomem/himem=0` は **per-objspace マクロ**(=その objspace の
+     `heap_pages.range`)なので mid-run の単一 objspace 解放自体は安全(当初の懸念は誤り)。
+   - **真の壁(本セッションで実測判明)**: 「空になったら解放(free-when-empty)」を実装したが**全孤児で発火ゼロ**。
+     計測すると各孤児に **T_ZOMBIE が最低 3 個**残り `total_allocated != total_freed` が永遠に成立しない。
+     T_ZOMBIE = deferred finalizer / T_DATA の `dfree` 待ちで、**終了 Ractor にはそれを実行するスレッドが無い**
+     ため永久に処理されない(ユーザ finalizer 無しの orphan_churn でも内部 T_DATA の dfree で発生)。
+     → handoff は「**終了 Ractor の deferred finalizer / zombie を誰が実行/flush するか**」を決めないと
+     リークが閉じない。#5(finalizer×RLGC)および §6.3 の d_finalizer/each_object と**同根・一体**。
+   - サブ判断: (a) ページ併合(no-move で joiner の objspace に吸収=joiner の local GC が zombie 含め回収)
+     vs (b) adopt(別 objspace のまま joiner/main が所有・zombie を実行してから global GC が回収・空で解放)。
+     いずれも zombie 実行の主体(joiner スレッド? main?)の決定が前提。
 3. **message copy の clone 二回呼び互換性**: materialize-on-receive で clone / initialize_clone が send 時と
    receive 時の二回呼ばれ、ユーザ観測可能な仕様変更。受容(仕様変更明示)/ 副作用なし内部 materialization /
    別の所有権移転、のいずれか。§6.3 の §3.10 UAF 根因とも一体。
@@ -548,4 +555,5 @@ pin / T_NONE guard 等は妥当な防御だが根本解ではない(特に inlin
   "try to mark T_NONE (parent T_UNDEF)"(root mark)。`ObjectSpace.define_finalizer` + `each_object` +
   per-Ractor objspace。finalizer table / deferred finalizer / each_object の cross-objspace 寿命(#4/#5 領域)。
   ※ `ObjectSpace.each_object` は `rb_objspace_each_objects`(current objspace)経由で、orphan 修正とは別系統。
-  要 ASAN 追跡。
+  要 ASAN 追跡。**#2 の handoff と同根**: 終了 Ractor に残る T_ZOMBIE(未実行 deferred finalizer / dfree)が
+  孤児を空にできなくしている — finalizer の実行主体を RLGC でどう決めるかが両者の鍵。
