@@ -605,13 +605,24 @@ P をマークして T_NONE 検出。= 「global GC が per-objspace 構造(こ�
 正しく再構築できていない」同系統の可能性。
 - **再現困難**: ~0.4%(0/120 等で頻繁に空振り、増幅シナリオでも 0/40)。HEAD/§3.10+finalizer-only/baseline
   4e8768968 いずれも ~0/100超 で**私の3修正とは無関係(pre-existing)**と bisect 確認。
-- **ツールギャップ**: `RGENGC_CHECK_MODE`(=2/3 の `gc_verify_internal_consistency`)が決定的検出に有効なはず
-  だが **RLGC 非対応**(§A 既述)。試した RLGC 対応化: `check_generation_i`/`check_color_i` で cross-objspace
-  エッジを skip(偽陽性 "WB miss O->Y" 解消)+ count 整合性を multi-ractor で skip までは通ったが、次に
-  `gc_marks_finish: available_slots >= marked_slots`(default.c:6164, global GC が cross-objspace を driver の
-  marked_slots に加算)等の assert が連鎖 → **RGENGC_CHECK_MODE の完全 RLGC 対応は別タスク**(本バグ修正の
-  前提インフラとして価値大)。本バグは確実な再現/検証手段が無いまま remembered-set 経路を弄るのは危険なので、
-  RLGC 対応 verify を整備してから決定的に追うべき。
+- **RLGC 対応 verify を整備した(commit 2e9b8445f, §A 更新)が、このバグは捕捉できなかった**:
+  `gc_verify_internal_consistency` を RLGC 対応化(cross-objspace エッジskip / current-objspace の during_gc
+  も一時 FALSE / 会計系 assert を multi-ractor で skip)し、`RUBY_GC_VERIFY=1` で通常ビルドから有効化可能に。
+  これで `check_generation_i`(old→young remembered-set 漏れ)を毎 GC の marks_finish で検査できるが、
+  **`RUBY_GC_VERIFY=1` で fibers_escaping を 665 回流して 0 catch**(0.4% なら 665回で0は ~7%、precondition が
+  より高頻度なら更に低確率)。
+- **∴ これは steady-state の remembered-set ロジック違反ではなく、負荷依存の concurrent race**:
+  - verify は `RB_GC_VM_LOCK`+`rb_gc_vm_barrier`(全 Ractor 停止)で snapshot 検査するため、**並行 GC の
+    timing 窓をマスク**して捕捉できない。
+  - クラッシュ率が**負荷依存**(重いセッション負荷時 ~1/30、idle 時 0/372、並行多重実行 0/72)。
+  - 機構の推定: worker の世代/remembered/age/mark ビット等のメタデータを、worker の lock-free local GC と
+    global GC(または並行する別 local GC)が**同期なしに並行アクセス**するデータレース。RLGC は「max 8
+    concurrent local GC + STW global GC」で、既に 6 件の concurrent-GC レースを修正済み(memory 参照)— 本件は
+    その同族の残り。
+- **次の正しいツール = ThreadSanitizer**(barrier ベースの snapshot verify では原理的に不可)。レース箇所の
+  並行アクセスは毎 GC 発生するので、稀なクラッシュを待たず即検出できるはず。ただし RLGC の lock-free 設計には
+  意図的な benign race が多く、TSan 出力のフィルタリングが要る。あるいは concurrent GC のメタデータ経路の
+  コードレビュー。RGENGC_CHECK_MODE は本バグ型には不適と判明。
 
 **残課題(設計判断が要る別件、クラッシュではない)**: handoff(#2)を阻む終了 Ractor の T_ZOMBIE(未実行
 deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)。
