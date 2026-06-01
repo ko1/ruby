@@ -276,9 +276,9 @@ rb_gc_mark_ractor_local_roots(rb_ractor_t *r)
     ractor_mark((void *)r);
 
     /* ractor_mark() marks each thread's wrapper object (th->self), but that object may live in
-     * the main objspace — foreign to this Ractor's local objspace — so the confined local mark
+     * the main objspace — foreign to this Ractor's local objspace — so the local mark
      * skips it and never reaches the thread's own roots (its VM/machine stacks and thread-local
-     * state, which DO live in this objspace). Mark those roots directly. The confined mark still
+     * state, which DO live in this objspace). Mark those roots directly. The local mark still
      * skips any foreign objects they reference. */
     if (r->threads.cnt > 0) {
         rb_thread_t *th = NULL;

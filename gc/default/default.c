@@ -568,7 +568,7 @@ typedef struct rb_objspace {
         unsigned int during_incremental_marking : 1;
         unsigned int measure_gc : 1;
 #if RACTOR_LOCAL_GC
-        /* set while this objspace is being collected in confined per-Ractor local mode:
+        /* set while this objspace is being collected in per-Ractor local mode:
          * marking is restricted to this objspace's own objects (refs into other objspaces
          * are treated as live leaves and not traversed). */
         unsigned int local_gc : 1;
@@ -1572,7 +1572,7 @@ rlgc_obj_in_any_heap(VALUE obj)
 
 /* The GLOBAL GC (STW, unified mark/sweep across all objspaces, reclaiming dead shareables) is a
  * layer on top of the parallel per-Ractor local GC, ON BY DEFAULT once any local objspace exists.
- * Set RUBY_RACTOR_GLOBAL_GC=0 to disable it (full/major collections then run as confined local
+ * Set RUBY_RACTOR_GLOBAL_GC=0 to disable it (full/major collections then run as local
  * GCs and shareables stay pinned for the objspace's lifetime, never reclaimed). */
 static bool
 rlgc_global_gc_enabled(void)
@@ -2852,7 +2852,7 @@ newobj_cache_miss(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *cache, size
      * local GC. The shared main objspace always locks (multiple Ractors allocate into it). */
     /* Fully lock-free for a per-Ractor (local) objspace: neither the page grab NOR the local GC it
      * triggers takes the VM-global lock, so Ractors allocate AND collect in parallel. Correctness
-     * requires every VM-GLOBAL mutable structure a confined local GC touches to be Ractor-GC-safe:
+     * requires every VM-GLOBAL mutable structure a local GC touches to be Ractor-GC-safe:
      * accessed under a NON-BARRIER lock (so the GC never joins a concurrent global-GC barrier
      * mid-collection) shared with that structure's mutators -- see gc_mark_generic_ivar_sync /
      * rb_free_generic_ivar / obj_free_object_id. The shared main objspace always locks. */
@@ -3987,7 +3987,7 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
               default:
 #if RACTOR_LOCAL_GC
                 if (objspace->local && RB_OBJ_SHAREABLE_P(vp) && !rlgc_global_gc_active) {
-                    /* A confined per-Ractor LOCAL GC cannot tell whether a shareable object is
+                    /* A per-Ractor LOCAL GC cannot tell whether a shareable object is
                      * still referenced from another objspace (a class callcache table, the shape
                      * tree's edge tables, an inline cache, the Ractor object, ...), so it must
                      * never free shareables — they stay pinned until a GLOBAL GC. The GLOBAL GC's
@@ -4005,7 +4005,7 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                      * cross-Ractor through paths a CONFINED GC cannot reliably trace under per-Ractor
                      * objspaces: WEAK inline caches (cd->cc in shareable iseqs, never marked), and a
                      * class callcache table living in one objspace whose cross-objspace remember bit
-                     * (set barrier-free by another Ractor) can race a minor GC. So a confined local
+                     * (set barrier-free by another Ractor) can race a minor GC. So a local
                      * GC (and a main minor GC) keeps them pinned -- but, exactly like the shareable
                      * pin above, the GLOBAL GC LIFTS the guard (`!rlgc_global_gc_active`): its unified
                      * STW mark establishes true cross-objspace reachability, so an unmarked cc/cme is
@@ -4035,12 +4035,12 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
 #endif
 
 #if RACTOR_LOCAL_GC_AUDIT
-                /* u->s liveness invariant: a confined per-Ractor local GC must NEVER free a shareable
+                /* u->s liveness invariant: a per-Ractor local GC must NEVER free a shareable
                  * object (a shareable may still be referenced from another objspace; it stays pinned
                  * until a global GC -- see the sweep pin above). Reaching the free path with a
                  * shareable means that pin was bypassed -> its unshareable children would dangle. */
                 if (objspace->local && !rlgc_global_gc_active && RB_OBJ_SHAREABLE_P(vp)) {
-                    rb_bug("RLGC-AUDIT: confined local GC freeing a shareable object: %s", rb_obj_info(vp));
+                    rb_bug("RLGC-AUDIT: local GC freeing a shareable object: %s", rb_obj_info(vp));
                 }
 #endif
 
@@ -5314,7 +5314,7 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
         gc_mark_shared_roots(objspace);
     }
     /* During a GLOBAL GC we deliberately do NOT root shareables via shared_bits: the unified mark
-     * (full VM roots + unconfined cross-objspace tracing) determines shareable liveness by
+     * (full VM roots + cross-objspace tracing) determines shareable liveness by
      * reachability so dead shareables can finally be reclaimed, and gc_shared_relation rebuilds
      * shared_bits from scratch as it marks (shared_bits were cleared at gc_marks_start). */
 #endif
@@ -6233,9 +6233,9 @@ gc_marks_finish(rb_objspace_t *objspace)
     // TODO: refactor so we don't need to call this
 #if RACTOR_LOCAL_GC
     /* rb_ractor_finish_marking() frees + clears the VM-GLOBAL freed_ractor_local_keys array (writer
-     * rb_ractor_local_storage_delkey appends under the VM lock). A confined local GC runs lock-free
-     * and concurrently, so two of them would double-free/clobber it -- a confinement violation. Run
-     * it only in an STW collection (the shared main objspace's GC, or a global GC); a confined local
+     * rb_ractor_local_storage_delkey appends under the VM lock). A local GC runs lock-free
+     * and concurrently, so two of them would double-free/clobber it -- a cross-Ractor isolation violation. Run
+     * it only in an STW collection (the shared main objspace's GC, or a global GC); a local
      * GC defers it (the freed keys harmlessly accumulate until the next STW collection). */
     if (!objspace->local || objspace->flags.global_gc) {
         rb_ractor_finish_marking();
@@ -6910,7 +6910,7 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
      * or an inline-cache cc (vm_search_method_slowpath0's RB_OBJ_WRITTEN) -- onto a shareable object
      * (a class / cc / cme) that the GLOBAL GC just reclaimed; that dangling pointer reaches this write
      * barrier as `b`. Stamping its shared_bit creates a stale remset entry naming a T_NONE slot, which a
-     * later confined gc_mark_shared_roots dereferences -> "[BUG] try to mark T_NONE". A check build
+     * later local-GC gc_mark_shared_roots dereferences -> "[BUG] try to mark T_NONE". A check build
      * catches this via the GC_ASSERT(RB_BUILTIN_TYPE(b) != T_NONE) above; an -O3 build compiles that
      * out, so guard explicitly. (WB-side defense; the dangling weak ref itself is the deeper
      * cross-objspace-liveness issue -- RACTOR_LOCAL_GC_DESIGN.md 5.1.) */
@@ -7262,7 +7262,7 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     /* A full/major collection becomes a GLOBAL GC: an STW barrier (all Ractors stopped), a
      * unified mark across every objspace (so cross-Ractor references and shareables are traced
      * by reachability rather than pinned), and a sweep of every objspace that reclaims dead
-     * shareables. Minor collections stay confined to one objspace (the parallel local-GC fast
+     * shareables. Minor collections stay restricted to one objspace (the parallel local-GC fast
      * path). We must decide this BEFORE gc_enter (which takes the barrier for a global GC), so
      * predict do_full_mark from the same inputs the finalization below uses. */
     if (rlgc_has_local && rlgc_global_gc_enabled()) {
@@ -7381,7 +7381,7 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     {
 #if RACTOR_LOCAL_GC
         /* GLOBAL GC: drive a single unified mark across ALL objspaces (the VM barrier has stopped
-         * every Ractor). rb_gc_mark_roots then uses the full VM roots and marking is unconfined. */
+         * every Ractor). rb_gc_mark_roots then uses the full VM roots and marking spans all objspaces. */
         rlgc_global_gc_active = objspace->flags.global_gc;
         if (objspace->flags.global_gc) RUBY_ATOMIC_FETCH_ADD(rlgc_global_gc_count, 1);
 #endif
@@ -7570,7 +7570,7 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
 #if RACTOR_LOCAL_GC
     if (objspace->local && !objspace->flags.global_gc) {
         /* Ractor-local MINOR GC: this objspace is private to one Ractor. Do NOT take the VM
-         * lock and do NOT stop other Ractors; marking is confined to this objspace so other
+         * lock and do NOT stop other Ractors; marking is restricted to this objspace so other
          * Ractors keep running and collecting in parallel. */
         *lock_lev = 0;
         objspace->flags.local_gc = TRUE;
@@ -7626,7 +7626,7 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
 
 #if RACTOR_LOCAL_GC
     if (objspace->local && !objspace->flags.global_gc) {
-        /* local minor GC: confined, no barrier was taken */
+        /* local minor GC: no barrier was taken */
         objspace->flags.local_gc = FALSE;
         RUBY_ATOMIC_FETCH_SUB(rlgc_concurrent_local_gc, 1);
     }

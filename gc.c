@@ -3403,7 +3403,7 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     if (objspace != vm->gc.objspace && !rlgc_global_gc_active) {
         /* Ractor-local GC: mark ONLY the current Ractor's own execution roots. We must not
          * touch other Ractors (they keep running) nor the VM-global tables (those live in the
-         * main objspace and are kept alive by the main Ractor's GC). Marking is confined to
+         * main objspace and are kept alive by the main Ractor's GC). Marking is restricted to
          * this objspace, so refs into other objspaces are skipped as live leaves. */
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
 
@@ -3421,7 +3421,7 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
          * rb_gc_mark_ractor_local_roots -> ractor_mark above. We must NOT mark the VM-GLOBAL
          * vm->global_hooks here: it is a shared list (only internal OBJSPACE-event hooks, whose data
          * is kept alive by the main objspace) that foreign Ractors mutate lock-free (hook_list_connect)
-         * -- a confined local GC iterating it races that writer. The STW global/main GC marks it
+         * -- a local GC iterating it races that writer. The STW global/main GC marks it
          * (rb_vm_mark -> rb_hook_list_mark(&vm->global_hooks)). */
         return;
     }
@@ -3529,34 +3529,34 @@ gc_mark_classext_iclass(rb_classext_t *ext, bool prime, VALUE box_value, void *a
  * non-default GC impl such as MMTk: rlgc_has_local stays false) and during the STW global GC
  * (rlgc_global_gc_active: all Ractors stopped, no writer can run, and the lock is already held). */
 #if RACTOR_LOCAL_GC
-/* True while a confined per-Ractor LOCAL GC is running (not a STW global GC, and some local
+/* True while a per-Ractor LOCAL GC is running (not a STW global GC, and some local
  * objspace exists). VM-global-but-per-Ractor structures that such a GC walks WITHOUT the VM
  * barrier -- e.g. a Ractor's own message ports / recv_queue / monitors, mutated by FOREIGN senders
  * under that Ractor's per-Ractor lock -- consult this to decide whether to take that per-Ractor
  * lock around the traversal (during a global GC all Ractors are stopped, so no lock is needed). */
 bool
-rb_gc_during_confined_local_gc_p(void)
+rb_gc_during_local_gc_p(void)
 {
     return rlgc_has_local && !rlgc_global_gc_active;
 }
 
-/* During a confined per-Ractor local GC, true iff `owner` is NOT the Ractor whose GC is running.
+/* During a per-Ractor local GC, true iff `owner` is NOT the Ractor whose GC is running.
  * A foreign Ractor executes concurrently, so its threads'/fibers' control frames and machine stacks
- * are unstable -- a confined GC must not walk them (the read races -> SEGV). Those objects are kept
+ * are unstable -- a local GC must not walk them (the read races -> SEGV). Those objects are kept
  * alive shallowly by the normal object mark; their running execution state is marked by the owner
  * Ractor's own GC. Always false during a global STW GC (all Ractors stopped, walking any EC is
  * safe) and when no local objspace exists. */
 bool
-rb_gc_confined_foreign_ractor_p(const rb_ractor_t *owner)
+rb_gc_local_gc_foreign_ractor_p(const rb_ractor_t *owner)
 {
-    if (!rb_gc_during_confined_local_gc_p()) return false;
+    if (!rb_gc_during_local_gc_p()) return false;
     return owner != rb_ec_ractor_ptr(rb_gc_get_ec());
 }
 
 /* Pin an in-flight Ractor message payload in its (the SENDER's) objspace via the shared_bits
- * remset, so the sender's confined local GC roots it and never frees it locally. An in-flight copy
+ * remset, so the sender's local GC roots it and never frees it locally. An in-flight copy
  * lives in the sender's objspace but is referenced ONLY from the receiver's basket queue -- a
- * cross-objspace edge the confined GC skips on BOTH sides, so without this the sender's local GC
+ * cross-objspace edge the local GC skips on BOTH sides, so without this the sender's local GC
  * frees it while it is queued -> dangling basket -> "mark T_NONE"/SEGV (test_ractor.rb:1651). The
  * sender calls this on its own freshly-created object, so there is no cross-objspace race; a global
  * GC later recomputes shared_bits and reclaims it once it is no longer referenced. */
@@ -3575,7 +3575,7 @@ gc_mark_generic_ivar_sync(VALUE obj)
 {
 #if RACTOR_LOCAL_GC
     if (rlgc_has_local && !rlgc_global_gc_active) {
-        /* Use the NON-BARRIER lock: this runs inside a confined local GC, which is not at a
+        /* Use the NON-BARRIER lock: this runs inside a local GC, which is not at a
          * safepoint and cannot yield to a global-GC barrier. A barrier-aware RB_VM_LOCKING would,
          * if a global GC is pending, JOIN the barrier here -- mid-mark -- leaving the objspace
          * half-collected for the global GC to walk (a stale generic_fields_tbl entry whose

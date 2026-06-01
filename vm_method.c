@@ -30,14 +30,14 @@ mark_cc_entry_i(VALUE ccs_ptr, void *data)
     VM_ASSERT(vm_ccs_p(ccs));
 
     /* Ractor-local-GC cache-consistency guard. A callcache / method-entry is shareable VM
-     * infrastructure that a confined per-Ractor GC keeps pinned and only the global GC reclaims (by
+     * infrastructure that a per-Ractor local GC keeps pinned and only the global GC reclaims (by
      * cross-objspace reachability). Under the lock-free, copy-on-write cc table (rb_vm_cc_table_dup
      * memcpy's raw cc/cme pointers across table versions; below) a reclaimed cc/cme can transiently
      * linger in a still-reachable ccs as a DANGLING pointer (its slot is now T_NONE). Marking it
      * would "try to mark T_NONE". The cc table is a reconstructable cache, so drop the whole stale
      * ccs -- it is rebuilt on the next call -- exactly the treatment the invalidated-cme branch below
      * gives an entry whose method has gone away. (RACTOR_LOCAL_GC_DESIGN.md 5.1, cc-table cluster.)
-     * Only reachable under multi-Ractor (the only configuration with confined GCs and the COW table);
+     * Only reachable under multi-Ractor (the only configuration with local GCs and the COW table);
      * single-Ractor never reclaims a referenced cc, so the scan never triggers there. Reads are safe:
      * mark runs inside a GC, so the heap is quiescent and these slots stay mapped. */
     if (rb_multi_ractor_p()) {

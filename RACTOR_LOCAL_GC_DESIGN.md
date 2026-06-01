@@ -66,7 +66,7 @@ CRuby の GC を **Ractor ごとに独立した objspace** へ分割し、各 Ra
 
 ### 1.4 ランタイムトグル (env)
 - `RUBY_RACTOR_LOCAL_GC=1` — per-Ractor objspace 機能全体を有効化(既定 OFF、つまり既定は従来通り)。
-- `RUBY_RACTOR_GLOBAL_GC=0` — グローバル GC を無効化(major も confined ローカルになり shareable は
+- `RUBY_RACTOR_GLOBAL_GC=0` — グローバル GC を無効化(major も ローカルになり shareable は
   objspace 寿命まで pin/leak)。既定 ON。
 - `RUBY_RACTOR_LOCAL_GC_LOCKFREE=0` — ロックフリー割り当てを無効化。既定 ON。
 - `RLGC_STATS=1` — 終了時にローカル GC 回数 / 最大同時実行数 / グローバル GC 回数を表示。
@@ -79,13 +79,13 @@ CRuby の GC を **Ractor ごとに独立した objspace** へ分割し、各 Ra
 ```
  gc.c                 | 298 +    VM 側グルー: objspace ルーティング, conservative_owner,
                        |          全 objspace 走査, 各種同期, ローカルルート, 各種ヘルパー
- gc/default/default.c | 863 +    GC 本体: per-objspace objspace, confined mark, shared_bits,
+ gc/default/default.c | 863 +    GC 本体: per-objspace objspace, local mark, shared_bits,
                        |          global GC, lock-free alloc + arena, 並行 race 修正
  ractor.c             |  38 +    per-Ractor objspace 生成, ローカルルートマーク, cache_free(r)
  ractor_core.h        |   9 +    rb_ractor_t に local_gc_objspace / main_newobj_cache
  ractor_sync.c        |  56 +    メッセージポートのマークを per-Ractor ロック, in-flight pin,
                        |          materialize-on-receive (§3.10)
- cont.c               |  12 +    confined GC で他 Ractor の fiber/EC を歩かない (§3.11)
+ cont.c               |  12 +    ローカル GC で他 Ractor の fiber/EC を歩かない (§3.11)
  vm.c                 |  32 +    gen_fields_cache を強ルート化, thread roots, EC-confinement assert
  variable.c           |   6 +    generic_fields_tbl sweep-delete を NON_BARRIER
  id_table.c           |   5 +    managed_id_table_dup に RB_OBJ_SET_SHAREABLE (グローバル GC 根本修正)
@@ -96,7 +96,7 @@ CRuby の GC を **Ractor ごとに独立した objspace** へ分割し、各 Ra
 
 機能対応:
 - **per-Ractor objspace ライフサイクル**: ractor.c, gc.c, ractor_core.h, default.c — §3.1
-- **confined mark / 封じ込め**: default.c, gc.c — §3.2
+- **local mark / 封じ込め**: default.c, gc.c — §3.2
 - **shared_bits + WB**: default.c — §3.3
 - **global GC**: default.c, gc.c — §3.4
 - **lock-free alloc + arena**: default.c — §3.5, §3.6
@@ -135,7 +135,7 @@ cache はその Ractor の objspace からページを引く。`rb_gc_ractor_cac
 グローバル GC のバリアが main を**コレクション途中で**捕まえると統一 mark/sweep が破綻するため、main も
 incremental/lazy を切ってアトミックにする。
 
-### 3.2 confined mark (封じ込め)
+### 3.2 local mark (封じ込め)
 
 **`gc_mark` の入口ガード** (default.c):
 ```c
@@ -153,7 +153,7 @@ if (objspace->flags.local_gc && GET_HEAP_OBJSPACE(obj) != objspace) {
 **ローカルルートの肝** (ractor.c `rb_gc_mark_ractor_local_roots`, vm.c `rb_gc_mark_thread_roots`):
 VM スタックを持つ ec を直接マークする(`thread_mark`→`rb_execution_context_mark(th->ec)`)。
 これが「object-heavy なローカル Ractor が全部クラッシュ」していた根本原因の修正:
-VM スタック上の live local が fiber wrapper(main objspace, foreign)経由でしか辿れず、confined mark が
+VM スタック上の live local が fiber wrapper(main objspace, foreign)経由でしか辿れず、local mark が
 skip して use-after-free していた。
 
 ### 3.3 shared_bits remset + write barrier
@@ -177,7 +177,7 @@ skip して use-after-free していた。
 ### 3.4 global GC
 
 **判定** (`gc_start`, gc_enter の前): `rlgc_has_local && rlgc_global_gc_enabled()` かつ full mark に
-なるなら `objspace->flags.global_gc = TRUE`。minor は confined ローカルのまま。
+なるなら `objspace->flags.global_gc = TRUE`。minor は ローカルのまま。
 
 **gc_enter / gc_exit**: ローカル minor は `lock_lev=0` + `flags.local_gc=TRUE`(VM ロックもバリアも取らない)。
 グローバル/main は `RB_GC_VM_LOCK()` + `rb_gc_vm_barrier()`(STW)。
@@ -219,8 +219,8 @@ objspace を中途半端な状態で渡す)or **VM グローバル GC スクラ�
 |---|------|------|------|
 | 1 | `generic_fields_tbl_` | mark lookup / sweep delete が writer の rehash と競合 | **NON_BARRIER VM ロック** (gc.c `gc_mark_generic_ivar_sync`, variable.c) |
 | 2 | `id2ref_tbl` | sweep delete が無同期 | **NON_BARRIER VM ロック** (gc.c `obj_free_object_id`) |
-| 3 | Ractor ポート `recv_queue`/`ports`/`monitors` | foreign sender が per-Ractor mutex で変更、ローカル GC が無ロック走査 | **生 `rb_native_mutex_lock(&r->sync.lock)`** を `rb_gc_during_confined_local_gc_p()` のとき取得 (ractor_sync.c) |
-| 4 | in-flight メッセージコピー | 送信側 objspace に居るが受信側 basket からのみ参照 → 両 confined GC が skip → 解放 | 送信側で **shared_bits pin** (gc.c `rb_gc_pin_in_flight_message`) |
+| 3 | Ractor ポート `recv_queue`/`ports`/`monitors` | foreign sender が per-Ractor mutex で変更、ローカル GC が無ロック走査 | **生 `rb_native_mutex_lock(&r->sync.lock)`** を `rb_gc_during_local_gc_p()` のとき取得 (ractor_sync.c) |
+| 4 | in-flight メッセージコピー | 送信側 objspace に居るが受信側 basket からのみ参照 → 両 ローカル GC が skip → 解放 | 送信側で **shared_bits pin** (gc.c `rb_gc_pin_in_flight_message`) |
 | 5 | `vm->gc.mark_func_data` | S の reachability チェックが R の実 GC マークを乗っ取り | 実 GC は `during_gc` で判定し無視 (gc.c `RB_GC_MARK_OR_TRAVERSE`) |
 | 6 | per-EC `gen_fields_cache` | weak 参照で sweep に解放され得る | **強 movable ルート化** (vm.c `rb_execution_context_mark`) |
 | 7 | `freed_ractor_local_keys` | `rb_ractor_finish_marking` が毎回 free+clear → 二重 free | STW のみ実行 (default.c `gc_marks_finish`) |
@@ -271,14 +271,14 @@ return v;
 - **コスト/互換**: copy/move 1件につき `#clone` がもう1回(send+receive で計2回)。ユーザ
   `clone`/`initialize_clone` の副作用が2回発火する(観測可能な互換変化)。
 - **検証**: 決定的再現テスト(`bootstraptest/test_ractor.rb`、orchestrated に global GC でピンを消し
-  confined minor で young 未ピン copy を掃いて slot を上書き)。修正無し 6/6 SIGABRT
+  ローカル minor で young 未ピン copy を掃いて slot を上書き)。修正無し 6/6 SIGABRT
   (`try to mark T_NONE`)→ 修正有り 6/6 ok。
 - **残存**: 極限並行ストレス(4並行送信+毎メッセージ global GC+大量 clobber+長期保持)でのみ ~7.5% で別系統の
   UAF が出る。受信側 `ractor_copy` が並行 global GC 下で破損クローンを生成するもので、§5.1 と同系統。
 
-### 3.11 confined GC と他 Ractor の fiber/EC (バグ修正済)
+### 3.11 ローカル GC と他 Ractor の fiber/EC (バグ修正済)
 
-**症状**: 子を生成した親 Ractor の confined GC 中に SEGV(`rb_execution_context_mark` →
+**症状**: 子を生成した親 Ractor の ローカル GC 中に SEGV(`rb_execution_context_mark` →
 `cont_mark` → `fiber_mark`)。**最小再現(決定的・10/10 crash)**:
 ```ruby
 parent = Ractor.new do
@@ -289,21 +289,21 @@ end
 parent.value
 ```
 **根本原因**: `Ractor.new` は親スレッド上で子の root fiber を確保するため、**子の fiber オブジェクトが
-物理的に親の objspace に在住**する(§3.10 と同型)。親の confined GC がそれをマーク →
+物理的に親の objspace に在住**する(§3.10 と同型)。親の ローカル GC がそれをマーク →
 `rb_execution_context_mark` が**子の並行実行中のフレームスタック**を歩く → 壊れた EP で SEGV。二分で確定:
-GLOBAL_GC=0/LOCKFREE=0 でも発生(confined GC 固有)、RLGC OFF で消滅。
+GLOBAL_GC=0/LOCKFREE=0 でも発生(ローカル GC 固有)、RLGC OFF で消滅。
 
-**修正**: `cont_mark`(cont.c) で、confined local GC 中に**別 Ractor 所有**の cont/fiber は
+**修正**: `cont_mark`(cont.c) で、ローカル GC 中に**別 Ractor 所有**の cont/fiber は
 saved_ec/VM スタック/machine スタックの走査を**スキップ**(その Ractor 自身の GC が自分の EC をマーク;
 cont オブジェクトと thread 参照は生かす)。所有判定は `cont->saved_ec.thread_ptr->ractor` を新ヘルパー
-`rb_gc_confined_foreign_ractor_p(owner)`(gc.c: confined GC 中かつ owner≠driver で true、global STW 中は
+`rb_gc_local_gc_foreign_ractor_p(owner)`(gc.c: ローカル GC 中かつ owner≠driver で true、global STW 中は
 常に false)で行う。検証: 最小再現 **0/30**、s2(non-main↔non-main+GC bomb) GLOBAL_GC=0 で **5/5→0/12**、
 btest 159/161。
 
 ### 3.12 confinement アサーション (RACTOR_LOCAL_GC_AUDIT / VM_CHECK_MODE)
-- **EC-confinement** (vm.c `rb_execution_context_mark` 先頭, `VM_ASSERT`): confined GC は自 Ractor の EC のみ
-  歩く(`ec->thread_ptr==NULL || !rb_gc_confined_foreign_ractor_p(ec->thread_ptr->ractor)`)。§3.11 種別を捕捉。
-- **u→s liveness** (default.c sweep, AUDIT, rb_bug): confined local GC は shareable を決して free しない
+- **EC-confinement** (vm.c `rb_execution_context_mark` 先頭, `VM_ASSERT`): ローカル GC は自 Ractor の EC のみ
+  歩く(`ec->thread_ptr==NULL || !rb_gc_local_gc_foreign_ractor_p(ec->thread_ptr->ractor)`)。§3.11 種別を捕捉。
+- **u→s liveness** (default.c sweep, AUDIT, rb_bug): ローカル GC は shareable を決して free しない
   (sweep pin 迂回の検出)。
 - **s→u WB-miss** (default.c `gc_shared_wb_miss`, AUDIT): shareable→unshareable で shared_bit 未記録の
   境界エッジを報告。
@@ -359,9 +359,9 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
 解放されたオブジェクトを参照して dangling**」が共通根で、多数の症状を生む。
 
 **この系統の中で修正できた個別インスタンス（コミット済み）**:
-- **③ confined GC が他 Ractor の fiber/EC を歩く**(§3.11) ── commit a19485dfc。
+- **③ ローカル GC が他 Ractor の fiber/EC を歩く**(§3.11) ── commit a19485dfc。
 - **cc/cme dangling**(commit e94190497): **クラスは全て shareable**(`Ractor.shareable?(Class.new)==true`)
-  なので、匿名クラス k は confined GC では解放されず **global GC が到達性で回収**する。バグは cc/cme pin が
+  なので、匿名クラス k は ローカル GC では解放されず **global GC が到達性で回収**する。バグは cc/cme pin が
   **全 GC（global 含む）**で効き、dead クラスが global GC に回収されるのに cme が pin で生き残って owner を
   dangling 参照していたこと。pin を `!rlgc_global_gc_active` でゲート(shareable pin と同じく global GC では
   guard を外す)→ r4 4/20→**0/40**、s2 2/12→**0/15**。live クラスは m_tbl/cc_tbl から cc/cme を強くマーク
@@ -377,7 +377,7 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
 - **cc-table が freed cc を強参照(cc-table cluster の近接機構)**: 計測で確定 ── `vm_cc_table_dup_i` の
   `memcpy(new_ccs, old_ccs)` が **同一 objspace 内**で「valid cme かつ **T_NONE cc**」の ccs を新テーブルに伝播
   (`RLGC-CCDUP` で確認; cur_os_cc/cme/tbl 全=1)。クラッシュは常に **global GC 中**(`local_gc=0,
-  global_active=1`)で、cc は global GC が回収(confined GC は shareable cc を pin)。cc-table は再構築可能な
+  global_active=1`)で、cc は global GC が回収(ローカル GC は shareable cc を pin)。cc-table は再構築可能な
   キャッシュなので、**collected(T_NONE)cc/cme を持つ ccs は drop**(mark_cc_entry_i = invalidated-cme と同じ
   扱い+生存 sibling を invalidate、vm_cc_table_dup_i = コピーせずスキップ)。→ `VM/cc_table → T_NONE cc`
   アサートは解消、maximize_confined 12/12 → ~3-7/12。
@@ -398,7 +398,7 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
 - **pre-existing**(cc/cme 修正の有無に関わらず発生 ── maximize_confined 2/5 w/o fix)。本セッションの修正は
   回帰ではない(btest_ractor 161/161、RLGC 有無とも)。
 - **投機的修正は5連敗**: (a) cc_table マークに NON_BARRIER ロック → 効果なし。(b) free 時に shared_bit クリア
-  → 効果なし(stale bit は free 経路起因でない)。(c) holder(§A.3) (d) don't-pin(§A.4)。(e) confined GC の
+  → 効果なし(stale bit は free 経路起因でない)。(c) holder(§A.3) (d) don't-pin(§A.4)。(e) ローカル GC の
   foreign weak-ref を `handle_weak_references_alive_p` でスキップ(foreign は alive 扱い)→ **効果なし**(残存は
   弱参照解決でなく cc-table 強参照経路だった)。**rapid-patch では割れない**。計測駆動(free-ring で世代相関 +
   dup で伝播確認)が機能した。
@@ -407,11 +407,11 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
 mark 層のガードでは閉じない。**§5.4 の main-objspace ルーティング(+ 終了 objspace ハンドオフ)が本筋**。
 
 ### 5.2 未監査で原理的に残るカテゴリ
-1. **ユーザ定義 T_DATA の `dmark`/`dfree`** — confined ローカル GC 中に任意の C 拡張コードが走り任意の共有 C
+1. **ユーザ定義 T_DATA の `dmark`/`dfree`** — ローカル GC 中に任意の C 拡張コードが走り任意の共有 C
    状態を触りうる(封じ込めモデルの根本的な穴)。要設計: custom-dmark を持つ T_DATA はローカル GC でマーク
    せずグローバル GC に委ねる等。
 2. **JIT (YJIT/ZJIT)** — Rust 側の per-Ractor 相互作用・GC 外の共有表アクセスは未確認。
-3. **`RUBY_INTERNAL_EVENT_FREEOBJ` フック** — confined sweep 中の発火で共有状態アクセス未追跡。
+3. **`RUBY_INTERNAL_EVENT_FREEOBJ` フック** — ローカル sweep 中の発火で共有状態アクセス未追跡。
 
 ### 5.3 性能の follow-up
 - グローバル GC の STW バリア(N=8 で ~13%)。major を「メモリ圧 or N 回ごと」だけグローバルにするスロットルは

@@ -211,7 +211,7 @@ void *rb_gc_ractor_cache_alloc_on_main(rb_ractor_t *ractor);
 void rb_gc_mark_ractor_local_roots(rb_ractor_t *ractor);
 bool rb_gc_rlgc_enabled(void);
 bool rb_gc_object_in_current_objspace_p(VALUE obj);
-bool rb_gc_confined_foreign_ractor_p(const rb_ractor_t *owner);
+bool rb_gc_local_gc_foreign_ractor_p(const rb_ractor_t *owner);
 
 bool rb_gc_size_allocatable_p(size_t size);
 size_t *rb_gc_heap_sizes(void);
@@ -250,12 +250,12 @@ void rb_objspace_each_objects(
 void rb_objspace_each_objects_all_ractors(
     int (*callback)(void *start, void *end, size_t stride, void *data),
     void *data);
-/* True while a confined per-Ractor local GC (not a STW global GC) is running. Per-Ractor structures
+/* True while a per-Ractor local GC (not a STW global GC) is running. Per-Ractor structures
  * a local GC walks lock-free (e.g. Ractor message ports) take their per-Ractor lock when this is
  * true to exclude concurrent foreign mutators. */
-bool rb_gc_during_confined_local_gc_p(void);
+bool rb_gc_during_local_gc_p(void);
 /* Pin an in-flight Ractor message payload in the sender's objspace (it is referenced only from the
- * receiver's basket queue, a cross-objspace edge both confined GCs skip). No-op without local GC. */
+ * receiver's basket queue, a cross-objspace edge both local GCs skip). No-op without local GC. */
 void rb_gc_pin_in_flight_message(VALUE obj);
 
 size_t rb_gc_obj_slot_size(VALUE obj);
