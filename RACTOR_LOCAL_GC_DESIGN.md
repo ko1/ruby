@@ -488,3 +488,64 @@ holder有 4/60 vs holder無 5/60 で**有意差なし(無効)** → 撤回・コ
 - **F2: shared_bits を cross-objspace エッジへ一般化** — root エッジが不可視(`parent_object=Qundef`、
   `gc_shared_relation` は `SPECIAL_CONST_P(parent)` で早期 return)で `basket_free` 後の root 参照を救えず
   **不完全**。
+
+---
+
+## 6. 外部レビュー所見と要設計判断 (2026-06-01)
+
+別レビュアーの総評: 性能方向(per-Ractor objspace + STW なし local GC + alloc cache-miss で VM lock 不取得)は
+有望。ただし正しさは「少数の race を潰せば終わる」種ではなく、**CRuby 内部の shareable VM object の配置と寿命を
+再設計し、local GC に参加できる object / callback / C-API の境界を明確化**する必要。本流に入れるなら少なくとも
+**デフォルト OFF の実験機能**として、未解決の cross-objspace lifetime 問題を明示の上で。現在の shared_bits /
+pin / T_NONE guard 等は妥当な防御だが根本解ではない(特に inline cache の弱い cross-objspace pointer は mark
+時に完全補正できない)。
+
+### 6.1 本セッションで解決済み(コミット済み)
+- 主要 extreme-stress UAF = **孤児 objspace**(§5.1, ASAN 確定)→ orphan-list を global GC 巡回に含める
+  (be9ea0120)+ 空 0-page sweep ガード(55c0578d4)+ 誤診ベースの masker(WB/cc-table guard)撤去(ec478dc4f)。
+  36 ストレスシナリオ中 32 が 0/10、btest 161/161 + 2050/2050。
+- 命名統一(confined→local, ebcf79309)、ASAN-buildable 化(arena recycle の unpoison)。
+
+### 6.2 要設計判断(後で決定。優先順はレビュー準拠)
+1. **shareable VM infra の寿命を VM root と揃える(最優先)**: cc/cme/cc_tbl/callinfo/shape-edge/classext は
+   弱参照・キャッシュ参照・raw pointer を多く持ち、guard 積み増しでは別 call path で再発。レビューは
+   main-objspace routing を本筋とするが、**ユーザ方針: main routing は「正しさ」のためには使わない(性能最適化の
+   後回し選択肢)**。→ 「main に頼らず寿命を揃える機構」をどう設計するかが核心の論点。
+2. **Ractor 終了時 objspace handoff 【ユーザ決定済】**: join した Ractor が継承 / 未 join のまま Ractor が
+   GC されたら main が継承。**未実装**(現状は orphan-list で global GC が回収するが objspace 殻はリーク継続)。
+   実装上の壁: `rb_gc_impl_objspace_free`(default.c)は VM shutdown 前提で `heap_pages_lomem/himem=0` 等
+   グローバル状態をリセットするため **mid-run の単一 objspace 解放に使えない** → 安全な mid-run teardown/併合
+   パスの新設が必要。サブ判断: (a) ページ併合(no-move で joiner の objspace に吸収=joiner の local GC が回収)
+   vs (b) adopt(別 objspace のまま joiner/main が所有、global GC のみ回収、空で解放)。
+3. **message copy の clone 二回呼び互換性**: materialize-on-receive で clone / initialize_clone が send 時と
+   receive 時の二回呼ばれ、ユーザ観測可能な仕様変更。受容(仕様変更明示)/ 副作用なし内部 materialization /
+   別の所有権移転、のいずれか。§6.3 の §3.10 UAF 根因とも一体。
+4. **T_DATA / dmark / dfree / FREEOBJ hook の境界**: 任意 C 拡張が他 Ractor mutator と並行に走る前提でない。
+   local GC 対象 T_DATA を declarative-marked / RLGC-safe 宣言型に限定し、他は global GC のみ mark/free。
+5. **process-wide API semantics**: GC.stat / GC.total_time / profiler / ObjectSpace.each_object / GC.disable /
+   GC.stress / malloc counters / finalizer / object_id / weakref / event hook が current objspace の意味に
+   変質。各々 current か全 objspace かを決定。`rb_gc_register_mark_object()` 等 current-objspace heap 判定で
+   foreign object を弾く箇所は正しさにも影響。
+6. **root set 完全性**: VM global root / C API global registration からのみ参照される local object の生存策。
+   JIT state / coverage / debug gem / objspace ext / `rb_objspace_each_objects()` 利用箇所が current か全
+   objspace かを個別決定。
+7. **shared_bits soundness の C 全体監査**: 「s→u edge は u の owner が作る」前提を、raw write / MEMCPY /
+   clone-move / generic ivar / classext / managed id table / shape tree / JIT pointer update 等の**非 WB
+   経路**で監査(現状は Ruby レベル隔離規則に依拠、C 実装全体の監査は不足)。
+
+### 6.3 本セッションで判明した open バグ(上記設計領域に属す)
+- **§3.10 受信クローン UAF(ASAN 確定, high-confidence)**: in-flight copy `v`(送信側 objspace 在住)が、
+  送信時 `rb_gc_pin_in_flight_message` の shared_bit を**途中の global GC が全クリア**→ v の唯一の到達性が
+  receiver の basket-queue root mark(`parent=Qundef`, 非 shareable-parent)なので `gc_shared_relation` が
+  再 stamp しない → さらに `ractor_basket_accept` が `ractor_copy(v)` の前に basket を dequeue+free →
+  materialize 中 v は受信スレッドの C ローカルのみが参照(送信側 local GC は走査しない)→ 送信側 confined
+  local GC が sweep → SEGV(`object.c:497`, `class.c:1055/1061`)。free スタック=
+  `gc_sweep`→`heap_page_add_freeobj`。**健全修正の難所**: 受信側で v を re-pin するのは shared_bits 所有権
+  不変条件違反 + cross-objspace ビットマップ data race(#7 と同根)で**不健全**。健全策 = 送信側 in-flight pin
+  を **global GC を跨いで durable に**(in-flight registry を STW 中に再 stamp)+ materialize 完了まで
+  sender 側 root を維持。= message ownership 設計(#3)と一体で決める。≈4% 再現。
+- **finalizer × RLGC**: `d_finalizer_churn` 10/10 SEGV、`d_objectspace_each_object` 10/10
+  "try to mark T_NONE (parent T_UNDEF)"(root mark)。`ObjectSpace.define_finalizer` + `each_object` +
+  per-Ractor objspace。finalizer table / deferred finalizer / each_object の cross-objspace 寿命(#4/#5 領域)。
+  ※ `ObjectSpace.each_object` は `rb_objspace_each_objects`(current objspace)経由で、orphan 修正とは別系統。
+  要 ASAN 追跡。
