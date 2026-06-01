@@ -368,24 +368,43 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
   するので生存、dead クラスは subtree ごと回収される。
 - **GC.compact / verify_compaction_references**(move は per-Ractor objspace と非互換): RLGC 時は non-move
   full GC にゲート ── commit b134827c5。
+- **WB が freed slot に shared_bit をスタンプ(Layer-1)**: 別 objspace の生きた shareable が、global GC が
+  回収した shareable(class / cc / cme)への WEAK 参照(subclasses imemo / inline-cache cc)を dangling させ、
+  その死んだポインタが `b` として WB に届く。`-O3` は `GC_ASSERT(b != T_NONE)` を消すので stale shared_bit を
+  スタンプ → 後で `gc_mark_shared_roots` が T_NONE を mark。WB の両 shared-bit 分岐を `RB_BUILTIN_TYPE(b) !=
+  T_NONE` でガード(コンパイルアウトされたアサートのランタイム版)。→ maximize_global / longheld_slot_reuse が
+  10+/10 → **0/10**。workflow で根因確証(9/20→0/50)。
+- **cc-table が freed cc を強参照(cc-table cluster の近接機構)**: 計測で確定 ── `vm_cc_table_dup_i` の
+  `memcpy(new_ccs, old_ccs)` が **同一 objspace 内**で「valid cme かつ **T_NONE cc**」の ccs を新テーブルに伝播
+  (`RLGC-CCDUP` で確認; cur_os_cc/cme/tbl 全=1)。クラッシュは常に **global GC 中**(`local_gc=0,
+  global_active=1`)で、cc は global GC が回収(confined GC は shareable cc を pin)。cc-table は再構築可能な
+  キャッシュなので、**collected(T_NONE)cc/cme を持つ ccs は drop**(mark_cc_entry_i = invalidated-cme と同じ
+  扱い+生存 sibling を invalidate、vm_cc_table_dup_i = コピーせずスキップ)。→ `VM/cc_table → T_NONE cc`
+  アサートは解消、maximize_confined 12/12 → ~3-7/12。
 
-**未解決の残存（極限ストレスでのみ顕在、通常〜型多様ワークロードは 0）**: 署名でクラスタ化すると概ね:
-- **`gc_mark_shared_roots` → T_NONE**(stale shared_bits) と **`VM/cc_table` → T_NONE cc**(class の
-  call-cache table が freed cc を参照): shareable な VM インフラ(shared_bits remset / class cc_table)が
-  並行 GC 下で解放と非整合になる。`GC.stress=true`(全 alloc を GC 化)+4-8 Ractor 並行で顕在。
-- **message :b 配列 → T_NONE 要素**(§3.10 残存, ~7.5%): 受信側 ractor_copy が並行 global GC 下で破損
-  クローンを生成。
+**未解決の残存（極限ストレスでのみ顕在、通常〜型多様ワークロードは 0）**:
+- **inline-cache cross-objspace dangling → SEGV(本系統の深部）**: cc-table アサートを潰すと、同じ dangling が
+  **メソッド呼び出し時の SEGV** として顕在(fanin / gc_stress_everywhere 12/12, NULL deref)。shareable iseq の
+  WEAK な `cd->cc`(iseq.c:391 `cc_is_active` で active のみ強マーク、それ以外は empty_cc にリセット)が、別
+  objspace で global GC に回収された cc を指して dangling。キャッシュ層のガードでは塞げない(回収済み cc の
+  inline-cache を mark 時に直せない)。**本筋の修正は §5.4 の cc/cme/cc_tbl の main objspace ルーティング**
+  (cc の寿命を shareable iseq と一致させる)。Ractor 終了時の per-box classext→dead objspace ダングリング
+  (§5.4 の objspace ハンドオフ)も同系。
+- **`gc_mark_shared_roots` → T_NONE / out-of-heap(parent T_UNDEF)**: 直前 global GC で回収され page も解放
+  された shareable を root が dangling 参照。Layer-1 で減ったが残存。同じ cross-objspace 寿命の根。
+- **message :b 配列 → T_NONE 要素**(§3.10 残存, ~7.5%): 受信側 ractor_copy が並行 global GC 下で破損クローン。
 
 **重要(再試行不要)**:
 - **pre-existing**(cc/cme 修正の有無に関わらず発生 ── maximize_confined 2/5 w/o fix)。本セッションの修正は
-  回帰ではない。
-- **投機的修正は4連敗**: (a) cc_table マークに NON_BARRIER ロック → 効果なし(クラッシュは
-  cc_table-mark-vs-populate ではなく `gc_mark_shared_roots` だった)。(b) free 時に shared_bit クリア →
-  効果なし(free 点の計測で「shared-bit オブジェクトは sweep で解放されていない」＝stale bit は free 経路
-  起因でない)。(c) holder(§A.3) (d) don't-pin(§A.4)。**rapid-patch では割れない。**
+  回帰ではない(btest_ractor 161/161、RLGC 有無とも)。
+- **投機的修正は5連敗**: (a) cc_table マークに NON_BARRIER ロック → 効果なし。(b) free 時に shared_bit クリア
+  → 効果なし(stale bit は free 経路起因でない)。(c) holder(§A.3) (d) don't-pin(§A.4)。(e) confined GC の
+  foreign weak-ref を `handle_weak_references_alive_p` でスキップ(foreign は alive 扱い)→ **効果なし**(残存は
+  弱参照解決でなく cc-table 強参照経路だった)。**rapid-patch では割れない**。計測駆動(free-ring で世代相関 +
+  dup で伝播確認)が機能した。
 
-**必要な対応**: ASAN/デバッガ級の精密診断(freed オブジェクトの alloc/free/use 特定)。これは RLGC
-プロトタイプの並行 GC 堅牢性の根の課題で、静的解析・投機パッチでは閉じない。**本セッション未クローズ。**
+**必要な対応**: 残るは cross-objspace **寿命**の構造課題(inline-cache cc / 終了 objspace の classext)。WB/
+mark 層のガードでは閉じない。**§5.4 の main-objspace ルーティング(+ 終了 objspace ハンドオフ)が本筋**。
 
 ### 5.2 未監査で原理的に残るカテゴリ
 1. **ユーザ定義 T_DATA の `dmark`/`dfree`** — confined ローカル GC 中に任意の C 拡張コードが走り任意の共有 C
