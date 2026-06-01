@@ -593,5 +593,25 @@ worker local GC が解放 → 後続 global GC が root fiber をマーク(globa
 （注: `make test-all -j`(並列ワーカー)では Ractor-local storage builtin 解決の pre-existing な並列レースで
 `uninitialized constant Ractor::Primitive` が散発。`-j1` で消える=テストハーネス側の別問題、本修正と無関係。）
 
+### 6.5 worker 内 old→young remembered-set 漏れ(未解決, ~0.4%, pre-existing, 要 RLGC 対応 verify)
+`fibers_escaping_objs_reuse_hammer`(`Fiber.yield`/`resume` + 各 fiber が `longlived` に obj を蓄積 +
+main で hammer global GC)が **~0.4%** で `[BUG] try to mark T_NONE (obj: out-of-heap, parent:
+out-of-heap)`。backtrace = global(major)GC の `gc_mark_children`(gc.c:3703 → default.c:5313)で、
+**生存中の worker オブジェクト P の子 C が T_NONE**(cont_mark/fiber EC ではない=§6.4 とは別)。P も C も
+同一 worker objspace 在住(両方 main から見て out-of-heap)→ **worker 内の old→young エッジの remembered-set
+漏れ**。仮説: hammer の頻繁な global(major)GC 後に worker の若い生存者が昇格しきれず、old 親 P が worker の
+remembered-set に無い状態で次の worker minor GC(`full_mark:false`)が young 子 C を解放 → 後続 global GC が
+P をマークして T_NONE 検出。= 「global GC が per-objspace 構造(ここでは世代/remembered-set)を全 objspace 分
+正しく再構築できていない」同系統の可能性。
+- **再現困難**: ~0.4%(0/120 等で頻繁に空振り、増幅シナリオでも 0/40)。HEAD/§3.10+finalizer-only/baseline
+  4e8768968 いずれも ~0/100超 で**私の3修正とは無関係(pre-existing)**と bisect 確認。
+- **ツールギャップ**: `RGENGC_CHECK_MODE`(=2/3 の `gc_verify_internal_consistency`)が決定的検出に有効なはず
+  だが **RLGC 非対応**(§A 既述)。試した RLGC 対応化: `check_generation_i`/`check_color_i` で cross-objspace
+  エッジを skip(偽陽性 "WB miss O->Y" 解消)+ count 整合性を multi-ractor で skip までは通ったが、次に
+  `gc_marks_finish: available_slots >= marked_slots`(default.c:6164, global GC が cross-objspace を driver の
+  marked_slots に加算)等の assert が連鎖 → **RGENGC_CHECK_MODE の完全 RLGC 対応は別タスク**(本バグ修正の
+  前提インフラとして価値大)。本バグは確実な再現/検証手段が無いまま remembered-set 経路を弄るのは危険なので、
+  RLGC 対応 verify を整備してから決定的に追うべき。
+
 **残課題(設計判断が要る別件、クラッシュではない)**: handoff(#2)を阻む終了 Ractor の T_ZOMBIE(未実行
 deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)。
