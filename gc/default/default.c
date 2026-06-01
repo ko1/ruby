@@ -1137,6 +1137,11 @@ gc_malloc_counters_snapshot(rb_objspace_t *objspace, struct gc_malloc_bytes *c)
 #define heap_pages_freeable_pages	objspace->heap_pages.freeable_pages
 #define heap_pages_deferred_final	objspace->heap_pages.deferred_final
 #define heaps              objspace->heaps
+/* Accessors for ANOTHER objspace's during_gc flag — must be defined BEFORE the macro below, which
+ * rewrites the bare token `during_gc` to `objspace->flags.during_gc` (so it cannot name a member of
+ * any objspace other than the local `objspace`). */
+static inline unsigned int rlgc_get_during_gc(const rb_objspace_t *os) { return os->flags.during_gc; }
+static inline void rlgc_set_during_gc(rb_objspace_t *os, unsigned int v) { os->flags.during_gc = v; }
 #define during_gc		objspace->flags.during_gc
 #define finalizing		objspace->atomic_flags.finalizing
 /* Accessor for ANOTHER objspace's finalizer_table — must be defined BEFORE the macro below, which
@@ -1328,6 +1333,9 @@ static int gc_mark_stacked_objects_incremental(rb_objspace_t *, size_t count);
 NO_SANITIZE("memory", static inline bool is_pointer_to_heap(rb_objspace_t *objspace, const void *ptr));
 
 static void gc_verify_internal_consistency(void *objspace_ptr);
+#if RACTOR_LOCAL_GC
+static void gc_verify_internal_consistency_maybe(rb_objspace_t *objspace);
+#endif
 
 static double getrusage_time(void);
 static inline void gc_prof_setup_new_record(rb_objspace_t *objspace, unsigned int reason);
@@ -3526,9 +3534,7 @@ rb_gc_impl_shutdown_call_finalizer(void *objspace_ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
+    gc_verify_internal_consistency_maybe(objspace);
 
     /* prohibit incremental GC */
     objspace->flags.dont_incremental = 1;
@@ -4472,9 +4478,7 @@ gc_sweep_finish(rb_objspace_t *objspace)
     rb_gc_event_hook(0, RUBY_INTERNAL_EVENT_GC_END_SWEEP);
     gc_mode_transition(objspace, gc_mode_none);
 
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
+    gc_verify_internal_consistency_maybe(objspace);
 }
 
 static int
@@ -5720,6 +5724,14 @@ check_generation_i(const VALUE child, void *ptr)
 
     if (RGENGC_CHECK_MODE) GC_ASSERT(RVALUE_OLD_P(data->objspace, parent));
 
+#if RACTOR_LOCAL_GC
+    /* RLGC: a cross-objspace old->young edge is NOT covered by the generational remembered set. The
+     * child lives in (and is kept alive by) ANOTHER objspace; the unshareable->shareable boundary is
+     * handled by shared_bits and the local GC foreign-skips foreign objects. Only WITHIN-objspace
+     * edges must be remembered, so a cross-objspace child is not a write-barrier miss. */
+    if (!SPECIAL_CONST_P(child) && GET_HEAP_OBJSPACE(child) != GET_HEAP_OBJSPACE(parent)) return;
+#endif
+
     if (!RVALUE_OLD_P(data->objspace, child)) {
         if (!RVALUE_REMEMBERED(data->objspace, parent) &&
             !RVALUE_REMEMBERED(data->objspace, child) &&
@@ -5735,6 +5747,11 @@ check_color_i(const VALUE child, void *ptr)
 {
     struct verify_internal_consistency_struct *data = (struct verify_internal_consistency_struct *)ptr;
     const VALUE parent = data->parent;
+
+#if RACTOR_LOCAL_GC
+    /* RLGC: cross-objspace edges are not tracked by the incremental write barrier (see check_generation_i). */
+    if (!SPECIAL_CONST_P(child) && GET_HEAP_OBJSPACE(child) != GET_HEAP_OBJSPACE(parent)) return;
+#endif
 
     if (!RVALUE_WB_UNPROTECTED(data->objspace, parent) && RVALUE_WHITE_P(data->objspace, child)) {
         fprintf(stderr, "verify_internal_consistency_reachable_i: WB miss (B->W) - %s -> %s\n",
@@ -5968,7 +5985,12 @@ gc_verify_internal_consistency_(rb_objspace_t *objspace)
         }
     }
 
-    if (!is_marking(objspace)) {
+    /* RLGC: skip in multi-Ractor mode -- old_objects / uncollectible_wb_unprotected_objects are
+     * CUMULATIVE counters incremented at promotion, and a global GC promotes objects in EVERY
+     * objspace through the driver (the marking objspace), so the driver's counter accumulates
+     * cross-objspace promotions that this per-objspace page walk cannot reproduce. (The WB /
+     * reachability checks above remain active and are what catch remembered-set bugs.) */
+    if (!is_marking(objspace) && !rb_gc_multi_ractor_p()) {
         if (objspace->rgengc.old_objects != data.old_object_count) {
             rb_bug("inconsistent old slot number: expect %"PRIuSIZE", but %"PRIuSIZE".",
                    objspace->rgengc.old_objects, data.old_object_count);
@@ -6017,13 +6039,42 @@ gc_verify_internal_consistency(void *objspace_ptr)
 
         unsigned int prev_during_gc = during_gc;
         during_gc = FALSE; // stop gc here
+#if RACTOR_LOCAL_GC
+        /* gc_verify_internal_consistency_ walks children via rb_objspace_reachable_objects_from(),
+         * which refuses to run while the CURRENT Ractor's objspace is mid-GC. Under RLGC that objspace
+         * can differ from the one being verified (e.g. a global GC driven by one Ractor while we verify
+         * another objspace's heap), so clear its during_gc too. The barrier above stopped every Ractor,
+         * so a read-only traversal is safe. */
+        rb_objspace_t *const cur_objspace = rb_gc_get_objspace();
+        unsigned int prev_cur_during_gc = rlgc_get_during_gc(cur_objspace);
+        rlgc_set_during_gc(cur_objspace, FALSE);
+#endif
         {
             gc_verify_internal_consistency_(objspace);
         }
+#if RACTOR_LOCAL_GC
+        rlgc_set_during_gc(cur_objspace, prev_cur_during_gc);
+#endif
         during_gc = prev_during_gc;
     }
     RB_GC_VM_UNLOCK(lev);
 }
+
+#if RACTOR_LOCAL_GC
+/* The (now RLGC-aware) consistency verifier is valuable for hunting RLGC generational bugs, but a
+ * full RGENGC_CHECK_MODE>=2 build also turns on many GC_ASSERTs not yet adapted to per-Ractor
+ * objspaces. This lets it be enabled at runtime via RUBY_GC_VERIFY=1 on an ordinary build, running
+ * gc_verify_internal_consistency at the same points RGENGC_CHECK_MODE>=2 would, and nothing else. */
+static void
+gc_verify_internal_consistency_maybe(rb_objspace_t *objspace)
+{
+    static int enabled = -1;
+    if (RB_UNLIKELY(enabled < 0)) enabled = (getenv("RUBY_GC_VERIFY") != NULL);
+    if (RGENGC_CHECK_MODE >= 2 || enabled) gc_verify_internal_consistency(objspace);
+}
+#else
+#define gc_verify_internal_consistency_maybe(os) do { if (RGENGC_CHECK_MODE >= 2) gc_verify_internal_consistency(os); } while (0)
+#endif
 
 static void
 heap_move_pooled_pages_to_free_pages(rb_heap_t *heap)
@@ -6181,9 +6232,7 @@ gc_marks_finish(rb_objspace_t *objspace)
 
     gc_update_weak_references(objspace);
 
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
+    gc_verify_internal_consistency_maybe(objspace);
 
 #if RGENGC_CHECK_MODE >= 4
     during_gc = FALSE;
@@ -6204,7 +6253,11 @@ gc_marks_finish(rb_objspace_t *objspace)
 
         int full_marking = is_full_marking(objspace);
 
-        GC_ASSERT(objspace_available_slots(objspace) >= objspace->marked_slots);
+        /* RLGC: during a global GC the driver objspace's marked_slots accumulates objects marked in
+         * EVERY objspace (gc_aging increments the marking objspace's counter), so it is an aggregate
+         * that can exceed this one objspace's available slots. The invariant holds per-objspace for a
+         * local GC. */
+        GC_ASSERT(rlgc_global_gc_active || objspace_available_slots(objspace) >= objspace->marked_slots);
 
         /* Setup freeable slots. */
         size_t total_init_slots = 0;
@@ -6420,9 +6473,7 @@ static void
 gc_sweep_compact(rb_objspace_t *objspace)
 {
     gc_compact_start(objspace);
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
+    gc_verify_internal_consistency_maybe(objspace);
 
     while (!gc_compact_all_compacted_p(objspace)) {
         for (int i = 0; i < HEAP_COUNT; i++) {
@@ -6449,9 +6500,7 @@ gc_sweep_compact(rb_objspace_t *objspace)
 
     gc_compact_finish(objspace);
 
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
+    gc_verify_internal_consistency_maybe(objspace);
 }
 
 static void
@@ -7313,9 +7362,7 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     /* reason may be clobbered, later, so keep set immediate_sweep here */
     objspace->flags.immediate_sweep = !!(reason & GPR_FLAG_IMMEDIATE_SWEEP);
 
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
+    gc_verify_internal_consistency_maybe(objspace);
 
     if (ruby_gc_stressful) {
         int flag = FIXNUM_P(ruby_gc_stress_mode) ? FIX2INT(ruby_gc_stress_mode) : 0;
@@ -7443,7 +7490,7 @@ gc_rest(rb_objspace_t *objspace)
         unsigned int lock_lev;
         gc_enter(objspace, gc_enter_event_rest, &lock_lev);
 
-        if (RGENGC_CHECK_MODE >= 2) gc_verify_internal_consistency(objspace);
+        gc_verify_internal_consistency_maybe(objspace);
 
         if (is_incremental_marking(objspace)) {
             gc_marking_enter(objspace);
