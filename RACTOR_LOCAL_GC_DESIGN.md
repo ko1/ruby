@@ -398,9 +398,11 @@ AMD Ryzen 9 5900HX (8 物理/16 HT)。
 - **GC.compact / verify_compaction_references**(move は per-Ractor objspace と非互換): RLGC 時は non-move
   full GC にゲート ── commit b134827c5。
 
-**残存(極小, 孤児修正後 ~4%: 75 run 中 3)**: nested_workers / 内部 GC の稀な SEGV。別系統(§3.10 message :b の
-ractor_copy 破損 ~7.5% など)か、孤児修正のエッジ(孤児化と進行中 global GC のタイミング、空孤児の未解放)を
-要追跡。通常〜型多様ワークロードは 0。
+**残存(極小)**: 孤児修正が露呈した**空孤児 objspace の sweep クラッシュ**(`heap_pages_free_unused_pages` が
+0-page objspace で `rb_darray_get(sorted,-1)`)は別途ガードで解消(nested_workers ~12% → 0/40)。残るのは
+fiber_heavy 等 ~4% で、バックトレース上 **`<internal:ractor> receive` → `rb_obj_clone_setup` →
+`rb_singleton_class_clone_and_attach`(class.c)** ── これは §3.10 の**メッセージコピー(受信側 clone)の
+cross-objspace 寿命**族で、孤児修正とは独立の既知残存(別途 ASAN 調査が要る)。通常〜型多様ワークロードは 0。
 
 **重要(再試行不要)**:
 - 真因特定は **ASAN(または VM_CHECK_MODE+RGENGC debug)が決定打**。推論・アドレス交絡リングでは閉じない。
