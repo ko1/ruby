@@ -5100,6 +5100,19 @@ gc_aging(rb_objspace_t *objspace, VALUE obj)
     if(!gc_config_full_mark_val)
         return;
 
+#if RACTOR_LOCAL_GC
+    /* A shareable object is concurrently read by other Ractors' mutators (e.g. vm_ic_hit_p reading
+     * its flags) and reachable from their GCs via shared_bits. A lock-free per-Ractor LOCAL GC must
+     * NOT read-modify-write its flags word (RVALUE_AGE / FL_PROMOTED) -- that races those readers and
+     * can tear the flags. Shareables are pinned (shared_bits, and the local sweep never frees them)
+     * and their generational/age state is managed only by the STW global GC. Still count it as a
+     * marked slot of this objspace (it is pinned, not swept), matching the tail of this function. */
+    if (objspace->flags.local_gc && RB_OBJ_SHAREABLE_P(obj)) {
+        objspace->marked_slots++;
+        return;
+    }
+#endif
+
     struct heap_page *page = GET_HEAP_PAGE(obj);
 
     GC_ASSERT(RVALUE_MARKING(objspace, obj) == FALSE);
@@ -10701,19 +10714,30 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
         ccan_list_head_init(&heap->pages);
     }
 
-    init_size_to_heap_idx();
+    /* Process-global, objspace-independent state: initialize exactly ONCE. rb_gc_impl_objspace_init
+     * runs per objspace (every Ractor), but these touch process globals that other Ractors read
+     * lock-free; re-writing them on each child-Ractor init races those readers (and, for
+     * heap_init_bytes, would clobber a RUBY_GC_HEAP_INIT_BYTES-tuned value). The first call is the
+     * main objspace at boot with no other Ractor running, and later calls hold the VM lock, so a
+     * plain static guard publishes them with a clean happens-before. (gc_params.heap_init_bytes is
+     * already set by its static initializer + rb_gc_impl_set_params, so it is dropped here entirely.) */
+    {
+        static bool process_globals_initialized = false;
+        if (!process_globals_initialized) {
+            init_size_to_heap_idx();
+#if defined(INIT_HEAP_PAGE_ALLOC_USE_MMAP)
+            heap_page_alloc_use_mmap = INIT_HEAP_PAGE_ALLOC_USE_MMAP; // determine mmap usability at runtime
+#endif
+            process_globals_initialized = true;
+        }
+    }
 
     rb_darray_make_without_gc(&objspace->heap_pages.sorted, 0);
     rb_darray_make_without_gc(&objspace->weak_references, 0);
 
-#if defined(INIT_HEAP_PAGE_ALLOC_USE_MMAP)
-    /* Need to determine if we can use mmap at runtime. */
-    heap_page_alloc_use_mmap = INIT_HEAP_PAGE_ALLOC_USE_MMAP;
-#endif
 #if RGENGC_ESTIMATE_OLDMALLOC
     objspace->rgengc.oldmalloc_increase_limit = gc_params.oldmalloc_limit_min;
 #endif
-    gc_params.heap_init_bytes = GC_HEAP_INIT_BYTES;
 
     init_mark_stack(&objspace->mark_stack);
 
