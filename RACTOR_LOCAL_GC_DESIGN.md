@@ -662,6 +662,31 @@ P をマークして T_NONE 検出。= 「global GC が per-objspace 構造(こ�
   必要があり、cc/ic のメモリモデルを把握した上で**別途**行うべき(GC 側の lost-update 系 real race は解消済み)。
 - **検証**: btest 2051/btest_ractor 161 維持・警告なし;全36シナリオバッテリ 720回 0;高負荷 crash repro 0/128。
 
+### 6.7 バグあぶり出しで発掘した3つの新規・高再現クラッシュ(secondary face 修正済、dominant face は OPEN)
+TSan を多様パスに展開 + 未開拓 RLGC 相互作用を狙う adversarial シナリオを生成して、既存36シナリオが
+見逃していた**確実に再現する新規クラッシュ3件**を発掘(repro: `$TMPDIR/gen2/`)。triage(ASAN+コード)で
+各々の real な secondary face を修正(`13f6db3a5`、回帰なし)したが、**支配的 face は RLGC の shareable
+寿命に関わる深い問題で未解決**:
+- **`compact_xractor_sharedbits_fullgc_hammer`(~100%)** `mark T_NONE`(parent out-of-heap=worker, child
+  T_NONE=main)。**fixed face**: main の非 global GC が、worker からのみ live な shareable(Ractor body の
+  isolated env 等)を解放(sweep guard が `objspace->local` で main を除外)→ guard を `(local||rlgc_has_local)`
+  に拡張。**dominant OPEN face**: `GC.compact`(+full GC)が **cross-objspace 参照される main の shareable を
+  移動/その subtree を解放し、worker 側の参照が未更新** → dangling。= compaction × cross-objspace 参照更新、
+  または shareable の subtree liveness(shareable は sweep guard でピンされるが自 objspace の root から到達せず
+  マークされないため子が辿られない)。design レベル。
+- **`termination_orphan_vs_global_gc`(~100%)** message clone の method search で **解放済み class の m_tbl
+  (id_table)を参照**して SEGV(`vm_search_cc`→`rb_id_table_lookup`)。**dominant OPEN face**: 終了/orphan
+  Ractor の objspace に作られた shareable class(cc_tbl/m_tbl 付き)が cross-objspace 保持されたまま、その
+  m_tbl/subtree が GC に解放 → 後の dispatch が dangling。= cc/cme lifetime 残課題(§5.1、no-main-routing 制約下で hard)。
+- **`id2ref_cross_ractor_idtable_gc_race`(~100%)** `object_id0`→`st_insert` SEGV。**fixed faces**:
+  id2ref_tbl の free/insert を VM ロックで直列化(SEGV 解消)+ worker local GC が自 objspace の VM-global
+  `id2ref_value` を解放しないよう keep-alive。**dominant OPEN residual**: `Object ID seen, but not in
+  _id2ref table`(id2ref_value が最初に `_id2ref` を呼んだ worker objspace に置かれ、その寿命管理が完全でない;
+  VM-global を worker objspace に置く設計上の齟齬)。
+→ 3件とも **「shareable / VM-global オブジェクトが worker(または orphan)objspace に住み、cross-objspace で
+live なのに、非 global GC / compaction がその subtree や寿命を正しく扱えない」** という同一の設計領域に収束。
+**設計判断パス(shareable 寿命・objspace 所有・handoff)と一体で扱うべき**。repro は永続回帰テストとして保存。
+
 **残課題(設計判断が要る別件、クラッシュではない)**: handoff(#2)を阻む終了 Ractor の T_ZOMBIE(未実行
 deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)、
 TSan の cc/ic lock-free read 側 annotate(by-design, 別タスク)。
