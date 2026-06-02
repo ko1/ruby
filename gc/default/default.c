@@ -3297,7 +3297,6 @@ objspace_each_pages(rb_objspace_t *objspace, each_page_callback *callback, void 
 VALUE
 rb_gc_impl_define_finalizer(void *objspace_ptr, VALUE obj, VALUE block)
 {
-    rb_objspace_t *objspace = objspace_ptr;
     VALUE table;
     st_data_t data;
 
@@ -3305,9 +3304,19 @@ rb_gc_impl_define_finalizer(void *objspace_ptr, VALUE obj, VALUE block)
 
     RBASIC(obj)->flags |= FL_FINALIZE;
 
+#if RACTOR_LOCAL_GC
+    /* The finalizer entry must live in obj's OWNER objspace's table: run_final() looks it up there
+     * during that objspace's sweep, and obj may be owned by a different Ractor than the caller (e.g.
+     * a finalizer defined on a shareable object). Mirrors rb_gc_impl_copy_finalizer(). */
+    st_table *const ftbl = rlgc_finalizer_table(GET_HEAP_OBJSPACE(obj));
+#else
+    rb_objspace_t *objspace = objspace_ptr;
+    st_table *const ftbl = finalizer_table;
+#endif
+
     unsigned int lev = RB_GC_VM_LOCK();
 
-    if (st_lookup(finalizer_table, obj, &data)) {
+    if (st_lookup(ftbl, obj, &data)) {
         table = (VALUE)data;
         VALUE dup_table = rb_ary_dup(table);
 
@@ -3332,7 +3341,7 @@ rb_gc_impl_define_finalizer(void *objspace_ptr, VALUE obj, VALUE block)
     else {
         table = rb_ary_new3(2, rb_obj_id(obj), block);
         rb_obj_hide(table);
-        st_add_direct(finalizer_table, obj, table);
+        st_add_direct(ftbl, obj, table);
     }
 
     RB_GC_VM_UNLOCK(lev);
@@ -3343,14 +3352,20 @@ rb_gc_impl_define_finalizer(void *objspace_ptr, VALUE obj, VALUE block)
 void
 rb_gc_impl_undefine_finalizer(void *objspace_ptr, VALUE obj)
 {
-    rb_objspace_t *objspace = objspace_ptr;
-
     GC_ASSERT(!OBJ_FROZEN(obj));
+
+#if RACTOR_LOCAL_GC
+    /* Delete from obj's OWNER objspace's table (where define_finalizer/run_final operate). */
+    st_table *const ftbl = rlgc_finalizer_table(GET_HEAP_OBJSPACE(obj));
+#else
+    rb_objspace_t *objspace = objspace_ptr;
+    st_table *const ftbl = finalizer_table;
+#endif
 
     st_data_t data = obj;
 
     int lev = RB_GC_VM_LOCK();
-    st_delete(finalizer_table, &data, 0);
+    st_delete(ftbl, &data, 0);
     RB_GC_VM_UNLOCK(lev);
 
     FL_UNSET(obj, FL_FINALIZE);
