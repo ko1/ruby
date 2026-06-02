@@ -2148,7 +2148,9 @@ void
 rb_gc_obj_id_moved(VALUE obj)
 {
     if (UNLIKELY(id2ref_tbl)) {
-        st_insert(id2ref_tbl, (st_data_t)rb_obj_id(obj), (st_data_t)obj);
+        RB_VM_LOCKING_NO_BARRIER() {
+            if (id2ref_tbl) st_insert(id2ref_tbl, (st_data_t)rb_obj_id(obj), (st_data_t)obj);
+        }
     }
 }
 
@@ -2197,9 +2199,16 @@ id2ref_tbl_memsize(const void *data)
 static void
 id2ref_tbl_free(void *data)
 {
-    id2ref_tbl = NULL; // clear global ref
     st_table *table = (st_table *)data;
-    st_free_table(table);
+    /* id2ref_tbl is a VM-global st_table whose wrapper can be swept by a per-Ractor LOCAL GC (it is
+     * registered in global_object_list, which a lock-free local GC's roots do not mark). Freeing it
+     * races VM-lock-protected inserters/readers (object_id0, class_object_id, rb_gc_obj_id_moved,
+     * object_id_to_ref), so clear the global pointer + free the table under the VM lock. NO_BARRIER:
+     * a sweep is not a safepoint and must not join a pending global-GC barrier mid-sweep. */
+    RB_VM_LOCKING_NO_BARRIER() {
+        id2ref_tbl = NULL; // clear under the lock so inserters re-checking inside the lock skip it
+        st_free_table(table);
+    }
 }
 
 static const rb_data_type_t id2ref_tbl_type = {
@@ -2274,7 +2283,7 @@ object_id0(VALUE obj)
 
     if (RB_UNLIKELY(id2ref_tbl)) {
         RB_VM_LOCKING() {
-            st_insert(id2ref_tbl, (st_data_t)id, (st_data_t)obj);
+            if (id2ref_tbl) st_insert(id2ref_tbl, (st_data_t)id, (st_data_t)obj); // re-check under lock (concurrent local-GC free)
         }
     }
     return id;
@@ -3464,6 +3473,17 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
          * is kept alive by the main objspace) that foreign Ractors mutate lock-free (hook_list_connect)
          * -- a local GC iterating it races that writer. The STW global/main GC marks it
          * (rb_vm_mark -> rb_hook_list_mark(&vm->global_hooks)). */
+
+        /* id2ref_value (the VM-global ObjectSpace._id2ref table wrapper) is allocated in whatever
+         * objspace FIRST called _id2ref -- which may be THIS worker Ractor, not main. The local root
+         * pass skips global_object_list (rb_vm_mark) on the assumption that VM globals live in main,
+         * so when the wrapper belongs to this objspace this lock-free local GC would sweep it, freeing
+         * the st_table that other Ractors concurrently insert into (-> SEGV in st_insert, or "Object ID
+         * seen, but not in _id2ref table"). Keep it alive here when it is ours (a foreign one is marked
+         * by its own owner / the global GC). */
+        if (id2ref_value && rb_gc_object_in_current_objspace_p(id2ref_value)) {
+            rb_gc_mark(id2ref_value);
+        }
         return;
     }
 #endif

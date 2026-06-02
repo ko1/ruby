@@ -4039,11 +4039,16 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
 
               default:
 #if RACTOR_LOCAL_GC
-                if (objspace->local && RB_OBJ_SHAREABLE_P(vp) && !rlgc_global_gc_active) {
-                    /* A per-Ractor LOCAL GC cannot tell whether a shareable object is
-                     * still referenced from another objspace (a class callcache table, the shape
-                     * tree's edge tables, an inline cache, the Ractor object, ...), so it must
-                     * never free shareables — they stay pinned until a GLOBAL GC. The GLOBAL GC's
+                if ((objspace->local || rlgc_has_local) && RB_OBJ_SHAREABLE_P(vp) && !rlgc_global_gc_active) {
+                    /* A NON-global GC cannot tell whether a shareable object is still referenced from
+                     * another objspace (a class callcache table, the shape tree's edge tables, an
+                     * inline cache, the Ractor object, ...), so it must never free shareables — they
+                     * stay pinned until a GLOBAL GC. This holds for a per-Ractor LOCAL GC (objspace->
+                     * local) AND for the MAIN objspace's non-global minor/compaction GC once per-Ractor
+                     * objspaces exist (rlgc_has_local): a shareable in main may be live ONLY via a
+                     * worker (e.g. a Ractor body's isolated env, a sent shareable graph) that main's
+                     * own roots do not reach -- freeing it there is an RLGC-invariant-3 violation
+                     * (it surfaced as a worker UAF / cross-objspace mark-T_NONE). The GLOBAL GC's
                      * unified mark DOES establish true reachability across all objspaces, so there
                      * the guard is lifted: an unmarked shareable is genuinely dead and is reclaimed
                      * together with its now-dead subtree (pinning it would instead leave its freed
@@ -4092,8 +4097,8 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                  * object (a shareable may still be referenced from another objspace; it stays pinned
                  * until a global GC -- see the sweep pin above). Reaching the free path with a
                  * shareable means that pin was bypassed -> its unshareable children would dangle. */
-                if (objspace->local && !rlgc_global_gc_active && RB_OBJ_SHAREABLE_P(vp)) {
-                    rb_bug("RLGC-AUDIT: local GC freeing a shareable object: %s", rb_obj_info(vp));
+                if ((objspace->local || rlgc_has_local) && !rlgc_global_gc_active && RB_OBJ_SHAREABLE_P(vp)) {
+                    rb_bug("RLGC-AUDIT: non-global GC freeing a shareable object: %s", rb_obj_info(vp));
                 }
 #endif
 
@@ -6853,7 +6858,20 @@ gc_mark_shared_roots(rb_objspace_t *objspace)
                 uintptr_t pp = p;
                 while (bitset) {
                     if (bitset & 1) {
-                        gc_mark(objspace, (VALUE)pp);
+                        VALUE sobj = (VALUE)pp;
+                        gc_mark(objspace, sobj);
+                        /* A shared-root boundary object that has already aged to OLD is uncollectible,
+                         * so gc_mark short-circuits (gc_mark_set returns "already marked") WITHOUT
+                         * greying it -- its YOUNG children are then not traversed by this (minor) GC.
+                         * Unlike a normal old object it is rooted via shared_bits, not the remembered
+                         * set, so rememberset_mark does not cover it either: its young subtree would be
+                         * swept while the cross-objspace shareable that references it keeps the root
+                         * alive -> a dangling cross-objspace child (the compact / terminated-Ractor
+                         * mark-T_NONE and freed class m_tbl/cc). Re-traverse its children directly,
+                         * exactly as rgengc_rememberset_mark does for remembered old objects. */
+                        if (RVALUE_OLD_P(objspace, sobj)) {
+                            gc_mark_children(objspace, sobj);
+                        }
                         marked++;
                     }
                     pp += slot_size;
