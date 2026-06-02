@@ -641,5 +641,27 @@ P をマークして T_NONE 検出。= 「global GC が per-objspace 構造(こ�
   実証。RLGC の lock-free 設計では並行書込される全メタデータの atomicity を TSan で継続監査すべき
   (残る pre-existing race: heap_page_allocate 系、gc_aging の shared object flags 書込など=別タスク)。
 
+### 6.6 TSan 監査(継続)— 残レースの分類と対処
+§6.5 の bitmap lost-update を潰した後、`nofiber_oldyoung_race` を TSan で再走し残レース(~95)を 6 カテゴリに
+分けて triage(並列分析)。**real は 2 件のみ、他は verified-benign**:
+- **REAL ① gc_aging が shareable の flags を非アトミック RMW**(local GC)→ local GC では shareable を aging
+  しない(`26aed2c45`)。
+- **REAL ② rb_gc_impl_objspace_init が process-global を子 Ractor init 毎に再書込**(`init_size_to_heap_idx`/
+  `heap_page_alloc_use_mmap`/`gc_params.heap_init_bytes`)→ 一度きり guard + heap_init_bytes 書込削除(`26aed2c45`)。
+- **hygiene**: grow-only な heap span 境界(`rlgc_global_lomem/himem`)の読みを relaxed atomic 化(`631c09673`)。
+- **benign(high-confidence で確認, 修正不要)**:
+  - `has_shared_objects` バイトフラグの read/write: global STW GC 以外では **FALSE→TRUE 単調 + 冪等 TRUE 書込**、
+    危険対象(unshareable 境界子)は GC 駆動中の所有 Ractor の program order、かつ local sweep は shareable を
+    解放しない(default.c の sweep pin)。
+  - WB の shared_bits 1-bit テスト読み: `||` 短絡で `a` が unshareable のときだけ読み、`a` の bit の唯一の
+    writer は同一スレッド(program order)か STW global GC(barrier happens-before)。1-bit テストは old-or-new
+    を許容。
+- **残 ~87 の TSan report の正体**: 大半は **VM の lock-free callcache/inline-cache dispatch(`vm_sendish`,
+  shareable VM インフラ=GC 外)の atomic-write vs non-atomic-read** と、上記 benign な GC フラグ/bitmap の
+  read-vs-atomic-write。完全な TSan-clean 化には、意図的 lock-free 設計の read 側を全 atomic 化/annotate する
+  必要があり、cc/ic のメモリモデルを把握した上で**別途**行うべき(GC 側の lost-update 系 real race は解消済み)。
+- **検証**: btest 2051/btest_ractor 161 維持・警告なし;全36シナリオバッテリ 720回 0;高負荷 crash repro 0/128。
+
 **残課題(設計判断が要る別件、クラッシュではない)**: handoff(#2)を阻む終了 Ractor の T_ZOMBIE(未実行
-deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)。
+deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)、
+TSan の cc/ic lock-free read 側 annotate(by-design, 別タスク)。
