@@ -1566,16 +1566,23 @@ static bool rlgc_global_gc_active = false; /* true while a GLOBAL (all-objspace 
 static size_t rlgc_global_lomem = 0;
 static size_t rlgc_global_himem = 0;
 
+/* Relaxed atomic load of a pointer-width word these lock-free producers (rlgc_span_extend's CAS) and
+ * consumers (rlgc_obj_in_any_heap's range test) share. The span is grow-only (lomem only shrinks,
+ * himem only grows), so a relaxed load returning a slightly-stale bound is harmless -- it can only
+ * fail to include a JUST-added page, never exclude an existing one -- but the read must be atomic so
+ * it does not race the CAS writer (else UB / a torn 64-bit value on some ABIs). */
+static inline size_t rlgc_span_load(const size_t *p) { return __atomic_load_n(p, __ATOMIC_RELAXED); }
+
 /* Atomically grow [rlgc_global_lomem, rlgc_global_himem) to cover [lo, hi). Called rarely (once
  * per arena grow) and harmlessly often (once per page, already covered -> just two atomic reads). */
 static inline void
 rlgc_span_extend(uintptr_t lo, uintptr_t hi)
 {
     size_t cur;
-    while ((cur = rlgc_global_lomem) == 0 || lo < cur) {
+    while ((cur = rlgc_span_load(&rlgc_global_lomem)) == 0 || lo < cur) {
         if (RUBY_ATOMIC_SIZE_CAS(rlgc_global_lomem, cur, (size_t)lo) == cur) break;
     }
-    while ((cur = rlgc_global_himem) < hi) {
+    while ((cur = rlgc_span_load(&rlgc_global_himem)) < hi) {
         if (RUBY_ATOMIC_SIZE_CAS(rlgc_global_himem, cur, (size_t)hi) == cur) break;
     }
 }
@@ -1603,7 +1610,7 @@ rlgc_obj_in_any_heap(VALUE obj)
     const uintptr_t p = (uintptr_t)obj;
     if (p % sizeof(VALUE) != 0) return false;
     const uintptr_t body = (uintptr_t)GET_PAGE_BODY(p);
-    if (body < rlgc_global_lomem || p >= rlgc_global_himem) return false;
+    if (body < rlgc_span_load(&rlgc_global_lomem) || p >= rlgc_span_load(&rlgc_global_himem)) return false;
     struct heap_page *const page = GET_HEAP_PAGE(p);
     return page != NULL && (uintptr_t)page->body == body; /* page back-pointer round-trips */
 }
