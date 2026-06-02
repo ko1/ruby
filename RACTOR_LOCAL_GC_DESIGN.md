@@ -593,7 +593,7 @@ worker local GC が解放 → 後続 global GC が root fiber をマーク(globa
 （注: `make test-all -j`(並列ワーカー)では Ractor-local storage builtin 解決の pre-existing な並列レースで
 `uninitialized constant Ractor::Primitive` が散発。`-j1` で消える=テストハーネス側の別問題、本修正と無関係。）
 
-### 6.5 worker 内 old→young remembered-set 漏れ(未解決, ~0.4%, pre-existing, 要 RLGC 対応 verify)
+### 6.5 worker 内 old→young remembered-set 漏れ → **TSan で根本特定・解決**(pre-existing concurrent race)
 `fibers_escaping_objs_reuse_hammer`(`Fiber.yield`/`resume` + 各 fiber が `longlived` に obj を蓄積 +
 main で hammer global GC)が **~0.4%** で `[BUG] try to mark T_NONE (obj: out-of-heap, parent:
 out-of-heap)`。backtrace = global(major)GC の `gc_mark_children`(gc.c:3703 → default.c:5313)で、
@@ -619,10 +619,27 @@ P をマークして T_NONE 検出。= 「global GC が per-objspace 構造(こ�
     global GC(または並行する別 local GC)が**同期なしに並行アクセス**するデータレース。RLGC は「max 8
     concurrent local GC + STW global GC」で、既に 6 件の concurrent-GC レースを修正済み(memory 参照)— 本件は
     その同族の残り。
-- **次の正しいツール = ThreadSanitizer**(barrier ベースの snapshot verify では原理的に不可)。レース箇所の
-  並行アクセスは毎 GC 発生するので、稀なクラッシュを待たず即検出できるはず。ただし RLGC の lock-free 設計には
-  意図的な benign race が多く、TSan 出力のフィルタリングが要る。あるいは concurrent GC のメタデータ経路の
-  コードレビュー。RGENGC_CHECK_MODE は本バグ型には不適と判明。
+- **ThreadSanitizer で根本原因を確定(out-of-tree tsan build, multi-Ractor old→young workload)**:
+  非 fiber の純粋 repro(`nofiber_oldyoung_race`)を TSan 実行 → **page bitmap の非アトミック RMW レース**を直接
+  検出。`MARK_IN_BITMAP` は `bits[i] |= mask` で、**lock-free write barrier が全 Ractor の mutator で並行実行**+
+  並行 local GC が、同じ `remembered_bits`/`shared_bits` ワードを同期なしに RMW。1 ワード=`BITS_BITLENGTH`
+  スロットなので、**並行 set の lost update が同ワードの別オブジェクトの remember/shared bit を落とす** →
+  その old object が次の minor GC で scan されず young 子が解放 → 後続 global GC が T_NONE。TSan が
+  `rgengc_remembersetbits_set` / WB の `GET_HEAP_SHARED_BITS` set を複数スレッド同時書込として報告。
+  これが**負荷依存**(並行度が上がるほど lost update 発生)+ **verify(barrier）で捕捉不能**(STW が窓を消す)
+  の説明。
+- **修正(2 commit)**: (1) `7fb4d8385` 並行書込される bitmap(shared_bits/remembered_bits)を **atomic CAS**
+  で set(`gc_bitmap_atomic_set`/`MARK_IN_BITMAP_ATOMIC`、bits_t はポインタ幅=size_t CAS)、remembered-set の
+  drain を **atomic exchange**(read-and-clear)化、`has_remembered_objects` を bit set の後にセット +
+  rememberset_mark は drain 前にクリア。 (2) `596402873` 並行書込される **page→flags(has_remembered/
+  has_uncollectible/has_shared)を bitfield → `unsigned char`** に(各自バイト=full-byte store はアトミックで
+  sibling フラグを失わない;bitfield ワードの RMW lost update を解消)。
+- **検証**: btest 2051/btest_ractor 161 維持・警告なし;**TSan: remembered/shared/flag の write-write
+  lost-update 消滅**(131→95、残りは has_shared の冪等 TRUE/TRUE バイト書込・bit テストの read-vs-atomic-write・
+  pre-existing な heap-page-allocation report=別系統);**高負荷 crash repro 0/128**(修正前は負荷時 ~1/30)。
+- 副産物: RGENGC_CHECK_MODE(snapshot verify）は **concurrent race には原理的に不適**(barrier が窓を消す)と
+  実証。RLGC の lock-free 設計では並行書込される全メタデータの atomicity を TSan で継続監査すべき
+  (残る pre-existing race: heap_page_allocate 系、gc_aging の shared object flags 書込など=別タスク)。
 
 **残課題(設計判断が要る別件、クラッシュではない)**: handoff(#2)を阻む終了 Ractor の T_ZOMBIE(未実行
 deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)。
