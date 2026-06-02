@@ -690,3 +690,63 @@ live なのに、非 global GC / compaction がその subtree や寿命を正し
 **残課題(設計判断が要る別件、クラッシュではない)**: handoff(#2)を阻む終了 Ractor の T_ZOMBIE(未実行
 deferred finalizer/dfree の実行主体)、§5.4 空孤児殻リーク、d_shape_churn の compact+stress 下の遅さ(perf)、
 TSan の cc/ic lock-free read 側 annotate(by-design, 別タスク)。
+
+### 6.8 網羅サーフェシング(batch 3–4, 26 サブシステム×adversarial シナリオ)
+「あぶり出しフェーズ」として、未開拓サブシステム×cross-feature 組合せを 26 シナリオ生成し、HEAD バイナリ
+(ractor-local-gc, `RUBY_RACTOR_LOCAL_GC=1`)で各 5 回再現確認。**4 件が確実に再現**(repro 永続化: `rlgc_repro/`):
+
+- **`embed-to-heap-transition`(4/5)** `mark T_NONE`(parent `T_ARRAY` out-of-heap=worker, child out-of-heap)。
+  Ractor receive/copy 経由(`<internal:ractor>`)。→ **Face A**(§6.7 dominant・§5.1 と同根)。
+- **`proc-binding-eval-iseq`(2/5)** `mark T_NONE`(parent/child とも out-of-heap)。`GC.start` 中、binding/proc/
+  iseq subtree のノードが cross-objspace 参照下で解放。→ **Face A**。
+- **`combo-terminate-compact`(5/5)** `SEGV@0x38`。終了 Ractor の orphan objspace × `GC.compact`。→ **Face C**
+  (§6.7 `compact_xractor` dominant OPEN と同根)。
+- **`autoload-const-cc`(5/5)** `[BUG] Aborted`(corrupted VALUE `0x3e8...`)、`remove_const` CFUNC 経由。**T_NONE
+  ではない新系統 = Face B**: autoload/const-cache(IC/`vm->constant_cache`)が cross-objspace const 操作 + GC で
+  dangling。cc lifetime(§5.1)に隣接する**未記録の独立 face**。
+
+**clean(頑健性を確認した主要サブシステム, 20 件)**: regexp/MatchData, IO/StringIO, Marshal deep-graph,
+Enumerator::Lazy+Fiber, Bignum/Rational malloc, refinement cc, TracePoint-during-GC, singleton-method churn,
+generic-ivars storm, Encoding/coderange, Fiber scheduler, deep machine-stack, ObjectSpace.dump/memsize,
+**Mutex/Queue/SizedQueue/CV(~45 runs 0)**, **Method/UnboundMethod/cme/cc_tbl(~50 runs 0)**, Thread variables,
+Comparable/sort, Set, frozen-string dedup, weak/finalizer×terminate。
+重要なネガティブ知見: **shareable Method/UnboundMethod は cme/def/iseq/owner subtree を home objspace に pin する**
+ため u→s liveness 不変条件が保たれクラッシュしない(§1.2 の裏付け)。エージェント報告の `freeze-dup-clone-edge` /
+`hooks-inherited-added` は HEAD 5 回で再現せず(低頻度/環境差)。
+
+→ **収束**: 新規 4 件は **Face A(cross-objspace subtree liveness → mark T_NONE; dominant)**, **Face B(const/IC
+cache lifetime; 新規・独立)**, **Face C(orphan × compaction SEGV)** の 3 面に整理。A/C は §6.7・§5.1 の設計判断と
+一体、**B は cc lifetime 隣接の新タスク**として記録。いずれも非クラッシュの data-only サブシステムは全て clean で、
+バグは「VM 内部参照(iseq/cme/IC)を持つ or VM-global なオブジェクトが worker/orphan objspace に住み、cross-objspace
+で live なのに非 global GC / compaction が subtree 寿命を扱えない」領域に限局する、という §6.7 の結論を強化。
+
+### 6.9 網羅サーフェシング(batch 5–6, 24 サブシステム)+ クラッシュ全 face 分類(A–F)
+batch 5(14, 未開拓 VM-global テーブル + Ractor 機構)+ batch 6(10, 残り VM-global テーブル + Port/finalizer)
+で **12 CRASH / 12 clean**。全クラッシュを **6 face** に確定分類。**うち B/D/E/F は設計判断不要・コード裏取り済の
+tractable バグ**(local-sound な修正方針あり)、A/C のみ設計判断と一体。repro は `rlgc_repro/`(b4/b5/b6)に永続化。
+
+| Face | 種別 | 根本(コード裏取り) | repro / HEAD 再現 | Task | 修正方針 |
+|---|---|---|---|---|---|
+| **A** | design | cross-objspace の object subtree(Array/Struct/Data/iseq/binding/backtrace T_DATA)を非 global GC / compaction が解放 → `mark T_NONE` | `move_embedded_struct`(5/5), `ractor_select_recv_copy`(5/5), `exc_backtrace`(8/8 既知), `s7`(~11%) | #3 | (設計: §5.1) |
+| **B** | locking | `Module#remove_const`(object.c:4682, **無ロック CFUNC**)→ rb_const_remove(variable.c:3649)が ① const cache の `rb_clear_constant_cache_for_id`(:3675)を**無ロック** `set_table_foreach`、concurrent な locked `set_insert`(vm_insnhelper.c:6412)の rehash と競合 → garbage IC → SEGV(vm_method.c:323)/Aborted ② `autoload_delete`(:3072)が `autoload_features` VM-global hash を**無ロック** `rb_hash_delete`、concurrent autoload と競合 | `b4_autoload-const-cc`(**5/5**), `b5/const_cache_…`(低頻度), `b6/autoload_features_…` | #6 | remove_const に VM ロック(const_set:3957 / const_tbl_update:4033 に倣う) |
+| **C** | design | orphan 終了 Ractor の objspace × `GC.compact` → SEGV | `b4_combo-terminate-compact`(5/5) | #3 | (設計) |
+| **D** | mark gap | VM-global `concurrent_set` の backing(NOT WB_PROTECTED)が resize 時に **load-factor を超えた Ractor の objspace** に確保 → その worker の lock-free local GC が `rb_gc_mark_roots`(gc.c:3445)で `rb_vm_mark`/`global_symbols`(:3484/:3513)の前に return するため未マーク → sweep → UAF。`id2ref_value` keep-alive(gc.c:3476)と**完全同根** | `b5/fstring_table_…`(確認中), `b5/dsym_…`(**7/30** SEGV@0x4), `b6/symbol_id_entry_bucket_…` | #7 | id2ref keep-alive を fstring_table_obj / ruby_global_symbols へ拡張(自 objspace 在住時にマーク) |
+| **E** | missing guard | `GC.auto_compact=true`(gc_set_auto_compact, default.c:10152)が立てる `ruby_enable_autocompact` を 6615/7428 で**無ガード**参照 → `during_compacting=TRUE` → RLGC 下で full/global GC が compaction → corruption。`gc_compact`(:10286)/`gc_verify_compaction_references`(:10366)は `if(rlgc_has_local) compact=false` でガード済なのにここだけ抜け | `b6/autocompact_…`(**agent 15/15**, code-verified) | #8 | 同じ `rlgc_has_local` ガードを auto_compact 参照点に追加 |
+| **F** | ownership routing | `define_finalizer`(gc.c:2079)が `rb_gc_get_objspace()`=**呼び出し元 Ractor の objspace** に登録(key の所有者でなく)+ foreign object に `FL_FINALIZE` → `run_final`(default.c:3398)が**所有者の** finalizer_table を `st_delete` → entry 不在 → `rb_bug`(:3417)。`copy_finalizer`(:3360)は RLGC ルーティング修正済だが `define_finalizer` は未修正 | `b6/cross_objspace_define_finalizer_…` | (新) | copy_finalizer 同様に key 所有者の objspace へルーティング |
+
+加えて **`port_inflight_copy_global_gc_unpinned`**(Ractor::Port 明示 API の in-flight copy message が global GC
+跨ぎで unpin)= §3.10/§6.3(1)の in-flight pin 再 stamp が Port 経路で取りこぼす**残 face**(Face A 系、要追確認)。
+
+**clean(頑健・強い negative, 12 件)**: $グローバル変数表(全 worker 書込が IsolationError or per-Ractor slot;
+共有 slot に入る $/, $-i は frozen-shareable で pin され安全 ⇒ §3447 の "VM globals live in main" 仮定が $globals
+には**成立**), gccct, overloaded_cme(shareable-pin), loaded_features, encoding 表, shape tree(edge table が
+`RB_OBJ_SET_SHAREABLE` で local GC 回収不可), cvar cache, WeakMap/WeakKeyMap, eval/iseq/env, ObjectSpace.each_object
+(concurrent global GC 下), fiber storage, identity-hash rehash(compaction)。
+ネガティブの要点: **shareable がその subtree を home objspace に pin する不変条件(§1.2)が効く領域は全て clean**;
+クラッシュは「① shareable でない or pin が効かない cross-objspace 参照(A/C)」「② VM-global テーブルが
+worker/orphan objspace を前提していない(B/D/E/F)」の 2 系統に限局する、と確定。
+
+**サーフェシング結論**: 設計判断と一体なのは **A(cross-objspace shareable/object subtree liveness)** と
+**C(orphan × compaction)** の 2 面のみ。残る **B(remove_const 無ロック)・D(VM-global concurrent_set の worker
+所有)・E(auto_compact 未ガード)・F(define_finalizer ルーティング)** は**いずれも local-sound に修正可能**で、設計
+判断を待たずに着手できる。E は最も再現性が高く修正も最小(1 ガード)、D は既存 id2ref 修正の素直な一般化。
