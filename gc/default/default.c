@@ -6666,7 +6666,16 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
                        "objspace->rincgc.step_slots: %"PRIdSIZE", \n",
                        objspace->marked_slots, objspace->rincgc.pooled_slots, objspace->rincgc.step_slots);
         objspace->flags.during_minor_gc = FALSE;
-        if (ruby_enable_autocompact) {
+        if (ruby_enable_autocompact
+#if RACTOR_LOCAL_GC
+            /* Auto-compaction MOVES objects, which is incompatible with per-Ractor objspaces
+             * (cross-objspace refs, the shared_bits remset, the no-move shareable invariant) --
+             * the same reason gc_compact()/gc_verify_compaction_references() force compact=false.
+             * GC.auto_compact=true may be set before any Ractor exists, so gate it here at the
+             * point of use rather than at the setter. */
+            && !rlgc_has_local
+#endif
+            ) {
             objspace->flags.during_compacting |= TRUE;
         }
         objspace->profile.major_gc_count++;
@@ -7477,7 +7486,13 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     }
 
     /* Explicitly enable compaction (GC.compact) */
-    if (do_full_mark && ruby_enable_autocompact) {
+    if (do_full_mark && ruby_enable_autocompact
+#if RACTOR_LOCAL_GC
+        /* See gc_marks_start(): auto-compaction moves objects and is unsupported under per-Ractor
+         * objspaces; gate the process-global flag at the point of use. */
+        && !rlgc_has_local
+#endif
+        ) {
         objspace->flags.during_compacting = TRUE;
 #if RGENGC_CHECK_MODE
         objspace->rcompactor.compare_func = ruby_autocompact_compare_func;
