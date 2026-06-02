@@ -871,12 +871,17 @@ struct heap_page {
     unsigned short pinned_slots;
     struct {
         unsigned int before_sweep : 1;
-        unsigned int has_remembered_objects : 1;
-        unsigned int has_uncollectible_wb_unprotected_objects : 1;
+        /* Ractor-local GC: these are set by the LOCK-FREE write barrier from any Ractor (and by
+         * concurrent local GCs), so they are full bytes rather than bits sharing one word -- a
+         * `flags.has_x = TRUE` is then a single atomic byte store that cannot lose a concurrent set
+         * of a sibling flag. (A bitfield `|=` on the shared word would; see the atomic shared_bits /
+         * remembered_bits fix.) */
+        unsigned char has_remembered_objects;
+        unsigned char has_uncollectible_wb_unprotected_objects;
 #if RACTOR_LOCAL_GC
         /* set if this page has any "shared" object: an unshareable object directly
          * referenced by a shareable object (a shareable->unshareable boundary). */
-        unsigned int has_shared_objects : 1;
+        unsigned char has_shared_objects;
 #endif
     } flags;
 
