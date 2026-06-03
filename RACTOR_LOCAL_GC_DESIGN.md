@@ -750,3 +750,31 @@ worker/orphan objspace を前提していない(B/D/E/F)」の 2 系統に限局
 **C(orphan × compaction)** の 2 面のみ。残る **B(remove_const 無ロック)・D(VM-global concurrent_set の worker
 所有)・E(auto_compact 未ガード)・F(define_finalizer ルーティング)** は**いずれも local-sound に修正可能**で、設計
 判断を待たずに着手できる。E は最も再現性が高く修正も最小(1 ガード)、D は既存 id2ref 修正の素直な一般化。
+
+### 6.10 設計判断不要の 4 面(B/D/E/F)を修正(本セッション、あぶり出し→修正ループ)
+§6.9 で「local-sound に修正可能」と整理した 4 面を、各々「repro 再現確認 → 修正 → リビルド → repro 消滅を多数回
+検証 → 回帰(btest/btest_ractor + 機能テスト)→ コミット」のループで実装。全て **btest 2045 / btest_ractor 161 で
+機能的回帰ゼロ**(失敗は partial build の stdlib `LoadError` 4 件=tempfile/tmpdir のみ、修正前後で同一)。
+
+- **Face E**(`95c551e7b`, gc/default/default.c): `gc_marks_start`/`gc_start` の `ruby_enable_autocompact` 参照点に
+  `&& !rlgc_has_local` を追加(gc_compact と同一ガード)。auto_compact が RLGC 下で compaction を起こさない。
+  repro **6/6 → 0/12**(tiny 0/8)。非RLGC の auto_compact は従来通り動作。
+- **Face F**(`72ad765aa`, gc/default/default.c): `rb_gc_impl_define_finalizer`/`undefine_finalizer` を
+  `rlgc_finalizer_table(GET_HEAP_OBJSPACE(obj))`=**key 所有者の table** にルーティング(copy_finalizer と同型)。
+  `run_final` の table と一致し `rb_bug` 解消。repro **8/8 → 0/12**。finalizer 実行/undefine は機能維持。
+- **Face D**(`f100f23ba`, gc.c + string.c + symbol.c + internal/{string,symbol}.h): ① local-GC root branch に
+  `gc_keepalive_vm_global_if_local()` を追加し id2ref_value + fstring 表 + symbol set/ids を「自 objspace 在住時
+  のみ」マーク(concurrent_set の dmark は no-op なので entries 非伝播=leak 無し)。② symbol id-entry bucket は
+  main の `ids` 経由でしか辿れないため、`set_id_entry` で `RB_OBJ_SET_SHAREABLE`(shape edge table と同型)し
+  local-sweep からピン。repro **dsym 7/30→0/30, fstring 0/30, symbol-bucket 20/20→0/20**。symbol/sym2id/fstring
+  dedup/cross-Ractor intern は機能維持。`rb_concurrent_set_new` 呼出元は sym_set/fstring の 2 箇所のみ=網羅。
+- **Face B**(`808e41fd9`, variable.c): `rb_const_remove` の **lookup+削除を `RB_VM_LOCKING()` 内で atomic 化**
+  (const_set と同型)。並行 remove の `rb_const_entry_t` 二重 free と、`rb_clear_constant_cache_for_id` の
+  set_table walk × 並行 insert rehash を解消。not-found raise と deprecation 警告(Ruby コードを走らせ得る)は
+  ロック外へ遅延(deprecated フラグはロック内で捕捉)。repro **autoload-const-cc 15/15→0/12**。
+
+**Face B から分離した残 1 件(設計案件・defer)**: `autoload_delete`(rb_hash_delete)が VM ロック下、`Module#autoload`
+(rb_hash_aset)が autoload_mutex 下で **異なるロック**のまま `autoload_features` ident hash を変更 → heap corruption
+(repro `b6/autoload_features_…` 9/15)。autoload の LOAD 経路(require)が autoload_mutex 下で VM ロックを取り得る
+ため、単純に一方へロックを足すと **VM-lock↔autoload_mutex の順序逆転 → デッドロック**。autoload サブシステム全体の
+ロック順序を統一する設計が要る(別タスク)。**残る設計案件は A / C / autoload_features の 3 つ**。
