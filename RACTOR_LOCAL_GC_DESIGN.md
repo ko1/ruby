@@ -843,3 +843,29 @@ root を confined local GC が未マーク = G, G-2, trap, D, at_exit, thread_va
 subtree liveness 族**(A, C, wait_receive, §3.10)に大別。(I) の直接 C field / 固定配列ケースは re-home / if-local-mark で
 **local-sound に修正可能**(B/D/E/F/G/G-2/trap = 7件修正済)。残りは foreign-object-ivar・lock-free-list・lazy-VM-table・
 in-flight-pin という、より深いライフタイム設計を要する。
+
+### 6.13 batch 9(体系監査拡張 + 新規14領域)— 新機構 Family III(generational WB × cross-objspace)を発見
+体系監査3軸(VM-global root / per-thread-fiber-ec field / foreign-object-ivar)+ 新規11領域。**8 crash / 6 clean**。
+clean が安全境界を確証(Ractor.select+monitor in-flight pin、chilled/fstring dedup、WeakMap×finalizer×orphan、
+sync-primitive で blocked のまま終了、introspection×並行 confined-local-GC、make_shareable/isolate proc env mixed
+[91 runs 0、shareable env の唯一の非shareable 子=ME_CREF imemo は home objspace の local GC が辿る/global STW が
+foreign-only ケースを担保])。クラッシュは既知族の変種 + **新機構 Family III**:
+
+- **Family III(generational WB × cross-objspace; 新)**: confined **minor** local GC の remembered-set が、cross-objspace
+  / copy 経路で生じた old→young edge をカバーしない。`generic_ivar_host_sendcopy`(**15/15 決定的**、単一 worker でも、
+  非RLGC 0/4): `Ractor#send` COPY(`obj_traverse_replace_i` ractor.c:1812 + `rb_copy_generic_ivar` variable.c:2270)で
+  生成した dest-objspace の generic-ivar-host 深グラフが、copy 中の minor GC で promote → `rgengc_rememberset_mark` が
+  freed child(T_NONE)を walk。`shareable_env_svar`(11/15、非RLGC 0/12): svar($~/$_)値が `imemo_svar` 経由で同様。
+  **default.c:5743-5749 が「cross-objspace old→young は意図的に remembered set 外」と明記**しており、本族はその設計前提が
+  copy/svar 経路で破れるケース。**1行 WB 追加では直らず、世代別GC×cross-objspace の設計判断が要る**(Task #17/#18)。
+- **Family I 追加(VM-global root; coverages)**: `vm->coverages`/`me2counter`(Coverage.start、main 固定)に worker が
+  自 objspace の per-file coverage Array を `rb_hash_aset` → worker confined GC が未マーク → sweep(6/15、main-only 0/20)。
+  trap と違い **Hash の値が各 worker objspace に散在**するため if-local-mark 不可 — symbol bucket 同様に値を shareable 化
+  する等の所有設計が要る(Task #19、niche)。
+- **既知再確認**: thread_variable(8/15, #15)、s7 Family-A(低頻度)、backtrace T_DATA passthrough(15/15, Family-A)。
+
+**到達点の更新**: クラッシュ機構は **(I) confinement-miss**(direct C field/固定配列 = 修正済7件; foreign-object-ivar /
+VM-global-Hash-散在値 = 設計)、**(II) cross-objspace subtree liveness**(A/C/§3.10 = 設計)、**(III) generational WB ×
+cross-objspace**(copy/svar の remembered-set = 設計)の3族。**local-sound に直せる範囲(I の直接ケース)は出し切った**。
+残る (I)-間接 / (II) / (III) は、cross-objspace のオブジェクト寿命・世代別 remembered-set・VM-global table 所有という
+RLGC の中核設計判断に属する。
