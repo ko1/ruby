@@ -3650,14 +3650,56 @@ static rb_const_entry_t * const_lookup(struct rb_id_table *tbl, ID id);
 VALUE
 rb_const_remove(VALUE mod, ID id)
 {
-    VALUE val;
-    rb_const_entry_t *ce;
+    VALUE val = Qnil;
+    bool not_found = false;
+    bool deprecated = false;
 
     rb_check_frozen(mod);
 
-    ce = rb_const_lookup(mod, id);
+    /* Look the entry up AND remove it atomically under the VM lock. Constant tables are mutated
+     * concurrently from multiple Ractors (rb_const_set of a shareable value is permitted off the main
+     * Ractor and is itself VM-locked), so doing the lookup outside the lock lets two concurrent
+     * removes obtain the SAME rb_const_entry_t and double-free it, and lets a remove racing a
+     * const_set write into freed memory. rb_clear_constant_cache_for_id() additionally walks the
+     * per-id inline-cache set_table (set_table_foreach), which other Ractors insert into -- under the
+     * lock -- on a constant-cache miss; unlocked, a concurrent insert's rehash reallocates entries[]
+     * out from under the walk, leaving a dangling inline-cache pointer. autoload_delete() mutates the
+     * VM-global autoload_features hash. Mirrors rb_const_set()/const_tbl_update(). The not-found
+     * raise and the deprecation warning, which may run Ruby code, are deferred until after unlock. */
+    RB_VM_LOCKING() {
+        rb_const_entry_t *ce = rb_const_lookup(mod, id);
 
-    if (!ce) {
+        if (!ce) {
+            not_found = true;
+        }
+        else {
+            deprecated = RB_CONST_DEPRECATED_P(ce);
+
+            VALUE writable_ce = 0;
+            if (rb_id_table_lookup(RCLASS_WRITABLE_CONST_TBL(mod), id, &writable_ce)) {
+                rb_id_table_delete(RCLASS_WRITABLE_CONST_TBL(mod), id);
+                if ((rb_const_entry_t *)writable_ce != ce) {
+                    SIZED_FREE((rb_const_entry_t *)writable_ce);
+                }
+            }
+
+            rb_clear_constant_cache_for_id(id);
+
+            val = ce->value;
+
+            if (UNDEF_P(val)) {
+                autoload_delete(mod, id);
+                val = Qnil;
+            }
+
+            if (ce != const_lookup(RCLASS_PRIME_CONST_TBL(mod), id)) {
+                SIZED_FREE(ce);
+            }
+            // else - skip free'ing the ce because it still exists in the prime classext
+        }
+    }
+
+    if (not_found) {
         if (rb_const_defined_at(mod, id)) {
             rb_name_err_raise("cannot remove %2$s::%1$s", mod, ID2SYM(id));
         }
@@ -3665,28 +3707,15 @@ rb_const_remove(VALUE mod, ID id)
         undefined_constant(mod, ID2SYM(id));
     }
 
-    VALUE writable_ce = 0;
-    if (rb_id_table_lookup(RCLASS_WRITABLE_CONST_TBL(mod), id, &writable_ce)) {
-        rb_id_table_delete(RCLASS_WRITABLE_CONST_TBL(mod), id);
-        if ((rb_const_entry_t *)writable_ce != ce) {
-            SIZED_FREE((rb_const_entry_t *)writable_ce);
+    if (deprecated && rb_warning_category_enabled_p(RB_WARN_CATEGORY_DEPRECATED)) {
+        if (mod == rb_cObject) {
+            rb_category_warn(RB_WARN_CATEGORY_DEPRECATED, "constant ::%"PRIsVALUE" is deprecated", QUOTE_ID(id));
+        }
+        else {
+            rb_category_warn(RB_WARN_CATEGORY_DEPRECATED, "constant %"PRIsVALUE"::%"PRIsVALUE" is deprecated",
+                             rb_class_name(mod), QUOTE_ID(id));
         }
     }
-
-    rb_const_warn_if_deprecated(ce, mod, id);
-    rb_clear_constant_cache_for_id(id);
-
-    val = ce->value;
-
-    if (UNDEF_P(val)) {
-        autoload_delete(mod, id);
-        val = Qnil;
-    }
-
-    if (ce != const_lookup(RCLASS_PRIME_CONST_TBL(mod), id)) {
-        SIZED_FREE(ce);
-    }
-    // else - skip free'ing the ce because it still exists in the prime classext
 
     return val;
 }
