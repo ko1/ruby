@@ -278,6 +278,13 @@ set_id_entry(rb_symbols_t *symbols, rb_id_serial_t num, VALUE str, VALUE sym)
     if (idx >= (size_t)RARRAY_LEN(ids) || NIL_P(id_entry_list = rb_ary_entry(ids, (long)idx))) {
         rb_darray_make(&entries, ID_ENTRY_UNIT);
         id_entry_list = TypedData_Wrap_Struct(0, &sym_id_entry_list_type, entries);
+        /* Ractor-local GC: this bucket is allocated in the CURRENT Ractor's objspace but is reached
+         * only through symbols->ids (in the main objspace), so a worker's confined local GC would
+         * not mark it and would sweep it -- yet it holds permanent (immortal-symbol) state shared
+         * VM-wide. Mark it shareable so the local-GC sweep pins it; the global GC reclaims it via ids
+         * normally. It only ever holds shareable symbols and frozen strings. (cf. shape edge tables,
+         * rb_managed_id_table_create.) */
+        RB_OBJ_SET_SHAREABLE(id_entry_list);
         rb_ary_store(ids, (long)idx, id_entry_list);
     }
     else {
@@ -429,6 +436,22 @@ rb_sym_global_symbols_mark_and_move(void)
 
     rb_gc_mark_and_move(&symbols->sym_set);
     rb_gc_mark_and_move(&symbols->ids);
+}
+
+/* The VM-global symbol tables (the str->sym concurrent_set and the serial->sym id array). Exposed
+ * for the Ractor-local GC keep-alive in rb_gc_mark_roots(): the sym_set backing is not WB-protected
+ * and a resize can reallocate it into a non-main Ractor's objspace, whose local GC must then keep
+ * it alive (the per-bucket id-entry lists are handled separately, at allocation). */
+VALUE
+rb_gc_vm_global_symbol_set(void)
+{
+    return ruby_global_symbols.sym_set;
+}
+
+VALUE
+rb_gc_vm_global_symbol_ids(void)
+{
+    return ruby_global_symbols.ids;
 }
 
 static int

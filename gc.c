@@ -101,6 +101,7 @@
 #include "internal/rational.h"
 #include "internal/re.h"
 #include "internal/sanitizers.h"
+#include "internal/string.h"
 #include "internal/struct.h"
 #include "internal/symbol.h"
 #include "internal/thread.h"
@@ -3437,6 +3438,20 @@ rb_gc_object_in_current_objspace_p(VALUE obj)
     if (SPECIAL_CONST_P(obj)) return true;
     return rb_gc_impl_pointer_to_heap_p(rb_gc_get_objspace(), (const void *)obj);
 }
+
+/* Keep a VM-global table object alive during a confined local GC when it happens to live in the
+ * current objspace. Such tables (the _id2ref wrapper, the fstring dedup table, the symbol set/ids)
+ * are not WB-protected and are (re)allocated into whichever Ractor crosses a resize threshold, so
+ * an objspace that ends up owning one would otherwise sweep it -- the local root pass below skips
+ * the global-roots mark (rb_vm_mark / global_symbols) on the assumption that VM globals live in the
+ * main objspace. A foreign table is left to its own owner / the global GC. */
+static void
+gc_keepalive_vm_global_if_local(VALUE obj)
+{
+    if (obj && rb_gc_object_in_current_objspace_p(obj)) {
+        rb_gc_mark(obj);
+    }
+}
 #endif
 
 void
@@ -3474,16 +3489,19 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
          * -- a local GC iterating it races that writer. The STW global/main GC marks it
          * (rb_vm_mark -> rb_hook_list_mark(&vm->global_hooks)). */
 
-        /* id2ref_value (the VM-global ObjectSpace._id2ref table wrapper) is allocated in whatever
-         * objspace FIRST called _id2ref -- which may be THIS worker Ractor, not main. The local root
-         * pass skips global_object_list (rb_vm_mark) on the assumption that VM globals live in main,
-         * so when the wrapper belongs to this objspace this lock-free local GC would sweep it, freeing
-         * the st_table that other Ractors concurrently insert into (-> SEGV in st_insert, or "Object ID
-         * seen, but not in _id2ref table"). Keep it alive here when it is ours (a foreign one is marked
-         * by its own owner / the global GC). */
-        if (id2ref_value && rb_gc_object_in_current_objspace_p(id2ref_value)) {
-            rb_gc_mark(id2ref_value);
-        }
+        /* VM-global tables that may have been (re)allocated into THIS worker objspace rather than
+         * main, and that the global-roots mark skipped above would otherwise leave for this local GC
+         * to sweep -- freeing a table other Ractors concurrently use (-> SEGV in st_insert /
+         * concurrent_set, "Object ID seen, but not in _id2ref table", mark of a freed bucket):
+         *   - id2ref_value: the _id2ref st_table wrapper, allocated in whatever objspace first
+         *     called _id2ref.
+         *   - the fstring dedup table and the symbol set/ids: concurrent_set / array backings that a
+         *     resize reallocates into whichever Ractor crosses the load factor.
+         * Keep ours alive; a foreign one is marked by its own owner / the global GC. */
+        gc_keepalive_vm_global_if_local(id2ref_value);
+        gc_keepalive_vm_global_if_local(rb_gc_vm_global_fstring_table());
+        gc_keepalive_vm_global_if_local(rb_gc_vm_global_symbol_set());
+        gc_keepalive_vm_global_if_local(rb_gc_vm_global_symbol_ids());
         return;
     }
 #endif

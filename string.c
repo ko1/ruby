@@ -565,6 +565,15 @@ Init_fstring_table(void)
     rb_gc_register_address(&fstring_table_obj);
 }
 
+/* The VM-global frozen-string dedup table object (a concurrent_set). Exposed for the Ractor-local
+ * GC keep-alive in rb_gc_mark_roots(): the backing is not WB-protected and a resize can reallocate
+ * it into a non-main Ractor's objspace, whose local GC must then keep it alive. */
+VALUE
+rb_gc_vm_global_fstring_table(void)
+{
+    return fstring_table_obj;
+}
+
 static VALUE
 register_fstring(VALUE str, bool copy, bool force_precompute_hash)
 {
