@@ -805,3 +805,41 @@ local GC が回収する」confinement-miss 族**で、同型の re-homing で�
 **修正済みクラッシュ面の総括(本作業)**: B(remove_const lock)・D(VM-global concurrent_set keep-alive + symbol
 bucket pin)・E(auto_compact guard)・F(define_finalizer routing)・G(thread 割り込み re-homing)。**残る設計案件は
 A / C / autoload_features**。
+
+### 6.12 confinement-miss 体系監査(batch 8)— 2件追加修正、4件は delicate/design として記録
+batch 8(12領域、confinement-miss 族 + copy/send + 未カバー)で **新規クラッシュ6件**(5件決定的・1件低頻度)、
+clean 6件。**#12 の「親 objspace で確保される thread/ractor フィールド」体系監査**が効き、Face G の兄弟を複数発掘。
+2件を同型で修正、残4件は tractable の境界を越えるため task 化:
+
+- **fiber_storage(Face G-2)**(`c0e1c99fe`, thread.c): Ractor main thread の `ec->storage`(fiber storage Hash)を
+  `rb_fiber_inherit_storage` が親で確保 → 子 objspace の Fiber[] 値が foreign Hash 経由でしか辿れず sweep。
+  Face G ブロックを拡張し `ec->storage` も `rb_obj_dup` で re-home。**12/12 → 0/12**、継承/子ストレージ機能維持。
+- **trap handler**(`51819fc7b`, gc.c): 非main Ractor の `Signal.trap` String command handler が worker objspace 在住で
+  VM-global `vm->trap_list.cmd[]`(`rb_vm_mark` 非confined パスのみ)からしか辿れず sweep → 信号配送で freed String を
+  eval。local branch で `trap_list.cmd[]` を `gc_keepalive_vm_global_if_local`(Face D helper)で if-local マーク(固定
+  配列・pointer-atomic read)。**12/12 → 0/12**、Proc/String handler 発火維持。
+- **clean 6件**: fiber_scheduler、WeakMap/WeakKeyMap、Encoding::Converter、Proc/Method callable(curry/compose/
+  to_proc/UnboundMethod/define_method — 非shareable Proc は send 不可、唯一の脱出 Ractor#value も既存 orphan 経路で
+  処理済)、enumerator-fiber、TracePoint。
+
+**残4件(tractable の境界外、task #14-16/#4)**:
+- **at_exit/END proc**(#14, 12/12 mark-T_NONE): worker の at_exit proc が VM-global `end_procs`(`rb_mark_end_proc`
+  非confined のみ)からしか辿れず sweep。trap と違い `end_procs` は **lock-free prepend のリンクリスト**(eval_jump.c:60、
+  ロック無し)。固定配列の trap と異なり **weak-memory での publication ordering(`link->next` 可視性)**が絡むため、
+  単純 iteration は弱メモリで不安全 → release/acquire か rb_set_end_proc のロック化が要る(delicate)。
+- **thread_variable**(#15, 12/12 SEGV): `Thread#thread_variable_set` の locals Hash は **th->self(Thread obj)の ivar**
+  (thread.c:128 `rb_ivar_set(thread, idLocals, ...)`)。Ractor main thread の th->self は親で `rb_thread_alloc` され
+  foreign。worker が作る Hash(worker objspace)が foreign th->self の ivar 経由でしか辿れず sweep。fiber-storage(直接
+  C field)と違い foreign オブジェクトの ivar 経由なので、th->self の re-home(invasive)か locals の C-field 化(refactor)
+  が要る → design。
+- **id2ref**(#4, 12/12「Object ID seen, but not in _id2ref table」): 既知 §6.7 residual。id2ref st_table を最初に
+  `_id2ref` を呼んだ objspace(worker かも)に lazy 構築する設計齟齬。VM ロック直列化 + keep-alive 済でも残る → design。
+- **wait_receive**(#16, 1/12 mark-T_NONE): `ractor_wait_receive` がロック外で in-flight basket を C-stack-local queue に
+  再配分、`ractor_sync_mark` が未マーク → 並行 global GC が cross-objspace payload を解放。§3.10 in-flight pin 族の residual
+  (過去に entanglement)。
+
+**確定タクソノミー(本作業の到達点)**: クラッシュ面は **(I) confinement-miss 族**(親 objspace 確保フィールド / VM-global
+root を confined local GC が未マーク = G, G-2, trap, D, at_exit, thread_variable, id2ref)と **(II) cross-objspace
+subtree liveness 族**(A, C, wait_receive, §3.10)に大別。(I) の直接 C field / 固定配列ケースは re-home / if-local-mark で
+**local-sound に修正可能**(B/D/E/F/G/G-2/trap = 7件修正済)。残りは foreign-object-ivar・lock-free-list・lazy-VM-table・
+in-flight-pin という、より深いライフタイム設計を要する。
