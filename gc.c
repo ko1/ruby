@@ -3502,6 +3502,17 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
         gc_keepalive_vm_global_if_local(rb_gc_vm_global_fstring_table());
         gc_keepalive_vm_global_if_local(rb_gc_vm_global_symbol_set());
         gc_keepalive_vm_global_if_local(rb_gc_vm_global_symbol_ids());
+
+        /* Signal trap handlers live in the VM-global fixed array vm->trap_list.cmd[], marked only by
+         * rb_vm_mark() on the non-confined path. Signal.trap is permitted off the main Ractor; a Proc
+         * handler is made shareable (pinned), but a String command handler is a plain this-objspace
+         * String. If THIS worker installed one, it is reachable only through that VM-global slot, so
+         * keep it alive -- otherwise this local GC sweeps it while installed and signal delivery
+         * eval's the freed String. Reads of cmd[i] are single-pointer (atomic) vs a concurrent
+         * Signal.trap; a foreign handler is left to its owner / the global GC. */
+        for (int i = 0; i < RUBY_NSIG; i++) {
+            gc_keepalive_vm_global_if_local(vm->trap_list.cmd[i]);
+        }
         return;
     }
 #endif
