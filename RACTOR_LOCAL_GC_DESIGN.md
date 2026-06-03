@@ -778,3 +778,30 @@ worker/orphan objspace を前提していない(B/D/E/F)」の 2 系統に限局
 (repro `b6/autoload_features_…` 9/15)。autoload の LOAD 経路(require)が autoload_mutex 下で VM ロックを取り得る
 ため、単純に一方へロックを足すと **VM-lock↔autoload_mutex の順序逆転 → デッドロック**。autoload サブシステム全体の
 ロック順序を統一する設計が要る(別タスク)。**残る設計案件は A / C / autoload_features の 3 つ**。
+
+### 6.11 confinement-miss 族の新面 Face G(thread 割り込み mask-stack)を修正(batch 7)
+未開拓サブシステム14領域の adversarial サーフェシング(batch 7)で、**決定的に再現する新面1件**を発掘(他に低頻度
+未確認2件、clean 12件)。新面は §6.4 root-fiber と同じ **「foreign edge 経由でしか辿れない子オブジェクトを confined
+local GC が回収する」confinement-miss 族**で、同型の re-homing で修正:
+
+- **Face G**(`f8885699f`, thread.c): `thread_create_core`(thread.c:885-888)が Ractor main thread の
+  `pending_interrupt_queue`/`pending_interrupt_mask_stack` を、**spawn 元(親)スレッド上で・子 objspace 生成
+  (`rb_ractor_living_threads_insert`)より前に確保** → 両配列が親 objspace に住む。`Thread.handle_interrupt` が
+  子 objspace の(非shareable)mask Hash をその foreign 配列に push → 子の confined local GC が親 objspace の配列を
+  foreign-skip(default.c:5162)し、その配列経由でしか辿れない mask Hash を未マーク → sweep → 割り込み配送で
+  `rb_threadptr_pending_interrupt_check_mask` が UAF(決定的 SEGV)。**修正**: `thread_start_func_2`(新スレッド上
+  =子 objspace で実行)冒頭で両配列を re-dup(`RBASIC_CLEAR_CLASS` で hidden 維持、`thread_invoke_type_ractor_proc`
+  限定)。継承マスク/キュー済み割り込みは保持。repro **15/15 → 0/15**(stress/tiny 含む)、handle_interrupt の
+  マスク/遅延セマンティクス維持、btest 2045 / btest_ractor 161 回帰なし。
+- **clean(頑健、12件)**: refinement cc/cref/cme(orphan 含め 101+ runs 0; 理由=refinement cc は shareable imemo で
+  sweep guard にピンされ、weak-set prune は global STW で sweep 前に走る)、m_tbl/cme/cc churn、method hooks、
+  singleton class、Ractor-local storage、imemo env/cref/svar/throw_data、ruby2_keywords flagged hash、pattern-match
+  deconstruct、GC/ObjectSpace introspection × global STW、make_shareable cyclic/deep half-shared orphan、orphan storm。
+  → cc/cme/m_tbl/imemo の機構は RLGC 下で概ね robust(shareable-pin + global-STW-prune で守られている)。
+- **未確認2件**(HEAD 全構成 0/12、エージェント環境差/極低頻度): `concurrent_include_prepend`(shareable な非frozen
+  class への並行 include/prepend が iclass を破壊 — make_shareable は Class を freeze せず `rb_class_modify_check` は
+  frozen のみ阻止、の主張)、`marshal_usrmarshal…mark_tnone`。前者は TSan 向き候補として repro 保存。
+
+**修正済みクラッシュ面の総括(本作業)**: B(remove_const lock)・D(VM-global concurrent_set keep-alive + symbol
+bucket pin)・E(auto_compact guard)・F(define_finalizer routing)・G(thread 割り込み re-homing)。**残る設計案件は
+A / C / autoload_features**。
