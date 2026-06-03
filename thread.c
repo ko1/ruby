@@ -684,14 +684,16 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
         RB_VM_UNLOCK();
     }
 
-    /* Re-home this Ractor main thread's interrupt queue + mask stack into THIS Ractor's own
-     * objspace. thread_create_core() allocated them on the spawning (parent) Ractor's thread, before
-     * this Ractor's objspace existed (rb_ractor_living_threads_insert creates it), so they live in
-     * the PARENT objspace. Thread.handle_interrupt() pushes this-objspace (non-shareable) mask
-     * hashes into the mask stack, but a confined local GC foreign-skips the parent-objspace array and
-     * so never marks those hashes -- they get swept and interrupt delivery UAFs. Re-dup here, where
-     * we run in this Ractor's objspace, preserving the inherited masks and any queued interrupts.
-     * Only ractor_proc threads have this mismatch; a regular thread shares its spawner's objspace. */
+    /* Re-home this Ractor main thread's per-thread containers into THIS Ractor's own objspace.
+     * thread_create_core() allocates them on the spawning (parent) Ractor's thread, before this
+     * Ractor's objspace exists (rb_ractor_living_threads_insert creates it), so they live in the
+     * PARENT objspace. The thread then stores its OWN (this-objspace, non-shareable) objects into
+     * them -- Thread.handle_interrupt() pushes mask hashes onto the mask stack; Fiber[]=/storage=
+     * writes into the inherited fiber-storage Hash. A confined local GC foreign-skips a parent-
+     * objspace container and never marks the this-objspace objects reachable only through it, so
+     * they are swept while live -> UAF (interrupt delivery / Fiber[] read). Re-dup here, where we run
+     * in this Ractor's objspace, preserving the inherited contents. Only ractor_proc threads have
+     * this mismatch; a regular thread shares its spawner's objspace. */
     if (th->invoke_type == thread_invoke_type_ractor_proc) {
         VALUE q = rb_ary_dup(th->pending_interrupt_queue);
         RBASIC_CLEAR_CLASS(q);
@@ -699,6 +701,10 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
         VALUE m = rb_ary_dup(th->pending_interrupt_mask_stack);
         RBASIC_CLEAR_CLASS(m);
         th->pending_interrupt_mask_stack = m;
+        /* fiber-storage Hash inherited from the parent by rb_fiber_inherit_storage() */
+        if (!NIL_P(th->ec->storage)) {
+            th->ec->storage = rb_obj_dup(th->ec->storage);
+        }
     }
 
     // Ensure that we are not joinable.
