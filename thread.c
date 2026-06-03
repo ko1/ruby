@@ -684,6 +684,23 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
         RB_VM_UNLOCK();
     }
 
+    /* Re-home this Ractor main thread's interrupt queue + mask stack into THIS Ractor's own
+     * objspace. thread_create_core() allocated them on the spawning (parent) Ractor's thread, before
+     * this Ractor's objspace existed (rb_ractor_living_threads_insert creates it), so they live in
+     * the PARENT objspace. Thread.handle_interrupt() pushes this-objspace (non-shareable) mask
+     * hashes into the mask stack, but a confined local GC foreign-skips the parent-objspace array and
+     * so never marks those hashes -- they get swept and interrupt delivery UAFs. Re-dup here, where
+     * we run in this Ractor's objspace, preserving the inherited masks and any queued interrupts.
+     * Only ractor_proc threads have this mismatch; a regular thread shares its spawner's objspace. */
+    if (th->invoke_type == thread_invoke_type_ractor_proc) {
+        VALUE q = rb_ary_dup(th->pending_interrupt_queue);
+        RBASIC_CLEAR_CLASS(q);
+        th->pending_interrupt_queue = q;
+        VALUE m = rb_ary_dup(th->pending_interrupt_mask_stack);
+        RBASIC_CLEAR_CLASS(m);
+        th->pending_interrupt_mask_stack = m;
+    }
+
     // Ensure that we are not joinable.
     VM_ASSERT(UNDEF_P(th->value));
 
