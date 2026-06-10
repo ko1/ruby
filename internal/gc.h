@@ -287,6 +287,8 @@ rb_obj_atomic_write(
 int rb_ec_stack_check(struct rb_execution_context_struct *ec);
 void rb_gc_writebarrier_remember(VALUE obj);
 void rb_gc_obj_became_shareable(VALUE obj);
+void rb_gc_pin_in_flight_message(VALUE obj);
+void *rb_gc_objspace_alloc_local(void);
 const char *rb_obj_info(VALUE obj);
 void ruby_annotate_mmap(const void *addr, unsigned long size, const char *name);
 
