@@ -953,7 +953,20 @@ struct heap_page {
         unsigned int has_uncollectible_wb_unprotected_objects : 1;
     } flags;
 
+    /* RLGCv2: set when any object on this page has its shref / shareable
+     * bit set.  Kept as plain bytes outside the bitfield above: they are
+     * set without a lock (containment makes the writer the page's owner),
+     * and a byte store cannot lose a concurrent locked update of the
+     * bitfield word. */
+    unsigned char has_shref_objects;
+    unsigned char has_shareable_objects;
+
     rb_heap_t *heap;
+
+    /* RLGCv2: the objspace that owns this page.  Lets any object resolve
+     * its owner in one load (GET_HEAP_OBJSPACE) once Ractors have their own
+     * objspaces; rewritten only when a page changes hands (inheritance). */
+    rb_objspace_t *objspace;
 
     struct heap_page *free_next;
     struct heap_page_body *body;
@@ -966,6 +979,16 @@ struct heap_page {
     bits_t marking_bits[HEAP_PAGE_BITMAP_LIMIT];
 
     bits_t remembered_bits[HEAP_PAGE_BITMAP_LIMIT];
+
+    /* RLGCv2 (design_v2.md §1.4), two extra bits per object:
+     * shareable_bits marks what a confined sweep must never free (only the
+     * global GC can prove a shareable dead); set at allocation for
+     * born-shareables and by rb_gc_impl_obj_became_shareable.
+     * shref_bits marks shrefs -- unshareable objects referenced from a
+     * shareable -- which the confined GC treats as roots; maintained by the
+     * write barrier. */
+    bits_t shareable_bits[HEAP_PAGE_BITMAP_LIMIT];
+    bits_t shref_bits[HEAP_PAGE_BITMAP_LIMIT];
 
     /* If set, the object is not movable */
     bits_t pinned_bits[HEAP_PAGE_BITMAP_LIMIT];
@@ -1041,6 +1064,9 @@ slot_index_for_offset(size_t offset, uint64_t reciprocal)
 #define GET_HEAP_UNCOLLECTIBLE_BITS(x)  (&GET_HEAP_PAGE(x)->uncollectible_bits[0])
 #define GET_HEAP_WB_UNPROTECTED_BITS(x) (&GET_HEAP_PAGE(x)->wb_unprotected_bits[0])
 #define GET_HEAP_MARKING_BITS(x)        (&GET_HEAP_PAGE(x)->marking_bits[0])
+#define GET_HEAP_SHAREABLE_BITS(x)      (&GET_HEAP_PAGE(x)->shareable_bits[0])
+#define GET_HEAP_SHREF_BITS(x)          (&GET_HEAP_PAGE(x)->shref_bits[0])
+#define GET_HEAP_OBJSPACE(x)            (GET_HEAP_PAGE(x)->objspace)
 
 static int
 RVALUE_AGE_GET(VALUE obj)
@@ -1904,6 +1930,11 @@ heap_page_add_free_region(rb_objspace_t *objspace, struct heap_page *page, VALUE
 
     asan_unlock_freelist(page);
 
+    /* RLGCv2: a freed slot must not carry stale shareable/shref bits into
+     * its next life. */
+    CLEAR_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(obj), obj);
+    CLEAR_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj);
+
     struct free_region *region = (struct free_region *)obj;
     region->flags = 0;
     region->end = (uintptr_t)obj + page->slot_size;
@@ -2303,6 +2334,7 @@ heap_page_allocate(rb_objspace_t *objspace)
 
     page->body = page_body;
     page_body->header.page = page;
+    page->objspace = objspace;
 
     objspace->heap_pages.allocated_pages++;
 
@@ -2522,6 +2554,14 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
 #if RBASIC_SHAPE_ID_FIELD
     RBASIC(obj)->shape_id = 0;
 #endif
+
+    if (RB_UNLIKELY(flags & RUBY_FL_SHAREABLE)) {
+        /* RLGCv2: mirror born-shareable into the page bitmap; the confined
+         * GC roots shareables from it (rlgc_pinned_roots_mark). */
+        struct heap_page *page = GET_HEAP_PAGE(obj);
+        _MARK_IN_BITMAP(page->shareable_bits, page, obj);
+        page->has_shareable_objects = TRUE;
+    }
 
 #if RGENGC_CHECK_MODE
     int lev = RB_GC_VM_LOCK_NO_BARRIER();
@@ -3911,6 +3951,11 @@ gc_sweep_register_free_slot(rb_objspace_t *objspace, struct heap_page *page, str
 {
     rb_asan_unpoison_object(p, false);
     ((struct RBasic *)p)->flags = 0;
+
+    /* RLGCv2: a freed slot must not carry stale shareable/shref bits into
+     * its next life. */
+    CLEAR_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(p), (VALUE)p);
+    CLEAR_IN_BITMAP(GET_HEAP_SHREF_BITS(p), (VALUE)p);
 
     struct free_region *existing_region = ctx->free_region;
     if (existing_region) rb_asan_unpoison_object((VALUE)existing_region, false);
@@ -6340,6 +6385,47 @@ gc_marks_continue(rb_objspace_t *objspace, rb_heap_t *heap)
     return marking_finished;
 }
 
+/* RLGCv2 (design_v2.md §2.1): mark, as roots of this objspace,
+ * - every shareable object: another objspace may hold the only reference,
+ *   and a confined GC cannot see it.  Marking (rather than skipping them in
+ *   the sweep) keeps the generational invariants intact: pinned objects age
+ *   and promote like ordinary live objects.  Only the global GC can prove a
+ *   shareable dead.
+ * - every shref (unshareable referenced from some shareable): the
+ *   referencing shareable may live in another objspace or be an in-flight
+ *   message queue.  Maintained by the write barrier.
+ * Skipped while the VM has a single Ractor: the local GC is then the
+ * whole-world GC and shareables can die normally. */
+static void
+rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
+{
+    struct heap_page *page = NULL;
+
+    ccan_list_for_each(&heap->pages, page, page_node) {
+        if (!(page->has_shareable_objects | page->has_shref_objects)) continue;
+
+        uintptr_t p = page->start;
+        short slot_size = page->slot_size;
+        int total_slots = page->total_slots;
+        int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
+
+        for (int j = 0; j < bitmap_plane_count; j++) {
+            bits_t bitset = page->shareable_bits[j] | page->shref_bits[j];
+            uintptr_t pp = p;
+            while (bitset) {
+                if (bitset & 1) {
+                    VALUE obj = (VALUE)pp;
+                    gc_report(2, objspace, "rlgc_pinned_roots_mark: mark %s\n", rb_obj_info(obj));
+                    gc_mark(objspace, obj);
+                }
+                pp += slot_size;
+                bitset >>= 1;
+            }
+            p += BITS_BITLENGTH * slot_size;
+        }
+    }
+}
+
 static void
 gc_marks_start(rb_objspace_t *objspace, int full_mark)
 {
@@ -6387,6 +6473,12 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
 
         for (int i = 0; i < HEAP_COUNT; i++) {
             rgengc_rememberset_mark(objspace, &heaps[i]);
+        }
+    }
+
+    if (rb_gc_multi_ractor_p()) {
+        for (int i = 0; i < HEAP_COUNT; i++) {
+            rlgc_pinned_roots_mark(objspace, &heaps[i]);
         }
     }
 
@@ -6680,6 +6772,20 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
     GC_ASSERT(RB_BUILTIN_TYPE(b) != T_MOVED);
     GC_ASSERT(RB_BUILTIN_TYPE(b) != T_ZOMBIE);
 
+    /* RLGCv2 shref (design_v2.md §2.1): a shareable now references an
+     * unshareable -- record b as a shref so its owner's confined GC treats
+     * it as a root (the parent may live in another objspace and is never
+     * traversed there).  By containment only b's owner can perform this
+     * store, so b's page belongs to the current Ractor: plain stores. */
+    if (RB_UNLIKELY(RB_FL_TEST_RAW(a, RUBY_FL_SHAREABLE)) &&
+            !RB_FL_TEST_RAW(b, RUBY_FL_SHAREABLE)) {
+        struct heap_page *bpage = GET_HEAP_PAGE(b);
+        if (!_MARKED_IN_BITMAP(bpage->shref_bits, bpage, b)) {
+            _MARK_IN_BITMAP(bpage->shref_bits, bpage, b);
+            bpage->has_shref_objects = TRUE;
+        }
+    }
+
   retry:
     if (!is_incremental_marking(objspace)) {
         if (!RVALUE_OLD_P(objspace, a) || RVALUE_OLD_P(objspace, b)) {
@@ -6706,6 +6812,16 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
         if (retry) goto retry;
     }
     return;
+}
+
+void
+rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
+{
+    /* RLGCv2: an object becomes shareable on its owner's thread
+     * (containment), so this page update is single-writer. */
+    struct heap_page *page = GET_HEAP_PAGE(obj);
+    _MARK_IN_BITMAP(page->shareable_bits, page, obj);
+    page->has_shareable_objects = TRUE;
 }
 
 void

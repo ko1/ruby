@@ -729,6 +729,7 @@ ractor_sync_init(rb_ractor_t *r)
     r->sync.ports = st_init_numtable();
     r->sync.default_port_value = ractor_port_new(r);
     FL_SET_RAW(r->sync.default_port_value, RUBY_FL_SHAREABLE); // only default ports are shareable
+    rb_gc_obj_became_shareable(r->sync.default_port_value);
 
     // legacy
     r->sync.legacy = Qundef;

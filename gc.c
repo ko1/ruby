@@ -261,26 +261,6 @@ rb_gc_get_objspace(void)
 }
 
 void
-rb_gc_ractor_newobj_cache_foreach(void (*func)(void *cache, void *data), void *data)
-{
-    rb_ractor_t *r = NULL;
-    if (RB_LIKELY(ruby_single_main_ractor)) {
-        GC_ASSERT(
-            ccan_list_empty(&GET_VM()->ractor.set) ||
-                (ccan_list_top(&GET_VM()->ractor.set, rb_ractor_t, vmlr_node) == ruby_single_main_ractor &&
-                    ccan_list_tail(&GET_VM()->ractor.set, rb_ractor_t, vmlr_node) == ruby_single_main_ractor)
-        );
-
-        func(ruby_single_main_ractor->newobj_cache, data);
-    }
-    else {
-        ccan_list_for_each(&GET_VM()->ractor.set, r, vmlr_node) {
-            func(r->newobj_cache, data);
-        }
-    }
-}
-
-void
 rb_gc_run_obj_finalizer(VALUE objid, long count, VALUE (*callback)(long i, void *data), void *data)
 {
     volatile struct {
@@ -654,6 +634,7 @@ typedef struct gc_function_map {
     void (*writebarrier)(void *objspace_ptr, VALUE a, VALUE b);
     void (*writebarrier_unprotect)(void *objspace_ptr, VALUE obj);
     void (*writebarrier_remember)(void *objspace_ptr, VALUE obj);
+    void (*obj_became_shareable)(void *objspace_ptr, VALUE obj);
     // Heap walking
     void (*each_objects)(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
     void (*each_object)(void *objspace_ptr, void (*func)(VALUE obj, void *data), void *data);
@@ -835,6 +816,7 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(writebarrier);
     load_modular_gc_func(writebarrier_unprotect);
     load_modular_gc_func(writebarrier_remember);
+    load_modular_gc_func(obj_became_shareable);
     // Heap walking
     load_modular_gc_func(each_objects);
     load_modular_gc_func(each_object);
@@ -925,6 +907,7 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_writebarrier rb_gc_functions.writebarrier
 # define rb_gc_impl_writebarrier_unprotect rb_gc_functions.writebarrier_unprotect
 # define rb_gc_impl_writebarrier_remember rb_gc_functions.writebarrier_remember
+# define rb_gc_impl_obj_became_shareable rb_gc_functions.obj_became_shareable
 // Heap walking
 # define rb_gc_impl_each_objects rb_gc_functions.each_objects
 # define rb_gc_impl_each_object rb_gc_functions.each_object
@@ -3441,6 +3424,14 @@ void
 rb_gc_writebarrier_remember(VALUE obj)
 {
     rb_gc_impl_writebarrier_remember(rb_gc_get_objspace(), obj);
+}
+
+/* RLGCv2: obj just became shareable (FL_SHAREABLE was set after birth).
+ * Tell the GC so it can update its per-page shareable bitmap. */
+void
+rb_gc_obj_became_shareable(VALUE obj)
+{
+    rb_gc_impl_obj_became_shareable(rb_gc_get_objspace(), obj);
 }
 
 void
