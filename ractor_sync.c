@@ -811,6 +811,14 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
 {
     VALUE v = ractor_prepare_payload(ec, obj, &type);
 
+    if (type == basket_type_copy || type == basket_type_move) {
+        /* RLGCv2 interim (until M3 materialize-on-receive lands): the
+         * copied payload lives in the sender's objspace but is handed to
+         * the receiver by reference.  Pin it (shref) so the sender's
+         * confined GC keeps the whole copy graph alive. */
+        rb_gc_pin_in_flight_message(v);
+    }
+
     struct ractor_basket *b = ractor_basket_alloc();
     b->type = type;
     b->p.v = v;
