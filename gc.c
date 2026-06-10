@@ -3037,37 +3037,47 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     if (categoryp) *categoryp = category; \
 } while (0)
 
-    MARK_CHECKPOINT("vm");
-    rb_vm_mark(vm);
+    /* RLGCv2 (design_v2.md §2.1): the current Ractor's own roots are marked
+     * from its C structures -- a confined GC cannot rely on the heap
+     * Ractor/Thread wrapper objects, which may live in another objspace. */
+    MARK_CHECKPOINT("ractor");
+    rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
 
-    MARK_CHECKPOINT("end_proc");
-    rb_mark_end_proc();
+    /* VM-global roots belong to the main Ractor's objspace (that is where
+     * boot-time objects live); a worker's confined GC does not scan them. */
+    if (objspace == vm->ractor.main_ractor->objspace) {
+        MARK_CHECKPOINT("vm");
+        rb_vm_mark(vm);
 
-    MARK_CHECKPOINT("global_tbl");
-    rb_gc_mark_global_tbl();
+        MARK_CHECKPOINT("end_proc");
+        rb_mark_end_proc();
+
+        MARK_CHECKPOINT("global_tbl");
+        rb_gc_mark_global_tbl();
 
 #if USE_YJIT
-    void rb_yjit_root_mark(void); // in Rust
+        void rb_yjit_root_mark(void); // in Rust
 
-    if (rb_yjit_enabled_p) {
-        MARK_CHECKPOINT("YJIT");
-        rb_yjit_root_mark();
-    }
+        if (rb_yjit_enabled_p) {
+            MARK_CHECKPOINT("YJIT");
+            rb_yjit_root_mark();
+        }
 #endif
 
 #if USE_ZJIT
-    void rb_zjit_root_mark(void);
-    if (rb_zjit_enabled_p) {
-        MARK_CHECKPOINT("ZJIT");
-        rb_zjit_root_mark();
-    }
+        void rb_zjit_root_mark(void);
+        if (rb_zjit_enabled_p) {
+            MARK_CHECKPOINT("ZJIT");
+            rb_zjit_root_mark();
+        }
 #endif
+
+        MARK_CHECKPOINT("global_symbols");
+        rb_sym_global_symbols_mark_and_move();
+    }
 
     MARK_CHECKPOINT("machine_context");
     mark_current_machine_context(ec);
-
-    MARK_CHECKPOINT("global_symbols");
-    rb_sym_global_symbols_mark_and_move();
 
     MARK_CHECKPOINT("finish");
 

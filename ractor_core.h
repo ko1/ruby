@@ -130,6 +130,9 @@ struct rb_ractor_struct {
     void *objspace;
 }; // rb_ractor_t is defined in vm_core.h
 
+/* RLGCv2: mark Ractor r's GC roots from its C structure (gc.c root scan). */
+void rb_ractor_mark_local_roots(rb_ractor_t *r);
+
 enum ractor_wakeup_status {
     wakeup_none,
     wakeup_by_send,

@@ -5081,6 +5081,12 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(during_gc);
     GC_ASSERT(!objspace->flags.during_reference_updating);
 
+    /* RLGCv2 containment (design_v2.md §2.1): never traverse into another
+     * objspace -- a foreign object is a live leaf here.  Its liveness is
+     * the responsibility of its owner (or of the global GC), and touching
+     * its bitmaps from this GC would be unsound. */
+    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace)) return;
+
     rgengc_check_relation(objspace, obj);
     if (!gc_mark_set(objspace, obj)) return; /* already marked */
 
@@ -5100,6 +5106,10 @@ static inline void
 gc_pin(rb_objspace_t *objspace, VALUE obj)
 {
     GC_ASSERT(!SPECIAL_CONST_P(obj));
+
+    /* RLGCv2 containment: never write a foreign page's pinned bits. */
+    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace)) return;
+
     if (RB_UNLIKELY(objspace->flags.during_compacting)) {
         if (RB_LIKELY(during_gc)) {
             if (!RVALUE_PINNED(objspace, obj)) {
@@ -6002,6 +6012,10 @@ bool
 rb_gc_impl_handle_weak_references_alive_p(void *objspace_ptr, VALUE obj)
 {
     rb_objspace_t *objspace = objspace_ptr;
+
+    /* RLGCv2 containment: a confined GC cannot judge a foreign object;
+     * treat it as alive (its owner or the global GC decides). */
+    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace)) return true;
 
     bool marked = RVALUE_MARKED(objspace, obj);
 
