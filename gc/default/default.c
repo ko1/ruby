@@ -240,19 +240,12 @@ static RB_THREAD_LOCAL_SPECIFIER int malloc_increase_local;
     SLOT(32) SLOT(64) SLOT(128) SLOT(256) SLOT(512)
 #endif
 
-typedef struct ractor_newobj_heap_cache {
-    uintptr_t cursor;
-    uintptr_t cursor_end;
-    struct free_region *next_region;
-    struct heap_page *using_page;
-    uintptr_t region_end;
-    size_t allocated_objects_count;
-} rb_ractor_newobj_heap_cache_t;
-
-typedef struct ractor_newobj_cache {
-    size_t incremental_mark_step_allocated_slots;
-    rb_ractor_newobj_heap_cache_t heap_caches[HEAP_COUNT];
-} rb_ractor_newobj_cache_t;
+/* RLGCv2: there is no per-Ractor newobj cache.  The bump-pointer
+ * allocation state (cursor / region chain) lives directly in rb_heap_t
+ * with a single writer (the objspace's owning Ractor); see
+ * RLGC_DOC/design_v2.md section 3.  Until per-Ractor objspaces arrive
+ * (M1), a multi-Ractor process serializes allocations on this shared
+ * objspace with RB_GC_CR_LOCK. */
 
 typedef struct {
     size_t heap_init_bytes;
@@ -524,6 +517,13 @@ typedef struct rb_heap_struct {
     size_t freed_slots;
     size_t empty_slots;
 
+    /* RLGCv2 allocation state (was the per-Ractor newobj cache).  Only the
+     * objspace's owner writes these. */
+    uintptr_t alloc_cursor;
+    uintptr_t alloc_cursor_end;
+    struct free_region *alloc_next_region;
+    struct heap_page *alloc_using_page;
+
     struct heap_page *free_pages;
     struct ccan_list_head pages;
     struct heap_page *sweeping_page; /* iterator for .pages */
@@ -614,6 +614,9 @@ typedef struct rb_objspace {
 
     mark_stack_t mark_stack;
     size_t marked_slots;
+
+    /* RLGCv2: was per-newobj-cache; there is one allocator per objspace now. */
+    size_t incremental_mark_step_allocated_slots;
 
     struct {
         rb_darray(struct heap_page *) sorted;
@@ -2583,86 +2586,58 @@ rb_gc_impl_size_allocatable_p(size_t size)
     return size <= rb_gc_impl_max_allocation_size();
 }
 
-static inline void
-gc_bump_flush_alloc_count(rb_ractor_newobj_heap_cache_t *heap_cache, rb_heap_t *heap)
-{
-    if (heap_cache->allocated_objects_count > 0) {
-        RUBY_ATOMIC_SIZE_ADD(heap->total_allocated_objects, heap_cache->allocated_objects_count);
-        heap_cache->allocated_objects_count = 0;
-    }
-}
-
-static void
-ractor_cache_flush_count(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache)
-{
-    for (int heap_idx = 0; heap_idx < HEAP_COUNT; heap_idx++) {
-        gc_bump_flush_alloc_count(&gc_cache->heap_caches[heap_idx], &heaps[heap_idx]);
-    }
-}
-
-static inline void
-ractor_cache_open_window(rb_objspace_t *objspace, rb_ractor_newobj_heap_cache_t *heap_cache,
-                         size_t heap_idx)
-{
-    uintptr_t end = heap_cache->region_end;
-
-    if (RB_UNLIKELY(is_incremental_marking(objspace))) {
-        uintptr_t window_end = heap_cache->cursor + INCREMENTAL_MARK_STEP_ALLOCATIONS * pool_slot_sizes[heap_idx];
-        if (window_end < end) end = window_end;
-    }
-
-    heap_cache->cursor_end = end;
-}
-
 static inline bool
-ractor_cache_advance_region(rb_objspace_t *objspace, rb_ractor_newobj_heap_cache_t *heap_cache,
-                            size_t heap_idx)
+heap_advance_region(rb_heap_t *heap)
 {
-    gc_bump_flush_alloc_count(heap_cache, &heaps[heap_idx]);
-
-    struct free_region *region = heap_cache->next_region;
+    struct free_region *region = heap->alloc_next_region;
     if (region == NULL) {
         return false;
     }
 
     rb_asan_unpoison_object((VALUE)region, false);
     GC_ASSERT(RB_TYPE_P((VALUE)region, T_NONE));
-    heap_cache->cursor = (uintptr_t)region;
-    heap_cache->region_end = region->end;
-    heap_cache->next_region = region->next;
+    heap->alloc_cursor = (uintptr_t)region;
+    heap->alloc_cursor_end = region->end;
+    heap->alloc_next_region = region->next;
     rb_asan_poison_object((VALUE)region);
-
-    ractor_cache_open_window(objspace, heap_cache, heap_idx);
 
     return true;
 }
 
 static inline VALUE
-ractor_cache_allocate_slot(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache,
-                           size_t heap_idx)
+heap_alloc_slot(rb_objspace_t *objspace, size_t heap_idx)
 {
-    rb_ractor_newobj_heap_cache_t *heap_cache = &gc_cache->heap_caches[heap_idx];
-    size_t slot_size = pool_slot_sizes[heap_idx];
+    rb_heap_t *heap = &heaps[heap_idx];
 
-    uintptr_t cursor = heap_cache->cursor;
-    if (RB_UNLIKELY(cursor + slot_size > heap_cache->cursor_end)) {
-        if (RB_UNLIKELY(is_incremental_marking(objspace))) {
+    uintptr_t cursor = heap->alloc_cursor;
+    if (RB_UNLIKELY(cursor >= heap->alloc_cursor_end)) {
+        if (heap_advance_region(heap) == false) {
+            return Qfalse;
+        }
+        cursor = heap->alloc_cursor;
+    }
+
+    if (RB_UNLIKELY(is_incremental_marking(objspace))) {
+        // Not allowed to allocate without running an incremental marking step
+        if (objspace->incremental_mark_step_allocated_slots >= INCREMENTAL_MARK_STEP_ALLOCATIONS) {
             return Qfalse;
         }
 
-        if (!ractor_cache_advance_region(objspace, heap_cache, heap_idx)) {
-            return Qfalse;
-        }
-        cursor = heap_cache->cursor;
+        objspace->incremental_mark_step_allocated_slots++;
     }
 
     VALUE obj = (VALUE)cursor;
     rb_asan_unpoison_object(obj, true);
-    heap_cache->cursor = cursor + slot_size;
-    heap_cache->allocated_objects_count++;
+    heap->alloc_cursor = cursor + pool_slot_sizes[heap_idx];
+
+    /* Single writer (or RB_GC_CR_LOCK serialized in the temporary
+     * multi-Ractor shared-objspace mode), so a plain increment is
+     * enough; the batched atomic flush of the cache era is gone. */
+    heap->total_allocated_objects++;
 
 #if RGENGC_CHECK_MODE
     GC_ASSERT(rb_gc_impl_obj_slot_size(obj) == heap_slot_size(heap_idx));
+    // zero clear
     MEMZERO((char *)obj, char, heap_slot_size(heap_idx));
 #endif
     return obj;
@@ -2688,29 +2663,26 @@ heap_next_free_page(rb_objspace_t *objspace, rb_heap_t *heap)
 }
 
 static inline void
-ractor_cache_set_page(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, size_t heap_idx,
-                      struct heap_page *page)
+heap_set_alloc_page(rb_objspace_t *objspace, size_t heap_idx, struct heap_page *page)
 {
-    gc_report(3, objspace, "ractor_set_cache: Using page %p\n", (void *)page->body);
+    gc_report(3, objspace, "heap_set_alloc_page: Using page %p\n", (void *)page->body);
 
-    rb_ractor_newobj_heap_cache_t *heap_cache = &gc_cache->heap_caches[heap_idx];
+    rb_heap_t *heap = &heaps[heap_idx];
 
-    GC_ASSERT(heap_cache->cursor + pool_slot_sizes[heap_idx] > heap_cache->cursor_end);
-    GC_ASSERT(heap_cache->next_region == NULL);
+    GC_ASSERT(heap->alloc_cursor >= heap->alloc_cursor_end);
+    GC_ASSERT(heap->alloc_next_region == NULL);
     GC_ASSERT(page->free_slots != 0);
     GC_ASSERT(page->free_region != NULL);
 
-    heap_cache->using_page = page;
+    heap->alloc_using_page = page;
 
     struct free_region *region = page->free_region;
     rb_asan_unpoison_object((VALUE)region, false);
     GC_ASSERT(RB_TYPE_P((VALUE)region, T_NONE));
-    heap_cache->cursor = (uintptr_t)region;
-    heap_cache->region_end = region->end;
-    heap_cache->next_region = region->next;
+    heap->alloc_cursor = (uintptr_t)region;
+    heap->alloc_cursor_end = region->end;
+    heap->alloc_next_region = region->next;
     rb_asan_poison_object((VALUE)region);
-
-    ractor_cache_open_window(objspace, heap_cache, heap_idx);
 
     page->free_slots = 0;
     page->free_region = NULL;
@@ -2752,45 +2724,21 @@ bool
 rb_gc_impl_zjit_new_obj_fastpath(void *objspace_ptr, size_t alloc_size, VALUE flags, VALUE klass,
                                  struct rb_gc_zjit_fastpath *fastpath)
 {
-#if USE_ZJIT
-    size_t heap_idx = 0;
-    size_t slot_size = 0;
-    for (; pool_slot_sizes[heap_idx] != 0; heap_idx++) {
-        if (alloc_size <= pool_slot_sizes[heap_idx]) {
-            slot_size = pool_slot_sizes[heap_idx];
-            break;
-        }
-    }
-    if (slot_size == 0) return false;
-
-    size_t base = offsetof(rb_ractor_newobj_cache_t, heap_caches) +
-                  heap_idx * sizeof(rb_ractor_newobj_heap_cache_t);
-
-    struct rb_gc_zjit_default_new_obj_fastpath default_fastpath = {
-        base + offsetof(rb_ractor_newobj_heap_cache_t, cursor),
-        base + offsetof(rb_ractor_newobj_heap_cache_t, cursor_end),
-        slot_size,
-        flags,
-        klass
-    };
-
-    memset(fastpath, 0, sizeof(*fastpath));
-    fastpath->kind = RB_GC_ZJIT_FASTPATH_DEFAULT;
-    memcpy(fastpath->data.words, &default_fastpath, sizeof(default_fastpath));
-
-    return true;
-#else
+    /* RLGCv2: there is no per-Ractor newobj cache, and in the temporary
+     * shared-objspace mode (until M1) allocations are serialized under
+     * RB_GC_CR_LOCK -- a lock-free bump allocation inlined into JIT code
+     * would bypass that. Report "no fastpath"; the caller falls back to the
+     * ordinary allocation path (same as gc/wbcheck). Per-Ractor objspaces
+     * are single-writer, so a heap-direct fastpath can be offered later. */
     return false;
-#endif
 }
 
-NOINLINE(static VALUE newobj_bump_pointer_miss(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, size_t heap_idx, bool vm_locked));
+
+NOINLINE(static VALUE newobj_refill(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked));
 
 static VALUE
-newobj_bump_pointer_miss(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, size_t heap_idx, bool vm_locked)
+newobj_refill(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked)
 {
-    rb_ractor_newobj_cache_t *cache = gc_cache;
-    rb_ractor_newobj_heap_cache_t *heap_cache = &cache->heap_caches[heap_idx];
     rb_heap_t *heap = &heaps[heap_idx];
     VALUE obj = Qfalse;
 
@@ -2802,6 +2750,74 @@ newobj_bump_pointer_miss(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_c
         unlock_vm = true;
     }
 
+    {
+        if (is_incremental_marking(objspace)) {
+            gc_continue(objspace, heap);
+            objspace->incremental_mark_step_allocated_slots = 0;
+
+            // Retry allocation after resetting incremental_mark_step_allocated_slots
+            obj = heap_alloc_slot(objspace, heap_idx);
+        }
+
+        if (obj == Qfalse) {
+            // Get next free page (possibly running GC)
+            struct heap_page *page = heap_next_free_page(objspace, heap);
+            heap_set_alloc_page(objspace, heap_idx, page);
+
+            // Retry allocation after moving to new page
+            obj = heap_alloc_slot(objspace, heap_idx);
+        }
+    }
+
+    if (unlock_vm) {
+        RB_GC_CR_UNLOCK(lev);
+    }
+
+    if (RB_UNLIKELY(obj == Qfalse)) {
+        rb_memerror();
+    }
+    return obj;
+}
+
+static VALUE
+newobj_alloc(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked)
+{
+    VALUE obj;
+
+    if (!vm_locked && RB_UNLIKELY(rb_gc_multi_ractor_p())) {
+        /* RLGCv2 M0: all Ractors still share this single objspace, and the
+         * heap allocation state has no per-Ractor partitioning anymore, so
+         * a multi-Ractor process serializes the whole allocation.  This
+         * disappears in M1 when each Ractor gets its own objspace (single
+         * writer, no lock). */
+        unsigned int lev = RB_GC_CR_LOCK();
+        {
+            obj = heap_alloc_slot(objspace, heap_idx);
+            if (RB_UNLIKELY(obj == Qfalse)) {
+                obj = newobj_refill(objspace, heap_idx, true);
+            }
+        }
+        RB_GC_CR_UNLOCK(lev);
+    }
+    else {
+        obj = heap_alloc_slot(objspace, heap_idx);
+        if (RB_UNLIKELY(obj == Qfalse)) {
+            obj = newobj_refill(objspace, heap_idx, vm_locked);
+        }
+    }
+
+    return obj;
+}
+
+ALWAYS_INLINE(static VALUE newobj_slowpath(VALUE klass, VALUE flags, rb_objspace_t *objspace, int wb_protected, size_t heap_idx));
+
+static inline VALUE
+newobj_slowpath(VALUE klass, VALUE flags, rb_objspace_t *objspace, int wb_protected, size_t heap_idx)
+{
+    VALUE obj;
+    unsigned int lev;
+
+    lev = RB_GC_CR_LOCK();
     {
         if (RB_UNLIKELY(during_gc || ruby_gc_stressful)) {
             if (during_gc) {
@@ -2820,72 +2836,7 @@ newobj_bump_pointer_miss(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_c
             }
         }
 
-        if (is_incremental_marking(objspace)) {
-            cache->incremental_mark_step_allocated_slots += heap_cache->allocated_objects_count;
-            gc_bump_flush_alloc_count(heap_cache, heap);
-
-            if (cache->incremental_mark_step_allocated_slots >= INCREMENTAL_MARK_STEP_ALLOCATIONS) {
-                gc_continue(objspace, heap);
-                cache->incremental_mark_step_allocated_slots = 0;
-            }
-
-            if (heap_cache->cursor + pool_slot_sizes[heap_idx] <= heap_cache->region_end) {
-                ractor_cache_open_window(objspace, heap_cache, heap_idx);
-                obj = ractor_cache_allocate_slot(objspace, gc_cache, heap_idx);
-            }
-        }
-
-        if (obj == Qfalse) {
-            if (ractor_cache_advance_region(objspace, heap_cache, heap_idx)) {
-                obj = ractor_cache_allocate_slot(objspace, gc_cache, heap_idx);
-            }
-        }
-
-        if (obj == Qfalse) {
-            struct heap_page *page = heap_next_free_page(objspace, heap);
-            ractor_cache_set_page(objspace, gc_cache, heap_idx, page);
-
-            obj = ractor_cache_allocate_slot(objspace, gc_cache, heap_idx);
-        }
-
-        if (RB_UNLIKELY(ruby_gc_stressful)) {
-            heap_cache->cursor_end = heap_cache->cursor;
-        }
-    }
-
-    if (unlock_vm) {
-        RB_GC_CR_UNLOCK(lev);
-    }
-
-    if (RB_UNLIKELY(obj == Qfalse)) {
-        rb_memerror();
-    }
-    return obj;
-}
-
-static VALUE
-newobj_alloc(rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, size_t heap_idx, bool vm_locked)
-{
-    VALUE obj = ractor_cache_allocate_slot(objspace, gc_cache, heap_idx);
-
-    if (RB_UNLIKELY(obj == Qfalse)) {
-        obj = newobj_bump_pointer_miss(objspace, gc_cache, heap_idx, vm_locked);
-    }
-
-    return obj;
-}
-
-ALWAYS_INLINE(static VALUE newobj_slowpath(VALUE klass, VALUE flags, rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, int wb_protected, size_t heap_idx));
-
-static inline VALUE
-newobj_slowpath(VALUE klass, VALUE flags, rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, int wb_protected, size_t heap_idx)
-{
-    VALUE obj;
-    unsigned int lev;
-
-    lev = RB_GC_CR_LOCK();
-    {
-        obj = newobj_alloc(objspace, gc_cache, heap_idx, true);
+        obj = newobj_alloc(objspace, heap_idx, true);
         newobj_init(klass, flags, wb_protected, objspace, obj);
     }
     RB_GC_CR_UNLOCK(lev);
@@ -2894,20 +2845,20 @@ newobj_slowpath(VALUE klass, VALUE flags, rb_objspace_t *objspace, rb_ractor_new
 }
 
 NOINLINE(static VALUE newobj_slowpath_wb_protected(VALUE klass, VALUE flags,
-                                                   rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, size_t heap_idx));
+                                                   rb_objspace_t *objspace, size_t heap_idx));
 NOINLINE(static VALUE newobj_slowpath_wb_unprotected(VALUE klass, VALUE flags,
-                                                     rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, size_t heap_idx));
+                                                     rb_objspace_t *objspace, size_t heap_idx));
 
 static VALUE
-newobj_slowpath_wb_protected(VALUE klass, VALUE flags, rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, size_t heap_idx)
+newobj_slowpath_wb_protected(VALUE klass, VALUE flags, rb_objspace_t *objspace, size_t heap_idx)
 {
-    return newobj_slowpath(klass, flags, objspace, gc_cache, TRUE, heap_idx);
+    return newobj_slowpath(klass, flags, objspace, TRUE, heap_idx);
 }
 
 static VALUE
-newobj_slowpath_wb_unprotected(VALUE klass, VALUE flags, rb_objspace_t *objspace, rb_ractor_newobj_cache_t *gc_cache, size_t heap_idx)
+newobj_slowpath_wb_unprotected(VALUE klass, VALUE flags, rb_objspace_t *objspace, size_t heap_idx)
 {
-    return newobj_slowpath(klass, flags, objspace, gc_cache, FALSE, heap_idx);
+    return newobj_slowpath(klass, flags, objspace, FALSE, heap_idx);
 }
 
 VALUE
@@ -2915,6 +2866,10 @@ rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags
 {
     VALUE obj;
     rb_objspace_t *objspace = objspace_ptr;
+
+    /* RLGCv2: the per-Ractor cache is gone; the parameter remains for ABI
+     * compatibility with other GC implementations (e.g. MMTk). */
+    (void)cache_ptr;
 
     RB_DEBUG_COUNTER_INC(obj_newobj);
     (void)RB_DEBUG_COUNTER_INC_IF(obj_newobj_wb_unprotected, !wb_protected);
@@ -2928,19 +2883,17 @@ rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags
     size_t heap_idx = heap_idx_for_size(alloc_size);
     *actual_alloc_size = heap_slot_size((unsigned char)heap_idx);
 
-    rb_ractor_newobj_cache_t *gc_cache = (rb_ractor_newobj_cache_t *)cache_ptr;
-
     if (!RB_UNLIKELY(during_gc || ruby_gc_stressful) &&
             wb_protected) {
-        obj = newobj_alloc(objspace, gc_cache, heap_idx, false);
+        obj = newobj_alloc(objspace, heap_idx, false);
         newobj_init(klass, flags, wb_protected, objspace, obj);
     }
     else {
         RB_DEBUG_COUNTER_INC(obj_newobj_slowpath);
 
         obj = wb_protected ?
-          newobj_slowpath_wb_protected(klass, flags, objspace, gc_cache, heap_idx) :
-          newobj_slowpath_wb_unprotected(klass, flags, objspace, gc_cache, heap_idx);
+          newobj_slowpath_wb_protected(klass, flags, objspace, heap_idx) :
+          newobj_slowpath_wb_unprotected(klass, flags, objspace, heap_idx);
     }
 
     return obj;
@@ -4186,16 +4139,16 @@ gc_mode_transition(rb_objspace_t *objspace, enum gc_mode mode)
 }
 
 static void
-heap_page_flush_cache_regions(struct heap_page *page, rb_ractor_newobj_heap_cache_t *heap_cache)
+heap_page_flush_alloc_regions(struct heap_page *page, rb_heap_t *heap)
 {
-    struct free_region *chain = heap_cache->next_region;
+    struct free_region *chain = heap->alloc_next_region;
 
-    if (heap_cache->cursor < heap_cache->region_end) {
-        VALUE start = (VALUE)heap_cache->cursor;
+    if (heap->alloc_cursor < heap->alloc_cursor_end) {
+        VALUE start = (VALUE)heap->alloc_cursor;
         rb_asan_unpoison_object(start, false);
         struct free_region *remnant = (struct free_region *)start;
         remnant->flags = 0;
-        remnant->end = heap_cache->region_end;
+        remnant->end = heap->alloc_cursor_end;
         remnant->next = chain;
         rb_asan_poison_object(start);
         chain = remnant;
@@ -4245,44 +4198,27 @@ static void gc_sort_heap_by_compare_func(rb_objspace_t *objspace, gc_compact_com
 static int compare_pinned_slots(const void *left, const void *right, void *d);
 #endif
 
+/* RLGCv2: give the current allocation page/freelist back to its page so the
+ * sweeper sees a consistent heap (was the per-Ractor cache flush). */
 static void
-gc_ractor_newobj_cache_clear(void *c, void *data)
+heap_alloc_state_clear(rb_objspace_t *objspace)
 {
-    rb_objspace_t *objspace = data;
-    rb_ractor_newobj_cache_t *gc_cache = c;
-    rb_ractor_newobj_cache_t *newobj_cache = gc_cache;
-
-    newobj_cache->incremental_mark_step_allocated_slots = 0;
+    objspace->incremental_mark_step_allocated_slots = 0;
 
     for (size_t heap_idx = 0; heap_idx < HEAP_COUNT; heap_idx++) {
-        rb_ractor_newobj_heap_cache_t *cache = &newobj_cache->heap_caches[heap_idx];
-
         rb_heap_t *heap = &heaps[heap_idx];
-        gc_bump_flush_alloc_count(cache, heap);
 
-        struct heap_page *page = cache->using_page;
-        RUBY_DEBUG_LOG("ractor using_page:%p cursor:%p", (void *)page, (void *)cache->cursor);
+        struct heap_page *page = heap->alloc_using_page;
+        RUBY_DEBUG_LOG("heap alloc_using_page:%p cursor:%p", (void *)page, (void *)heap->alloc_cursor);
 
         if (page) {
-            heap_page_flush_cache_regions(page, cache);
+            heap_page_flush_alloc_regions(page, heap);
         }
 
-        cache->using_page = NULL;
-        cache->next_region = NULL;
-        cache->region_end = 0;
-        cache->cursor = 0;
-        cache->cursor_end = 0;
-    }
-}
-
-static void
-gc_ractor_newobj_cache_exhaust(void *c, void *data)
-{
-    rb_ractor_newobj_cache_t *gc_cache = c;
-
-    for (size_t heap_idx = 0; heap_idx < HEAP_COUNT; heap_idx++) {
-        rb_ractor_newobj_heap_cache_t *heap_cache = &gc_cache->heap_caches[heap_idx];
-        heap_cache->cursor_end = heap_cache->cursor;
+        heap->alloc_using_page = NULL;
+        heap->alloc_cursor = 0;
+        heap->alloc_cursor_end = 0;
+        heap->alloc_next_region = NULL;
     }
 }
 
@@ -4393,7 +4329,7 @@ gc_sweep_start(rb_objspace_t *objspace)
         }
     }
 
-    rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_clear, objspace);
+    heap_alloc_state_clear(objspace);
 }
 
 static void
@@ -5851,8 +5787,6 @@ gc_verify_internal_consistency_(rb_objspace_t *objspace)
 
     /* check counters */
 
-    ractor_cache_flush_count(objspace, rb_gc_get_ractor_newobj_cache());
-
     if (!is_lazy_sweeping(objspace) &&
             !finalizing &&
             !rb_gc_multi_ractor_p()) {
@@ -6450,10 +6384,6 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
 
     mark_roots(objspace, NULL);
 
-    if (is_incremental_marking(objspace)) {
-        rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_exhaust, NULL);
-    }
-
     gc_report(1, objspace, "gc_marks_start: (%s) end, stack in %"PRIdSIZE"\n",
               full_mark ? "full" : "minor", mark_stack_size(&objspace->mark_stack));
 }
@@ -6909,22 +6839,24 @@ rb_gc_impl_ractor_cache_alloc(void *objspace_ptr, void *ractor)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
+    /* RLGCv2: no per-Ractor cache.  We still count Ractors for the
+     * heap-growth heuristic and return NULL (gc.c just stores it).  The
+     * count can drift high because some teardown paths skip the free call
+     * for a NULL cache; it only feeds the capped r_mul heuristic and the
+     * whole counter is rethought with per-Ractor objspaces in M1. */
     objspace->live_ractor_cache_count++;
 
-    rb_ractor_newobj_cache_t *gc_cache = calloc1(sizeof(rb_ractor_newobj_cache_t));
-
-    return gc_cache;
+    return NULL;
 }
 
 void
-rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache_ptr)
+rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache)
 {
     rb_objspace_t *objspace = objspace_ptr;
-    rb_ractor_newobj_cache_t *gc_cache = cache_ptr;
 
+    GC_ASSERT(cache == NULL);
+    GC_ASSERT(objspace->live_ractor_cache_count > 0);
     objspace->live_ractor_cache_count--;
-    gc_ractor_newobj_cache_clear(gc_cache, objspace);
-    free(gc_cache);
 }
 
 static void
@@ -8290,7 +8222,6 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
 
     setup_gc_stat_symbols();
 
-    ractor_cache_flush_count(objspace, rb_gc_get_ractor_newobj_cache());
     malloc_increase_local_flush(objspace);
 
     if (RB_TYPE_P(hash_or_sym, T_HASH)) {
@@ -8349,7 +8280,6 @@ rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym)
     SET(oldmalloc_increase_bytes_limit, objspace->rgengc.oldmalloc_increase_limit);
 #endif
 
-    ractor_cache_flush_count(objspace, rb_gc_get_ractor_newobj_cache());
     SET(total_allocated_objects, total_allocated_objects(objspace));
     SET(total_freed_objects, total_freed_objects(objspace));
     SET(heap_available_slots, objspace_available_slots(objspace));
@@ -8463,8 +8393,6 @@ rb_gc_impl_stat_heap(void *objspace_ptr, VALUE heap_name, VALUE hash_or_sym)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
-    ractor_cache_flush_count(objspace, rb_gc_get_ractor_newobj_cache());
-
     setup_gc_stat_heap_symbols();
 
     if (NIL_P(heap_name)) {
@@ -8564,10 +8492,6 @@ rb_gc_impl_stress_set(void *objspace_ptr, VALUE flag)
 
     objspace->flags.gc_stressful = RTEST(flag);
     objspace->gc_stress_mode = flag;
-
-    if (objspace->flags.gc_stressful) {
-        rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_exhaust, NULL);
-    }
 }
 
 static int
@@ -10435,7 +10359,7 @@ rb_gc_impl_after_fork(void *objspace_ptr, rb_pid_t pid)
     objspace->fork_vm_lock_lev = 0;
 
     if (pid == 0) { /* child process */
-        rb_gc_ractor_newobj_cache_foreach(gc_ractor_newobj_cache_clear, objspace);
+        heap_alloc_state_clear(objspace);
     }
 }
 
