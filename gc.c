@@ -251,7 +251,13 @@ rb_gc_event_hook(VALUE obj, rb_event_flag_t event)
 void *
 rb_gc_get_objspace(void)
 {
-    return GET_VM()->gc.objspace;
+    rb_ractor_t *cr = rb_current_ractor_raw(false);
+    if (cr != NULL && cr->objspace != NULL) {
+        return cr->objspace;
+    }
+    /* Early boot or a thread with no current Ractor: fall back to the main
+     * Ractor's objspace.  The VM itself points only at rb_global_objspace. */
+    return GET_VM()->ractor.main_ractor->objspace;
 }
 
 void
@@ -392,7 +398,7 @@ void rb_vm_update_references(void *ptr);
 #define unless_objspace(objspace) \
     void *objspace; \
     rb_vm_t *unless_objspace_vm = GET_VM(); \
-    if (unless_objspace_vm) objspace = unless_objspace_vm->gc.objspace; \
+    if (unless_objspace_vm) objspace = rb_gc_get_objspace(); \
     else /* return; or objspace will be warned uninitialized */
 
 #define RMOVED(obj) ((struct RMoved *)(obj))
@@ -597,6 +603,7 @@ static const char *obj_type_name(VALUE obj);
 
 typedef struct gc_function_map {
     // Bootup
+    void *(*global_objspace_alloc)(void);
     void *(*objspace_alloc)(void);
     void (*objspace_init)(void *objspace_ptr);
     void *(*ractor_cache_alloc)(void *objspace_ptr, void *ractor);
@@ -777,6 +784,7 @@ ruby_modular_gc_init(void)
 } while (0)
 
     // Bootup
+    load_modular_gc_func(global_objspace_alloc);
     load_modular_gc_func(objspace_alloc);
     load_modular_gc_func(objspace_init);
     load_modular_gc_func(ractor_cache_alloc);
@@ -866,6 +874,7 @@ ruby_modular_gc_init(void)
 }
 
 // Bootup
+# define rb_gc_impl_global_objspace_alloc rb_gc_functions.global_objspace_alloc
 # define rb_gc_impl_objspace_alloc rb_gc_functions.objspace_alloc
 # define rb_gc_impl_objspace_init rb_gc_functions.objspace_init
 # define rb_gc_impl_ractor_cache_alloc rb_gc_functions.ractor_cache_alloc
@@ -964,8 +973,16 @@ rb_objspace_alloc(void)
     ruby_modular_gc_init();
 #endif
 
+    rb_vm_t *vm = ruby_current_vm_ptr;
+
+    /* The VM points only at rb_global_objspace; the boot objspace belongs
+     * to the main Ractor (design_v2.md §1.1).  Init_BareVM allocates the
+     * main Ractor before calling us. */
+    vm->gc.global_objspace = rb_gc_impl_global_objspace_alloc();
+
     void *objspace = rb_gc_impl_objspace_alloc();
-    ruby_current_vm_ptr->gc.objspace = objspace;
+    RUBY_ASSERT(vm->ractor.main_ractor != NULL);
+    vm->ractor.main_ractor->objspace = objspace;
     rb_gc_impl_objspace_init(objspace);
     rb_gc_impl_stress_set(objspace, initial_stress);
 
@@ -2625,7 +2642,7 @@ ruby_stack_check(void)
     if (!RB_SPECIAL_CONST_P(obj)) { \
         struct gc_mark_func_data_struct **mfdp = GC_MARK_FUNC_DATA_SLOTP(); \
         struct gc_mark_func_data_struct *mark_func_data = *mfdp; \
-        void *objspace = GET_VM()->gc.objspace; \
+        void *objspace = rb_gc_get_objspace(); \
         if (LIKELY(mark_func_data == NULL)) { \
             GC_ASSERT(rb_gc_impl_during_gc_p(objspace)); \
             (func)(objspace, (obj_or_ptr)); \
@@ -4571,8 +4588,6 @@ rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE,
 {
     if (rb_gc_impl_during_gc_p(rb_gc_get_objspace())) rb_bug("rb_gc_impl_objspace_reachable_objects_from_root() is not supported while during GC");
 
-    rb_vm_t *vm = GET_VM();
-
     struct root_objects_data data = {
         .func = func,
         .data = passing_data,
@@ -4587,7 +4602,7 @@ rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE,
 
     *mfdp = &mfd;
     rb_gc_save_machine_context();
-    rb_gc_mark_roots(vm->gc.objspace, &data.category);
+    rb_gc_mark_roots(rb_gc_get_objspace(), &data.category);
     *mfdp = prev_mfd;
 }
 

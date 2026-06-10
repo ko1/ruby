@@ -3522,7 +3522,7 @@ ruby_vm_destruct(rb_vm_t *vm)
             thread_free(th);
         }
 
-        struct rb_objspace *objspace = vm->gc.objspace;
+        void *objspace = vm->ractor.main_ractor ? vm->ractor.main_ractor->objspace : NULL;
 
         rb_vm_living_threads_init(vm);
         ruby_vm_run_at_exit_hooks(vm);
@@ -4689,7 +4689,7 @@ Init_VM(void)
         rb_define_global_const("TOPLEVEL_BINDING", rb_binding_new());
 
 #ifdef _WIN32
-        rb_objspace_gc_enable(vm->gc.objspace);
+        rb_objspace_gc_enable(rb_gc_get_objspace());
 #endif
     }
     vm_init_redefined_flag();
@@ -4737,7 +4737,11 @@ Init_BareVM(void)
     vm_init2(vm);
 
     ruby_current_vm_ptr = vm;
+    /* RLGCv2: the boot objspace belongs to the main Ractor, so the main
+     * Ractor must exist before rb_objspace_alloc assigns it. */
+    vm->ractor.main_ractor = rb_ractor_main_alloc();
     rb_objspace_alloc();
+    vm->ractor.main_ractor->newobj_cache = rb_gc_ractor_cache_alloc(vm->ractor.main_ractor);
     rb_id_table_init(&vm->negative_cme_table, 16);
     st_init_existing_numtable_with_size(&vm->overloaded_cme_table, 0);
     st_init_existing_strtable_with_size(&vm->static_ext_inits, 0);
@@ -4746,7 +4750,7 @@ Init_BareVM(void)
 
     // setup main thread
     th->nt = ZALLOC(struct rb_native_thread);
-    th->ractor = vm->ractor.main_ractor = rb_ractor_main_alloc();
+    th->ractor = vm->ractor.main_ractor;
     Init_native_thread(th);
     rb_jit_cont_init();
     th_init(th, 0, vm);

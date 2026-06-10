@@ -807,12 +807,11 @@ typedef struct rb_vm_struct {
     int coverage_mode;
 
     struct {
-        struct rb_objspace *objspace;
+        /* RLGCv2: the VM points only at rb_global_objspace (process-wide GC
+         * data such as the page pool).  Each Ractor owns its rb_objspace via
+         * r->objspace; the boot objspace belongs to the main Ractor. */
+        struct rb_global_objspace *global_objspace;
 #if USE_MODULAR_GC
-        /* A modular GC (e.g. MMTk) may mark on worker threads that have no
-         * current EC, so the traversal mark redirect must be reachable without
-         * a Ractor and lives here.  Otherwise it is per-Ractor
-         * (rb_ractor_t.mark_func_data). */
         struct gc_mark_func_data_struct *mark_func_data;
 #endif
     } gc;

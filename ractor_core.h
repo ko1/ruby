@@ -123,6 +123,11 @@ struct rb_ractor_struct {
     bool malloc_gc_disabled;
     bool main_ractor;
     void *newobj_cache;
+
+    /* RLGCv2: this Ractor's objspace.  The main Ractor receives the boot
+     * objspace in rb_objspace_alloc; non-main Ractors share the main
+     * objspace (NULL here) until M1 gives each Ractor its own. */
+    void *objspace;
 }; // rb_ractor_t is defined in vm_core.h
 
 enum ractor_wakeup_status {

@@ -796,6 +796,14 @@ global_objspace_init(void)
     }
 }
 
+void *
+rb_gc_impl_global_objspace_alloc(void)
+{
+    global_objspace_init();
+
+    return global_objspace;
+}
+
 #ifndef HEAP_PAGE_ALIGN_LOG
 /* default tiny heap size: 64KiB */
 #define HEAP_PAGE_ALIGN_LOG 16
