@@ -227,6 +227,39 @@ mark_targeted_hook_list(st_data_t key, st_data_t value, st_data_t _arg)
 }
 
 static void
+ractor_mark_unshareable_parts(rb_ractor_t *r)
+{
+    rb_gc_mark(r->r_stdin);
+    rb_gc_mark(r->r_stdout);
+    rb_gc_mark(r->r_stderr);
+    rb_gc_mark(r->verbose);
+    rb_gc_mark(r->debug);
+
+    // mark received messages
+    ractor_sync_mark(r);
+
+    rb_hook_list_mark(&r->pub.hooks);
+    if (r->pub.targeted_hooks.num_entries) {
+        st_foreach(&r->pub.targeted_hooks, mark_targeted_hook_list, 0);
+    }
+
+    if (r->threads.cnt > 0) {
+        rb_thread_t *th = 0;
+        ccan_list_for_each(&r->threads.set, th, lt_node) {
+            VM_ASSERT(th != NULL);
+            rb_gc_mark(th->self);
+            /* RLGCv2: also mark the execution context directly.  Under a
+             * confined GC the Thread wrapper may live in another objspace
+             * (until it is re-homed), in which case its mark function does
+             * not run here, yet the stacks must stay alive. */
+            if (th->ec) rb_execution_context_mark(th->ec);
+        }
+    }
+
+    ractor_local_storage_mark(r);
+}
+
+static void
 ractor_mark(void *ptr)
 {
     rb_ractor_t *r = (rb_ractor_t *)ptr;
@@ -237,30 +270,20 @@ ractor_mark(void *ptr)
 
     if (!checking_shareable) {
         // may unshareable objects
-        rb_gc_mark(r->r_stdin);
-        rb_gc_mark(r->r_stdout);
-        rb_gc_mark(r->r_stderr);
-        rb_gc_mark(r->verbose);
-        rb_gc_mark(r->debug);
-
-        // mark received messages
-        ractor_sync_mark(r);
-
-        rb_hook_list_mark(&r->pub.hooks);
-        if (r->pub.targeted_hooks.num_entries) {
-            st_foreach(&r->pub.targeted_hooks, mark_targeted_hook_list, 0);
-        }
-
-        if (r->threads.cnt > 0) {
-            rb_thread_t *th = 0;
-            ccan_list_for_each(&r->threads.set, th, lt_node) {
-                VM_ASSERT(th != NULL);
-                rb_gc_mark(th->self);
-            }
-        }
-
-        ractor_local_storage_mark(r);
+        ractor_mark_unshareable_parts(r);
     }
+}
+
+/* RLGCv2 (design_v2.md §2.1): mark the GC roots of Ractor r that are
+ * reachable from its C structure.  A confined GC cannot rely on the heap
+ * Ractor/Thread wrapper objects (they may live in another objspace), so the
+ * current Ractor's belongings are rooted directly from here. */
+void
+rb_ractor_mark_local_roots(rb_ractor_t *r)
+{
+    rb_gc_mark(r->loc);
+    rb_gc_mark(r->name);
+    ractor_mark_unshareable_parts(r);
 }
 
 static int
