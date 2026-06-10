@@ -1195,6 +1195,12 @@ rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj)
 }
 
 void
+rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
+{
+    /* RLGCv2: MMTk does not track per-page shareable bits. */
+}
+
+void
 rb_gc_impl_writebarrier_remember(void *objspace_ptr, VALUE obj)
 {
     struct MMTk_ractor_cache *cache = rb_gc_get_ractor_newobj_cache();
