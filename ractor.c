@@ -481,6 +481,7 @@ ractor_alloc(VALUE klass)
     rb_ractor_t *r;
     VALUE rv = TypedData_Make_Struct(klass, rb_ractor_t, &ractor_data_type, r);
     FL_SET_RAW(rv, RUBY_FL_SHAREABLE);
+    rb_gc_obj_became_shareable(rv);
     r->pub.self = rv;
     r->next_ec_serial = 1;
     VM_ASSERT(ractor_status_p(r, ractor_created));
@@ -580,6 +581,7 @@ rb_ractor_main_setup(rb_vm_t *vm, rb_ractor_t *r, rb_thread_t *th)
 {
     VALUE rv = r->pub.self = TypedData_Wrap_Struct(rb_cRactor, &ractor_data_type, r);
     FL_SET_RAW(r->pub.self, RUBY_FL_SHAREABLE);
+    rb_gc_obj_became_shareable(r->pub.self);
     ractor_init(r, Qnil, Qnil);
     r->threads.main = th;
     rb_ractor_living_threads_insert(r, th);
@@ -1188,12 +1190,14 @@ static void
 rb_obj_set_shareable_no_assert(VALUE obj)
 {
     FL_SET_RAW(obj, FL_SHAREABLE);
+    rb_gc_obj_became_shareable(obj);
 
     if (rb_obj_gen_fields_p(obj)) {
         VALUE fields = rb_obj_fields_no_ractor_check(obj);
         if (imemo_type_p(fields, imemo_fields)) {
             // no recursive mark
             FL_SET_RAW(fields, FL_SHAREABLE);
+            rb_gc_obj_became_shareable(fields);
         }
     }
 }
