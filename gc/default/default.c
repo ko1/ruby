@@ -2830,28 +2830,12 @@ newobj_refill(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked)
 static VALUE
 newobj_alloc(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked)
 {
-    VALUE obj;
+    /* RLGCv2 (design_v2.md §3): the objspace belongs to the current Ractor
+     * and has a single writer, so the fast path needs no lock at all. */
+    VALUE obj = heap_alloc_slot(objspace, heap_idx);
 
-    if (!vm_locked && RB_UNLIKELY(rb_gc_multi_ractor_p())) {
-        /* RLGCv2 M0: all Ractors still share this single objspace, and the
-         * heap allocation state has no per-Ractor partitioning anymore, so
-         * a multi-Ractor process serializes the whole allocation.  This
-         * disappears in M1 when each Ractor gets its own objspace (single
-         * writer, no lock). */
-        unsigned int lev = RB_GC_CR_LOCK();
-        {
-            obj = heap_alloc_slot(objspace, heap_idx);
-            if (RB_UNLIKELY(obj == Qfalse)) {
-                obj = newobj_refill(objspace, heap_idx, true);
-            }
-        }
-        RB_GC_CR_UNLOCK(lev);
-    }
-    else {
-        obj = heap_alloc_slot(objspace, heap_idx);
-        if (RB_UNLIKELY(obj == Qfalse)) {
-            obj = newobj_refill(objspace, heap_idx, vm_locked);
-        }
+    if (RB_UNLIKELY(obj == Qfalse)) {
+        obj = newobj_refill(objspace, heap_idx, vm_locked);
     }
 
     return obj;
@@ -3383,7 +3367,11 @@ finalize_deferred(rb_objspace_t *objspace)
 static void
 gc_finalize_deferred(void *dmy)
 {
-    rb_objspace_t *objspace = dmy;
+    /* RLGCv2: one shared postponed job serves every objspace (the
+     * preregistration table holds only ~32 entries while Ractors churn).
+     * Deferred finalizers belong to the objspace of the thread that
+     * triggered the job -- the current one. */
+    rb_objspace_t *objspace = rb_gc_get_objspace();
     if (RUBY_ATOMIC_EXCHANGE(finalizing, 1)) return;
 
     finalize_deferred(objspace);
@@ -5599,6 +5587,10 @@ check_generation_i(const VALUE child, void *ptr)
 
     if (RGENGC_CHECK_MODE) GC_ASSERT(RVALUE_OLD_P(data->objspace, parent));
 
+    /* RLGCv2: a cross-objspace edge is kept alive by the shareable/shref
+     * machinery, not by this objspace's remembered set. */
+    if (GET_HEAP_OBJSPACE(child) != data->objspace) return;
+
     if (!RVALUE_OLD_P(data->objspace, child)) {
         if (!RVALUE_REMEMBERED(data->objspace, parent) &&
             !RVALUE_REMEMBERED(data->objspace, child) &&
@@ -5626,6 +5618,11 @@ static void
 check_children_i(const VALUE child, void *ptr)
 {
     struct verify_internal_consistency_struct *data = (struct verify_internal_consistency_struct *)ptr;
+
+    /* RLGCv2: consistency rules are per-objspace; a foreign child is
+     * checked by its owner. */
+    if (GET_HEAP_OBJSPACE(child) != data->objspace) return;
+
     if (check_rvalue_consistency_force(data->objspace, child, FALSE) != 0) {
         fprintf(stderr, "check_children_i: %s has error (referenced from %s)",
                 rb_obj_info(child), rb_obj_info(data->parent));
@@ -6415,6 +6412,10 @@ rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
 {
     struct heap_page *page = NULL;
 
+    /* This runs before mark_roots: give rgengc_check_relation a valid
+     * (no) parent instead of the poisoned one left by the previous GC. */
+    gc_mark_set_parent_raw(objspace, Qundef, false);
+
     ccan_list_for_each(&heap->pages, page, page_node) {
         if (!(page->has_shareable_objects | page->has_shref_objects)) continue;
 
@@ -6429,8 +6430,20 @@ rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             while (bitset) {
                 if (bitset & 1) {
                     VALUE obj = (VALUE)pp;
-                    gc_report(2, objspace, "rlgc_pinned_roots_mark: mark %s\n", rb_obj_info(obj));
-                    gc_mark(objspace, obj);
+                    asan_unpoisoning_object(obj) {
+                        switch (BUILTIN_TYPE(obj)) {
+                          case T_NONE:
+                          case T_ZOMBIE:
+                          case T_MOVED:
+                            /* a dead slot (e.g. a zombie awaiting its
+                             * finalizer) is not a root */
+                            break;
+                          default:
+                            gc_report(2, objspace, "rlgc_pinned_roots_mark: mark %s\n", rb_obj_info(obj));
+                            gc_mark(objspace, obj);
+                            break;
+                        }
+                    }
                 }
                 pp += slot_size;
                 bitset >>= 1;
@@ -6836,6 +6849,19 @@ rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
     struct heap_page *page = GET_HEAP_PAGE(obj);
     _MARK_IN_BITMAP(page->shareable_bits, page, obj);
     page->has_shareable_objects = TRUE;
+}
+
+void
+rb_gc_impl_pin_in_flight_message(void *objspace_ptr, VALUE obj)
+{
+    if (RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE)) return; /* pinned anyway */
+
+    /* The sender owns the payload's page (containment): plain stores. */
+    struct heap_page *page = GET_HEAP_PAGE(obj);
+    if (!_MARKED_IN_BITMAP(page->shref_bits, page, obj)) {
+        _MARK_IN_BITMAP(page->shref_bits, page, obj);
+        page->has_shref_objects = TRUE;
+    }
 }
 
 void
@@ -10577,7 +10603,8 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
 #ifdef MALLOC_COUNTERS_NEED_LOCK
     rb_native_mutex_initialize(&objspace->malloc_counters.lock);
 #endif
-    objspace->finalize_deferred_pjob = rb_postponed_job_preregister(0, gc_finalize_deferred, objspace);
+    /* Shared across objspaces; preregister dedupes on (func, data). */
+    objspace->finalize_deferred_pjob = rb_postponed_job_preregister(0, gc_finalize_deferred, NULL);
     if (objspace->finalize_deferred_pjob == POSTPONED_JOB_HANDLE_INVALID) {
         rb_bug("Could not preregister postponed job for GC");
     }

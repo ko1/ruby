@@ -635,6 +635,7 @@ typedef struct gc_function_map {
     void (*writebarrier_unprotect)(void *objspace_ptr, VALUE obj);
     void (*writebarrier_remember)(void *objspace_ptr, VALUE obj);
     void (*obj_became_shareable)(void *objspace_ptr, VALUE obj);
+    void (*pin_in_flight_message)(void *objspace_ptr, VALUE obj);
     // Heap walking
     void (*each_objects)(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
     void (*each_object)(void *objspace_ptr, void (*func)(VALUE obj, void *data), void *data);
@@ -817,6 +818,7 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(writebarrier_unprotect);
     load_modular_gc_func(writebarrier_remember);
     load_modular_gc_func(obj_became_shareable);
+    load_modular_gc_func(pin_in_flight_message);
     // Heap walking
     load_modular_gc_func(each_objects);
     load_modular_gc_func(each_object);
@@ -908,6 +910,7 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_writebarrier_unprotect rb_gc_functions.writebarrier_unprotect
 # define rb_gc_impl_writebarrier_remember rb_gc_functions.writebarrier_remember
 # define rb_gc_impl_obj_became_shareable rb_gc_functions.obj_became_shareable
+# define rb_gc_impl_pin_in_flight_message rb_gc_functions.pin_in_flight_message
 // Heap walking
 # define rb_gc_impl_each_objects rb_gc_functions.each_objects
 # define rb_gc_impl_each_object rb_gc_functions.each_object
@@ -972,6 +975,21 @@ rb_objspace_alloc(void)
 #ifdef RUBY_ASAN_ENABLED
     __sanitizer_set_death_callback(asan_death_callback);
 #endif
+
+    return objspace;
+}
+
+/* RLGCv2 (design_v2.md §1.1): allocate the objspace of a new (non-main)
+ * Ractor.  Called on the creating Ractor's thread before the new Ractor
+ * starts running; GC knobs are inherited from the creator. */
+void *
+rb_gc_objspace_alloc_local(void)
+{
+    void *parent_objspace = rb_gc_get_objspace();
+
+    void *objspace = rb_gc_impl_objspace_alloc();
+    rb_gc_impl_objspace_init(objspace);
+    rb_gc_impl_stress_set(objspace, rb_gc_impl_stress_get(parent_objspace));
 
     return objspace;
 }
@@ -3442,6 +3460,17 @@ void
 rb_gc_obj_became_shareable(VALUE obj)
 {
     rb_gc_impl_obj_became_shareable(rb_gc_get_objspace(), obj);
+}
+
+/* RLGCv2 (design_v2.md §4.2): pin an in-flight message payload in its
+ * owner's (the sender's) objspace so a confined GC keeps it alive while it
+ * sits in a queue the sender never scans. */
+void
+rb_gc_pin_in_flight_message(VALUE obj)
+{
+    if (RB_SPECIAL_CONST_P(obj)) return;
+
+    rb_gc_impl_pin_in_flight_message(rb_gc_get_objspace(), obj);
 }
 
 void

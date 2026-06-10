@@ -46,7 +46,30 @@ VALUE
 rb_imemo_new(enum imemo_type type, VALUE v0, size_t size, bool is_shareable)
 {
     VALUE flags = T_IMEMO | (type << FL_USHIFT) | (is_shareable ? FL_SHAREABLE : 0);
-    return rb_newobj_of(v0, flags, size);
+    VALUE obj = rb_newobj_of(v0, flags, size);
+
+    if (!is_shareable) {
+        /* RLGCv2 (design_v2.md 決定17): method/inline-cache VM internals are
+         * referenced across Ractors (e.g. a method defined by one Ractor on
+         * a shareable class is called by another), so a confined GC must
+         * never free them; only the global GC can.  Pin them via the
+         * per-page shareable bitmap.  Setting FL_SHAREABLE itself is a
+         * follow-up (it needs the checking_shareable gates that classes
+         * already have for their unshareable parts). */
+        switch (type) {
+          case imemo_ment:
+          case imemo_callcache:
+          case imemo_callinfo:
+          case imemo_constcache:
+          case imemo_iseq:
+            rb_gc_obj_became_shareable(obj);
+            break;
+          default:
+            break;
+        }
+    }
+
+    return obj;
 }
 
 VALUE
