@@ -700,12 +700,16 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
             r->r_stdout = rb_io_prep_stdout();
             r->r_stderr = rb_io_prep_stderr();
 
-            /* Build the interrupt queue and mask stack here, on the new Ractor's
-             * own main thread, instead of carrying over the ones the creating
-             * thread made. The mask stack starts empty so a new Ractor does not
-             * inherit the creating thread's Thread.handle_interrupt state. */
+            /* RLGCv2 (design_v2.md §1.5): the interrupt queue/mask stack and
+             * the Thread wrapper were created by the parent's thread
+             * (thread_create_core / rb_thread_alloc), i.e. in the parent's
+             * objspace.  Re-create them here so this Ractor's main thread is
+             * made of objects it owns.  The mask stack starts empty on
+             * purpose: inheriting it would carry references to the parent's
+             * unshareable mask Hashes. */
             th->pending_interrupt_queue = rb_ary_hidden_new(0);
             th->pending_interrupt_mask_stack = rb_ary_hidden_new(0);
+            rb_thread_rewrap_for_ractor(th);
         }
         RB_VM_UNLOCK();
     }
@@ -881,9 +885,9 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
                  "can't start a new thread (frozen ThreadGroup)");
     }
 
-    /* A new Ractor must not inherit the creating thread's fiber storage: its
-     * entries may be objects owned by the creating Ractor. Only threads created
-     * within the same Ractor inherit it. */
+    /* RLGCv2 (design_v2.md §1.5): a new Ractor does not inherit fiber
+     * storage -- the entries may be unshareable objects owned by the
+     * creating Ractor, which the new Ractor must never reference. */
     if (params->type != thread_invoke_type_ractor_proc) {
         rb_fiber_inherit_storage(ec, th->ec->fiber_ptr);
     }
