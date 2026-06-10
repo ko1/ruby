@@ -500,7 +500,9 @@ rb_ractor_t *
 rb_ractor_main_alloc(void)
 {
     rb_ractor_t *r = &_main_ractor;
-    r->newobj_cache = rb_gc_ractor_cache_alloc(r);
+    /* RLGCv2: the main Ractor is allocated before the objspace exists, so
+     * the newobj cache is created later in Init_BareVM, after
+     * rb_objspace_alloc assigned r->objspace. */
     ruby_single_main_ractor = r;
 
     return r;
