@@ -798,7 +798,10 @@ typedef struct rb_vm_struct {
     int coverage_mode;
 
     struct {
-        struct rb_objspace *objspace;
+        /* RLGCv2: the VM points only at rb_global_objspace (process-wide GC
+         * data such as the page pool).  Each Ractor owns its rb_objspace via
+         * r->objspace; the boot objspace belongs to the main Ractor. */
+        struct rb_global_objspace *global_objspace;
         struct gc_mark_func_data_struct {
             void *data;
             void (*mark_func)(VALUE v, void *data);

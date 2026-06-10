@@ -571,6 +571,15 @@ rb_mmtk_builder_init(void)
 }
 
 void *
+rb_gc_impl_global_objspace_alloc(void)
+{
+    /* RLGCv2: MMTk does not use rb_global_objspace yet; return a non-NULL
+     * placeholder so boot can store it. */
+    static char rlgc_global_objspace_placeholder;
+    return &rlgc_global_objspace_placeholder;
+}
+
+void *
 rb_gc_impl_objspace_alloc(void)
 {
     MMTk_Builder *builder = rb_mmtk_builder_init();
