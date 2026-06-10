@@ -750,6 +750,49 @@ typedef struct rb_objspace {
     struct rb_gc_vm_context vm_context;
 } rb_objspace_t;
 
+/* RLGCv2 (see RLGC_DOC/design_v2.md §1.2): the only VM-global GC structure.
+ * For now it holds just the page pool: heap page bodies for every objspace
+ * are carved out of large mmap'd arenas and recycled through a process-wide
+ * freelist, so pages released by one objspace can be reused by another, and
+ * per-page mmap/munmap (which serializes every thread on the kernel's
+ * process-wide mmap_lock) is avoided.  The lock is a leaf lock: page-grained
+ * operations only, no allocation and no GC while holding it. */
+struct rlgc_page_arena {
+    struct rlgc_page_arena *next;
+    char *start;                /* HEAP_PAGE_ALIGN-aligned usable area */
+    size_t size;                /* usable bytes (multiple of HEAP_PAGE_SIZE) */
+};
+
+typedef struct rb_global_objspace {
+    struct {
+        rb_nativethread_lock_t lock;
+        struct heap_page_body *freelist; /* recycled bodies; the next pointer is stored in the body itself */
+        struct rlgc_page_arena *arenas;  /* all arenas, newest first */
+        char *arena_cursor;              /* next uncarved body in the newest arena */
+        char *arena_end;
+    } page_pool;
+} rb_global_objspace_t;
+
+static rb_global_objspace_t rb_global_objspace_instance;
+static rb_global_objspace_t *global_objspace = NULL;
+
+static struct heap_page_body *page_pool_acquire(void);
+static void page_pool_release(struct heap_page_body *body);
+
+static void
+global_objspace_init(void)
+{
+    if (global_objspace == NULL) {
+        rb_global_objspace_t *g = &rb_global_objspace_instance;
+        rb_native_mutex_initialize(&g->page_pool.lock);
+        g->page_pool.freelist = NULL;
+        g->page_pool.arenas = NULL;
+        g->page_pool.arena_cursor = NULL;
+        g->page_pool.arena_end = NULL;
+        global_objspace = g;
+    }
+}
+
 #ifndef HEAP_PAGE_ALIGN_LOG
 /* default tiny heap size: 64KiB */
 #define HEAP_PAGE_ALIGN_LOG 16
@@ -1964,17 +2007,7 @@ heap_page_body_free(struct heap_page_body *page_body)
 {
     GC_ASSERT((uintptr_t)page_body % HEAP_PAGE_ALIGN == 0);
 
-    if (HEAP_PAGE_ALLOC_USE_MMAP) {
-#ifdef HAVE_MMAP
-        GC_ASSERT(HEAP_PAGE_SIZE % sysconf(_SC_PAGE_SIZE) == 0);
-        if (munmap(page_body, HEAP_PAGE_SIZE)) {
-            rb_bug("heap_page_body_free: munmap failed");
-        }
-#endif
-    }
-    else {
-        gc_aligned_free(page_body, HEAP_PAGE_SIZE);
-    }
+    page_pool_release(page_body);
 }
 
 static void
@@ -2064,61 +2097,138 @@ gc_aligned_malloc(size_t alignment, size_t size)
     return res;
 }
 
-static struct heap_page_body *
-heap_page_body_allocate(void)
+/* RLGCv2 page pool (global_objspace->page_pool): every heap page body is
+ * carved out of a large arena and recycled through the pool freelist. */
+
+#define PAGE_POOL_ARENA_SIZE (HEAP_PAGE_SIZE * 32) /* 2MiB with 64KiB pages */
+
+#ifdef HAVE_MMAP
+/* Map a new arena and make it the carving source.  Called with the pool
+ * lock held; the previous arena is always fully carved at this point. */
+static bool
+page_pool_add_arena(rb_global_objspace_t *g)
 {
-    struct heap_page_body *page_body;
+    GC_ASSERT(HEAP_PAGE_ALIGN % sysconf(_SC_PAGE_SIZE) == 0);
+
+    size_t mmap_size = PAGE_POOL_ARENA_SIZE + HEAP_PAGE_ALIGN;
+    char *ptr = mmap(NULL, mmap_size,
+                     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        return false;
+    }
+
+    // If we are building `default.c` as part of the ruby executable, we
+    // may just call `ruby_annotate_mmap`.  But if we are building
+    // `default.c` as a shared library, we will not have access to private
+    // symbols, and we have to either call prctl directly or make our own
+    // wrapper.
+#if defined(HAVE_SYS_PRCTL_H) && defined(PR_SET_VMA) && defined(PR_SET_VMA_ANON_NAME)
+    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ptr, mmap_size, "Ruby:GC:default:page_pool_arena");
+    errno = 0;
+#endif
+
+    /* Trim the unaligned head and tail so the usable area is
+     * HEAP_PAGE_ALIGN-aligned. */
+    char *aligned = ptr + HEAP_PAGE_ALIGN;
+    aligned -= ((uintptr_t)aligned & (HEAP_PAGE_ALIGN - 1));
+    GC_ASSERT(aligned > ptr);
+    GC_ASSERT(aligned <= ptr + HEAP_PAGE_ALIGN);
+
+    size_t start_out_of_range_size = aligned - ptr;
+    GC_ASSERT(start_out_of_range_size % sysconf(_SC_PAGE_SIZE) == 0);
+    if (start_out_of_range_size > 0) {
+        if (munmap(ptr, start_out_of_range_size)) {
+            rb_bug("page_pool_add_arena: munmap failed for start");
+        }
+    }
+
+    size_t end_out_of_range_size = HEAP_PAGE_ALIGN - start_out_of_range_size;
+    GC_ASSERT(end_out_of_range_size % sysconf(_SC_PAGE_SIZE) == 0);
+    if (end_out_of_range_size > 0) {
+        if (munmap(aligned + PAGE_POOL_ARENA_SIZE, end_out_of_range_size)) {
+            rb_bug("page_pool_add_arena: munmap failed for end");
+        }
+    }
+
+    struct rlgc_page_arena *arena = calloc1(sizeof(struct rlgc_page_arena));
+    if (arena == NULL) {
+        if (munmap(aligned, PAGE_POOL_ARENA_SIZE)) {
+            rb_bug("page_pool_add_arena: munmap failed for arena");
+        }
+        return false;
+    }
+    arena->start = aligned;
+    arena->size = PAGE_POOL_ARENA_SIZE;
+    arena->next = g->page_pool.arenas;
+    g->page_pool.arenas = arena;
+
+    g->page_pool.arena_cursor = aligned;
+    g->page_pool.arena_end = aligned + PAGE_POOL_ARENA_SIZE;
+
+    return true;
+}
+#endif
+
+static struct heap_page_body *
+page_pool_acquire(void)
+{
+    struct heap_page_body *body = NULL;
 
     if (HEAP_PAGE_ALLOC_USE_MMAP) {
 #ifdef HAVE_MMAP
-        GC_ASSERT(HEAP_PAGE_ALIGN % sysconf(_SC_PAGE_SIZE) == 0);
+        rb_global_objspace_t *g = global_objspace;
 
-        size_t mmap_size = HEAP_PAGE_ALIGN + HEAP_PAGE_SIZE;
-        char *ptr = mmap(NULL, mmap_size,
-                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (ptr == MAP_FAILED) {
-            return NULL;
+        rb_native_mutex_lock(&g->page_pool.lock);
+        if (g->page_pool.freelist != NULL) {
+            body = g->page_pool.freelist;
+            asan_unpoison_memory_region(body, sizeof(struct heap_page_body *), false);
+            g->page_pool.freelist = *(struct heap_page_body **)body;
         }
-
-        // If we are building `default.c` as part of the ruby executable, we
-        // may just call `ruby_annotate_mmap`.  But if we are building
-        // `default.c` as a shared library, we will not have access to private
-        // symbols, and we have to either call prctl directly or make our own
-        // wrapper.
-#if defined(HAVE_SYS_PRCTL_H) && defined(PR_SET_VMA) && defined(PR_SET_VMA_ANON_NAME)
-        prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ptr, mmap_size, "Ruby:GC:default:heap_page_body_allocate");
-        errno = 0;
-#endif
-
-        char *aligned = ptr + HEAP_PAGE_ALIGN;
-        aligned -= ((VALUE)aligned & (HEAP_PAGE_ALIGN - 1));
-        GC_ASSERT(aligned > ptr);
-        GC_ASSERT(aligned <= ptr + HEAP_PAGE_ALIGN);
-
-        size_t start_out_of_range_size = aligned - ptr;
-        GC_ASSERT(start_out_of_range_size % sysconf(_SC_PAGE_SIZE) == 0);
-        if (start_out_of_range_size > 0) {
-            if (munmap(ptr, start_out_of_range_size)) {
-                rb_bug("heap_page_body_allocate: munmap failed for start");
-            }
+        else if (g->page_pool.arena_cursor != g->page_pool.arena_end ||
+                 page_pool_add_arena(g)) {
+            GC_ASSERT(g->page_pool.arena_cursor + HEAP_PAGE_SIZE <= g->page_pool.arena_end);
+            body = (struct heap_page_body *)g->page_pool.arena_cursor;
+            g->page_pool.arena_cursor += HEAP_PAGE_SIZE;
         }
+        rb_native_mutex_unlock(&g->page_pool.lock);
 
-        size_t end_out_of_range_size = HEAP_PAGE_ALIGN - start_out_of_range_size;
-        GC_ASSERT(end_out_of_range_size % sysconf(_SC_PAGE_SIZE) == 0);
-        if (end_out_of_range_size > 0) {
-            if (munmap(aligned + HEAP_PAGE_SIZE, end_out_of_range_size)) {
-                rb_bug("heap_page_body_allocate: munmap failed for end");
-            }
+        if (body != NULL) {
+            asan_unpoison_memory_region(body, HEAP_PAGE_SIZE, false);
         }
-
-        page_body = (struct heap_page_body *)aligned;
 #endif
     }
     else {
-        page_body = gc_aligned_malloc(HEAP_PAGE_ALIGN, HEAP_PAGE_SIZE);
+        body = gc_aligned_malloc(HEAP_PAGE_ALIGN, HEAP_PAGE_SIZE);
     }
 
-    GC_ASSERT((uintptr_t)page_body % HEAP_PAGE_ALIGN == 0);
+    return body;
+}
+
+static void
+page_pool_release(struct heap_page_body *body)
+{
+    if (HEAP_PAGE_ALLOC_USE_MMAP) {
+#ifdef HAVE_MMAP
+        rb_global_objspace_t *g = global_objspace;
+
+        rb_native_mutex_lock(&g->page_pool.lock);
+        *(struct heap_page_body **)body = g->page_pool.freelist;
+        g->page_pool.freelist = body;
+        asan_poison_memory_region(body, HEAP_PAGE_SIZE);
+        rb_native_mutex_unlock(&g->page_pool.lock);
+#endif
+    }
+    else {
+        gc_aligned_free(body, HEAP_PAGE_SIZE);
+    }
+}
+
+static struct heap_page_body *
+heap_page_body_allocate(void)
+{
+    struct heap_page_body *page_body = page_pool_acquire();
+
+    GC_ASSERT(page_body == NULL || (uintptr_t)page_body % HEAP_PAGE_ALIGN == 0);
 
     return page_body;
 }
@@ -10386,6 +10496,8 @@ rb_gcdebug_remove_stress_to_class(int argc, VALUE *argv, VALUE self)
 void *
 rb_gc_impl_objspace_alloc(void)
 {
+    global_objspace_init();
+
     rb_objspace_t *objspace = calloc1(sizeof(rb_objspace_t));
 
     return objspace;
