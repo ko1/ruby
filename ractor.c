@@ -9,6 +9,7 @@
 #include "vm_sync.h"
 #include "ractor_core.h"
 #include "internal/complex.h"
+#include "internal/cont.h"
 #include "internal/error.h"
 #include "internal/gc.h"
 #include "internal/hash.h"
@@ -258,6 +259,21 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
              * (until it is re-homed), in which case its mark function does
              * not run here, yet the stacks must stay alive. */
             if (th->ec) rb_execution_context_mark(th->ec);
+
+            /* RLGCv2 (design_v2.md §1.5): the thread's ec lives inside the
+             * root fiber struct, which is freed together with its wrapper
+             * object -- and for a Ractor's main thread that wrapper may
+             * live in the creating Ractor's objspace, where nothing else
+             * roots it.  Mark the fiber wrappers from here so whichever
+             * objspace owns them keeps them (a foreign mark is a no-op). */
+            if (th->root_fiber) {
+                VALUE root_fiber_self = rb_fiberptr_self(th->root_fiber);
+                if (root_fiber_self) rb_gc_mark(root_fiber_self);
+            }
+            if (th->ec && th->ec->fiber_ptr) {
+                VALUE fiber_self = rb_fiberptr_self(th->ec->fiber_ptr);
+                if (fiber_self) rb_gc_mark(fiber_self);
+            }
         }
     }
 
@@ -624,6 +640,11 @@ ractor_create(rb_execution_context_t *ec, VALUE self, VALUE loc, VALUE name, VAL
     rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
     r->verbose = cr->verbose;
     r->debug = cr->debug;
+
+    /* RLGCv2 (design_v2.md §1.1): every Ractor owns an objspace.  It must
+     * exist before the Ractor's thread runs (its very first allocations go
+     * there via rb_gc_get_objspace). */
+    r->objspace = rb_gc_objspace_alloc_local();
 
     rb_yjit_before_ractor_spawn();
     rb_zjit_before_ractor_spawn();
