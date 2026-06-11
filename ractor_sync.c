@@ -814,6 +814,19 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
     rb_ractor_t *sr = ractor_set_successor_once(r, cr);
 
     if (sr == cr) {
+        /* RLGCv2 (design_v2.md section 4.3): the value is returned by
+         * reference, so inherit the dead Ractor's objspace into ours
+         * first -- after the merge the return value is our own object
+         * and containment holds without any copy.
+         * The monitor-port wakeup precedes the end of the dying thread's
+         * teardown (vm_remove_ractor still touches the objspace), so wait
+         * for the terminated status, which is set under the VM lock after
+         * the teardown's last objspace access. */
+        while (!rb_ractor_status_p(r, ractor_terminated)) {
+            rb_thread_schedule();
+        }
+        rb_gc_objspace_absorb_into_current(&r->objspace);
+
         ractor_reset_belonging(r->sync.legacy);
 
         if (r->sync.legacy_exc) {
