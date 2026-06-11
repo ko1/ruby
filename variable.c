@@ -66,14 +66,36 @@ static void setup_const_entry(rb_const_entry_t *, VALUE, VALUE, rb_const_flag_t)
 static VALUE rb_const_search(VALUE klass, ID id, int exclude, int recurse, int visibility, VALUE *found_in);
 static st_table *generic_fields_tbl_;
 
+/* RLGCv2 (design_v2.md §2.4): generic_fields_tbl_ is read and written
+ * by the lock-free local GC path (rb_mark_generic_ivar on mark,
+ * rb_free_generic_ivar on sweep), which must never block on the VM
+ * lock -- a thread waiting for it joins a pending barrier, and joining
+ * mid-mark/mid-sweep would expose a half-collected heap to the global
+ * GC. So the table synchronizes on its own native mutex instead.
+ * Sections that may allocate (a growing st_insert) disable GC first:
+ * an allocation can start this thread's own local GC, whose mark and
+ * sweep take the same mutex. The global GC's weak-table pass
+ * (vm_weak_table_gen_fields_foreach) runs under the STW barrier with
+ * every mutator and local GC parked outside these (non-blocking)
+ * critical sections, so it needs no mutex. */
+static rb_nativethread_lock_t generic_fields_lock;
+
 typedef int rb_ivar_foreach_callback_func(ID key, VALUE val, st_data_t arg);
 static void rb_field_foreach(VALUE obj, rb_ivar_foreach_callback_func *func, st_data_t arg, bool ivar_only);
+
+void
+rb_generic_fields_lock_atfork(void)
+{
+    /* another thread may hold it at fork time: give the child a fresh one */
+    rb_native_mutex_initialize(&generic_fields_lock);
+}
 
 void
 Init_var_tables(void)
 {
     rb_global_tbl = rb_id_table_create(0);
     generic_fields_tbl_ = st_init_numtable();
+    rb_native_mutex_initialize(&generic_fields_lock);
     autoload = rb_intern_const("__autoload__");
 
     autoload_mutex = rb_mutex_new();
@@ -1241,8 +1263,7 @@ ivar_ractor_check(VALUE obj, ID id)
 static inline struct st_table *
 generic_fields_tbl_no_ractor_check(void)
 {
-    ASSERT_vm_locking();
-
+    /* the caller holds generic_fields_lock */
     return generic_fields_tbl_;
 }
 
@@ -1255,9 +1276,15 @@ rb_generic_fields_tbl_get(void)
 void
 rb_mark_generic_ivar(VALUE obj)
 {
-    VALUE data;
-    // Bypass ASSERT_vm_locking() check because marking may happen concurrently with mmtk
-    if (st_lookup(generic_fields_tbl_, (st_data_t)obj, (st_data_t *)&data)) {
+    /* Runs on the owner's lock-free local GC mark (and the global GC's
+     * STW mark): the mutex excludes a concurrent insert's st resize.
+     * Mutex holders never block (inserts run with GC disabled), so
+     * this wait inside GC is bounded. */
+    VALUE data = 0;
+    rb_native_mutex_lock(&generic_fields_lock);
+    int found = st_lookup(generic_fields_tbl_, (st_data_t)obj, (st_data_t *)&data);
+    rb_native_mutex_unlock(&generic_fields_lock);
+    if (found) {
         rb_gc_mark_movable(data);
     }
 }
@@ -1266,10 +1293,12 @@ VALUE
 rb_obj_fields_generic_uncached(VALUE obj)
 {
     VALUE fields_obj = 0;
-    RB_VM_LOCKING() {
-        if (!st_lookup(generic_fields_tbl_, (st_data_t)obj, (st_data_t *)&fields_obj)) {
-            rb_bug("Object is missing entry in generic_fields_tbl");
-        }
+    int found;
+    rb_native_mutex_lock(&generic_fields_lock);
+    found = st_lookup(generic_fields_tbl_, (st_data_t)obj, (st_data_t *)&fields_obj);
+    rb_native_mutex_unlock(&generic_fields_lock);
+    if (!found) {
+        rb_bug("Object is missing entry in generic_fields_tbl");
     }
     return fields_obj;
 }
@@ -1363,10 +1392,13 @@ rb_free_generic_ivar(VALUE obj)
                     ec->gen_fields_cache.obj = Qundef;
                     ec->gen_fields_cache.fields_obj = Qundef;
                 }
-                RB_VM_LOCKING() {
-                    if (!st_delete(generic_fields_tbl_no_ractor_check(), &key, &value)) {
-                        rb_bug("Object is missing entry in generic_fields_tbl");
-                    }
+                /* also runs on the lock-free local sweep (obj_free of a
+                 * generic-fields host); st_delete does not allocate */
+                rb_native_mutex_lock(&generic_fields_lock);
+                int deleted = st_delete(generic_fields_tbl_no_ractor_check(), &key, &value);
+                rb_native_mutex_unlock(&generic_fields_lock);
+                if (!deleted) {
+                    rb_bug("Object is missing entry in generic_fields_tbl");
                 }
             }
         }
@@ -1408,9 +1440,15 @@ rb_obj_set_fields(VALUE obj, VALUE fields_obj, ID field_name, VALUE original_fie
           default:
           generic_fields:
             {
-                RB_VM_LOCKING() {
-                    st_insert(generic_fields_tbl_, (st_data_t)obj, (st_data_t)fields_obj);
-                }
+                /* st_insert may malloc; with GC disabled it cannot start
+                 * this thread's local GC, whose mark/sweep take the same
+                 * mutex (self-deadlock), and the mutex holder never
+                 * blocks, keeping every other waiter bounded. */
+                bool gc_disabled = RTEST(rb_gc_disable_no_rest());
+                rb_native_mutex_lock(&generic_fields_lock);
+                st_insert(generic_fields_tbl_, (st_data_t)obj, (st_data_t)fields_obj);
+                rb_native_mutex_unlock(&generic_fields_lock);
+                if (!gc_disabled) rb_gc_enable();
                 RB_OBJ_WRITTEN(obj, original_fields_obj, fields_obj);
 
                 rb_execution_context_t *ec = GET_EC();
@@ -2217,15 +2255,22 @@ rb_copy_generic_ivar(VALUE dest, VALUE obj)
 void
 rb_replace_generic_ivar(VALUE clone, VALUE obj)
 {
-    RB_VM_LOCKING() {
-        st_data_t fields_tbl, obj_data = (st_data_t)obj;
-        if (st_delete(generic_fields_tbl_, &obj_data, &fields_tbl)) {
-            st_insert(generic_fields_tbl_, (st_data_t)clone, fields_tbl);
-            RB_OBJ_WRITTEN(clone, Qundef, fields_tbl);
-        }
-        else {
-            rb_bug("unreachable");
-        }
+    st_data_t fields_tbl = 0, obj_data = (st_data_t)obj;
+    /* the insert may malloc: same GC-disable discipline as
+     * rb_obj_set_fields */
+    bool gc_disabled = RTEST(rb_gc_disable_no_rest());
+    rb_native_mutex_lock(&generic_fields_lock);
+    int moved = st_delete(generic_fields_tbl_, &obj_data, &fields_tbl);
+    if (moved) {
+        st_insert(generic_fields_tbl_, (st_data_t)clone, fields_tbl);
+    }
+    rb_native_mutex_unlock(&generic_fields_lock);
+    if (!gc_disabled) rb_gc_enable();
+    if (moved) {
+        RB_OBJ_WRITTEN(clone, Qundef, fields_tbl);
+    }
+    else {
+        rb_bug("unreachable");
     }
 }
 
