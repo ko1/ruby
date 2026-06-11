@@ -833,7 +833,27 @@ ractor_basket_value(struct ractor_basket *b)
       case basket_type_ref:
         break;
       case basket_type_copy:
+        /* RLGCv2 M3 (design_v2.md §4.2): materialize the sender-side
+         * snapshot into the receiving Ractor's objspace. Handing the
+         * sender-resident graph over by reference would create
+         * unshareable cross-objspace edges that neither confined GC may
+         * traverse (the receiver's stores into it would also bypass the
+         * owner's write barrier accounting). The snapshot stays pinned
+         * (in-flight shref) in the sender's objspace and becomes garbage
+         * there once this copy is made.
+         * TODO(M3, 決定11): the materializing copy still goes through
+         * ractor_copy (user-visible #clone), so a cloned object's hooks
+         * run once at send and once here; replace with the native /
+         * Marshal snapshot format. */
+        b->p.v = ractor_copy(b->p.v);
+        ractor_reset_belonging(b->p.v);
+        break;
       case basket_type_move:
+        /* TODO(M3): a moved graph is still handed over by reference and
+         * stays in the sender's objspace (kept by the in-flight pin).
+         * Materializing it like copy would break dmove-style T_DATA
+         * (e.g. IO fd ownership) and moved-object identity; the move
+         * path needs its own re-homing design. */
         ractor_reset_belonging(b->p.v);
         break;
       default:
