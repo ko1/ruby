@@ -345,6 +345,23 @@ ractor_free(void *ptr)
         r->newobj_cache = NULL;
     }
 
+    /* RLGCv2 (design_v2.md section 2.3): this Ractor died unjoined and
+     * its handle is now gone, so nobody can ever inherit its objspace
+     * through Ractor#value. Only the global GC collects Ractor objects
+     * (they are shareable), so we are inside its sweep, under the
+     * barrier: queue the objspace; the cycle merges it into main right
+     * after the sweep.
+     *
+     * The main Ractor gets here only from the free-at-exit walk
+     * (rb_objspace_free_objects), which is driven by the main objspace
+     * itself: leave it alone (ruby_vm_destruct frees it last), and keep
+     * r->objspace set so rb_gc_get_objspace() stays valid for the
+     * remaining dfree calls of the walk. */
+    if (r->objspace && !r->main_ractor) {
+        rb_gc_objspace_orphaned(r->objspace);
+        r->objspace = NULL;
+    }
+
     ractor_sync_free(r);
     if (!r->main_ractor) {
         SIZED_FREE(r);
@@ -581,6 +598,12 @@ rb_ractor_terminate_atfork(rb_vm_t *vm, rb_ractor_t *r)
     rb_gc_ractor_cache_free(r->newobj_cache);
     r->newobj_cache = NULL;
     r->status_ = ractor_terminated;
+    /* RLGCv2 (design decision 8): in the forked child every other Ractor
+     * becomes terminated-unjoined; keep its objspace enumerable so the
+     * GC passes see it, until a join or the global GC merges it. */
+    if (r->objspace) {
+        rb_gc_objspace_retire(r->objspace);
+    }
     ractor_sync_terminate_atfork(vm, r);
 }
 #endif
