@@ -506,8 +506,9 @@ assert_equal 'false', %q{
   obj.object_id == r.value
 }
 
-# To copy the object, now Marshal#dump is used
-assert_match /can't clone unshareable instance of Thread/, %q{
+# To copy the object, the native copier or Marshal#dump is used
+# (RLGCv2 design decision 11: the copy never calls the user-visible #clone)
+assert_match /can not copy Thread object/, %q{
   obj = Thread.new{}
   begin
     r = Ractor.new obj do |msg|

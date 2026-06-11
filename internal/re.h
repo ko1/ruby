@@ -64,6 +64,7 @@ VALUE rb_reg_check_preprocess(VALUE);
 long rb_reg_search0(VALUE, VALUE, long, int, int, VALUE *);
 VALUE rb_reg_match_p(VALUE re, VALUE str, long pos);
 VALUE rb_reg_regsub_match(VALUE str, VALUE src, VALUE match);
+VALUE rb_match_init_copy(VALUE copy, VALUE orig);
 bool rb_reg_start_with_p(VALUE re, VALUE str);
 VALUE rb_reg_hash(VALUE re);
 VALUE rb_reg_equal(VALUE re1, VALUE re2);
