@@ -995,17 +995,26 @@ struct heap_page {
     unsigned short free_slots;
     unsigned short final_slots;
     unsigned short pinned_slots;
+    /* RLGCv2: full bytes, not bits packed into one word.
+     * has_remembered_objects is set by the lock-free write barrier from
+     * ANY Ractor's thread (remembering a shareable object on its owner's
+     * page); a bitfield `flags.x = TRUE` would be a read-modify-write of
+     * the shared word that can lose a concurrent store to a sibling flag.
+     * As bytes, every store is a single byte store that cannot disturb
+     * its siblings. Ordering: the write barrier sets the remembered BIT
+     * first, then this flag; rgengc_rememberset_mark clears the flag
+     * first, then drains the bits -- so a racing remember always leaves
+     * either its bit in the drain or the flag set for a rescan. */
     struct {
-        unsigned int before_sweep : 1;
-        unsigned int has_remembered_objects : 1;
-        unsigned int has_uncollectible_wb_unprotected_objects : 1;
+        unsigned char before_sweep;
+        unsigned char has_remembered_objects;
+        unsigned char has_uncollectible_wb_unprotected_objects;
     } flags;
 
     /* RLGCv2: set when any object on this page has its shref / shareable
-     * bit set.  Kept as plain bytes outside the bitfield above: they are
-     * set without a lock (containment makes the writer the page's owner),
-     * and a byte store cannot lose a concurrent locked update of the
-     * bitfield word. */
+     * bit set.  Plain bytes for the same reason as the flags above; the
+     * bits themselves are single-writer (containment makes the writer the
+     * page's owner), so they need no atomics. */
     unsigned char has_shref_objects;
     unsigned char has_shareable_objects;
 
@@ -1106,6 +1115,47 @@ slot_index_for_offset(size_t offset, uint64_t reciprocal)
 #define MARKED_IN_BITMAP(bits, p)    _MARKED_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
 #define MARK_IN_BITMAP(bits, p)      _MARK_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
 #define CLEAR_IN_BITMAP(bits, p)     _CLEAR_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
+
+/* RLGCv2 (design_v2.md §2.1 write barrier): remembered_bits is the one
+ * per-object bitmap written from OTHER Ractors' threads -- the lock-free
+ * write barrier remembers a shareable object on its owner's page. A plain
+ * |= / &= ~ is a read-modify-write over a whole bits_t word covering
+ * BITS_BITLENGTH slots, so two concurrent writers can lose the bit of a
+ * DIFFERENT object sharing the word (a lost remembered bit = an old
+ * object's young child missed by the next minor GC = freed alive). Every
+ * write to remembered_bits goes through these atomics. bits_t is
+ * pointer-width, so a size_t CAS covers the whole word.
+ *
+ * The CAS loop starts from old = 0 so the word is only ever accessed by
+ * the atomic op itself (no plain load to race a concurrent writer); a
+ * spurious first miss just reloads the value the CAS observed. Returns
+ * true iff this call set the bit. */
+static inline bool
+gc_bitmap_atomic_set(bits_t *bits, const struct heap_page *page, VALUE obj)
+{
+    volatile size_t *const word = (volatile size_t *)&bits[SLOT_BITMAP_INDEX(page, obj)];
+    const size_t mask = (size_t)SLOT_BITMAP_BIT(page, obj);
+    size_t old = 0;
+    while ((old & mask) != mask) {
+        const size_t prev = RUBY_ATOMIC_SIZE_CAS(*word, old, old | mask);
+        if (prev == old) return true;
+        old = prev;
+    }
+    return false;
+}
+
+static inline void
+gc_bitmap_atomic_clear(bits_t *bits, const struct heap_page *page, VALUE obj)
+{
+    volatile size_t *const word = (volatile size_t *)&bits[SLOT_BITMAP_INDEX(page, obj)];
+    const size_t mask = (size_t)SLOT_BITMAP_BIT(page, obj);
+    size_t old = mask;
+    while ((old & mask) != 0) {
+        const size_t prev = RUBY_ATOMIC_SIZE_CAS(*word, old, old & ~mask);
+        if (prev == old) return;
+        old = prev;
+    }
+}
 
 #define GET_HEAP_MARK_BITS(x)           (&GET_HEAP_PAGE(x)->mark_bits[0])
 #define GET_HEAP_PINNED_BITS(x)         (&GET_HEAP_PAGE(x)->pinned_bits[0])
@@ -1826,7 +1876,10 @@ RVALUE_DEMOTE(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(RVALUE_OLD_P(objspace, obj));
 
     if (!is_incremental_marking(objspace) && RVALUE_REMEMBERED(objspace, obj)) {
-        CLEAR_IN_BITMAP(GET_HEAP_PAGE(obj)->remembered_bits, obj);
+        /* atomic: a plain &= ~mask could lose a concurrent write
+         * barrier's set of ANOTHER object's bit in the same word */
+        struct heap_page *page = GET_HEAP_PAGE(obj);
+        gc_bitmap_atomic_clear(page->remembered_bits, page, obj);
     }
 
     CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(obj), obj);
@@ -6714,14 +6767,15 @@ rgengc_remembersetbits_set(rb_objspace_t *objspace, VALUE obj)
     struct heap_page *page = GET_HEAP_PAGE(obj);
     bits_t *bits = &page->remembered_bits[0];
 
-    if (MARKED_IN_BITMAP(bits, obj)) {
-        return FALSE;
-    }
-    else {
-        page->flags.has_remembered_objects = TRUE;
-        MARK_IN_BITMAP(bits, obj);
-        return TRUE;
-    }
+    /* Atomic: the lock-free write barrier remembers shareable objects
+     * from any Ractor's thread, concurrently with the owner's GC and
+     * with other writers on the same word. Set the bit FIRST, then the
+     * page flag, so a concurrent rgengc_rememberset_mark (which clears
+     * the flag before draining the bits) leaves the page flagged for a
+     * rescan rather than skipping a freshly remembered object. */
+    const bool newly = gc_bitmap_atomic_set(bits, page, obj);
+    page->flags.has_remembered_objects = TRUE;
+    return newly ? TRUE : FALSE;
 }
 
 /* wb, etc */
@@ -6805,11 +6859,18 @@ rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             else if (page->flags.has_remembered_objects) has_old++;
             else if (page->flags.has_uncollectible_wb_unprotected_objects) has_shady++;
 #endif
-            for (j=0; j < (size_t)bitmap_plane_count; j++) {
-                bits[j] = remembered_bits[j] | (uncollectible_bits[j] & wb_unprotected_bits[j]);
-                remembered_bits[j] = 0;
-            }
+            /* Clear has_remembered_objects BEFORE draining the bits: a
+             * concurrent lock-free write barrier (another Ractor
+             * remembering a shareable on this page) sets its bit first
+             * and the flag after, so clearing the flag first keeps the
+             * page flagged for a rescan if such a set races in. The
+             * per-word drain is an atomic read-and-clear so a racing
+             * set is never lost (it lands on the zeroed word). */
             page->flags.has_remembered_objects = FALSE;
+            for (j=0; j < (size_t)bitmap_plane_count; j++) {
+                bits[j] = RUBY_ATOMIC_SIZE_EXCHANGE(*(volatile size_t *)&remembered_bits[j], 0)
+                          | (uncollectible_bits[j] & wb_unprotected_bits[j]);
+            }
 
             for (j=0; j < (size_t)bitmap_plane_count; j++) {
                 bitset = bits[j];
@@ -6839,6 +6900,12 @@ rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
         memset(&page->mark_bits[0],       0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->uncollectible_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->marking_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
+        /* The plain memset can lose a concurrent write barrier's
+         * remember, but only a SHAREABLE can be remembered from another
+         * Ractor's thread, and shareables are re-rooted by every local
+         * mark (rlgc_pinned_roots_mark) regardless of their remembered
+         * bit, while the major this clear precedes rescans everything
+         * anyway. */
         memset(&page->remembered_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->pinned_bits[0],     0, HEAP_PAGE_BITMAP_SIZE);
         page->flags.has_uncollectible_wb_unprotected_objects = FALSE;
@@ -7002,6 +7069,12 @@ void
 rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj)
 {
     rb_objspace_t *objspace = objspace_ptr;
+
+    /* RLGCv2 (design decision 13): a shareable is never WB-unprotected.
+     * The shref maintenance relies on every s->u store passing through
+     * the write barrier, and this keeps wb_unprotected_bits single-writer
+     * (only the owner thread can unprotect its own unshareables). */
+    GC_ASSERT(!RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE));
 
     if (RVALUE_WB_UNPROTECTED(objspace, obj)) {
         return;
