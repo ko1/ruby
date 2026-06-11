@@ -825,6 +825,14 @@ static struct {
 static rb_objspace_t *rlgc_orphaned_head;
 static void rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
+/* The MAIN objspace, for gc_enter's locking policy. A stable pointer on
+ * purpose: vm->ractor.main_ractor->objspace is briefly swapped during
+ * Ractor creation (rb_thread_create_ractor), and gc_enter/gc_exit must
+ * make the same decision on both ends of a GC. Set at boot (the first
+ * objspace initialized is main's) and re-pointed in the forked child
+ * (its main Ractor is whichever forked). */
+static rb_objspace_t *rlgc_main_objspace;
+
 static struct heap_page_body *page_pool_acquire(void);
 static void page_pool_release(struct heap_page_body *body);
 
@@ -2855,6 +2863,14 @@ heap_set_alloc_page(rb_objspace_t *objspace, size_t heap_idx, struct heap_page *
 static void
 init_size_to_heap_idx(void)
 {
+    /* The table is process-wide and its contents never change; build it
+     * once at boot. Re-filling it from every later objspace_init (Ractor
+     * creation) would harmlessly rewrite the same values, but it races
+     * every other thread's lock-free allocation fast path reading it. */
+    static bool initialized = false;
+    if (initialized) return;
+    initialized = true;
+
     for (size_t i = 0; i < sizeof(size_to_heap_idx); i++) {
         size_t effective = i * 8 + RVALUE_OVERHEAD;
         uint8_t idx;
@@ -7697,7 +7713,7 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
         rb_gc_vm_barrier();
         break;
       default:
-        if (objspace == rb_gc_vm_main_objspace()) {
+        if (objspace == rlgc_main_objspace) {
             *lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
         }
         break;
@@ -7757,7 +7773,7 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
         RB_GC_VM_UNLOCK(*lock_lev);
         break;
       default:
-        if (objspace == rb_gc_vm_main_objspace()) {
+        if (objspace == rlgc_main_objspace) {
             RB_GC_VM_UNLOCK_NO_BARRIER(*lock_lev);
         }
         break;
@@ -7990,6 +8006,12 @@ rlgc_global_gc(rb_objspace_t *driver)
 
     /* step 8 */
     gc_update_weak_references(driver);
+
+    /* this cycle's all-Ractor root pass purged the deleted
+     * ractor-local keys from every storage; release the key structs
+     * while still inside the barrier (a local GC never may -- see
+     * rb_ractor_finish_marking) */
+    rb_ractor_finish_marking();
 
     /* step 9: sweep every objspace inside the barrier, not lazily;
      * dead shareables go here, empty pages return to the pool */
@@ -11147,6 +11169,8 @@ rb_gc_impl_after_fork(void *objspace_ptr, rb_pid_t pid)
 
     if (pid == 0) { /* child process */
         heap_alloc_state_clear(objspace);
+        /* the forking Ractor is the child's main Ractor */
+        rlgc_main_objspace = objspace;
     }
 }
 
@@ -11246,19 +11270,28 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
         ccan_list_head_init(&heap->pages);
     }
 
-    init_size_to_heap_idx();
+    if (rlgc_main_objspace == NULL) {
+        /* Boot, single-threaded: the first objspace belongs to main.
+         * Process-wide constants are computed here ONCE -- a later
+         * objspace_init (Ractor creation) rewriting them, even with the
+         * same values, races every other thread's lock-free reads. */
+        rlgc_main_objspace = objspace;
+
+        init_size_to_heap_idx();
+
+#if defined(INIT_HEAP_PAGE_ALLOC_USE_MMAP)
+        /* Need to determine if we can use mmap at runtime. */
+        heap_page_alloc_use_mmap = INIT_HEAP_PAGE_ALLOC_USE_MMAP;
+#endif
+        gc_params.heap_init_bytes = GC_HEAP_INIT_BYTES;
+    }
 
     rb_darray_make_without_gc(&objspace->heap_pages.sorted, 0);
     rb_darray_make_without_gc(&objspace->weak_references, 0);
 
-#if defined(INIT_HEAP_PAGE_ALLOC_USE_MMAP)
-    /* Need to determine if we can use mmap at runtime. */
-    heap_page_alloc_use_mmap = INIT_HEAP_PAGE_ALLOC_USE_MMAP;
-#endif
 #if RGENGC_ESTIMATE_OLDMALLOC
     objspace->rgengc.oldmalloc_increase_limit = gc_params.oldmalloc_limit_min;
 #endif
-    gc_params.heap_init_bytes = GC_HEAP_INIT_BYTES;
 
     init_mark_stack(&objspace->mark_stack);
 

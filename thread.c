@@ -927,8 +927,16 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     th->thgroup = current_th->thgroup;
 
     if (th->invoke_type == thread_invoke_type_ractor_proc) {
-        /* A new Ractor's main thread builds these on start
-         * (thread_start_func_2); leave them unset until then. */
+        /* RLGCv2: a new Ractor's main thread re-creates these in its own
+         * objspace when it starts (thread_start_func_2). Arrays created
+         * HERE would live in the parent's objspace with no parent-side
+         * root -- only this not-yet-started thread references them, so
+         * the parent's concurrent local GC frees them before the child
+         * runs, and a later mark through the Thread object hits freed
+         * slots. Leave them 0 ("uninitialized thread", the existing
+         * convention): every cross-thread reader either raises or
+         * returns empty for 0, and nothing can queue an interrupt into
+         * the child before it starts. */
         th->pending_interrupt_queue = 0;
         th->pending_interrupt_mask_stack = 0;
         th->pending_interrupt_queue_checked = 0;

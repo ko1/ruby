@@ -2385,12 +2385,23 @@ ractor_local_storage_mark(rb_ractor_t *r)
     if (r->local_storage) {
         st_foreach(r->local_storage, ractor_local_storage_mark_i, 0);
 
-        for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
-            rb_ractor_local_key_t key = freed_ractor_local_keys.keys[i];
-            st_data_t val, k = (st_data_t)key;
-            if (st_delete(r->local_storage, &k, &val) &&
-                (key = (rb_ractor_local_key_t)k)->type->free) {
-                (*key->type->free)((void *)val);
+        /* RLGCv2 M1b: deleted keys are purged from every Ractor's
+         * storage in ONE collection and their structs freed at its end
+         * (rb_ractor_finish_marking) -- that requires a collection that
+         * visits every Ractor with no other marker running, i.e. the
+         * global GC (or the single-objspace world). A concurrent local
+         * GC must neither purge (its cycle covers only one Ractor, so
+         * the structs would be freed under other storages still holding
+         * entries) nor race the list. Until a global cycle runs, dead
+         * keys just keep their entries alive. */
+        if (rb_gc_single_objspace_p() || rb_gc_during_global_gc_p()) {
+            for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
+                rb_ractor_local_key_t key = freed_ractor_local_keys.keys[i];
+                st_data_t val, k = (st_data_t)key;
+                if (st_delete(r->local_storage, &k, &val) &&
+                    (key = (rb_ractor_local_key_t)k)->type->free) {
+                    (*key->type->free)((void *)val);
+                }
             }
         }
     }
@@ -2563,6 +2574,17 @@ rb_ractor_local_storage_ptr_set(rb_ractor_local_key_t key, void *ptr)
 void
 rb_ractor_finish_marking(void)
 {
+    /* RLGCv2 M1b: the freed-key structs may be released only by a
+     * collection whose mark pass purged them from EVERY Ractor's
+     * storage with no other marker running -- the global GC or the
+     * single-objspace world (see ractor_local_storage_mark). Local GCs
+     * also reach here via gc_marks_finish: do nothing then, both for
+     * correctness (other storages still hold entries) and because
+     * concurrent finishers would double-free the list. */
+    if (!(rb_gc_single_objspace_p() || rb_gc_during_global_gc_p())) {
+        return;
+    }
+
     for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
         SIZED_FREE(freed_ractor_local_keys.keys[i]);
     }
