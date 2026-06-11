@@ -2323,6 +2323,12 @@ build_id2ref_i(VALUE obj, void *data)
     }
 }
 
+static void
+build_id2ref_objspace_i(void *objspace, void *data)
+{
+    rb_gc_impl_each_object(objspace, build_id2ref_i, data);
+}
+
 static VALUE
 object_id_to_ref(void *objspace_ptr, VALUE object_id)
 {
@@ -2349,7 +2355,10 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
             id2ref_tbl = tmp_id2ref_tbl;
             id2ref_value = tmp_id2ref_value;
 
-            rb_gc_impl_each_object(objspace, build_id2ref_i, (void *)id2ref_tbl);
+            /* RLGCv2: every objspace's objects can carry an object_id,
+             * and obj_free_object_id rb_bugs on a seen-but-missing id,
+             * so the build must cover them all (zombies included). */
+            rb_gc_vm_each_objspace(build_id2ref_objspace_i, (void *)id2ref_tbl);
         }
         if (!gc_disabled) rb_gc_enable();
     }
@@ -3405,15 +3414,25 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     MARK_CHECKPOINT("vm_registered_objects");
     rb_vm_mark_registered_global_objects(vm);
 
+    /* Same shape: a worker's at_exit/END proc sits in the VM-global
+     * end_procs C list but lives in the worker's objspace, where only
+     * this walk can root it. */
+    MARK_CHECKPOINT("end_proc");
+    rb_mark_end_proc();
+
+    /* And a worker's String trap handler sits in the VM-global
+     * vm->trap_list.cmd[] slots. A fixed array of aligned VALUE stores
+     * (signal.c uses ACCESS_ONCE): no lock needed, a racing walk reads
+     * the old or the new handler, both alive. */
+    MARK_CHECKPOINT("trap_list");
+    rb_gc_mark_values(RUBY_NSIG, vm->trap_list.cmd);
+
     /* VM-global roots belong to the main Ractor's objspace (that is where
      * boot-time objects live); a worker's confined GC does not scan them.
      * The global GC scans everything. */
     if (global_gc || objspace == vm->ractor.main_ractor->objspace) {
         MARK_CHECKPOINT("vm");
         rb_vm_mark(vm);
-
-        MARK_CHECKPOINT("end_proc");
-        rb_mark_end_proc();
 
         MARK_CHECKPOINT("global_tbl");
         rb_gc_mark_global_tbl();
