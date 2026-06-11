@@ -4738,6 +4738,7 @@ Init_BareVM(void)
     vm_init2(vm);
 
     ruby_current_vm_ptr = vm;
+    rb_gc_init_global_locks();
     /* RLGCv2: the boot objspace belongs to the main Ractor, so the main
      * Ractor must exist before rb_objspace_alloc assigns it. */
     vm->ractor.main_ractor = rb_ractor_main_alloc();
@@ -4852,13 +4853,20 @@ pin_array_list_append(VALUE obj, VALUE item)
     struct pin_array_list *array_list;
     TypedData_Get_Struct(obj, struct pin_array_list, &pin_array_list_type, array_list);
 
+    /* Allocate a full bucket's successor BEFORE taking
+     * registered_globals_lock: the allocation can run this thread's
+     * local GC, whose root walk takes the same mutex. The chunk chain
+     * and len are then published under the mutex, excluding the
+     * lock-free walkers (rb_vm_mark_registered_global_objects). */
     if (array_list->len >= MARK_OBJECT_ARY_BUCKET_SIZE) {
         obj = pin_array_list_new(obj);
         TypedData_Get_Struct(obj, struct pin_array_list, &pin_array_list_type, array_list);
     }
 
+    rb_gc_registered_globals_lock();
     RB_OBJ_WRITE(obj, &array_list->array[array_list->len], item);
     array_list->len++;
+    rb_gc_registered_globals_unlock();
     return obj;
 }
 
@@ -4921,9 +4929,18 @@ rb_vm_ractor_migrate_mark_objects(rb_ractor_t *dst, rb_ractor_t *src)
 void
 rb_vm_mark_registered_global_objects(rb_vm_t *vm)
 {
+    /* Walked by every objspace's lock-free root pass (design_v2.md
+     * §2.1 step 3.e); the mutex excludes the registration writers.
+     * Marking never allocates through the GC (mark-stack chunks come
+     * from the GC's own cache/malloc with GC re-entry blocked), so
+     * holding the mutex across the walk cannot self-deadlock. */
+    rb_gc_registered_globals_lock();
+
     for (size_t index = 0; index < vm->global_object_list_size; index++) {
         rb_gc_mark_maybe(*vm->global_object_list[index]);
     }
+
+    rb_gc_registered_globals_unlock();
 }
 
 VALUE rb_cc_refinement_set_create(void);

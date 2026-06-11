@@ -573,6 +573,31 @@ rb_gc_guarded_ptr_val(volatile VALUE *ptr, VALUE val)
 #endif
 
 static const char *obj_type_name(VALUE obj);
+/* RLGCv2 (design_v2.md §2.4): VM-shared structures that the lock-free
+ * local GC path reads or writes get their own native mutex -- the GC
+ * must never block on the VM lock (a thread waiting for it joins a
+ * pending barrier, and joining mid-mark/mid-sweep would expose a
+ * half-collected heap to the global GC).
+ *
+ * Deadlock discipline: a critical section must not start a GC on this
+ * thread (its mark or sweep takes the same mutex). Nothing blocks while
+ * holding it, so cross-thread waiters are bounded. */
+static rb_nativethread_lock_t registered_globals_lock;
+
+void
+rb_gc_init_global_locks(void)
+{
+    rb_native_mutex_initialize(&registered_globals_lock);
+}
+
+/* The forking thread cannot hold this (fork happens at a safepoint, never
+ * inside GC or the table writers), but another thread might: give the
+ * child a fresh mutex. */
+void
+rb_gc_atfork_global_locks(void)
+{
+    rb_native_mutex_initialize(&registered_globals_lock);
+}
 
 #include "gc/default/default.c"
 
@@ -3574,13 +3599,36 @@ rb_gc_register_address(VALUE *addr)
     VALUE obj = *addr;
 
     RB_VM_LOCKING() {
+        /* Every objspace's root walk reads this list without the VM lock
+         * (registered_globals_lock instead, design_v2.md §2.1 step 3.e).
+         * Growth is two-phase so the locked section never allocates (an
+         * allocation can run this thread's local GC, whose root walk
+         * takes the same mutex): build the bigger array outside, swap it
+         * in under the mutex, free the old one outside. The VM lock
+         * serializes the writers themselves. */
+        VALUE **old_list = NULL;
+        size_t old_capa = 0;
         if (vm->global_object_list_size == vm->global_object_list_capa) {
             size_t new_capa = vm->global_object_list_capa ? vm->global_object_list_capa * 2 : 64;
-            SIZED_REALLOC_N(vm->global_object_list, VALUE *, new_capa, vm->global_object_list_capa);
-            vm->global_object_list_capa = new_capa;
-        }
+            VALUE **new_list = ALLOC_N(VALUE *, new_capa);
+            MEMCPY(new_list, vm->global_object_list, VALUE *, vm->global_object_list_size);
 
-        vm->global_object_list[vm->global_object_list_size++] = addr;
+            rb_native_mutex_lock(&registered_globals_lock);
+            old_list = vm->global_object_list;
+            old_capa = vm->global_object_list_capa;
+            vm->global_object_list = new_list;
+            vm->global_object_list_capa = new_capa;
+            vm->global_object_list[vm->global_object_list_size++] = addr;
+            rb_native_mutex_unlock(&registered_globals_lock);
+        }
+        else {
+            rb_native_mutex_lock(&registered_globals_lock);
+            vm->global_object_list[vm->global_object_list_size++] = addr;
+            rb_native_mutex_unlock(&registered_globals_lock);
+        }
+        if (old_list) {
+            SIZED_FREE_N(old_list, old_capa);
+        }
     }
 
     /*
@@ -3600,6 +3648,7 @@ rb_gc_unregister_address(VALUE *addr)
 {
     rb_vm_t *vm = GET_VM();
     RB_VM_LOCKING() {
+        rb_native_mutex_lock(&registered_globals_lock);
         size_t index;
         for (index = 0; index < vm->global_object_list_size; index++) {
             if (addr == vm->global_object_list[index]) {
@@ -3613,7 +3662,21 @@ rb_gc_unregister_address(VALUE *addr)
                 break;
             }
         }
+        rb_native_mutex_unlock(&registered_globals_lock);
     }
+}
+
+/* for the walkers and writers that live outside this file (vm.c) */
+void
+rb_gc_registered_globals_lock(void)
+{
+    rb_native_mutex_lock(&registered_globals_lock);
+}
+
+void
+rb_gc_registered_globals_unlock(void)
+{
+    rb_native_mutex_unlock(&registered_globals_lock);
 }
 
 void

@@ -297,6 +297,10 @@ void rb_gc_objspace_retire(void **objspace_slot);
 void rb_gc_objspace_absorb_into_current(void **objspace_slot);
 void rb_gc_objspace_absorb_all_zombies(void);
 void rb_gc_objspace_orphaned(void *objspace);
+void rb_gc_init_global_locks(void);
+void rb_gc_atfork_global_locks(void);
+void rb_gc_registered_globals_lock(void);
+void rb_gc_registered_globals_unlock(void);
 const char *rb_obj_info(VALUE obj);
 void ruby_annotate_mmap(const void *addr, unsigned long size, const char *name);
 
