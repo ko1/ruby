@@ -1838,7 +1838,12 @@ static inline void
 RVALUE_PAGE_OLD_UNCOLLECTIBLE_SET(rb_objspace_t *objspace, struct heap_page *page, VALUE obj)
 {
     MARK_IN_BITMAP(&page->uncollectible_bits[0], obj);
-    objspace->rgengc.old_objects++;
+    /* RLGCv2: count the promotion on the OBJECT's objspace. During a
+     * local GC that is the caller's, but the global GC's unified mark
+     * ages every objspace's slots from the driver -- crediting the
+     * driver would skew every other objspace's old_objects (zeroed at
+     * the cycle start), and with it their major-GC pacing. */
+    page->objspace->rgengc.old_objects++;
 
 #if RGENGC_PROFILE >= 2
     objspace->profile.total_promoted_count++;
@@ -1905,7 +1910,8 @@ RVALUE_DEMOTE(rb_objspace_t *objspace, VALUE obj)
     RVALUE_AGE_RESET(obj);
 
     if (RVALUE_MARKED(objspace, obj)) {
-        objspace->rgengc.old_objects--;
+        /* symmetric with RVALUE_PAGE_OLD_UNCOLLECTIBLE_SET */
+        GET_HEAP_PAGE(obj)->objspace->rgengc.old_objects--;
     }
 
     check_rvalue_consistency(objspace, obj);
@@ -6145,7 +6151,8 @@ gc_remember_unprotected(rb_objspace_t *objspace, VALUE obj)
     if (!MARKED_IN_BITMAP(uncollectible_bits, obj)) {
         page->flags.has_uncollectible_wb_unprotected_objects = TRUE;
         MARK_IN_BITMAP(uncollectible_bits, obj);
-        objspace->rgengc.uncollectible_wb_unprotected_objects++;
+        /* on the object's objspace, as in RVALUE_PAGE_OLD_UNCOLLECTIBLE_SET */
+        page->objspace->rgengc.uncollectible_wb_unprotected_objects++;
 
 #if RGENGC_PROFILE > 0
         objspace->profile.total_remembered_shady_object_count++;
