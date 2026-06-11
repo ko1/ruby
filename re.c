@@ -1176,8 +1176,8 @@ match_check(VALUE match)
 }
 
 /* :nodoc: */
-static VALUE
-match_init_copy(VALUE obj, VALUE orig)
+VALUE
+rb_match_init_copy(VALUE obj, VALUE orig)
 {
     struct RMatch *rm = RMATCH(obj);
 
@@ -5082,7 +5082,7 @@ Init_Regexp(void)
     rb_undef_method(CLASS_OF(rb_cMatch), "new");
     rb_undef_method(CLASS_OF(rb_cMatch), "allocate");
 
-    rb_define_method(rb_cMatch, "initialize_copy", match_init_copy, 1);
+    rb_define_method(rb_cMatch, "initialize_copy", rb_match_init_copy, 1);
     rb_define_method(rb_cMatch, "regexp", match_regexp, 0);
     rb_define_method(rb_cMatch, "names", match_names, 0);
     rb_define_method(rb_cMatch, "size", match_size, 0);

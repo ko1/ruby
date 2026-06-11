@@ -678,10 +678,23 @@ master の Ractor コピーには「move 不可で、直接参照が全部 share
 なら無害な最適化だが、per-Ractor objspace では「受信側のコピー済みグラフの中に、送信側
 objspace の unshareable T_DATA への生ポインタが残る」ことを意味し、どの生存保証にも
 引っかからず UAF になる(例: 例外オブジェクトの backtrace がまさにこの形に該当する)。
-**この例外は廃止し、コピーできない unshareable T_DATA の送信はエラーにする**
-(shareable な T_DATA は従来どおり参照渡しで問題ない)。
-今後も「コピーをサボって参照を渡す」最適化を send 系に入れないこと。なお `Ractor#value` が
-コピー無しで済むのはすり抜けではなく、参照を返す前に objspace ごと併合するからである(§4.3)。
+
+扱いは型ごとに 3 通り:
+
+- **backtrace は専用のネイティブ複製**(`rb_backtrace_dup`)。フレームが参照するのは
+  iseq / メソッドエントリ(決定 17 で shareable)だけなので、複製は封じ込めに反しない。
+  文字列配列・Location 配列は受信側で lazy に再生成される。これにより例外の送信で
+  `backtrace` / `backtrace_locations` の両方が保たれる(エラー化すると例外伝搬そのものが
+  壊れるため、この型だけは複製で救う)。
+- それ以外の unshareable T_DATA は **Marshal に乗れば乗せ、乗らなければ送信エラー**
+  (`_dump` 系を持つ型は受信側で別オブジェクトとして実体化される)。
+- shareable な T_DATA は従来どおり参照渡しで問題ない。
+
+ネイティブコピーの enter は対応型以外で即 stop して Marshal 経路へ落ちるので、
+**by-ref passthrough にはコピー経路から到達できない**(move 経路は従来どおり
+「move できない T_DATA はエラー」)。今後も「コピーをサボって参照を渡す」最適化を
+send 系に入れないこと。なお `Ractor#value` がコピー無しで済むのはすり抜けではなく、
+参照を返す前に objspace ごと併合するからである(§4.3)。
 
 ## 5. 実装計画(origin/master から。各段で全テスト green)
 
