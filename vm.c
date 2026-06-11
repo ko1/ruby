@@ -3357,9 +3357,9 @@ rb_vm_mark(void *ptr)
             rb_gc_mark(rb_ractor_self(r));
         }
 
-        for (size_t index = 0; index < vm->global_object_list_size; index++) {
-            rb_gc_mark_maybe(*vm->global_object_list[index]);
-        }
+        /* global_object_list and mark_object_ary are marked by
+         * rb_vm_mark_registered_global_objects() from every objspace's
+         * root scan, not here: their entries can live in any objspace. */
 
         rb_gc_mark_movable(vm->self);
 
@@ -3370,7 +3370,6 @@ rb_vm_mark(void *ptr)
             rb_box_entry_mark(vm->main_box);
         }
 
-        rb_gc_mark_movable(vm->mark_object_ary);
         rb_gc_mark_movable(vm->orig_progname);
         rb_gc_mark_movable(vm->coverages);
         rb_gc_mark_movable(vm->me2counter);
@@ -4846,6 +4845,28 @@ rb_vm_register_global_object(VALUE obj)
             GET_VM()->mark_object_ary = head;
         }
         RB_GC_GUARD(obj);
+    }
+}
+
+/* Mark the VM-global object registrations (rb_gc_register_address and
+ * rb_vm_register_global_object).  Both lists can hold objects from any
+ * objspace (whoever registers allocates), so every objspace's root scan
+ * walks them structurally: marking filters out foreign entries, and each
+ * objspace keeps exactly its own residents (and its own list chunks)
+ * alive. */
+void
+rb_vm_mark_registered_global_objects(rb_vm_t *vm)
+{
+    for (size_t index = 0; index < vm->global_object_list_size; index++) {
+        rb_gc_mark_maybe(*vm->global_object_list[index]);
+    }
+
+    VALUE chunk = vm->mark_object_ary;
+    while (chunk && !NIL_P(chunk)) {
+        struct pin_array_list *array_list = RTYPEDDATA_GET_DATA(chunk);
+        rb_gc_mark(chunk);
+        rb_gc_mark_vm_stack_values(array_list->len, array_list->array);
+        chunk = array_list->next;
     }
 }
 
