@@ -3709,19 +3709,51 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
 /* Called when a Ractor terminates without having been joined: its
  * objspace no longer has an owner thread, but its pages still hold
  * shareable objects reachable from other Ractors. Keep it enumerable
- * until M4 inheritance merges it away. VM lock required. */
+ * until inheritance merges it away. */
 void
 rb_gc_objspace_retire(void *objspace)
 {
-    ASSERT_vm_locking();
-
     rb_vm_t *vm = GET_VM();
-    if (vm->gc.zombie_objspaces_count == vm->gc.zombie_objspaces_capa) {
-        size_t new_capa = vm->gc.zombie_objspaces_capa ? vm->gc.zombie_objspaces_capa * 2 : 16;
-        SIZED_REALLOC_N(vm->gc.zombie_objspaces, void *, new_capa, vm->gc.zombie_objspaces_capa);
-        vm->gc.zombie_objspaces_capa = new_capa;
+
+    RB_VM_LOCKING() {
+        if (vm->gc.zombie_objspaces_count == vm->gc.zombie_objspaces_capa) {
+            size_t new_capa = vm->gc.zombie_objspaces_capa ? vm->gc.zombie_objspaces_capa * 2 : 16;
+            SIZED_REALLOC_N(vm->gc.zombie_objspaces, void *, new_capa, vm->gc.zombie_objspaces_capa);
+            vm->gc.zombie_objspaces_capa = new_capa;
+        }
+        vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = objspace;
     }
-    vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = objspace;
+}
+
+/* The Ractor object owning this objspace has been collected: nobody
+ * can ever join it. Queued from ractor_free (which runs inside a GC
+ * sweep, so the impl links it intrusively without allocating) and
+ * merged into main by the next global GC cycle. */
+void
+rb_gc_objspace_orphaned(void *objspace)
+{
+    rb_gc_impl_objspace_orphaned(objspace);
+}
+
+/* helpers for the global GC's orphan merge (design_v2.md section 2.3) */
+void *
+rb_gc_vm_main_objspace(void)
+{
+    return GET_VM()->ractor.main_ractor->objspace;
+}
+
+void
+rb_gc_vm_forget_zombie(void *objspace)
+{
+    rb_vm_t *vm = GET_VM();
+    size_t n = vm->gc.zombie_objspaces_count;
+    for (size_t i = 0; i < n; i++) {
+        if (vm->gc.zombie_objspaces[i] == objspace) {
+            vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[n - 1];
+            vm->gc.zombie_objspaces_count = n - 1;
+            break;
+        }
+    }
 }
 
 size_t

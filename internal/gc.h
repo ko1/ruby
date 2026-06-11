@@ -295,6 +295,7 @@ void rb_gc_pin_in_flight_message(VALUE obj);
 void *rb_gc_objspace_alloc_local(void);
 void rb_gc_objspace_retire(void *objspace);
 void rb_gc_objspace_absorb_into_current(void **objspace_slot);
+void rb_gc_objspace_orphaned(void *objspace);
 const char *rb_obj_info(VALUE obj);
 void ruby_annotate_mmap(const void *addr, unsigned long size, const char *name);
 

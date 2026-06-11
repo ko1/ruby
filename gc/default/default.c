@@ -640,6 +640,12 @@ typedef struct rb_objspace {
         size_t stalled_shareables;
     } rlgc;
 
+    /* RLGCv2 (design_v2.md section 2.3): intrusive link for the orphan
+     * chain -- objspaces whose Ractor object was collected unjoined.
+     * Linked from ractor_free, which runs inside a GC sweep where no
+     * allocation is possible, hence intrusive. */
+    struct rb_objspace *rlgc_orphan_next;
+
     struct {
         rb_darray(struct heap_page *) sorted;
 
@@ -816,6 +822,10 @@ static struct {
     struct rb_objspace **list;
     size_t count, capa;
 } rlgc_global;
+
+/* orphaned objspaces awaiting their merge into main (section 2.3) */
+static rb_objspace_t *rlgc_orphaned_head;
+static void rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
 static struct heap_page_body *page_pool_acquire(void);
 static void page_pool_release(struct heap_page_body *body);
@@ -7924,6 +7934,26 @@ rlgc_global_gc(rb_objspace_t *driver)
     }
     rlgc_global.active = false;
 
+    /* step 9 cleanup (design_v2.md section 2.3): the sweep above may
+     * have collected Ractor objects whose objspaces were never joined;
+     * ractor_free queued them, and everyone is still stopped, so merge
+     * them into main now. (After the flags are down: the merge frees
+     * those objspace shells, which must no longer be in any pass. The
+     * GC work is finished, so lift during_gc around the merge -- it
+     * reallocates bookkeeping arrays, which the malloc guard forbids
+     * inside a GC.) */
+    {
+        rb_objspace_t *objspace = driver;
+        during_gc = FALSE;
+        while (rlgc_orphaned_head) {
+            rb_objspace_t *orphan = rlgc_orphaned_head;
+            rlgc_orphaned_head = orphan->rlgc_orphan_next;
+            rb_gc_vm_forget_zombie(orphan);
+            rlgc_objspace_absorb(rb_gc_vm_main_objspace(), orphan);
+        }
+        during_gc = TRUE; /* for gc_exit's accounting */
+    }
+
     gc_exit(driver, gc_enter_event_start, &lock_lev);
 }
 
@@ -8116,6 +8146,16 @@ void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
     rlgc_objspace_absorb(dst_ptr, src_ptr);
+}
+
+/* Queue an ownerless objspace whose Ractor object has just been freed.
+ * Runs inside a GC sweep: must not allocate. */
+void
+rb_gc_impl_objspace_orphaned(void *objspace_ptr)
+{
+    rb_objspace_t *objspace = objspace_ptr;
+    objspace->rlgc_orphan_next = rlgc_orphaned_head;
+    rlgc_orphaned_head = objspace;
 }
 
 void

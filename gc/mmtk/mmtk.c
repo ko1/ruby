@@ -1758,3 +1758,9 @@ rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
     /* single objspace */
 }
+
+void
+rb_gc_impl_objspace_orphaned(void *objspace_ptr)
+{
+    /* single objspace */
+}
