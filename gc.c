@@ -3702,26 +3702,31 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
         }
     }
     for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
-        func(vm->gc.zombie_objspaces[i], data);
+        func(vm->gc.zombie_objspaces[i].objspace, data);
     }
 }
 
 /* Called when a Ractor terminates without having been joined: its
  * objspace no longer has an owner thread, but its pages still hold
  * shareable objects reachable from other Ractors. Keep it enumerable
- * until inheritance merges it away. */
+ * until inheritance merges it away. Takes the owning r->objspace slot;
+ * the slot stays set (Ractor#value still inherits through it) and is
+ * cleared by whichever inheritance path takes the objspace. */
 void
-rb_gc_objspace_retire(void *objspace)
+rb_gc_objspace_retire(void **objspace_slot)
 {
     rb_vm_t *vm = GET_VM();
 
     RB_VM_LOCKING() {
         if (vm->gc.zombie_objspaces_count == vm->gc.zombie_objspaces_capa) {
             size_t new_capa = vm->gc.zombie_objspaces_capa ? vm->gc.zombie_objspaces_capa * 2 : 16;
-            SIZED_REALLOC_N(vm->gc.zombie_objspaces, void *, new_capa, vm->gc.zombie_objspaces_capa);
+            SIZED_REALLOC_N(vm->gc.zombie_objspaces, struct rb_objspace_zombie, new_capa, vm->gc.zombie_objspaces_capa);
             vm->gc.zombie_objspaces_capa = new_capa;
         }
-        vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = objspace;
+        vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = (struct rb_objspace_zombie){
+            .objspace = *objspace_slot,
+            .owner_slot = objspace_slot,
+        };
     }
 }
 
@@ -3748,7 +3753,7 @@ rb_gc_vm_forget_zombie(void *objspace)
     rb_vm_t *vm = GET_VM();
     size_t n = vm->gc.zombie_objspaces_count;
     for (size_t i = 0; i < n; i++) {
-        if (vm->gc.zombie_objspaces[i] == objspace) {
+        if (vm->gc.zombie_objspaces[i].objspace == objspace) {
             vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[n - 1];
             vm->gc.zombie_objspaces_count = n - 1;
             break;
@@ -3780,21 +3785,33 @@ rb_gc_single_objspace_p(void)
 void
 rb_gc_objspace_absorb_into_current(void **objspace_slot)
 {
-    rb_vm_t *vm = GET_VM();
-
     RB_VM_LOCKING() {
         void *objspace = *objspace_slot;
         if (objspace != NULL) {
             *objspace_slot = NULL;
-            size_t n = vm->gc.zombie_objspaces_count;
-            for (size_t i = 0; i < n; i++) {
-                if (vm->gc.zombie_objspaces[i] == objspace) {
-                    vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[n - 1];
-                    vm->gc.zombie_objspaces_count = n - 1;
-                    break;
-                }
-            }
+            rb_gc_vm_forget_zombie(objspace);
             rb_gc_impl_objspace_absorb(rb_gc_get_objspace(), objspace);
+        }
+    }
+}
+
+/* VM shutdown (design_v2.md decision 9): rb_ractor_terminate_all has
+ * just killed every other Ractor; merge all still-uninherited
+ * objspaces into main, so the traditional at-exit passes (finalizers,
+ * IO flush, free-at-exit) cover every object and run the dead
+ * Ractors' deferred finalizers on the main thread. Going through the
+ * owner slots also disarms the dead Ractor objects: a later #value or
+ * their own free finds r->objspace == NULL instead of a freed shell. */
+void
+rb_gc_objspace_absorb_all_zombies(void)
+{
+    rb_vm_t *vm = GET_VM();
+
+    while (vm->gc.zombie_objspaces_count > 0) {
+        size_t before = vm->gc.zombie_objspaces_count;
+        rb_gc_objspace_absorb_into_current(vm->gc.zombie_objspaces[0].owner_slot);
+        if (vm->gc.zombie_objspaces_count >= before) {
+            rb_bug("rb_gc_objspace_absorb_all_zombies: zombie list did not shrink");
         }
     }
 }
