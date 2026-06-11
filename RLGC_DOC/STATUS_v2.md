@@ -52,10 +52,23 @@
 - M1b 系: Ractor dmark が他 Ractor の owner 変異構造を歩く(threads/EC ×1、queues/ports ×1)、deleted-key 機構の STW 前提、gc_enter の main 判定揺れ、interrupt queue の create→start 窓(v1 §6.4 残存面)、process-wide static の再書込
 - M5 系: end_procs / trap_list の封じ込め漏れ、_id2ref build の単一 objspace 走査、**圧縮ガード未移植**(multi-objspace で full GC に degrade)、**value 継承物の到達性穴**(legacy/stdio/Thread wrapper → 併合直後 shref pin)、**mark_func_data redirect 乗っ取り**(v1 during_gc ゲート未移植 — 4 オラクル一括治癒)、**svar 封じ込め**(shref 不発 + Ractor 間共有 svar の per-EC 退避 = `$~` 漏れ解消)、**昇格カウンタの driver 偏り**(major ペーシング歪み)
 
-## 残項目
+## 残項目(2026-06-11 設計合意済みの実装キュー — 上から順に)
 
-1. **move の re-homing 方式**(§4.4): コピー+無効化 vs dmove 特別扱い — **ユーザ判断待ち**(現状 move はコピー経路で安全)
-2. generic_fields の per-objspace 分割(§2.4-2): 性能最適化。現状は global 表+専用 mutex で正しく、現ベンチでは非ホット
-3. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
-4. N=1 の残オーバーヘッド(~11%): gc_sweep_page 26% の精査余地、`rb_gc_get_objspace` の残呼び出し
-5. TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲、値レースの可能性大)
+1. **Ractor 宛て postponed job(決定 18)**: 汎用 VM 機構として独立実装・独立コミット。
+   per-Ractor triggered マスク + 宛先 EC への割込みフラグ(ubf では起こさない)
+2. **orphan 併合の pjob 化(§2.3 改稿済み)**: cycle 内 main 併合 → main 宛て pjob へ。
+   zombie entry の owner slot を ractor_free で NULL 化、shutdown 一括併合の slotless 対応、
+   fork 子での再トリガ。**absorb 全体の GC 禁止ガード**(表挿入の確保が継承側 local GC を
+   ページ半繋ぎで誘発し得る潜在ハザード)も同時に
+3. **zombie トリガのページ量化(§2.2 トリガ 3 改稿済み)**: 個数 8 → `vm->gc.zombie_total_pages`
+   ベース(retire/併合で増減)。閾値・下限の既定値はここで決める
+4. **mark_func_data の per-Ractor 化(§1.3 どおりへ)**: 現実装は VM 共有 + during_gc ゲート
+   (M5(3))の暫定。per-Ractor 化でゲート自体を不要にする
+5. **決定 12(foreign define_finalizer のエラー化)**: デザイン詰め中 — 未決 2 点
+   (shareable も一律拒否でよいか / clone・dup は cross-objspace では finalizer を引き継がない、
+   でよいか)の判断待ち → 確定後に実装(現状は不発・dangling entry の不整合経路が残存)
+6. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
+7. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
+8. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
+9. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
+10. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)

@@ -80,6 +80,12 @@ single writer から「割り当ても GC もロック不要」が出る。
     callinfo / iseq などメソッド・キャッシュ系の VM 内部オブジェクトは born-shareable に
     し、shareable_bits は FL_SHAREABLE と 1:1 に保つ。shareable → unshareable を許す
     例外は明示的なリストで管理する(§2.1)。
+18. **postponed job を特定の Ractor(まずは main)宛てに配送できる機構**を、GC とは
+    独立の汎用 VM 機構として新設する。トリガ側は宛先 Ractor の triggered マスクに
+    ビットを立てて宛先 EC に POSTPONED_JOB 割込みフラグを立てるだけ(ubf では
+    起こさない — ブロック中なら次に自然な safepoint へ戻ったときに実行される)。
+    flush は従来の「自分宛て(トリガしたスレッド)」のジョブに加えて自 Ractor 宛ての
+    マスクを drain する。最初の利用者は orphan objspace の main 併合(§2.3)。
 
 ---
 
@@ -160,6 +166,9 @@ typedef struct rb_global_objspace {
 - 空きページ・アリーナを持たない(ページプールへ)。
 - GC ノブ(stress / config / measure …)は objspace ごと。新しい Ractor は生成時に
   親 Ractor の設定を引き継ぐ。
+- GC の internal event(GC_START / GC_END_MARK / GC_END_SWEEP / GC_ENTER / GC_EXIT)は
+  **有効化した Ractor の objspace の GC でのみ発火**する。他 Ractor の並行 local GC が
+  VM 共有の hook list を辿らないための封じ込めであり、当面の確定仕様とする。
 - finalizer テーブルは objspace ごとで、**finalizer の実行もその Ractor のスレッドだけ**で
   行う(他の Ractor 上で勝手に走ることはない)。
 - malloc カウンタも objspace ごとで、その Ractor の GC トリガを駆動する。
@@ -264,6 +273,12 @@ shareable は unshareable を参照しない)なので、「WB を通らない s
   **root** にする(手順 3.c: rb_ractor_t から直接辿る。Ractor オブジェクト自体は生成元の
   objspace に居て、所有者から見ると foreign なので、オブジェクト経由ではなく C 構造体から
   root を引くのが正しい)。
+- **shareable な env(isolate 済み proc)のフレームの特殊変数**($~ / $_ の svar)。
+  env の svar slot に置くと、proc を共有する全 Ractor が 1 つの unshareable svar を
+  相互に読み書きしてしまう(封じ込めの「u に書けるのは所有者だけ」が崩れる上、$~ が
+  Ractor 間で混ざる)。そこで lep が shareable env のフレームは特殊変数を **per-EC
+  (`ec->root_svar`)に置く** — 割当て分類は「root で守る(EC = Ractor の C 構造)」。
+  cref は従来どおり env slot に残る。
 - 他にもあり得る(候補: iseq が持つ実行時の可変スロット — once キャッシュ、coverage 等)。
   実装時に「shareable の mark 関数が辿る先」を監査し、見つけたものはこのリストに追加して
   「shareable にする / shref で守る(WB で書かれる物)/ root で守る(所有者の構造から
@@ -406,8 +421,11 @@ local GC では回収できず、global GC まで滞留し続けるからであ�
    **新たに**マークされた数」 — 自分の root からは届かない shareable、すなわち自分の
    ヒープに滞留している「local では回収できないゴミ」の上界推定(cc / cme 等の VM 内部
    オブジェクトも含む)— の比率が閾値を超えた。
-3. **終了済み・未 join の Ractor** の objspace が溜まった(回収・併合できるのは
-   global GC だけ、§2.3)。
+3. **終了済み・未 join の Ractor の objspace が保持するページ総量**が閾値を超えた
+   (回収・併合できるのは global GC だけ、§2.3)。個数ではなく量で測る — 小さな
+   Ractor を大量に使い捨てるパターンで個数基準はすぐ発火してしまうし、困るのは
+   結局メモリなので。VM が retire / 併合時に増減させる合計ページ数
+   (`vm->gc.zombie_total_pages`)を見る。既定の閾値・下限は M5 で確定する。
 4. 明示(`GC.start`)と VM 終了。
 
 判定に使う計数はすべて**自分の objspace のもの**なので、global な状態も他 objspace の
@@ -474,6 +492,13 @@ local GC では回収できず、global GC まで滞留し続けるからであ�
      objspace を main に併合する(§2.3)。
 10. 全 objspace の「global GC 中」の印を下ろし、バリアを解除する。
 
+**compaction について**: GC.compact / GC.auto_compact= / GC.verify_compaction_references
+は、オブジェクトの移動が全空間の参照更新を要するため per-Ractor objspace の世界では
+そのまま動かせない。当面は **objspace が複数あるときは非移動の full GC に degrade**
+する(誤って動くと heap corruption になる面は v1 で実証済み)。将来は **global GC
+(STW)の一部**として「各 objspace 内でのページ内移動 + バリア内での全空間参照更新」
+の形で実装する方針(所有権は変えない。バリア内なら参照更新は安全に行える)。
+
 ### 2.3 Ractor 終了 — objspace は join した者が、いなければ main が引き継ぐ
 
 終了した Ractor の objspace は、その場では誰にも併合されず、終了済みの Ractor に
@@ -486,13 +511,22 @@ local GC では回収できず、global GC まで滞留し続けるからであ�
   (§4.3)。併合は自分のヒープへの書き込みなので single writer はそのまま守られる。
   value の呼び出し自体が引き継ぎの実行場所であり、受け渡しの仕掛けは何も要らない。
 - **join されないまま Ractor オブジェクトが回収された場合**: Ractor オブジェクトは
-  shareable なので、回収するのは必ず global GC(STW 中)。全員止まっているので、
-  global GC がバリアの中で(sweep の後始末として)その objspace を main に併合する。
-  STW 中は single writer の制約自体が発生しない。
+  shareable なので、回収するのは必ず global GC(STW 中)= ここが「もう誰も join
+  できない」ことの判定を兼ねる。ractor_free はその objspace を侵入リスト(orphan
+  chain)に積むだけにし(sweep 内なので確保はできない)、cycle の末尾で **main 宛て
+  postponed job(決定 18)をトリガ**する。実際の併合は main が自分の次の safepoint で
+  **main 自身のスレッド**として行う。これで 3 経路すべて(value = joiner / orphan =
+  main / shutdown = main)が「併合は継承者自身のスレッドで」という同一の形になり、
+  「STW 中だけ single writer が免除される」という特例が設計から消える。
+  併合されるまでの間も orphan は zombie 帳簿(下記)に残り、global GC の列挙から
+  漏れない。fork の子では chain が残っていれば子の main へ再トリガする。shutdown は
+  chain と zombie をまとめて main が併合する。
 
 併合の作業内容はどちらも同じ: ページを size pool ごとに引き継ぎ側のヒープへ繋ぎ替え、
 各ページの `page->objspace` を書き換え、finalizer テーブル・zombie・カウンタ類を併合し、
-空きページはページプールへ返し、objspace の殻を解放する。死んだ Ractor の deferred
+空きページはページプールへ返し、objspace の殻を解放する。**併合の間は継承側の GC を
+禁止する**(`rb_gc_disable_no_rest`)— 併合内部の表挿入は確保を伴い得るので、放って
+おくと継承側の local GC がページ半繋ぎの状態で起動し得る。死んだ Ractor の deferred
 finalizer は以後**引き継いだ側のスレッド**が実行する(終了した Ractor にはそれを実行する
 スレッドが無い — 放置すると zombie が永遠に残り、objspace は決して空にならない。
 引き継ぎがその答えになっている)。
@@ -501,11 +535,15 @@ finalizer は以後**引き継いだ側のスレッド**が実行する(終了�
 
 - この objspace を local GC する者は居ない(所有者不在)。中のゴミは global GC が回収し
   続ける。戻り値とそこから辿れるものは、終了済み Ractor 経由で生きている。
-- 「全 objspace は Ractor の一覧から辿れる」を保つため、終了済み・未引き継ぎの Ractor は
-  VM の Ractor 一覧に**終了済みとして残し**、引き継ぎ完了で外す。プロセスで言う zombie と
-  同じ構図(join = wait、main = init への reparent)。新しいリストではなく既存の一覧の
-  延命である。ただし**バリアの参加者としては数えない**(スレッドが無いので合流できない)し、
-  「Ractor が 1 個か」の判定(単一 Ractor 最適化、§2.1)でも生きている Ractor だけを数える。
+- 「全 objspace は列挙から漏れない」を保つため、終了した Ractor の objspace は
+  `vm->gc.zombie_objspaces`(objspace と、継承時にクリアする owner slot =
+  `&r->objspace` の組)に登録し、引き継ぎ完了で外す。プロセスで言う zombie と同じ
+  構図(join = wait、main = init への reparent)。Ractor 自体は終了時に VM の一覧から
+  外す — 一覧に残す案も等価だが、その場合は Ractor 数の計数・バリア参加・単一 Ractor
+  判定のすべてに「終了済みを除く」例外が要る。帳簿の本質は全 objspace 列挙の完全性で、
+  それは別帳簿で満たせるので、計数系を無傷に保てる方を採る。orphan 化(Ractor
+  オブジェクト回収)で rb_ractor_t が解放されたら entry の owner slot は NULL に
+  しておく(shutdown の一括併合は slot なしでも併合できる形にする)。
 - 封じ込めにより、この objspace の unshareable に外から刺さる参照は無い(戻り値は併合後に
   しか Ruby コードへ返らない、§4.3)。外から参照され得るのは shareable だけで、それは
   誰の local GC も解放しない。だからこの待機状態は安全。
