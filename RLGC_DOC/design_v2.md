@@ -68,9 +68,10 @@ single writer から「割り当ても GC もロック不要」が出る。
     local major は自分の旧世代(unshareable)の増加で、global GC は **shareable の世界の
     増加・滞留**(と終了済み Ractor の堆積)で起動する(§2.2)。
 15. ページに **shareable_bits** を追加し、「local GC が解放してはならないオブジェクト」
-    (shareable + 共有され得る VM 内部 imemo)をビットマップ化する。local sweep の解放
-    可否判定と滞留計数(§2.2)が word 単位のビット演算になる。ページ上の RLGC 追加
-    ビットはオブジェクトあたり shref と合わせて 2 bit(§1.4)。
+    (shareable + 共有され得る VM 内部 imemo)をビットマップ化する。confined GC は
+    これを索引に shareable を **root としてマークして**生かす(§2.1 — sweep で除外する
+    方式は、生かしたオブジェクトの世代が進まず世代不変条件と衝突するため不採用)。
+    ページ上の RLGC 追加ビットはオブジェクトあたり shref と合わせて 2 bit(§1.4)。
 16. ユーザ定義 T_DATA の `dmark` / `dfree` は、upstream で導入予定の
     [Feature #22067](https://bugs.ruby-lang.org/issues/22067) の宣言機構に従う:
     宣言済みの型のみ local GC に参加し、未宣言の型は global GC だけが mark / free する
@@ -187,8 +188,8 @@ typedef struct rb_global_objspace {
   born-shareable な割り当てと `RB_OBJ_SET_SHAREABLE`(make_shareable)が header の
   フラグと同時に立てる。書き手は常に所有 Ractor のスレッド(封じ込めにより、どちらの
   操作も所有 Ractor 上でしか起きない)なので atomic は不要。bit を消すのは global sweep
-  だけ(`shareable_bits &= mark_bits`)。これで local sweep の解放可否と滞留計数が
-  ビット演算になる(§2.1)。
+  (`shareable_bits &= mark_bits`)と slot の解放時だけ。confined GC はこのビットマップを
+  索引に shareable を root としてマークする(§2.1)。
 - 複数スレッドが書き得るビットマップ(remembered set / shref_bits)への set は atomic CAS、
   ページ単位のフラグはビットフィールドでなく byte にする。非 atomic の `bits[i] |= mask`
   は並行する set を片方消し、関係ないオブジェクトの bit を落とす(young な子が解放される)。
@@ -269,12 +270,16 @@ shareable は unshareable を参照しない)なので、「WB を通らない s
   判定できないから。shareable の回収は global GC だけが行う。
   (クラスはもともと shareable。メソッドエントリ・コールキャッシュ等の VM 内部
   オブジェクトも born-shareable にする(決定 17)ので、同じ扱いに自然に含まれる。)
-  判定は per-page の shareable_bits(§1.4)とのビット演算で行う:
-  解放候補 = `有効 slot & ~mark_bits & ~shareable_bits`。slot ごとにヘッダを読む必要が
-  なく、word 単位で済む。滞留計数(§2.2)も `popcount(~mark_bits & shareable_bits)` で
-  同時に出る。
-  例外として、Ractor が 1 個しか居なければ local GC = 全体 GC なので shareable も回収して
-  よい(shareable_bits を無視するだけ)。引き継ぎ(§2.3)で objspace は main 1 個に戻り
+  実現方法は「**mark フェーズで shareable_bits を索引に root としてマークする**」
+  (shref と同じ walk)。sweep 側でビット演算により除外する方式は採らない —
+  生かしたオブジェクトがマークされないと age が進まず、「old の親 → 永遠に young の子」
+  という remember されない O→Y エッジが生じて世代不変条件
+  (GC.verify_internal_consistency)と衝突する。mark で生かせば普通に老化・昇格し、
+  その子も traversal で自然に生きる。滞留計数(§2.2)は「この root 化で**新たに**
+  マークされた数」(= 自分の root からは届かなかった shareable の数)として同じ walk で
+  得られる。
+  例外として、Ractor が 1 個しか居なければ local GC = 全体 GC なのでこの root 化ごと
+  スキップし、shareable も普通に死ぬ。引き継ぎ(§2.3)で objspace は main 1 個に戻り
   得るので、この最適化は復帰可能にしておく。
 - 完全に空になったページは**即ページプールへ返す**(直近 1 ページの保持などの
   ヒステリシスは実装の裁量)。
@@ -313,12 +318,21 @@ minor / major とも自スレッドで実行し、ロックもバリアも取ら
       無視する(その生存は所有者か global GC の責任)。
    c. Ractor self と Ractor-local storage。
    d. 自 objspace の finalizer テーブル(値を pin)。
-   e. 自 objspace の registered roots★。`rb_global_variable` / `rb_gc_register_mark_object`
-      は「呼んだ Ractor の objspace」の表に登録する(boot 時の VM グローバルは main の表に
-      入る)。こうしないと「VM グローバルな表に入れた worker のオブジェクトを誰も root に
-      しない」という穴が開く。
-   f. ★shref: `has_shref_objects` の立った自分のページを走査し、shref_bits の立った
-      オブジェクトを root として mark する(bit の在処は自分のページなので走査は自己完結)。
+   e. VM-global の registered roots★(`rb_global_variable` / `rb_gc_register_mark_object`)。
+      登録リストは VM に 1 つのまま、**全 objspace の root 走査が C レベルで全エントリを
+      なめる** — mark 側の foreign-skip が「自分の objspace のエントリ」だけを自然に
+      選別する(リストのチャンク自体も登録した Ractor の objspace 生まれなので、所有者が
+      mark して生かす)。こうしないと「VM グローバルな表に入れた worker のオブジェクトを
+      誰も root にしない」という穴が開く(lazy 初期化の static 変数を worker が先に踏む
+      ケースで実証済み: `clone(freeze: true)` の freeze_true_hash 等)。
+      per-objspace の登録表に分割する案は不採用 — `rb_global_variable(VALUE *)` は
+      アドレス登録で、スロットには後から**別の objspace の値**が代入され得るため、
+      表の所有 objspace を決められない。走査コストは O(全登録数) × objspace 数だが、
+      登録物は定数規模(チューニングは M5)。
+   f. ★shareable と shref を root 化: `has_shareable_objects` / `has_shref_objects` の
+      立った自分のページを走査し、shareable_bits | shref_bits の立ったオブジェクトを
+      root として mark する(bit の在処は自分のページなので走査は自己完結)。
+      このとき「新たにマークされた shareable の数」を数えておく — 滞留推定(§2.2)。
    g. minor のみ: remembered set(master と同じ。remembered ページの旧世代の子を再走査し、
       wb-unprotected な uncollectible も再走査する)。
 4. 推移的 mark(mark stack が空になるまで):
@@ -332,14 +346,10 @@ minor / major とも自スレッドで実行し、ロックもバリアも取ら
    ★対象が foreign のものは触らない(global GC が処理する)。世代カウンタの更新は
    master と同じ。
 6. sweep(lazy 可。master の枠組みに以下の差分):
-   - ★解放候補をビット演算で出す: `free = 有効 slot & ~mark_bits & ~shareable_bits`。
-     shareable(cc / cme 等の VM 内部オブジェクトも shareable、決定 17)は unmarked でも
-     解放されない。VM の Ractor 一覧が main だけのときは shareable_bits を無視してよい
-     (= 全体 GC と同じ)。
-   - ★滞留計数: `popcount(有効 slot & ~mark_bits & shareable_bits)` をページごとに合算
-     する — 自分のヒープに滞留している「local では回収できないゴミ」の上界推定で、
-     global GC の起動判定(§2.2)の入力になる。
+   - shareable は手順 3.f の root 化により必ずマーク済みなので、sweep 自体は master の
+     「unmarked を解放する」のままでよい(★sweep に shareable の特別扱いは無い)。
    - finalizer 持ちは zombie 化して自分の deferred リストへ(実行も自スレッド)。
+   - ★解放した slot の shareable / shref ビットはクリアする(再利用に引き継がない)。
    - ★完全に空になったページは `page->objspace = NULL` にして global page pool へ返す。
 7. 終了: `during_gc` を下ろし、deferred finalizer を通常の機構で実行する。
 
@@ -379,10 +389,10 @@ local GC では回収できず、global GC まで滞留し続けるからであ�
    limit は global sweep が shareable_bits の popcount で正確な生存数を取り直し、
    `生存数 × factor(既定 2.0 — 旧世代の GC_HEAP_OLDOBJECT_LIMIT_FACTOR と同じ)+ 下限`
    で再設定する(下限が無いと新しい Ractor が 1 → 2 で即発火してしまう)。
-2. **滞留の観測**: 自分の local sweep が数えている「unmarked のまま残した shareable
-   スロット」(自分のヒープ内の回収不能ゴミの上界推定。cc / cme 等の VM 内部オブジェクトも
-   shareable なので含まれる。shareable_bits との popcount で sweep のついでに出る、§2.1)の
-   比率が閾値を超えた。
+2. **滞留の観測**: 自分の local GC が数えている「shareable の root 化(§2.1 手順 3.f)で
+   **新たに**マークされた数」 — 自分の root からは届かない shareable、すなわち自分の
+   ヒープに滞留している「local では回収できないゴミ」の上界推定(cc / cme 等の VM 内部
+   オブジェクトも含む)— の比率が閾値を超えた。
 3. **終了済み・未 join の Ractor** の objspace が溜まった(回収・併合できるのは
    global GC だけ、§2.3)。
 4. 明示(`GC.start`)と VM 終了。
@@ -500,6 +510,23 @@ local GC はロックを取らずに走るため、「local GC のコードパ�
    dynamic symbol 表のエントリは shareable であり、local GC は shareable を解放しない
    (shareable_bits)。つまり**これらの表からの削除は global GC(STW)中にしか起きない**
    ので、mutator 側の挿入(既存の同期のまま)と local GC が競合する経路が存在しない。
+
+   注意: エントリだけでなく**表の入れ物(コンテナオブジェクト)自体も shareable で
+   なければならない**。concurrent set(fstring 表・sym 表の実体)は resize 時に
+   「resize したスレッド」の objspace に新世代の T_DATA を確保して C グローバルを
+   差し替える。worker の objspace に生まれた表は worker の local root から届かず、
+   main から見れば foreign なので、shareable 化しないと worker の local GC が
+   生きた表ごと回収してしまう(実際に M1a で fstring 表がこの経路で壊れた)。
+   同型: symbol の id→(str,sym) 逆引きに使う `id_entry_list`(T_DATA)も intern した
+   Ractor の objspace に生まれ、main 在住の `symbols->ids` Array からしか参照されない。
+   どちらも born-shareable にして所有 objspace の pin で守る。代償として、resize で
+   不要になった旧世代の表は global GC まで回収されない(retention)が、旧世代の合計は
+   最終サイズの定数倍で抑えられるので許容する。
+   一般則: **「VM グローバル(C global / VM 構造体)から届く GC オブジェクトを
+   main 以外のスレッドが確保する」箇所は、必ず born-shareable にする**(決定 17 の系)。
+   born-shareable にできない(意味的に unshareable な)ものは、§2.1 手順 3.e の
+   VM-global 登録リスト(全 objspace が C 走査)に載せる — 例: `clone(freeze:)` の
+   freeze_true/false_hash や `<cfunc>` 文字列のような lazy 初期化 static。
 2. **オブジェクトに紐づく表は per-objspace に分割する**。generic ivar の表
    (非 T_OBJECT ホストの ivar 置き場)はホストごとのエントリなので、ホストの所有
    objspace の表に分ける。挿入・削除(local sweep での解放時)・mark 中の参照がすべて

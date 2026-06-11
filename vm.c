@@ -3409,9 +3409,11 @@ rb_vm_mark(void *ptr)
             rb_gc_mark(rb_ractor_self(r));
         }
 
-        for (size_t index = 0; index < vm->global_object_list_size; index++) {
-            rb_gc_mark_maybe(*vm->global_object_list[index]);
-        }
+        /* global_object_list (rb_gc_register_address) is marked by
+         * rb_vm_mark_registered_global_objects() from every objspace's root
+         * scan, not here: its entries can live in any objspace.  Registered
+         * mark objects (rb_gc_register_mark_object) are per-Ractor and marked
+         * from ractor_mark (and the main Ractor's list, above). */
 
         rb_gc_mark_movable(vm->self);
 
@@ -3429,7 +3431,6 @@ rb_vm_mark(void *ptr)
         if (vm->ractor.main_ractor && vm->ractor.main_ractor->mark_object_ary) {
             rb_gc_mark_movable(vm->ractor.main_ractor->mark_object_ary);
         }
-
         rb_gc_mark_movable(vm->orig_progname);
         rb_gc_mark_movable(vm->coverages);
         rb_gc_mark_movable(vm->me2counter);
@@ -4929,6 +4930,19 @@ rb_vm_ractor_migrate_mark_objects(rb_ractor_t *dst, rb_ractor_t *src)
         list = array_list->next;
     }
     src->mark_object_ary = 0;
+}
+
+/* Mark the VM-global address registrations (rb_gc_register_address).  The list
+ * can hold objects from any objspace (whoever registers allocates), so every
+ * objspace's root scan walks it structurally: mark_maybe keeps exactly its own
+ * residents alive.  (rb_gc_register_mark_object is per-Ractor; see
+ * rb_ractor_t.mark_object_ary and ractor_mark.) */
+void
+rb_vm_mark_registered_global_objects(rb_vm_t *vm)
+{
+    for (size_t index = 0; index < vm->global_object_list_size; index++) {
+        rb_gc_mark_maybe(*vm->global_object_list[index]);
+    }
 }
 
 VALUE rb_cc_refinement_set_create(void);

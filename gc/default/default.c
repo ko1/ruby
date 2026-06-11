@@ -2254,6 +2254,10 @@ page_pool_release(struct heap_page_body *body)
         rb_global_objspace_t *g = global_objspace;
 
         rb_native_mutex_lock(&g->page_pool.lock);
+        /* The body of a page parked in the empty pages pool is kept fully
+         * poisoned (see gc_sweep_page); unpoison the head before linking
+         * it into the pool freelist. */
+        asan_unpoison_memory_region(body, sizeof(struct heap_page_body *), false);
         *(struct heap_page_body **)body = g->page_pool.freelist;
         g->page_pool.freelist = body;
         asan_poison_memory_region(body, HEAP_PAGE_SIZE);
