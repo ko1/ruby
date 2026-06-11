@@ -814,9 +814,15 @@ typedef struct rb_vm_struct {
         /* RLGCv2 (design_v2.md §2.2 step 5): objspaces of terminated, not
          * yet inherited Ractors. The owner thread is gone, so nothing
          * mutates them, but the global GC must enumerate them in every
-         * pass (one missed objspace leaves stale mark bits behind = UAF);
-         * M4 merges them away. Mutated under the VM lock only. */
-        void **zombie_objspaces;
+         * pass (one missed objspace leaves stale mark bits behind = UAF).
+         * owner_slot is the dead Ractor's r->objspace: inheritance
+         * (Ractor#value, the global GC's orphan merge, VM shutdown)
+         * clears it together with dropping the entry, under the VM lock,
+         * so nobody can reach the absorbed shell through the Ractor. */
+        struct rb_objspace_zombie {
+            void *objspace;
+            void **owner_slot;
+        } *zombie_objspaces;
         size_t zombie_objspaces_count;
         size_t zombie_objspaces_capa;
 
