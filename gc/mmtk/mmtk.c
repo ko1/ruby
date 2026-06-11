@@ -1746,3 +1746,9 @@ rb_gc_impl_active_gc_name(void)
 {
     return "mmtk";
 }
+
+bool
+rb_gc_impl_during_global_gc_p(void *objspace_ptr)
+{
+    return false;
+}
