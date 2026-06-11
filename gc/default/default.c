@@ -3267,7 +3267,14 @@ rb_gc_impl_undefine_finalizer(void *objspace_ptr, VALUE obj)
 void
 rb_gc_impl_copy_finalizer(void *objspace_ptr, VALUE dest, VALUE obj)
 {
-    rb_objspace_t *objspace = objspace_ptr;
+    /* RLGCv2: finalizers are kept in the table of the objspace that owns
+     * the object. dest was just allocated by the running Ractor, so its
+     * entry goes into the current objspace's table, but obj may be a
+     * foreign (e.g. shareable) object whose entry lives in its owner's
+     * table. All finalizer_table accesses run under the VM lock.
+     * (The finalizer_table macro reads the local "objspace" variable,
+     * which is repointed from obj's owner to dest's objspace below.) */
+    rb_objspace_t *objspace = GET_HEAP_OBJSPACE(obj);
     VALUE table;
     st_data_t data;
 
@@ -3277,6 +3284,7 @@ rb_gc_impl_copy_finalizer(void *objspace_ptr, VALUE dest, VALUE obj)
     if (RB_LIKELY(st_lookup(finalizer_table, obj, &data))) {
         table = rb_ary_dup((VALUE)data);
         RARRAY_ASET(table, 0, rb_obj_id(dest));
+        objspace = objspace_ptr;
         st_insert(finalizer_table, dest, table);
         FL_SET(dest, FL_FINALIZE);
     }
