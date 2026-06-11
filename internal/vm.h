@@ -46,6 +46,8 @@ VALUE rb_vm_push_frame_fname(struct rb_execution_context_struct *ec, VALUE fname
 /* vm.c */
 VALUE rb_obj_is_thread(VALUE obj);
 void rb_vm_mark(void *ptr);
+struct rb_vm_struct;
+void rb_vm_mark_registered_global_objects(struct rb_vm_struct *vm);
 void rb_vm_register_global_object(VALUE obj);
 void rb_vm_each_stack_value(void *ptr, void (*cb)(VALUE, void*), void *ctx);
 PUREFUNC(VALUE rb_vm_top_self(void));

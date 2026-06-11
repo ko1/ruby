@@ -3061,6 +3061,12 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     MARK_CHECKPOINT("ractor");
     rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
 
+    /* The VM-global object registrations can hold entries from any
+     * objspace (whoever registers allocates them), so every objspace
+     * walks them; marking skips foreign entries (design_v2.md §2.4). */
+    MARK_CHECKPOINT("vm_registered_objects");
+    rb_vm_mark_registered_global_objects(vm);
+
     /* VM-global roots belong to the main Ractor's objspace (that is where
      * boot-time objects live); a worker's confined GC does not scan them. */
     if (objspace == vm->ractor.main_ractor->objspace) {
