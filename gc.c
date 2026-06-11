@@ -2972,11 +2972,19 @@ ruby_stack_check(void)
 
 /* ==================== Marking ==================== */
 
+/* RLGCv2: mark_func_data is VM-GLOBAL, but the redirect belongs only to
+ * the thread that installed it (a traversal API holding the VM lock,
+ * never inside a real GC). A concurrent lock-free local GC on another
+ * thread must keep actually marking while a redirect is installed --
+ * taking the traverse branch there would feed its objects to a foreign
+ * callback and leave them unmarked (freed alive). during_gc on the
+ * CURRENT objspace tells the two apart. */
 #define RB_GC_MARK_OR_TRAVERSE(func, obj_or_ptr, obj, check_obj) do { \
     if (!RB_SPECIAL_CONST_P(obj)) { \
         rb_vm_t *vm = GET_VM(); \
         void *objspace = rb_gc_get_objspace(); \
-        if (LIKELY(vm->gc.mark_func_data == NULL)) { \
+        if (LIKELY(vm->gc.mark_func_data == NULL) || \
+                rb_gc_impl_during_gc_p(objspace)) { \
             GC_ASSERT(rb_gc_impl_during_gc_p(objspace)); \
             (func)(objspace, (obj_or_ptr)); \
         } \
