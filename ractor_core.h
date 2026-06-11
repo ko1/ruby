@@ -140,6 +140,7 @@ struct rb_ractor_struct {
 /* RLGCv2: mark Ractor r's GC roots from its C structure (gc.c root scan). */
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
+void rb_ractor_pin_inherited_parts(rb_ractor_t *r);
 
 enum ractor_wakeup_status {
     wakeup_none,
