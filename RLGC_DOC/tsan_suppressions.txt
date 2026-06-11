@@ -39,3 +39,17 @@ race:rb_gc_single_objspace_p
 race:rlgc_global_wanted_p
 race:vm_remove_ractor
 race:vm_insert_ractor0
+
+# zombie_threads list links are VM-locked on both sides (the dying
+# thread's add and the root-pass walk); the report is the
+# sched.finished bool, written lock-free by the exiting native thread.
+# A stale false only re-marks the wrapper for one more cycle; the
+# delete happens on the next walk.
+race:rb_thread_sched_mark_zombies
+
+# The Ractor-creation objspace swap (cr->objspace, under the VM lock)
+# is read lock-free only by other Ractors' mark_roots main-objspace
+# comparison -- for them the swapped value can never equal their own
+# objspace, so either value compares false. gc_enter itself keys off
+# the stable rlgc_main_objspace instead.
+race:rb_thread_create_ractor

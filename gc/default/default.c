@@ -4062,6 +4062,9 @@ struct gc_sweep_context {
     int final_slots;
     int freed_slots;
     int empty_slots;
+    /* hoisted out of the per-slot pinned-free assert: the predicate is
+     * an external call, far too hot for the sweep loop */
+    unsigned char check_pinned_free;
 
     struct free_region *free_region;
 };
@@ -4133,7 +4136,7 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 /* RLGC_DEBUG: a confined GC must never free a pinned slot.
                  * (The global GC may: its unified mark is exact, and dead
                  * shareables are precisely what it exists to collect.) */
-                if (!rb_gc_single_objspace_p() && !objspace->during_global_gc &&
+                if (ctx->check_pinned_free &&
                     (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(vp), vp) ||
                      MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp))) {
                     rb_bug("page_sweep: freeing pinned slot %s (shareable=%d shref=%d)",
@@ -4610,6 +4613,12 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
     gc_prof_sweep_timer_start(objspace);
 #endif
 
+    /* hoisted for the per-slot pinned-free assert; see gc_sweep_context.
+     * A Ractor-count transition mid-sweep only relaxes the check for the
+     * remainder (the pin invariants still hold for this cycle's marks). */
+    const unsigned char check_pinned_free =
+        !rb_gc_single_objspace_p() && !objspace->during_global_gc;
+
     do {
         RUBY_DEBUG_LOG("sweep_page:%p", (void *)sweep_page);
 
@@ -4618,6 +4627,7 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
             .final_slots = 0,
             .freed_slots = 0,
             .empty_slots = 0,
+            .check_pinned_free = check_pinned_free,
         };
         gc_sweep_page(objspace, heap, &ctx);
         int free_slots = ctx.freed_slots + ctx.empty_slots;
