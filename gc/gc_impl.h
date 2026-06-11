@@ -128,6 +128,7 @@ GC_IMPL_FN void rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN void rb_gc_impl_pin_in_flight_message(void *objspace_ptr, VALUE obj);
 // Heap walking
 GC_IMPL_FN void rb_gc_impl_each_objects(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
+GC_IMPL_FN bool rb_gc_impl_during_global_gc_p(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_each_object(void *objspace_ptr, void (*func)(VALUE obj, void *data), void *data);
 // Finalizers
 GC_IMPL_FN void rb_gc_impl_make_zombie(void *objspace_ptr, VALUE obj, void (*dfree)(void *), void *data);
