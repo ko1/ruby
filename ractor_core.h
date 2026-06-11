@@ -42,6 +42,13 @@ struct rb_ractor_sync {
     rb_ractor_t *successor;
     VALUE legacy;
     bool legacy_exc;
+
+    /* RLGCv2 (design_v2.md §4.2): the snapshot currently being
+     * materialized by this Ractor's receive. The basket has already been
+     * popped from the queue, so this slot is what lets the root scan and
+     * the global GC's in-flight re-pin keep the sender-resident snapshot
+     * alive while the copy is running. */
+    VALUE in_flight_materializing;
 };
 
 // created
@@ -132,6 +139,7 @@ struct rb_ractor_struct {
 
 /* RLGCv2: mark Ractor r's GC roots from its C structure (gc.c root scan). */
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
+void rb_ractor_repin_in_flight(rb_ractor_t *r);
 
 enum ractor_wakeup_status {
     wakeup_none,

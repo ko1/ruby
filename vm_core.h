@@ -811,6 +811,15 @@ typedef struct rb_vm_struct {
          * data such as the page pool).  Each Ractor owns its rb_objspace via
          * r->objspace; the boot objspace belongs to the main Ractor. */
         struct rb_global_objspace *global_objspace;
+        /* RLGCv2 (design_v2.md §2.2 step 5): objspaces of terminated, not
+         * yet inherited Ractors. The owner thread is gone, so nothing
+         * mutates them, but the global GC must enumerate them in every
+         * pass (one missed objspace leaves stale mark bits behind = UAF);
+         * M4 merges them away. Mutated under the VM lock only. */
+        void **zombie_objspaces;
+        size_t zombie_objspaces_count;
+        size_t zombie_objspaces_capa;
+
 #if USE_MODULAR_GC
         struct gc_mark_func_data_struct *mark_func_data;
 #endif

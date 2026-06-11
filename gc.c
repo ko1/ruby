@@ -3055,11 +3055,25 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     if (categoryp) *categoryp = category; \
 } while (0)
 
+    bool global_gc = rb_gc_impl_during_global_gc_p(objspace);
+
     /* RLGCv2 (design_v2.md §2.1): the current Ractor's own roots are marked
      * from its C structures -- a confined GC cannot rely on the heap
-     * Ractor/Thread wrapper objects, which may live in another objspace. */
+     * Ractor/Thread wrapper objects, which may live in another objspace.
+     * The global GC (§2.2 step 6) processes the same root list for every
+     * Ractor, and re-pins the in-flight payloads whose shref bits the
+     * clear pass removed. */
     MARK_CHECKPOINT("ractor");
-    rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
+    if (global_gc) {
+        rb_ractor_t *r;
+        ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+            rb_ractor_mark_local_roots(r);
+            rb_ractor_repin_in_flight(r);
+        }
+    }
+    else {
+        rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
+    }
 
     /* The VM-global object registrations can hold entries from any
      * objspace (whoever registers allocates them), so every objspace
@@ -3068,8 +3082,9 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     rb_vm_mark_registered_global_objects(vm);
 
     /* VM-global roots belong to the main Ractor's objspace (that is where
-     * boot-time objects live); a worker's confined GC does not scan them. */
-    if (objspace == vm->ractor.main_ractor->objspace) {
+     * boot-time objects live); a worker's confined GC does not scan them.
+     * The global GC scans everything. */
+    if (global_gc || objspace == vm->ractor.main_ractor->objspace) {
         MARK_CHECKPOINT("vm");
         rb_vm_mark(vm);
 
@@ -3668,11 +3683,14 @@ rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *
     }
 }
 
-/* Walk the objects of every living Ractor's objspace. The caller must
- * hold the VM lock and have issued a barrier: other Ractors' heaps may
- * only be read while their owners are stopped (RLGCv2 single-writer). */
+/* Enumerate every objspace in the process: the living Ractors' ones and
+ * the retired (zombie) ones of terminated, not yet inherited Ractors.
+ * The caller must hold the VM lock; reading other objspaces additionally
+ * requires a barrier (RLGCv2 single-writer). The completeness of this
+ * enumeration is load-bearing for the global GC: one missed objspace
+ * leaves stale mark bits behind (design_v2.md §2.2 step 5). */
 void
-rb_objspace_each_objects_all(int (*callback)(void *, void *, size_t, void *), void *data)
+rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
 {
     ASSERT_vm_locking();
 
@@ -3680,9 +3698,51 @@ rb_objspace_each_objects_all(int (*callback)(void *, void *, size_t, void *), vo
     rb_ractor_t *r;
     ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
         if (r->objspace) {
-            rb_gc_impl_each_objects(r->objspace, callback, data);
+            func(r->objspace, data);
         }
     }
+    for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
+        func(vm->gc.zombie_objspaces[i], data);
+    }
+}
+
+/* Called when a Ractor terminates without having been joined: its
+ * objspace no longer has an owner thread, but its pages still hold
+ * shareable objects reachable from other Ractors. Keep it enumerable
+ * until M4 inheritance merges it away. VM lock required. */
+void
+rb_gc_objspace_retire(void *objspace)
+{
+    ASSERT_vm_locking();
+
+    rb_vm_t *vm = GET_VM();
+    if (vm->gc.zombie_objspaces_count == vm->gc.zombie_objspaces_capa) {
+        size_t new_capa = vm->gc.zombie_objspaces_capa ? vm->gc.zombie_objspaces_capa * 2 : 16;
+        SIZED_REALLOC_N(vm->gc.zombie_objspaces, void *, new_capa, vm->gc.zombie_objspaces_capa);
+        vm->gc.zombie_objspaces_capa = new_capa;
+    }
+    vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = objspace;
+}
+
+struct each_objects_all_data {
+    int (*callback)(void *, void *, size_t, void *);
+    void *data;
+};
+
+static void
+each_objects_all_i(void *objspace, void *ptr)
+{
+    struct each_objects_all_data *d = ptr;
+    rb_gc_impl_each_objects(objspace, d->callback, d->data);
+}
+
+/* Walk the objects of every objspace (living and zombie). The caller
+ * must hold the VM lock and have issued a barrier. */
+void
+rb_objspace_each_objects_all(int (*callback)(void *, void *, size_t, void *), void *data)
+{
+    struct each_objects_all_data d = { .callback = callback, .data = data };
+    rb_gc_vm_each_objspace(each_objects_all_i, &d);
 }
 
 static void

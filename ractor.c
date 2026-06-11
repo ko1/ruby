@@ -511,6 +511,12 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         rb_gc_ractor_cache_free(cr->newobj_cache);
         cr->newobj_cache = NULL;
 
+        /* RLGCv2: the objspace loses its owner thread here; keep it
+         * enumerable for the global GC until M4 inheritance merges it. */
+        if (cr->objspace) {
+            rb_gc_objspace_retire(cr->objspace);
+        }
+
         ractor_status_set(cr, ractor_terminated);
     }
     RB_VM_UNLOCK();

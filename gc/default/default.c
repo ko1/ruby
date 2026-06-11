@@ -602,6 +602,12 @@ typedef struct rb_objspace {
         unsigned int measure_gc : 1;
     } flags;
 
+    /* RLGCv2 (design_v2.md §2.2 step 4): set on every objspace by the
+     * global GC driver inside the barrier; mark/sweep decisions that must
+     * lift the containment guards consult this. A byte (not a bitfield
+     * bit) so the cross-thread write rule stays uniform. */
+    unsigned char during_global_gc;
+
     rb_event_flag_t hook_events;
 
     rb_heap_t heaps[HEAP_COUNT];
@@ -778,6 +784,15 @@ typedef struct rb_global_objspace {
 
 static rb_global_objspace_t rb_global_objspace_instance;
 static rb_global_objspace_t *global_objspace = NULL;
+
+/* RLGCv2 global GC (design_v2.md §2.2). Mark/sweep predicates consult the
+ * per-objspace during_global_gc flag; this is only the driver's iteration
+ * snapshot, taken and used under the barrier. */
+static struct {
+    bool active;
+    struct rb_objspace **list;
+    size_t count, capa;
+} rlgc_global;
 
 static struct heap_page_body *page_pool_acquire(void);
 static void page_pool_release(struct heap_page_body *body);
@@ -4010,8 +4025,10 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 break;
 
               default:
-                /* RLGC_DEBUG: a confined GC must never free a pinned slot. */
-                if (rb_gc_multi_ractor_p() &&
+                /* RLGC_DEBUG: a confined GC must never free a pinned slot.
+                 * (The global GC may: its unified mark is exact, and dead
+                 * shareables are precisely what it exists to collect.) */
+                if (rb_gc_multi_ractor_p() && !objspace->during_global_gc &&
                     (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(vp), vp) ||
                      MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp))) {
                     rb_bug("page_sweep: freeing pinned slot %s (shareable=%d shref=%d)",
@@ -5093,8 +5110,26 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
     /* RLGCv2 containment (design_v2.md §2.1): never traverse into another
      * objspace -- a foreign object is a live leaf here.  Its liveness is
      * the responsibility of its owner (or of the global GC), and touching
-     * its bitmaps from this GC would be unsound. */
-    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace)) return;
+     * its bitmaps from this GC would be unsound. The global GC (§2.2 step
+     * 7) lifts this: everyone is stopped, and the bits live on the
+     * object's own page, so cross-objspace writes land where they belong. */
+    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace) && !objspace->during_global_gc) {
+        return;
+    }
+
+    if (RB_UNLIKELY(objspace->during_global_gc)) {
+        /* §2.2 step 7: recompute shref on every shareable -> unshareable
+         * edge, same-objspace or cross-objspace (the clear pass wiped all
+         * shref bits; the write barrier maintains them from here on). */
+        VALUE parent = objspace->rgengc.parent_object;
+        if (!UNDEF_P(parent) && parent != Qfalse &&
+            RB_FL_TEST_RAW(parent, RUBY_FL_SHAREABLE) &&
+            !RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE)) {
+            struct heap_page *page = GET_HEAP_PAGE(obj);
+            _MARK_IN_BITMAP(page->shref_bits, page, obj);
+            page->has_shref_objects = TRUE;
+        }
+    }
 
     rgengc_check_relation(objspace, obj);
     if (!gc_mark_set(objspace, obj)) return; /* already marked */
@@ -5116,8 +5151,9 @@ gc_pin(rb_objspace_t *objspace, VALUE obj)
 {
     GC_ASSERT(!SPECIAL_CONST_P(obj));
 
-    /* RLGCv2 containment: never write a foreign page's pinned bits. */
-    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace)) return;
+    /* RLGCv2 containment: never write a foreign page's pinned bits
+     * (the global GC may: everyone is stopped). */
+    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace) && !objspace->during_global_gc) return;
 
     if (RB_UNLIKELY(objspace->flags.during_compacting)) {
         if (RB_LIKELY(during_gc)) {
@@ -5172,6 +5208,19 @@ rb_gc_impl_mark_and_pin(void *objspace_ptr, VALUE obj)
     gc_mark_and_pin(objspace, obj);
 }
 
+/* RLGCv2 (design_v2.md §2.2 step 6): conservative words scanned by the
+ * global GC can point into any objspace; resolve membership against the
+ * driver's snapshot of all of them (the bits then land on the owner's
+ * page via the lifted gc_mark/gc_pin). */
+static bool
+rlgc_global_pointer_to_heap_p(const void *ptr)
+{
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        if (is_pointer_to_heap(rlgc_global.list[i], ptr)) return true;
+    }
+    return false;
+}
+
 void
 rb_gc_impl_mark_maybe(void *objspace_ptr, VALUE obj)
 {
@@ -5179,7 +5228,9 @@ rb_gc_impl_mark_maybe(void *objspace_ptr, VALUE obj)
 
     (void)VALGRIND_MAKE_MEM_DEFINED(&obj, sizeof(obj));
 
-    if (is_pointer_to_heap(objspace, (void *)obj)) {
+    if (RB_UNLIKELY(objspace->during_global_gc)
+            ? rlgc_global_pointer_to_heap_p((void *)obj)
+            : is_pointer_to_heap(objspace, (void *)obj)) {
         asan_unpoisoning_object(obj) {
             /* Garbage can live on the stack, so do not mark or pin */
             switch (BUILTIN_TYPE(obj)) {
@@ -5237,8 +5288,10 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
      * of the root set, so it must run in every root scan -- in particular
      * also in the final incremental re-scan (gc_marks_finish), or an
      * object that became shareable during the incremental window and is
-     * only reachable through a foreign container stays white. */
-    if (rb_gc_multi_ractor_p()) {
+     * only reachable through a foreign container stays white.
+     * The global GC must NOT pin: its unified mark is exact reachability,
+     * and the pin would keep every dead shareable alive (§2.2 step 9). */
+    if (rb_gc_multi_ractor_p() && !objspace->during_global_gc) {
         MARK_CHECKPOINT("rlgc_pinned");
         for (int i = 0; i < HEAP_COUNT; i++) {
             rlgc_pinned_roots_mark(objspace, &heaps[i]);
@@ -5248,7 +5301,18 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
     MARK_CHECKPOINT("objspace");
     gc_mark_set_parent_raw(objspace, Qundef, false);
 
-    if (finalizer_table != NULL) {
+    if (objspace->during_global_gc) {
+        /* §2.2 step 6: every objspace's finalizer table (zombies included).
+         * (finalizer_table is a macro over a local "objspace".) */
+        rb_objspace_t *const driver = objspace;
+        for (size_t i = 0; i < rlgc_global.count; i++) {
+            rb_objspace_t *objspace = rlgc_global.list[i];
+            if (finalizer_table != NULL) {
+                st_foreach(finalizer_table, pin_value, (st_data_t)driver);
+            }
+        }
+    }
+    else if (finalizer_table != NULL) {
         st_foreach(finalizer_table, pin_value, (st_data_t)objspace);
     }
 
@@ -6046,8 +6110,9 @@ rb_gc_impl_handle_weak_references_alive_p(void *objspace_ptr, VALUE obj)
     rb_objspace_t *objspace = objspace_ptr;
 
     /* RLGCv2 containment: a confined GC cannot judge a foreign object;
-     * treat it as alive (its owner or the global GC decides). */
-    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace)) return true;
+     * treat it as alive (its owner or the global GC decides -- the
+     * global GC's unified mark is exact, so it judges everything). */
+    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace) && !objspace->during_global_gc) return true;
 
     bool marked = RVALUE_MARKED(objspace, obj);
 
@@ -7675,6 +7740,121 @@ gc_set_candidate_object_i(void *vstart, void *vend, size_t stride, void *data)
     return 0;
 }
 
+bool
+rb_gc_impl_during_global_gc_p(void *objspace_ptr)
+{
+    rb_objspace_t *objspace = objspace_ptr;
+    return objspace->during_global_gc != 0;
+}
+
+static void
+rlgc_global_objspaces_i(void *os, void *data)
+{
+    if (rlgc_global.count == rlgc_global.capa) {
+        size_t new_capa = rlgc_global.capa ? rlgc_global.capa * 2 : 16;
+        struct rb_objspace **new_list = realloc(rlgc_global.list, new_capa * sizeof(*new_list));
+        if (new_list == NULL) rb_bug("rlgc_global_objspaces_i: realloc failed");
+        rlgc_global.list = new_list;
+        rlgc_global.capa = new_capa;
+    }
+    rlgc_global.list[rlgc_global.count++] = os;
+}
+
+static void
+rlgc_clear_shref_bits(rb_objspace_t *objspace)
+{
+    for (int i = 0; i < HEAP_COUNT; i++) {
+        struct heap_page *page = NULL;
+        ccan_list_for_each(&heaps[i].pages, page, page_node) {
+            memset(&page->shref_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+            page->has_shref_objects = FALSE;
+        }
+    }
+}
+
+/* RLGCv2 global GC (design_v2.md §2.2): stop every Ractor, then clear,
+ * mark and sweep every objspace as one heap. The only collector that may
+ * free shareables and judge cross-objspace reachability exactly. */
+static void
+rlgc_global_gc(rb_objspace_t *driver)
+{
+    unsigned int lock_lev;
+    gc_enter(driver, gc_enter_event_start, &lock_lev);
+
+    GC_ASSERT(is_mark_stack_empty(&driver->mark_stack));
+
+    /* the driver's snapshot of every objspace, zombies included */
+    rlgc_global.count = 0;
+    rb_gc_vm_each_objspace(rlgc_global_objspaces_i, NULL);
+
+    /* step 3: settle every objspace's lazy sweep, so the meaning of the
+     * mark bits is fixed before the clear below.
+     * (during_gc is a macro over the local "objspace".)
+     * rb_gc_get_ec() resolves through objspace->vm_context while that
+     * objspace is in GC, so initialize it for everyone (the driver's
+     * thread runs all of their phases). */
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        rb_objspace_t *objspace = rlgc_global.list[i];
+        rb_gc_initialize_vm_context(&objspace->vm_context);
+        if (objspace != driver) during_gc = TRUE;
+        gc_sweep_rest(objspace);
+    }
+
+    /* step 4: flag every objspace; predicates consult this */
+    rlgc_global.active = true;
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        rlgc_global.list[i]->during_global_gc = 1;
+    }
+
+    /* step 5: clear marks / remembered sets / generation counters / shref
+     * on every objspace (one missed objspace = stale mark bits = UAF).
+     * (heaps is a macro over the local "objspace".) */
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        rb_objspace_t *objspace = rlgc_global.list[i];
+        objspace->flags.during_minor_gc = FALSE;
+        objspace->flags.during_incremental_marking = FALSE;
+        objspace->rgengc.uncollectible_wb_unprotected_objects = 0;
+        objspace->rgengc.old_objects = 0;
+        objspace->rgengc.last_major_gc = objspace->profile.count;
+        objspace->marked_slots = 0;
+        for (int h = 0; h < HEAP_COUNT; h++) {
+            rb_heap_t *heap = &heaps[h];
+            rgengc_mark_and_rememberset_clear(objspace, heap);
+            heap_move_pooled_pages_to_free_pages(heap);
+        }
+        rlgc_clear_shref_bits(objspace);
+    }
+    driver->profile.major_gc_count++;
+
+    /* steps 6-7: every Ractor's roots (gc.c walks them all and re-pins
+     * the in-flight payloads), then one unified, exact mark */
+    mark_roots(driver, NULL);
+    gc_mark_stacked_objects_all(driver);
+
+    /* step 8 */
+    gc_update_weak_references(driver);
+
+    /* step 9: sweep every objspace inside the barrier, not lazily;
+     * dead shareables go here, empty pages return to the pool */
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        rb_objspace_t *os = rlgc_global.list[i];
+        unsigned int prev_immediate = os->flags.immediate_sweep;
+        os->flags.immediate_sweep = TRUE;
+        gc_sweep(os);
+        os->flags.immediate_sweep = prev_immediate;
+    }
+
+    /* step 10 */
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        rb_objspace_t *objspace = rlgc_global.list[i];
+        objspace->during_global_gc = 0;
+        if (objspace != driver) during_gc = FALSE;
+    }
+    rlgc_global.active = false;
+
+    gc_exit(driver, gc_enter_event_start, &lock_lev);
+}
+
 void
 rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool immediate_sweep, bool compact)
 {
@@ -7697,6 +7877,16 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
         if (!full_mark)       reason &= ~GPR_FLAG_FULL_MARK;
         if (!immediate_mark)  reason &= ~GPR_FLAG_IMMEDIATE_MARK;
         if (!immediate_sweep) reason &= ~GPR_FLAG_IMMEDIATE_SWEEP;
+    }
+
+    /* RLGCv2 (design_v2.md §2.2 trigger 4): an explicit full GC.start with
+     * multiple objspaces runs the global GC -- the only collector that can
+     * reclaim shareables and cross-objspace garbage. */
+    if (rb_gc_multi_ractor_p() && (reason & GPR_FLAG_FULL_MARK) && !compact) {
+        rlgc_global_gc(objspace);
+        gc_finalize_deferred(objspace);
+        gc_config_full_mark_set(full_marking_p);
+        return;
     }
 
     garbage_collect(objspace, reason);
