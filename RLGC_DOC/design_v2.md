@@ -298,6 +298,8 @@ shareable は unshareable を参照しない)なので、「WB を通らない s
 
 minor / major とも自スレッドで実行し、ロックもバリアも取らない。master の GC との差分に
 ★を付ける。
+(実装は 2 段階: M1a では従来どおり VM lock + barrier の下で動かして封じ込めの正しさを
+固め、「ロックもバリアも取らない」は M1b で達成する — §5 の順序と理由を参照。)
 
 0. 前提: 自分の lazy sweep が残っていれば先に完走させる(master と同じ)。`during_gc` を
    立てて再入を防ぐ。incremental marking は objspace が複数ある間は使わない★
@@ -683,23 +685,56 @@ objspace の unshareable T_DATA への生ポインタが残る」ことを意味
 
 ## 5. 実装計画(origin/master から。各段で全テスト green)
 
+順序は **M0 → M1a → M3 → M2 → M4 → M1b → M5**。local GC の並行化(M1b)を
+最後尾近くまで遅らせるのが要点(理由は M1b の項)。並列性能が出るのは M1b 以降で、
+それまでの各段は「master と同等性能・正しさは段ごとに full green」を保って進める。
+
 - **M0 土台**: rb_global_objspace(ページプール)新設、`vm->gc.objspace` を
   `vm->gc.global_objspace` に差し替え、main objspace を main Ractor 持ちに、newobj cache を
   剥がしてヒープ直割り当てに(単一 Ractor なら自明に single writer)。master と性能比較。
-- **M1 per-Ractor objspace と local GC**: Ractor 生成で objspace 生成、封じ込め mark、
-  shareable 不回収 sweep(滞留計数つき)、shref_bits と write barrier、atomic bitmap。
+- **M1a per-Ractor objspace と local GC(STW 段階)**: Ractor 生成で objspace 生成、
+  封じ込め mark、shareable / shref の root 化 pin(§2.1 手順 3.f)、shref_bits と
+  write barrier。**この段階では gc_enter が従来どおり VM lock + barrier を取る** —
+  「自分のヒープしか刈らないが、刈る間は全 Ractor が停止する」。§2.1 冒頭の
+  「ロックもバリアも取らない」はまだ実現せず、M1b で達成する。並行性バグが存在しない
+  世界で、封じ込め・pin・root 集合の正しさだけを固めるための分割。
   (global GC がまだ無いので shareable は滞留する。M2 で解消。)
-- **M2 global GC**: バリア、root 表(local と共有)、全 objspace の一括 mark/sweep、
-  shref_bits の再計算、global の起動条件(shareable 増加・滞留・zombie Ractor)。
 - **M3 message send**: 受信側実体化(コア型の C 深コピー + Marshal 経路)、送信中 pin
   (global GC またぎ含む)、**受信側 write barrier の徹底**(§4.2 世代の整合)、
   T_DATA passthrough の廃止、value の successor 規則(§4.3。併合本体は M4)。
+  M2 より先に行う: 実体化と pin の形が決まらないと、global GC が in-flight メッセージを
+  どう扱うか(pin の付け直し先)を確定できないため。
+- **M2 global GC**: バリア、root 表(local と共有)、全 objspace の一括 mark/sweep、
+  shref_bits の再計算、global の起動条件(shareable 増加・滞留・zombie Ractor)。
 - **M4 終了と引き継ぎ**: join 時のその場併合、未 join の global GC 内 main 併合、
   終了済み Ractor の一覧延命、finalizer / zombie の引き継ぎ実行、単一 Ractor 復帰時の
   shareable 回収、fork / shutdown の接続。
+- **M1b local GC の並行化(バリア外し)**: gc_enter / gc_exit から VM lock と barrier を
+  外し、§2.1 本文どおり「local GC はロックもバリアも取らない」を実現する。
+  **並列性能はここで出る**(それまでは GC が STW なので、GC を踏む負荷では master と
+  同等止まり)。最後尾に置く理由:
+  1. **競合面を開くのは一度だけにする。** M1a〜M4 の green は「GC 中は誰も動かない」
+     前提で検証されている。バリアを外すと、バリアが隠していた競合面(§1.4 の
+     ビットマップ書き込み、§2.4 の VM 共有構造、§4.2 の in-flight メッセージの読み書き)が
+     一斉に表に出る。ここは経験的に最もバグ密度が高く、再現が確率的で TSan でしか
+     根本原因に辿れない領域なので、機能追加と混ぜずに単独で開けたい。
+  2. **手戻りの回避。** M2 / M4 は「全 Ractor を止めて全 objspace を見る・併合する」
+     STW コードであり、M1b の有無にほぼ影響されない。逆に M1b を先にやると、M2 / M4 を
+     足すたびに「並行中の local GC と global GC の遷移プロトコル」を再設計・再検証する
+     ことになり、いちばん高い検証コストを複数回払う。
+  3. **遷移プロトコルは global GC が無いと設計できない。** 「global 開始時に進行中の
+     local GC を完走させてから全停止する」「local 側は global の進行中フラグを見て退避する」
+     といった排他は、相手(M2)が存在して初めて書ける・試せる。M1b が先だと、その時点の
+     並行性検証は M2 導入で陳腐化する。
+  4. **機能完結が先。** M2 / M4 が無い間は shareable と終了 Ractor の objspace が
+     貯まり続ける。その状態で性能を測っても「リークする処理系の速度」になり、
+     チューニングの判断材料にならない。
+  なお M0 時点で master と同等性能(割り当て経路に退行なし)は確認済み。性能の伸び代は
+  M1b 完了後にまとめて測り直す。
 - **M5 堅牢化・調整**: 既知のクラッシュ再現スクリプト群(`rlgc_repro/`)と多 Ractor
   ストレスシナリオをテストオラクルに常用する。btest / test-all に加え、**ASAN / TSan を
   CI に常設**する(並行 GC のバグは再現が確率的で、サニタイザでないと根本原因まで
-  辿れない)。GC_STRESS はタイミングを変えて昇格依存のバグを隠すことがあるので、
-  stress あり / なしの両方を回す。global GC 起動条件の係数・下限(§2.2)と
-  born-shareable の increment 箇所の網羅(クラス生成・fstring・freeze 等)もここで確定。
+  辿れない — 特に M1b の検証は TSan が主武器)。GC_STRESS はタイミングを変えて
+  昇格依存のバグを隠すことがあるので、stress あり / なしの両方を回す。global GC
+  起動条件の係数・下限(§2.2)と born-shareable の increment 箇所の網羅
+  (クラス生成・fstring・freeze 等)もここで確定。
