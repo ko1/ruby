@@ -4052,7 +4052,7 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 /* RLGC_DEBUG: a confined GC must never free a pinned slot.
                  * (The global GC may: its unified mark is exact, and dead
                  * shareables are precisely what it exists to collect.) */
-                if (rb_gc_multi_ractor_p() && !objspace->during_global_gc &&
+                if (!rb_gc_single_objspace_p() && !objspace->during_global_gc &&
                     (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(vp), vp) ||
                      MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp))) {
                     rb_bug("page_sweep: freeing pinned slot %s (shareable=%d shref=%d)",
@@ -5315,7 +5315,7 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
      * only reachable through a foreign container stays white.
      * The global GC must NOT pin: its unified mark is exact reachability,
      * and the pin would keep every dead shareable alive (§2.2 step 9). */
-    if (rb_gc_multi_ractor_p() && !objspace->during_global_gc) {
+    if (!rb_gc_single_objspace_p() && !objspace->during_global_gc) {
         MARK_CHECKPOINT("rlgc_pinned");
         size_t marked_before = objspace->marked_slots;
         for (int i = 0; i < HEAP_COUNT; i++) {
@@ -7257,7 +7257,7 @@ static void rlgc_global_gc(rb_objspace_t *driver);
 static bool
 rlgc_global_wanted_p(rb_objspace_t *objspace)
 {
-    if (!rb_gc_multi_ractor_p()) return false;
+    if (rb_gc_single_objspace_p()) return false;
     if (objspace->rlgc.shareable_objects > objspace->rlgc.shareable_objects_limit) return true;
     if (rb_gc_vm_zombie_objspaces_count() >= RLGC_ZOMBIE_OBJSPACES_TRIGGER) return true;
     return false;
@@ -7349,7 +7349,7 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
              * while there are multiple objspaces. The windows between
              * incremental steps let other Ractors create/share objects
              * this objspace's root scan has already passed over. */
-            rb_gc_multi_ractor_p()) {
+            !rb_gc_single_objspace_p()) {
         objspace->flags.during_incremental_marking = FALSE;
     }
     else {
@@ -7927,6 +7927,197 @@ rlgc_global_gc(rb_objspace_t *driver)
     gc_exit(driver, gc_enter_event_start, &lock_lev);
 }
 
+static int
+rlgc_absorb_finalizer_i(st_data_t key, st_data_t val, st_data_t data)
+{
+    rb_objspace_t *objspace = (rb_objspace_t *)data;
+    st_insert(finalizer_table, key, val);
+    return ST_CONTINUE;
+}
+
+/* RLGCv2 (design_v2.md §2.3): merge a dead Ractor's objspace into dst.
+ * Callers hold the VM lock; src has no owner thread anymore, and dst is
+ * either the calling thread's own objspace (join/value-time inheritance)
+ * or main while everyone is stopped (global-GC inheritance), so the
+ * single-writer rule holds throughout. Pages move wholesale: their
+ * object bits describe the objects, not the objspace, so they stay; the
+ * next collection of dst is forced to be a full mark so the merged
+ * generation state is rebuilt from scratch. */
+static void
+rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
+{
+    GC_ASSERT(dst != src);
+
+    /* settle dst first: appending pages while its lazy sweep cursor is
+     * walking the heap lists would sweep the merged pages against src's
+     * stale mark bits and free live objects */
+    {
+        rb_objspace_t *objspace = dst;
+        if (is_lazy_sweeping(objspace)) {
+            during_gc = TRUE;
+            gc_sweep_rest(objspace);
+            during_gc = FALSE;
+        }
+    }
+
+    /* settle src: no lazy sweep, no allocation page in flight */
+    {
+        rb_objspace_t *objspace = src;
+        during_gc = TRUE;
+        gc_sweep_rest(objspace);
+        during_gc = FALSE;
+        heap_alloc_state_clear(objspace);
+    }
+
+    /* per size pool: hand the pages over.
+     * ("heaps" is a macro over a local objspace, so take the arrays via
+     * scoped locals.) */
+    rb_heap_t *dst_heaps;
+    rb_heap_t *src_heaps;
+    {
+        rb_objspace_t *objspace = dst;
+        dst_heaps = heaps;
+    }
+    {
+        rb_objspace_t *objspace = src;
+        src_heaps = heaps;
+    }
+    for (int h = 0; h < HEAP_COUNT; h++) {
+        rb_heap_t *dheap = &dst_heaps[h];
+        rb_heap_t *sheap = &src_heaps[h];
+        struct heap_page *page = NULL;
+
+        GC_ASSERT(sheap->sweeping_page == NULL);
+        GC_ASSERT(sheap->pooled_pages == NULL);
+
+        ccan_list_for_each(&sheap->pages, page, page_node) {
+            page->objspace = dst;
+            page->heap = dheap;
+        }
+        ccan_list_append_list(&dheap->pages, &sheap->pages);
+
+        /* free pages chain: append */
+        if (sheap->free_pages) {
+            struct heap_page **tail = &dheap->free_pages;
+            while (*tail) tail = &(*tail)->free_next;
+            *tail = sheap->free_pages;
+            sheap->free_pages = NULL;
+        }
+
+        dheap->total_pages += sheap->total_pages;
+        dheap->total_slots += sheap->total_slots;
+        dheap->total_allocated_pages += sheap->total_allocated_pages;
+        dheap->total_allocated_objects += sheap->total_allocated_objects;
+        dheap->total_freed_objects += sheap->total_freed_objects;
+        dheap->final_slots_count += sheap->final_slots_count;
+    }
+
+    /* empty pages: re-own and append */
+    for (struct heap_page *page = src->empty_pages; page; page = page->free_next) {
+        page->objspace = dst;
+    }
+    if (src->empty_pages) {
+        struct heap_page **tail = &dst->empty_pages;
+        while (*tail) tail = &(*tail)->free_next;
+        *tail = src->empty_pages;
+        dst->empty_pages_count += src->empty_pages_count;
+        src->empty_pages = NULL;
+        src->empty_pages_count = 0;
+    }
+
+    /* objspace-wide page bookkeeping */
+    {
+        rb_objspace_t *objspace = dst; /* for the heap_pages_* macros */
+        struct heap_page *page = NULL;
+        size_t srcn = rb_darray_size(src->heap_pages.sorted);
+        for (size_t i = 0; i < srcn; i++) {
+            page = rb_darray_get(src->heap_pages.sorted, i);
+            uintptr_t body = (uintptr_t)page->body;
+            uintptr_t start = body + sizeof(struct heap_page_header);
+            uintptr_t end = body + HEAP_PAGE_SIZE;
+
+            /* The array must stay ordered by page BODY address: the
+             * conservative lookup (heap_page_for_ptr) bsearches on the
+             * body range, and a stripped empty page has start == 0, so
+             * comparing on page->start would scramble the order and make
+             * the lookup miss live pages (then the global GC fails to
+             * mark a registered root and sweeps it). */
+            size_t lo = 0;
+            size_t hi = rb_darray_size(objspace->heap_pages.sorted);
+            while (lo < hi) {
+                size_t mid = (lo + hi) / 2;
+                struct heap_page *mid_page = rb_darray_get(objspace->heap_pages.sorted, mid);
+                if ((uintptr_t)mid_page->body < body) lo = mid + 1;
+                else hi = mid;
+            }
+            rb_darray_insert_without_gc(&objspace->heap_pages.sorted, hi, page);
+
+            if (heap_pages_lomem == 0 || heap_pages_lomem > start) heap_pages_lomem = start;
+            if (heap_pages_himem < end) heap_pages_himem = end;
+        }
+        objspace->heap_pages.allocated_pages += src->heap_pages.allocated_pages;
+        objspace->heap_pages.freed_pages += src->heap_pages.freed_pages;
+        rb_darray_free_without_gc(src->heap_pages.sorted);
+        src->heap_pages.sorted = NULL;
+    }
+
+    /* finalizers: table entries move, and the dead Ractor's deferred
+     * zombies are now run by dst's thread (design_v2.md §2.3) */
+    {
+        st_table *src_finalizers;
+        {
+            rb_objspace_t *objspace = src;
+            src_finalizers = finalizer_table;
+            finalizer_table = NULL;
+        }
+        if (src_finalizers) {
+            rb_objspace_t *objspace = dst;
+            if (finalizer_table == NULL) {
+                finalizer_table = src_finalizers;
+            }
+            else {
+                st_foreach(src_finalizers, rlgc_absorb_finalizer_i, (st_data_t)dst);
+                st_free_table(src_finalizers);
+            }
+        }
+    }
+    {
+        VALUE src_deferred = RUBY_ATOMIC_VALUE_EXCHANGE(src->heap_pages.deferred_final, 0);
+        if (src_deferred) {
+            VALUE tail_obj = src_deferred;
+            while (RZOMBIE(tail_obj)->next) tail_obj = RZOMBIE(tail_obj)->next;
+            VALUE prev;
+            do {
+                prev = dst->heap_pages.deferred_final;
+                RZOMBIE(tail_obj)->next = prev;
+            } while (RUBY_ATOMIC_VALUE_CAS(dst->heap_pages.deferred_final, prev, src_deferred) != prev);
+        }
+    }
+
+    /* counters that survive into dst */
+    dst->rgengc.old_objects += src->rgengc.old_objects;
+    dst->rgengc.uncollectible_wb_unprotected_objects += src->rgengc.uncollectible_wb_unprotected_objects;
+    dst->rlgc.shareable_objects += src->rlgc.shareable_objects;
+
+    /* the merged pages carry src-consistent mark/age state; rebuild
+     * dst's view of the world on the next collection */
+    dst->rgengc.need_major_gc |= GPR_FLAG_MAJOR_BY_FORCE;
+
+    /* free the shell */
+    free_stack_chunks(&src->mark_stack);
+    mark_stack_free_cache(&src->mark_stack);
+#ifdef MALLOC_COUNTERS_NEED_LOCK
+    rb_native_mutex_destroy(&src->malloc_counters.lock);
+#endif
+    free(src);
+}
+
+void
+rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
+{
+    rlgc_objspace_absorb(dst_ptr, src_ptr);
+}
+
 void
 rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool immediate_sweep, bool compact)
 {
@@ -7954,7 +8145,7 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
     /* RLGCv2 (design_v2.md §2.2 trigger 4): an explicit full GC.start with
      * multiple objspaces runs the global GC -- the only collector that can
      * reclaim shareables and cross-objspace garbage. */
-    if (rb_gc_multi_ractor_p() && (reason & GPR_FLAG_FULL_MARK) && !compact) {
+    if (!rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK) && !compact) {
         rlgc_global_gc(objspace);
         gc_finalize_deferred(objspace);
         gc_config_full_mark_set(full_marking_p);

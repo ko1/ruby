@@ -3730,6 +3730,43 @@ rb_gc_vm_zombie_objspaces_count(void)
     return GET_VM()->gc.zombie_objspaces_count;
 }
 
+/* RLGCv2: true when only one objspace exists in the whole process (one
+ * living Ractor and no zombie objspaces). Only then is a local GC the
+ * whole world: the shareable pin and the other multi-objspace guards
+ * can be skipped (design_v2.md section 2.3). */
+bool
+rb_gc_single_objspace_p(void)
+{
+    rb_vm_t *vm = GET_VM();
+    return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0;
+}
+
+/* RLGCv2 (design_v2.md section 2.3): inherit a dead Ractor's objspace
+ * into the calling Ractor's one. Takes the owning slot so that clearing
+ * it and freeing the objspace happen under one VM-lock critical section
+ * (the dying thread's teardown reads the slot under the same lock). */
+void
+rb_gc_objspace_absorb_into_current(void **objspace_slot)
+{
+    rb_vm_t *vm = GET_VM();
+
+    RB_VM_LOCKING() {
+        void *objspace = *objspace_slot;
+        if (objspace != NULL) {
+            *objspace_slot = NULL;
+            size_t n = vm->gc.zombie_objspaces_count;
+            for (size_t i = 0; i < n; i++) {
+                if (vm->gc.zombie_objspaces[i] == objspace) {
+                    vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[n - 1];
+                    vm->gc.zombie_objspaces_count = n - 1;
+                    break;
+                }
+            }
+            rb_gc_impl_objspace_absorb(rb_gc_get_objspace(), objspace);
+        }
+    }
+}
+
 struct each_objects_all_data {
     int (*callback)(void *, void *, size_t, void *);
     void *data;
