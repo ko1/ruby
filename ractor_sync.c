@@ -819,15 +819,6 @@ ractor_make_remote_exception(VALUE cause, VALUE sender)
     return err;
 }
 
-static int
-pin_inherited_storage_i(st_data_t key, st_data_t val, st_data_t arg)
-{
-    if (!SPECIAL_CONST_P((VALUE)val)) {
-        rb_gc_pin_in_flight_message((VALUE)val);
-    }
-    return ST_CONTINUE;
-}
-
 /* RLGCv2 (design_v2.md section 4.3): after Ractor#value absorbed the
  * dead Ractor's objspace, everything still referenced from its C struct
  * (the legacy value for repeat #value calls, its stdio, its local
@@ -852,9 +843,14 @@ rb_ractor_pin_inherited_parts(rb_ractor_t *r)
             rb_gc_pin_in_flight_message(slots[i]);
         }
     }
-    if (r->local_storage) {
-        st_foreach(r->local_storage, pin_inherited_storage_i, 0);
-    }
+
+    /* The dead Ractor's local storage is unreachable to Ruby code from
+     * now on (Ractor#[] works only from inside): release it here rather
+     * than pinning it -- its values can then die naturally, and neither
+     * ractor_mark nor ractor_free walks a stale table later. */
+    ractor_local_storage_free(r);
+    r->local_storage = NULL;
+    r->idkey_local_storage = NULL;
 
     /* The dead Ractor's main thread stays on its threads list, and its
      * Thread/Fiber wrapper objects were born in the dead objspace
