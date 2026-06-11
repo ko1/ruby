@@ -573,6 +573,39 @@ rb_gc_guarded_ptr_val(volatile VALUE *ptr, VALUE val)
 
 static const char *obj_type_name(VALUE obj);
 static st_table *id2ref_tbl;
+
+/* RLGCv2 (design_v2.md §2.4): VM-shared structures that the lock-free
+ * local GC path reads or writes get their own native mutexes -- the GC
+ * must never block on the VM lock (a thread waiting for it joins a
+ * pending barrier, and joining mid-mark/mid-sweep would expose a
+ * half-collected heap to the global GC).
+ *
+ * Deadlock discipline for these mutexes: a critical section must not
+ * start a GC on this thread (its mark or sweep takes the same mutex).
+ * Sections that cannot allocate satisfy this trivially; the ones that
+ * may (a growing st_insert, a list realloc) either disable GC for the
+ * section or move the allocation outside it. Nothing blocks while
+ * holding one of these mutexes, so cross-thread waiters are bounded. */
+static rb_nativethread_lock_t id2ref_tbl_lock;
+static rb_nativethread_lock_t registered_globals_lock;
+
+void
+rb_gc_init_global_locks(void)
+{
+    rb_native_mutex_initialize(&id2ref_tbl_lock);
+    rb_native_mutex_initialize(&registered_globals_lock);
+}
+
+/* The forking thread cannot hold these (fork happens at a safepoint,
+ * never inside GC or the table writers), but another thread might:
+ * give the child fresh mutexes. */
+void
+rb_gc_atfork_global_locks(void)
+{
+    rb_native_mutex_initialize(&id2ref_tbl_lock);
+    rb_native_mutex_initialize(&registered_globals_lock);
+}
+
 #include "gc/default/default.c"
 
 #if USE_MODULAR_GC && !defined(HAVE_DLOPEN)
@@ -2094,11 +2127,26 @@ generate_next_object_id(void)
 #endif
 }
 
+/* Insert under id2ref_tbl_lock. st_insert may malloc, and a malloc can
+ * start this thread's own local GC, whose sweep takes the same mutex
+ * (obj_free_object_id) -- a self-deadlock. So GC is disabled for the
+ * locked section; other threads' local GCs just block on the mutex for
+ * its (bounded, non-blocking) duration. */
+static void
+id2ref_tbl_insert(st_data_t key, st_data_t value)
+{
+    bool gc_disabled = RTEST(rb_gc_disable_no_rest());
+    rb_native_mutex_lock(&id2ref_tbl_lock);
+    st_insert(id2ref_tbl, key, value);
+    rb_native_mutex_unlock(&id2ref_tbl_lock);
+    if (!gc_disabled) rb_gc_enable();
+}
+
 void
 rb_gc_obj_id_moved(VALUE obj)
 {
     if (UNLIKELY(id2ref_tbl)) {
-        st_insert(id2ref_tbl, (st_data_t)rb_obj_id(obj), (st_data_t)obj);
+        id2ref_tbl_insert((st_data_t)rb_obj_id(obj), (st_data_t)obj);
     }
 }
 
@@ -2147,7 +2195,9 @@ id2ref_tbl_memsize(const void *data)
 static void
 id2ref_tbl_free(void *data)
 {
+    rb_native_mutex_lock(&id2ref_tbl_lock);
     id2ref_tbl = NULL; // clear global ref
+    rb_native_mutex_unlock(&id2ref_tbl_lock);
     st_table *table = (st_table *)data;
     st_free_table(table);
 }
@@ -2176,7 +2226,7 @@ class_object_id(VALUE klass)
             id = existing_id;
         }
         else if (RB_UNLIKELY(id2ref_tbl)) {
-            st_insert(id2ref_tbl, id, klass);
+            id2ref_tbl_insert(id, klass);
         }
         RB_GC_VM_UNLOCK(lock_lev);
     }
@@ -2223,7 +2273,7 @@ object_id0(VALUE obj)
 
     if (RB_UNLIKELY(id2ref_tbl)) {
         RB_VM_LOCKING() {
-            st_insert(id2ref_tbl, (st_data_t)id, (st_data_t)obj);
+            id2ref_tbl_insert((st_data_t)id, (st_data_t)obj);
         }
     }
     return id;
@@ -2306,6 +2356,8 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
         // build_id2ref_i will most certainly malloc, which could trigger GC and sweep
         // objects we just added to the table.
         // By calling rb_gc_disable() we also save having to handle potentially garbage objects.
+        // The barrier above also means no lock-free sweep is in flight, so the
+        // bulk inserts may bypass id2ref_tbl_lock.
         bool gc_disabled = RTEST(rb_gc_disable());
         {
             id2ref_tbl = tmp_id2ref_tbl;
@@ -2316,8 +2368,16 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
         if (!gc_disabled) rb_gc_enable();
     }
 
+    /* The lookup must exclude concurrent sweep-side deletes
+     * (obj_free_object_id runs on lock-free local GCs). A non-shareable
+     * foreign object cannot be returned (the caller rejects it), and
+     * shareables never die in a local sweep, so the freshness check may
+     * run outside the mutex. */
     VALUE obj;
-    bool found = st_lookup(id2ref_tbl, object_id, &obj) && !rb_gc_impl_garbage_object_p(objspace, obj);
+    rb_native_mutex_lock(&id2ref_tbl_lock);
+    bool found = st_lookup(id2ref_tbl, object_id, &obj);
+    rb_native_mutex_unlock(&id2ref_tbl_lock);
+    found = found && !rb_gc_impl_garbage_object_p(objspace, obj);
 
     RB_GC_VM_UNLOCK(lev);
 
@@ -2364,7 +2424,16 @@ obj_free_object_id(VALUE obj)
         if (RB_UNLIKELY(obj_id)) {
             RUBY_ASSERT(FIXNUM_P(obj_id) || RB_TYPE_P(obj_id, T_BIGNUM));
 
-            if (!st_delete(id2ref_tbl, (st_data_t *)&obj_id, NULL)) {
+            /* Runs on the lock-free sweep of any Ractor's local GC: the
+             * mutex (never the VM lock -- a GC must not join a barrier
+             * mid-sweep) excludes concurrent inserts and lookups.
+             * st_delete does not allocate. Re-check the table under the
+             * mutex: it is dropped at shutdown. */
+            rb_native_mutex_lock(&id2ref_tbl_lock);
+            st_table *tbl = id2ref_tbl;
+            bool deleted = tbl ? st_delete(tbl, (st_data_t *)&obj_id, NULL) : true;
+            rb_native_mutex_unlock(&id2ref_tbl_lock);
+            if (!deleted) {
                 // The the object is a T_IMEMO/fields, then it's possible the actual object
                 // has been garbage collected already.
                 if (!RB_TYPE_P(obj, T_IMEMO)) {
@@ -3824,13 +3893,36 @@ rb_gc_register_address(VALUE *addr)
     VALUE obj = *addr;
 
     RB_VM_LOCKING() {
+        /* Every objspace's root walk reads this list without the VM lock
+         * (registered_globals_lock instead, design_v2.md §2.1 step 3.e).
+         * Growth is two-phase so the locked section never allocates (an
+         * allocation can run this thread's local GC, whose root walk
+         * takes the same mutex): build the bigger array outside, swap it
+         * in under the mutex, free the old one outside. The VM lock
+         * serializes the writers themselves. */
+        VALUE **old_list = NULL;
+        size_t old_capa = 0;
         if (vm->global_object_list_size == vm->global_object_list_capa) {
             size_t new_capa = vm->global_object_list_capa ? vm->global_object_list_capa * 2 : 64;
-            SIZED_REALLOC_N(vm->global_object_list, VALUE *, new_capa, vm->global_object_list_capa);
-            vm->global_object_list_capa = new_capa;
-        }
+            VALUE **new_list = ALLOC_N(VALUE *, new_capa);
+            MEMCPY(new_list, vm->global_object_list, VALUE *, vm->global_object_list_size);
 
-        vm->global_object_list[vm->global_object_list_size++] = addr;
+            rb_native_mutex_lock(&registered_globals_lock);
+            old_list = vm->global_object_list;
+            old_capa = vm->global_object_list_capa;
+            vm->global_object_list = new_list;
+            vm->global_object_list_capa = new_capa;
+            vm->global_object_list[vm->global_object_list_size++] = addr;
+            rb_native_mutex_unlock(&registered_globals_lock);
+        }
+        else {
+            rb_native_mutex_lock(&registered_globals_lock);
+            vm->global_object_list[vm->global_object_list_size++] = addr;
+            rb_native_mutex_unlock(&registered_globals_lock);
+        }
+        if (old_list) {
+            SIZED_FREE_N(old_list, old_capa);
+        }
     }
 
     /*
@@ -3850,6 +3942,7 @@ rb_gc_unregister_address(VALUE *addr)
 {
     rb_vm_t *vm = GET_VM();
     RB_VM_LOCKING() {
+        rb_native_mutex_lock(&registered_globals_lock);
         size_t index;
         for (index = 0; index < vm->global_object_list_size; index++) {
             if (addr == vm->global_object_list[index]) {
@@ -3863,7 +3956,21 @@ rb_gc_unregister_address(VALUE *addr)
                 break;
             }
         }
+        rb_native_mutex_unlock(&registered_globals_lock);
     }
+}
+
+/* for the walkers and writers that live outside this file (vm.c) */
+void
+rb_gc_registered_globals_lock(void)
+{
+    rb_native_mutex_lock(&registered_globals_lock);
+}
+
+void
+rb_gc_registered_globals_unlock(void)
+{
+    rb_native_mutex_unlock(&registered_globals_lock);
 }
 
 void
