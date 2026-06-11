@@ -2643,7 +2643,9 @@ ruby_stack_check(void)
 /* The traversal mark redirect is per-Ractor, except on a modular GC where
  * marking can run on worker threads with no current EC and it lives in the VM.
  * GC_MARK_FUNC_DATA_SLOTP() points at the active slot; a non-modular build pays
- * nothing extra over a plain GET_VM() (one GET_RACTOR(), no NULL check). */
+ * nothing extra over a plain GET_VM() (one GET_RACTOR(), no NULL check).  Per
+ * Ractor, a real GC never observes a foreign traversal's redirect, so no
+ * during_gc gate is needed. */
 #if USE_MODULAR_GC
 #  define GC_MARK_FUNC_DATA_SLOTP()  (&GET_VM()->gc.mark_func_data)
 #else
