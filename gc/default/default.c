@@ -5399,23 +5399,11 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
     if (categoryp) *categoryp = category; \
 } while (0)
 
-    /* RLGCv2 (design_v2.md §2.1 step 3.f): the shareable/shref pin is part
-     * of the root set, so it must run in every root scan -- in particular
-     * also in the final incremental re-scan (gc_marks_finish), or an
-     * object that became shareable during the incremental window and is
-     * only reachable through a foreign container stays white.
-     * The global GC must NOT pin: its unified mark is exact reachability,
-     * and the pin would keep every dead shareable alive (§2.2 step 9). */
-    if (!rb_gc_single_objspace_p() && !objspace->during_global_gc) {
-        MARK_CHECKPOINT("rlgc_pinned");
-        size_t marked_before = objspace->marked_slots;
-        for (int i = 0; i < HEAP_COUNT; i++) {
-            rlgc_pinned_roots_mark(objspace, &heaps[i]);
-        }
-        /* freshly pinned-marked = not reachable from our own roots =
-         * upper bound on garbage only the global GC can reclaim */
-        objspace->rlgc.stalled_shareables = objspace->marked_slots - marked_before;
-    }
+    /* RLGCv2: the shareable/shref pin (design_v2.md §2.1 step 3.f) runs
+     * at the END of marking (gc_marks_finish), not here -- after the
+     * full traversal it only touches what the normal mark did not
+     * reach, which is both cheaper and exactly the §2.2 retention
+     * metric. */
 
     MARK_CHECKPOINT("objspace");
     gc_mark_set_parent_raw(objspace, Qundef, false);
@@ -6291,6 +6279,26 @@ gc_marks_finish(rb_objspace_t *objspace)
         for (int i = 0; i < HEAP_COUNT; i++) {
             gc_marks_wb_unprotected_objects(objspace, &heaps[i]);
         }
+    }
+
+    /* RLGCv2 (design_v2.md §2.1 step 3.f): pin the shareables and shrefs
+     * the normal mark did NOT reach -- a confined GC must never free a
+     * shareable (another objspace may hold it) nor a shref (a foreign
+     * shareable points at it). Running after the full traversal, the
+     * pinned count is the §2.2 retention metric: an upper bound on the
+     * garbage only the global GC can reclaim. The global GC must not
+     * pin (its unified mark is exact reachability, §2.2 step 9).
+     * (RGENGC_CHECK_MODE >= 4's allrefs comparison does not model this
+     * pin and would flag the pinned-unreachable objects.) */
+    if (!rb_gc_single_objspace_p() && !objspace->during_global_gc) {
+        size_t marked_before = objspace->marked_slots;
+        gc_mark_set_parent_raw(objspace, Qundef, false);
+        for (int i = 0; i < HEAP_COUNT; i++) {
+            rlgc_pinned_roots_mark(objspace, &heaps[i]);
+        }
+        /* and everything they keep alive */
+        gc_mark_stacked_objects_all(objspace);
+        objspace->rlgc.stalled_shareables = objspace->marked_slots - marked_before;
     }
 
     gc_update_weak_references(objspace);
@@ -7366,6 +7374,11 @@ rlgc_global_wanted_p(rb_objspace_t *objspace)
     if (rb_gc_single_objspace_p()) return false;
     if (objspace->rlgc.shareable_objects > objspace->rlgc.shareable_objects_limit) return true;
     if (rb_gc_vm_zombie_objspaces_count() >= RLGC_ZOMBIE_OBJSPACES_TRIGGER) return true;
+    /* design_v2.md §2.2 trigger 2: retention. Shareables unreachable
+     * from our own roots (counted by the end-of-mark pin) have piled up
+     * to the scale of the last global cycle's survivor count
+     * (shareable_objects_limit = survivors x 2, floored). */
+    if (objspace->rlgc.stalled_shareables > objspace->rlgc.shareable_objects_limit / 2) return true;
     return false;
 }
 
