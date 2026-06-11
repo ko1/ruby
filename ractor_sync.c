@@ -206,6 +206,11 @@ struct ractor_basket {
     struct {
         VALUE v;
         bool exception;
+        /* RLGCv2 (design_v2.md §4.2): true when v is a Marshal byte
+         * String snapshot (the graph contained a type the native copier
+         * does not support); the receiver materializes it with
+         * Marshal.load instead of the native traversal. */
+        bool marshaled;
     } p; // payload
 
     struct ccan_list_node node;
@@ -783,11 +788,24 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
     }
 }
 
-static VALUE ractor_move(VALUE obj); // in this file
-static VALUE ractor_copy(VALUE obj); // in this file
+static VALUE ractor_move(VALUE obj);            // in ractor.c
+static VALUE ractor_copy_native_try(VALUE obj); // in ractor.c
 
 static VALUE
-ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type *ptype)
+ractor_marshal_dump_body(VALUE obj)
+{
+    return rb_marshal_dump(obj, Qnil);
+}
+
+static VALUE
+ractor_marshal_dump_rescue(VALUE obj, VALUE errinfo)
+{
+    rb_raise(rb_eRactorError, "can not copy %"PRIsVALUE" object.", rb_class_of(obj));
+    UNREACHABLE_RETURN(Qnil);
+}
+
+static VALUE
+ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type *ptype, bool *pmarshaled)
 {
     switch (*ptype) {
       case basket_type_ref:
@@ -800,8 +818,20 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
             return obj;
         }
         else {
+            /* design_v2.md §4.2 / decision 11: snapshot copy on the
+             * sender, without calling the user-visible #clone. Core
+             * types are deep-copied natively; any other type makes the
+             * snapshot a Marshal byte string (whose user hooks run here,
+             * on the sender, like #clone hooks used to). */
             *ptype = basket_type_copy;
-            return ractor_copy(obj);
+            VALUE snapshot = ractor_copy_native_try(obj);
+            if (UNDEF_P(snapshot)) {
+                snapshot = rb_rescue2(ractor_marshal_dump_body, obj,
+                                      ractor_marshal_dump_rescue, obj,
+                                      rb_eTypeError, (VALUE)0);
+                *pmarshaled = true;
+            }
+            return snapshot;
         }
     }
 }
@@ -809,13 +839,13 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
 static struct ractor_basket *
 ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type type, bool exc)
 {
-    VALUE v = ractor_prepare_payload(ec, obj, &type);
+    bool marshaled = false;
+    VALUE v = ractor_prepare_payload(ec, obj, &type, &marshaled);
 
     if (type == basket_type_copy || type == basket_type_move) {
-        /* RLGCv2 interim (until M3 materialize-on-receive lands): the
-         * copied payload lives in the sender's objspace but is handed to
-         * the receiver by reference.  Pin it (shref) so the sender's
-         * confined GC keeps the whole copy graph alive. */
+        /* RLGCv2: the snapshot (native copy graph or Marshal string)
+         * lives in the sender's objspace until the receiver materializes
+         * it.  Pin it (shref) so the sender's confined GC keeps it. */
         rb_gc_pin_in_flight_message(v);
     }
 
@@ -823,6 +853,7 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     b->type = type;
     b->p.v = v;
     b->p.exception = exc;
+    b->p.marshaled = marshaled;
     return b;
 }
 
@@ -840,12 +871,16 @@ ractor_basket_value(struct ractor_basket *b)
          * traverse (the receiver's stores into it would also bypass the
          * owner's write barrier accounting). The snapshot stays pinned
          * (in-flight shref) in the sender's objspace and becomes garbage
-         * there once this copy is made.
-         * TODO(M3, 決定11): the materializing copy still goes through
-         * ractor_copy (user-visible #clone), so a cloned object's hooks
-         * run once at send and once here; replace with the native /
-         * Marshal snapshot format. */
-        b->p.v = ractor_copy(b->p.v);
+         * there once this copy is made. Marshal.load allocates through
+         * the ordinary newobj/write-barrier paths of this Ractor. */
+        if (b->p.marshaled) {
+            b->p.v = rb_marshal_load(b->p.v);
+        }
+        else {
+            VALUE v = ractor_copy_native_try(b->p.v);
+            if (UNDEF_P(v)) rb_bug("ractor_basket_value: native snapshot not natively copyable");
+            b->p.v = v;
+        }
         ractor_reset_belonging(b->p.v);
         break;
       case basket_type_move:

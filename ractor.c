@@ -16,9 +16,12 @@
 #include "internal/object.h"
 #include "internal/ractor.h"
 #include "internal/rational.h"
+#include "internal/re.h"
 #include "internal/struct.h"
 #include "internal/st.h"
 #include "internal/thread.h"
+#include "internal/vm.h"
+#include "ruby/encoding.h"
 #include "variable.h"
 #include "yjit.h"
 #include "zjit.h"
@@ -1669,6 +1672,8 @@ rb_ractor_make_shareable(VALUE obj)
     return obj;
 }
 
+static VALUE ractor_copy(VALUE obj); // below
+
 VALUE
 rb_ractor_make_shareable_copy(VALUE obj)
 {
@@ -2178,29 +2183,76 @@ ractor_move(VALUE obj)
     }
 }
 
+/* RLGCv2 / design decision 11: the message-copy traversal never calls the
+ * user-visible #clone / #initialize_clone. Core container types get a
+ * native shallow copy here (the traversal machinery then rewrites the
+ * children inside the copy); every other unshareable type falls back to
+ * a whole-graph Marshal round-trip (ractor_prepare_payload).
+ * The native copies always build fresh buffers: a #clone-based copy of a
+ * long String/Array shares the buffer root with the source, which under
+ * per-Ractor objspaces would leave the receiver's contents pointing into
+ * the sender's heap. */
 static VALUE
-ractor_call_clone_try(VALUE obj)
+ractor_native_shallow_copy(VALUE obj)
 {
-    return rb_funcall(obj, idClone, 0);
-}
+    VALUE copy;
 
-static VALUE
-ractor_call_clone_rescue(VALUE obj, VALUE exc)
-{
-    rb_raise(rb_eRactorError, "can't clone unshareable instance of %"PRIsVALUE, rb_class_of(obj));
-    UNREACHABLE_RETURN(Qnil);
-}
-
-static VALUE
-ractor_obj_clone(VALUE obj)
-{
-    VALUE clone = rb_rescue(ractor_call_clone_try, obj, ractor_call_clone_rescue, obj);
-
-    if (obj == clone) {
-        rb_raise(rb_eRactorError, "#clone returned self");
+    /* An object with a singleton class is not natively copyable (the
+     * #clone-based copy used to carry the singleton over); let it fall
+     * through to Marshal, which raises a proper error for it. */
+    VALUE klass = RBASIC_CLASS(obj);
+    if (klass == 0 || FL_TEST_RAW(klass, FL_SINGLETON)) {
+        return Qundef;
     }
 
-    return clone;
+    switch (BUILTIN_TYPE(obj)) {
+      case T_OBJECT:
+        copy = rb_obj_alloc(rb_obj_class(obj));
+        rb_obj_copy_ivar(copy, obj);
+        break;
+      case T_STRING:
+        copy = rb_enc_str_new(RSTRING_PTR(obj), RSTRING_LEN(obj), rb_enc_get(obj));
+        break;
+      case T_ARRAY:
+        copy = rb_ary_new_from_values(RARRAY_LEN(obj), RARRAY_CONST_PTR(obj));
+        break;
+      case T_HASH:
+        copy = rb_hash_dup(obj);
+        break;
+      case T_STRUCT:
+        copy = rb_obj_alloc(rb_obj_class(obj));
+        rb_struct_init_copy(copy, obj);
+        break;
+      case T_MATCH:
+        copy = rb_obj_alloc(rb_obj_class(obj));
+        rb_match_init_copy(copy, obj);
+        break;
+      case T_DATA:
+        /* a copied exception must not smuggle a raw pointer to the
+         * sender-resident backtrace across objspaces (design_v2.md §4.4) */
+        if (rb_backtrace_p(obj)) {
+            copy = rb_backtrace_dup(obj);
+            break;
+        }
+        return Qundef;
+      default:
+        return Qundef;
+    }
+
+    /* non-T_OBJECT hosts keep their instance variables in the generic
+     * fields table; #clone used to carry them over. */
+    if (BUILTIN_TYPE(obj) != T_OBJECT && UNLIKELY(rb_obj_gen_fields_p(obj))) {
+        rb_copy_generic_ivar(copy, obj);
+    }
+
+    /* The traversal machinery rewrites the children inside the copy with
+     * raw stores, so the frozen bit can be set up front. (At leave time
+     * the original is no longer in view: the walker swaps obj for the
+     * replacement before descending.) */
+    if (OBJ_FROZEN(obj)) {
+        RB_FL_SET_RAW(copy, RUBY_FL_FREEZE);
+    }
+    return copy;
 }
 
 static enum obj_traverse_iterator_result
@@ -2211,7 +2263,9 @@ copy_enter(VALUE obj, struct obj_traverse_replace_data *data)
         return traverse_skip;
     }
     else {
-        data->replacement = ractor_obj_clone(obj);
+        VALUE copy = ractor_native_shallow_copy(obj);
+        if (UNDEF_P(copy)) return traverse_stop; /* not natively copyable */
+        data->replacement = copy;
         return traverse_cont;
     }
 }
@@ -2222,16 +2276,26 @@ copy_leave(VALUE obj, struct obj_traverse_replace_data *data)
     return traverse_cont;
 }
 
+/* Native deep copy of obj's graph; Qundef if the graph contains a type
+ * the native copier does not support (callers fall back to Marshal). */
+static VALUE
+ractor_copy_native_try(VALUE obj)
+{
+    return rb_obj_traverse_replace(obj, copy_enter, copy_leave, false);
+}
+
+/* Same-objspace deep copy (Ractor.make_shareable(obj, copy: true)):
+ * native first, whole-graph Marshal round-trip otherwise. */
 static VALUE
 ractor_copy(VALUE obj)
 {
-    VALUE val = rb_obj_traverse_replace(obj, copy_enter, copy_leave, false);
-    if (!UNDEF_P(val)) {
-        return val;
+    VALUE copy = ractor_copy_native_try(obj);
+    if (UNDEF_P(copy)) {
+        copy = rb_marshal_load(rb_rescue2(ractor_marshal_dump_body, obj,
+                                          ractor_marshal_dump_rescue, obj,
+                                          rb_eTypeError, (VALUE)0));
     }
-    else {
-        rb_raise(rb_eRactorError, "can not copy the object");
-    }
+    return copy;
 }
 
 // Ractor local storage
