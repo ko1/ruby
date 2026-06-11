@@ -669,17 +669,30 @@ ractor_mark_ports_i(st_data_t key, st_data_t val, st_data_t data)
 static void
 ractor_sync_mark(rb_ractor_t *r)
 {
+    /* Single VALUE slots are stable (set once at creation, or written
+     * by the owner as one aligned word): safe to read from any GC. */
     rb_gc_mark(r->sync.default_port_value);
-
-    if (r->sync.ports) {
-        ractor_queue_mark(r->sync.recv_queue);
-        st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
-    }
 
     /* snapshot being materialized by a receive (basket already popped) */
     rb_gc_mark(r->sync.in_flight_materializing);
 
-    ractor_mark_monitors(r);
+    /* RLGCv2 M1b: the queues, the port table and the monitor list are
+     * mutated by the owner under its sync lock, so a lock-free foreign
+     * mark (main's local GC traversing this Ractor object) reads them
+     * torn -- and by containment everything in them is foreign to that
+     * marker anyway (payload snapshots stay alive through the sender's
+     * shref pin, ports through the shareable pin). Walk them only when
+     * no concurrent owner can exist: our own Ractor, a terminated one,
+     * or under the global GC's barrier. */
+    rb_ractor_t *cr = rb_current_ractor_raw(false);
+    if (r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p()) {
+        if (r->sync.ports) {
+            ractor_queue_mark(r->sync.recv_queue);
+            st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
+        }
+
+        ractor_mark_monitors(r);
+    }
 }
 
 static void

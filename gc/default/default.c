@@ -243,9 +243,7 @@ static RB_THREAD_LOCAL_SPECIFIER int malloc_increase_local;
 /* RLGCv2: there is no per-Ractor newobj cache.  The bump-pointer
  * allocation state (cursor / region chain) lives directly in rb_heap_t
  * with a single writer (the objspace's owning Ractor); see
- * RLGC_DOC/design_v2.md section 3.  Until per-Ractor objspaces arrive
- * (M1), a multi-Ractor process serializes allocations on this shared
- * objspace with RB_GC_CR_LOCK. */
+ * RLGC_DOC/design_v2.md section 3. */
 
 typedef struct {
     size_t heap_init_bytes;
@@ -1467,11 +1465,24 @@ static int garbage_collect(rb_objspace_t *, unsigned int reason);
 static int  gc_start(rb_objspace_t *objspace, unsigned int reason);
 static void gc_rest(rb_objspace_t *objspace);
 
+/* RLGCv2 M1b: GC-cycle events (ENTER/EXIT/START/END_MARK/END_SWEEP)
+ * fire only for objspaces whose Ractor enabled them: a concurrent
+ * local GC must not traverse the VM-global hook lists while another
+ * Ractor mutates them, and the events of a foreign Ractor's GC are
+ * not this Ractor's business anyway. NEWOBJ/FREEOBJ were already
+ * gated this way. */
+#define gc_event_hook_objspace(objspace, event) do { \
+    if (RB_UNLIKELY((objspace)->hook_events & (event))) { \
+        rb_gc_event_hook(0, (event)); \
+    } \
+} while (0)
+
 enum gc_enter_event {
     gc_enter_event_start,
     gc_enter_event_continue,
     gc_enter_event_rest,
     gc_enter_event_finalizer,
+    gc_enter_event_global,
 };
 
 static inline void gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_lev);
@@ -2784,9 +2795,8 @@ heap_alloc_slot(rb_objspace_t *objspace, size_t heap_idx)
     rb_asan_unpoison_object(obj, true);
     heap->alloc_cursor = cursor + pool_slot_sizes[heap_idx];
 
-    /* Single writer (or RB_GC_CR_LOCK serialized in the temporary
-     * multi-Ractor shared-objspace mode), so a plain increment is
-     * enough; the batched atomic flush of the cache era is gone. */
+    /* Single writer (the owner Ractor's GVL), so a plain increment
+     * is enough; the batched atomic flush of the cache era is gone. */
     heap->total_allocated_objects++;
 
 #if RGENGC_CHECK_MODE
@@ -2878,53 +2888,42 @@ bool
 rb_gc_impl_zjit_new_obj_fastpath(void *objspace_ptr, size_t alloc_size, VALUE flags, VALUE klass,
                                  struct rb_gc_zjit_fastpath *fastpath)
 {
-    /* RLGCv2: there is no per-Ractor newobj cache, and in the temporary
-     * shared-objspace mode (until M1) allocations are serialized under
-     * RB_GC_CR_LOCK -- a lock-free bump allocation inlined into JIT code
-     * would bypass that. Report "no fastpath"; the caller falls back to the
-     * ordinary allocation path (same as gc/wbcheck). Per-Ractor objspaces
-     * are single-writer, so a heap-direct fastpath can be offered later. */
+    /* RLGCv2: the bump-pointer allocation state lives in the per-objspace
+     * heaps (there is no per-Ractor newobj cache), and ZJIT's inline
+     * fastpath machinery is built around that cache struct. Report "no
+     * fastpath"; the caller falls back to the ordinary allocation path
+     * (same as gc/wbcheck). The heaps are single-writer, so a heap-direct
+     * fastpath can be offered later. */
     return false;
 }
 
-
-NOINLINE(static VALUE newobj_refill(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked));
+NOINLINE(static VALUE newobj_refill(rb_objspace_t *objspace, size_t heap_idx));
 
 static VALUE
-newobj_refill(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked)
+newobj_refill(rb_objspace_t *objspace, size_t heap_idx)
 {
     rb_heap_t *heap = &heaps[heap_idx];
     VALUE obj = Qfalse;
 
-    unsigned int lev = 0;
-    bool unlock_vm = false;
+    /* RLGCv2 M1b: no lock -- the heap is single-writer (owner thread,
+     * GVL-serialized within the Ractor), the page pool has its own
+     * mutex, and a GC started from here takes whatever gc_enter
+     * decides it needs. */
+    if (is_incremental_marking(objspace)) {
+        gc_continue(objspace, heap);
+        objspace->incremental_mark_step_allocated_slots = 0;
 
-    if (!vm_locked) {
-        lev = RB_GC_CR_LOCK();
-        unlock_vm = true;
+        // Retry allocation after resetting incremental_mark_step_allocated_slots
+        obj = heap_alloc_slot(objspace, heap_idx);
     }
 
-    {
-        if (is_incremental_marking(objspace)) {
-            gc_continue(objspace, heap);
-            objspace->incremental_mark_step_allocated_slots = 0;
+    if (obj == Qfalse) {
+        // Get next free page (possibly running GC)
+        struct heap_page *page = heap_next_free_page(objspace, heap);
+        heap_set_alloc_page(objspace, heap_idx, page);
 
-            // Retry allocation after resetting incremental_mark_step_allocated_slots
-            obj = heap_alloc_slot(objspace, heap_idx);
-        }
-
-        if (obj == Qfalse) {
-            // Get next free page (possibly running GC)
-            struct heap_page *page = heap_next_free_page(objspace, heap);
-            heap_set_alloc_page(objspace, heap_idx, page);
-
-            // Retry allocation after moving to new page
-            obj = heap_alloc_slot(objspace, heap_idx);
-        }
-    }
-
-    if (unlock_vm) {
-        RB_GC_CR_UNLOCK(lev);
+        // Retry allocation after moving to new page
+        obj = heap_alloc_slot(objspace, heap_idx);
     }
 
     if (RB_UNLIKELY(obj == Qfalse)) {
@@ -2934,14 +2933,14 @@ newobj_refill(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked)
 }
 
 static VALUE
-newobj_alloc(rb_objspace_t *objspace, size_t heap_idx, bool vm_locked)
+newobj_alloc(rb_objspace_t *objspace, size_t heap_idx)
 {
     /* RLGCv2 (design_v2.md §3): the objspace belongs to the current Ractor
      * and has a single writer, so the fast path needs no lock at all. */
     VALUE obj = heap_alloc_slot(objspace, heap_idx);
 
     if (RB_UNLIKELY(obj == Qfalse)) {
-        obj = newobj_refill(objspace, heap_idx, vm_locked);
+        obj = newobj_refill(objspace, heap_idx);
     }
 
     return obj;
@@ -2953,31 +2952,28 @@ static inline VALUE
 newobj_slowpath(VALUE klass, VALUE flags, rb_objspace_t *objspace, int wb_protected, size_t heap_idx)
 {
     VALUE obj;
-    unsigned int lev;
 
-    lev = RB_GC_CR_LOCK();
-    {
-        if (RB_UNLIKELY(during_gc || ruby_gc_stressful)) {
-            if (during_gc) {
-                dont_gc_on();
-                during_gc = 0;
-                if (rb_memerror_reentered()) {
-                    rb_memerror();
-                }
-                rb_bug("object allocation during garbage collection phase");
+    /* RLGCv2 M1b: no lock; see newobj_refill. during_gc and the stress
+     * flag are this objspace's own state. */
+    if (RB_UNLIKELY(during_gc || ruby_gc_stressful)) {
+        if (during_gc) {
+            dont_gc_on();
+            during_gc = 0;
+            if (rb_memerror_reentered()) {
+                rb_memerror();
             }
-
-            if (ruby_gc_stressful) {
-                if (!garbage_collect(objspace, GPR_FLAG_NEWOBJ)) {
-                    rb_memerror();
-                }
-            }
+            rb_bug("object allocation during garbage collection phase");
         }
 
-        obj = newobj_alloc(objspace, heap_idx, true);
-        newobj_init(klass, flags, wb_protected, objspace, obj);
+        if (ruby_gc_stressful) {
+            if (!garbage_collect(objspace, GPR_FLAG_NEWOBJ)) {
+                rb_memerror();
+            }
+        }
     }
-    RB_GC_CR_UNLOCK(lev);
+
+    obj = newobj_alloc(objspace, heap_idx);
+    newobj_init(klass, flags, wb_protected, objspace, obj);
 
     return obj;
 }
@@ -3023,7 +3019,7 @@ rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags
 
     if (!RB_UNLIKELY(during_gc || ruby_gc_stressful) &&
             wb_protected) {
-        obj = newobj_alloc(objspace, heap_idx, false);
+        obj = newobj_alloc(objspace, heap_idx);
         newobj_init(klass, flags, wb_protected, objspace, obj);
     }
     else {
@@ -4569,7 +4565,7 @@ gc_sweep_finish(rb_objspace_t *objspace)
         }
     }
 
-    rb_gc_event_hook(0, RUBY_INTERNAL_EVENT_GC_END_SWEEP);
+    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_END_SWEEP);
     gc_mode_transition(objspace, gc_mode_none);
 
 #if RGENGC_CHECK_MODE >= 2
@@ -6356,7 +6352,7 @@ gc_marks_finish(rb_objspace_t *objspace)
     // TODO: refactor so we don't need to call this
     rb_ractor_finish_marking();
 
-    rb_gc_event_hook(0, RUBY_INTERNAL_EVENT_GC_END_MARK);
+    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_END_MARK);
 }
 
 static bool
@@ -6926,13 +6922,12 @@ gc_writebarrier_generational(VALUE a, VALUE b, rb_objspace_t *objspace)
         if (is_incremental_marking(objspace)) rb_bug("gc_writebarrier_generational: called while incremental marking: %s -> %s", rb_obj_info(a), rb_obj_info(b));
     }
 
-    /* mark `a' and remember (default behavior) */
+    /* mark `a' and remember (default behavior).
+     * RLGCv2 M1b: lock-free -- the remembered-bit set is atomic
+     * (rgengc_remembersetbits_set), which is all a concurrent local GC
+     * or another Ractor's write barrier can race with here. */
     if (!RVALUE_REMEMBERED(objspace, a)) {
-        int lev = RB_GC_VM_LOCK_NO_BARRIER();
-        {
-            rgengc_remember(objspace, a);
-        }
-        RB_GC_VM_UNLOCK_NO_BARRIER(lev);
+        rgengc_remember(objspace, a);
 
         gc_report(1, objspace, "gc_writebarrier_generational: %s (remembered) -> %s\n", rb_obj_info(a), rb_obj_info(b));
     }
@@ -7022,20 +7017,16 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
         }
     }
     else {
-        bool retry = false;
-        /* slow path */
-        int lev = RB_GC_VM_LOCK_NO_BARRIER();
-        {
-            if (is_incremental_marking(objspace)) {
-                gc_writebarrier_incremental(a, b, objspace);
-            }
-            else {
-                retry = true;
-            }
+        /* slow path. RLGCv2 M1b: lock-free -- incremental marking runs
+         * only while the process has a single objspace (multi-objspace
+         * disables it), so the owner Ractor's GVL already serializes
+         * this barrier against its own GC. */
+        if (is_incremental_marking(objspace)) {
+            gc_writebarrier_incremental(a, b, objspace);
         }
-        RB_GC_VM_UNLOCK_NO_BARRIER(lev);
-
-        if (retry) goto retry;
+        else {
+            goto retry;
+        }
     }
     return;
 }
@@ -7083,29 +7074,30 @@ rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj)
         gc_report(2, objspace, "rb_gc_writebarrier_unprotect: %s %s\n", rb_obj_info(obj),
                   RVALUE_REMEMBERED(objspace, obj) ? " (already remembered)" : "");
 
-        unsigned int lev = RB_GC_VM_LOCK_NO_BARRIER();
-        {
-            if (RVALUE_OLD_P(objspace, obj)) {
-                gc_report(1, objspace, "rb_gc_writebarrier_unprotect: %s\n", rb_obj_info(obj));
-                RVALUE_DEMOTE(objspace, obj);
-                gc_mark_set(objspace, obj);
-                gc_remember_unprotected(objspace, obj);
+        /* RLGCv2 M1b: lock-free. The assert above makes obj an
+         * unshareable of the current Ractor, so every bit touched here
+         * (wb_unprotected, uncollectible, age) is on an owned page and
+         * single-writer; the remembered-bit clear inside RVALUE_DEMOTE
+         * is atomic against foreign writers sharing the word. */
+        if (RVALUE_OLD_P(objspace, obj)) {
+            gc_report(1, objspace, "rb_gc_writebarrier_unprotect: %s\n", rb_obj_info(obj));
+            RVALUE_DEMOTE(objspace, obj);
+            gc_mark_set(objspace, obj);
+            gc_remember_unprotected(objspace, obj);
 
 #if RGENGC_PROFILE
-                objspace->profile.total_shade_operation_count++;
+            objspace->profile.total_shade_operation_count++;
 #if RGENGC_PROFILE >= 2
-                objspace->profile.shade_operation_count_types[BUILTIN_TYPE(obj)]++;
+            objspace->profile.shade_operation_count_types[BUILTIN_TYPE(obj)]++;
 #endif /* RGENGC_PROFILE >= 2 */
 #endif /* RGENGC_PROFILE */
-            }
-            else {
-                RVALUE_AGE_RESET(obj);
-            }
-
-            RB_DEBUG_COUNTER_INC(obj_wb_unprotect);
-            MARK_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(obj), obj);
         }
-        RB_GC_VM_UNLOCK_NO_BARRIER(lev);
+        else {
+            RVALUE_AGE_RESET(obj);
+        }
+
+        RB_DEBUG_COUNTER_INC(obj_wb_unprotect);
+        MARK_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(obj), obj);
     }
 }
 
@@ -7133,19 +7125,17 @@ rb_gc_impl_writebarrier_remember(void *objspace_ptr, VALUE obj)
 
     gc_report(1, objspace, "rb_gc_writebarrier_remember: %s\n", rb_obj_info(obj));
 
-    if (is_incremental_marking(objspace) || RVALUE_OLD_P(objspace, obj)) {
-        int lev = RB_GC_VM_LOCK_NO_BARRIER();
-        {
-            if (is_incremental_marking(objspace)) {
-                if (RVALUE_BLACK_P(objspace, obj)) {
-                    gc_grey(objspace, obj);
-                }
-            }
-            else if (RVALUE_OLD_P(objspace, obj)) {
-                rgengc_remember(objspace, obj);
-            }
+    /* RLGCv2 M1b: lock-free for the same reasons as
+     * rb_gc_impl_writebarrier -- the remember is an atomic bitmap set,
+     * and the incremental branch only runs single-objspace where the
+     * Ractor's GVL serializes it against its own GC. */
+    if (is_incremental_marking(objspace)) {
+        if (RVALUE_BLACK_P(objspace, obj)) {
+            gc_grey(objspace, obj);
         }
-        RB_GC_VM_UNLOCK_NO_BARRIER(lev);
+    }
+    else if (RVALUE_OLD_P(objspace, obj)) {
+        rgengc_remember(objspace, obj);
     }
 }
 
@@ -7351,27 +7341,28 @@ garbage_collect(rb_objspace_t *objspace, unsigned int reason)
 {
     int ret;
 
-    int lev = RB_GC_VM_LOCK();
-    {
+    /* RLGCv2 M1b: no outer VM lock -- gc_enter takes what each path
+     * needs (nothing for a worker's local GC, the no-barrier VM lock
+     * for main's, lock + barrier for the global cycle). Two Ractors
+     * deciding on a global GC at once just run two cycles back to
+     * back; the second is wasted work, not a correctness problem. */
 #if GC_PROFILE_MORE_DETAIL
-        objspace->profile.prepare_time = getrusage_time();
+    objspace->profile.prepare_time = getrusage_time();
 #endif
 
-        gc_rest(objspace);
+    gc_rest(objspace);
 
 #if GC_PROFILE_MORE_DETAIL
-        objspace->profile.prepare_time = getrusage_time() - objspace->profile.prepare_time;
+    objspace->profile.prepare_time = getrusage_time() - objspace->profile.prepare_time;
 #endif
 
-        if (rlgc_global_wanted_p(objspace)) {
-            rlgc_global_gc(objspace);
-            ret = TRUE;
-        }
-        else {
-            ret = gc_start(objspace, reason);
-        }
+    if (rlgc_global_wanted_p(objspace)) {
+        rlgc_global_gc(objspace);
+        ret = TRUE;
     }
-    RB_GC_VM_UNLOCK(lev);
+    else {
+        ret = gc_start(objspace, reason);
+    }
 
     return ret;
 }
@@ -7488,7 +7479,7 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     gc_prof_setup_new_record(objspace, reason);
     gc_reset_malloc_info(objspace, do_full_mark);
 
-    rb_gc_event_hook(0, RUBY_INTERNAL_EVENT_GC_START);
+    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_START);
 
     GC_ASSERT(during_gc);
 
@@ -7618,6 +7609,7 @@ gc_enter_event_cstr(enum gc_enter_event event)
       case gc_enter_event_continue: return "continue";
       case gc_enter_event_rest: return "rest";
       case gc_enter_event_finalizer: return "finalizer";
+      case gc_enter_event_global: return "global";
     }
     return NULL;
 }
@@ -7630,6 +7622,7 @@ gc_enter_count(enum gc_enter_event event)
       case gc_enter_event_continue:       RB_DEBUG_COUNTER_INC(gc_enter_continue); break;
       case gc_enter_event_rest:           RB_DEBUG_COUNTER_INC(gc_enter_rest); break;
       case gc_enter_event_finalizer:      RB_DEBUG_COUNTER_INC(gc_enter_finalizer); break;
+      case gc_enter_event_global:         RB_DEBUG_COUNTER_INC(gc_enter_start); break;
     }
 }
 
@@ -7662,7 +7655,26 @@ gc_clock_end(struct timespec *ts)
 static inline void
 gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_lev)
 {
-    *lock_lev = RB_GC_VM_LOCK();
+    /* RLGCv2 M1b (design_v2.md section 2.1): a local GC runs on its
+     * owner's thread and takes neither the VM lock nor the barrier --
+     * containment makes the heap single-writer, and the cross-objspace
+     * bitmap writes are atomic. Two exceptions:
+     *
+     * - the global GC stops the world: VM lock + barrier. The barrier
+     *   implicitly waits for every in-flight local GC, because a GC
+     *   has no safepoint: its thread joins only after gc_exit.
+     * - the MAIN objspace's local GC also walks the VM-global roots
+     *   (rb_vm_mark), which are mutated under the VM lock, so it takes
+     *   the lock WITHOUT raising a barrier; workers keep running. A
+     *   thread that blocks on the VM lock here joins a pending global
+     *   barrier BEFORE its own GC starts, never in the middle.
+     *
+     * Consequently nothing inside a GC may acquire the VM lock: a
+     * waiter joins a pending barrier mid-collection, exposing a
+     * half-collected heap to the global GC. The shared structures the
+     * GC path touches use their own native mutexes (id2ref,
+     * registered globals, generic fields) or the page-pool lock. */
+    *lock_lev = 0;
 
     RUBY_DTRACE_GC_HOOK(ENTER, event);
 
@@ -7674,18 +7686,20 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
             objspace->profile.gc_pause_start_time = rb_hrtime_now();
             break;
           case gc_enter_event_finalizer:
+          case gc_enter_event_global:
             break;
         }
     }
-
     switch (event) {
-      case gc_enter_event_rest:
-      case gc_enter_event_start:
-      case gc_enter_event_continue:
+      case gc_enter_event_global:
+        *lock_lev = RB_GC_VM_LOCK();
         // stop other ractors
         rb_gc_vm_barrier();
         break;
       default:
+        if (objspace == rb_gc_vm_main_objspace()) {
+            *lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
+        }
         break;
     }
 
@@ -7705,7 +7719,7 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
     gc_report(1, objspace, "gc_enter: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     gc_record(objspace, 0, gc_enter_event_cstr(event));
 
-    rb_gc_event_hook(0, RUBY_INTERNAL_EVENT_GC_ENTER);
+    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_ENTER);
 }
 
 static inline void
@@ -7715,7 +7729,7 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
 
     RUBY_DTRACE_GC_HOOK(EXIT, event);
 
-    rb_gc_event_hook(0, RUBY_INTERNAL_EVENT_GC_EXIT);
+    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_EXIT);
 
     if (objspace->profile.gc_pause_start_time) {
         if (gc_prof_enabled(objspace)) {
@@ -7738,7 +7752,16 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
     gc_report(1, objspace, "gc_exit: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     during_gc = FALSE;
 
-    RB_GC_VM_UNLOCK(*lock_lev);
+    switch (event) {
+      case gc_enter_event_global:
+        RB_GC_VM_UNLOCK(*lock_lev);
+        break;
+      default:
+        if (objspace == rb_gc_vm_main_objspace()) {
+            RB_GC_VM_UNLOCK_NO_BARRIER(*lock_lev);
+        }
+        break;
+    }
 }
 
 #ifndef MEASURE_GC
@@ -7913,7 +7936,7 @@ static void
 rlgc_global_gc(rb_objspace_t *driver)
 {
     unsigned int lock_lev;
-    gc_enter(driver, gc_enter_event_start, &lock_lev);
+    gc_enter(driver, gc_enter_event_global, &lock_lev);
 
     GC_ASSERT(is_mark_stack_empty(&driver->mark_stack));
 
@@ -8027,7 +8050,7 @@ rlgc_global_gc(rb_objspace_t *driver)
         during_gc = TRUE; /* for gc_exit's accounting */
     }
 
-    gc_exit(driver, gc_enter_event_start, &lock_lev);
+    gc_exit(driver, gc_enter_event_global, &lock_lev);
 }
 
 static int

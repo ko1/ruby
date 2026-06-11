@@ -152,20 +152,6 @@ rb_gc_vm_unlock(unsigned int lev, const char *file, int line)
 }
 
 unsigned int
-rb_gc_cr_lock(const char *file, int line)
-{
-    unsigned int lev;
-    rb_vm_lock_enter_cr(GET_RACTOR(), &lev, file, line);
-    return lev;
-}
-
-void
-rb_gc_cr_unlock(unsigned int lev, const char *file, int line)
-{
-    rb_vm_lock_leave_cr(GET_RACTOR(), &lev, file, line);
-}
-
-unsigned int
 rb_gc_vm_lock_no_barrier(const char *file, int line)
 {
     unsigned int lev = 0;
@@ -3801,6 +3787,15 @@ void
 rb_gc_objspace_orphaned(void *objspace)
 {
     rb_gc_impl_objspace_orphaned(objspace);
+}
+
+/* Is a global (stop-the-world) GC cycle running? Only its driver can
+ * be executing at all then, so asking through the current objspace is
+ * exact. */
+bool
+rb_gc_during_global_gc_p(void)
+{
+    return rb_gc_impl_during_global_gc_p(rb_gc_get_objspace());
 }
 
 /* helpers for the global GC's orphan merge (design_v2.md section 2.3) */
