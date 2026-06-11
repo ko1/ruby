@@ -700,16 +700,15 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
             r->r_stdout = rb_io_prep_stdout();
             r->r_stderr = rb_io_prep_stderr();
 
-            /* RLGCv2 (design_v2.md §1.5): the interrupt queue/mask stack and
-             * the Thread wrapper were created by the parent's thread
-             * (thread_create_core / rb_thread_alloc), i.e. in the parent's
-             * objspace.  Re-create them here so this Ractor's main thread is
-             * made of objects it owns.  The mask stack starts empty on
-             * purpose: inheriting it would carry references to the parent's
-             * unshareable mask Hashes. */
+            /* RLGCv2 (design_v2.md §1.5): the interrupt queue and mask stack
+             * were created by the parent's thread (thread_create_core), i.e.
+             * in the parent's objspace.  Re-create them here so this Ractor's
+             * main thread is made of objects it owns.  The mask stack starts
+             * empty on purpose: inheriting it would carry references to the
+             * parent's unshareable mask Hashes.  (The Thread/root-Fiber
+             * wrappers are born in this objspace, rb_thread_create_ractor.) */
             th->pending_interrupt_queue = rb_ary_hidden_new(0);
             th->pending_interrupt_mask_stack = rb_ary_hidden_new(0);
-            rb_thread_rewrap_for_ractor(th);
         }
         RB_VM_UNLOCK();
     }
@@ -1078,7 +1077,20 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
         .args = args,
         .proc = proc,
     };
-    return thread_create_core(rb_thread_alloc(rb_cThread), &params);
+
+    /* RLGCv2 (design_v2.md §1.5): allocate the new Ractor's main-thread
+     * Thread and root-Fiber wrappers directly in the child's objspace, so
+     * the thread is made of objects it owns and its identity never
+     * changes. The child has not started yet, so the parent is the only
+     * writer of that objspace; a stress-triggered GC over the still-empty
+     * child heap is a no-op thanks to the containment guards. */
+    rb_ractor_t *cr = GET_RACTOR();
+    void *const parent_objspace = cr->objspace;
+    cr->objspace = r->objspace;
+    VALUE thval = rb_thread_alloc(rb_cThread);
+    cr->objspace = parent_objspace;
+
+    return thread_create_core(thval, &params);
 }
 
 

@@ -4010,25 +4010,6 @@ thread_alloc(VALUE klass)
     return TypedData_Make_Struct(klass, rb_thread_t, &thread_data_type, th);
 }
 
-/* RLGCv2 (design_v2.md §1.5): a new Ractor's main thread receives its
- * Thread wrapper from the creating Ractor, so the wrapper lives in the
- * creator's objspace.  Called on the Ractor's own thread once it runs,
- * this gives the thread a wrapper it owns; the old wrapper is neutered
- * (data cleared -- mark/free skip a NULL data pointer) and left to be
- * collected by its owner. */
-VALUE
-rb_thread_rewrap_for_ractor(rb_thread_t *th)
-{
-    VALUE old_self = th->self;
-    VM_ASSERT(th == GET_THREAD());
-
-    RTYPEDDATA_DATA(old_self) = NULL;
-    th->self = TypedData_Wrap_Struct(rb_cThread, &thread_data_type, th);
-
-    RB_GC_GUARD(old_self);
-    return th->self;
-}
-
 void
 rb_ec_set_vm_stack(rb_execution_context_t *ec, VALUE *stack, size_t size)
 {

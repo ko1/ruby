@@ -1956,7 +1956,6 @@ VM_BH_FROM_PROC(VALUE procval)
 
 /* VM related object allocate functions */
 VALUE rb_thread_alloc(VALUE klass);
-VALUE rb_thread_rewrap_for_ractor(rb_thread_t *th); /* RLGCv2 */
 VALUE rb_binding_alloc(VALUE klass);
 VALUE rb_proc_alloc(VALUE klass);
 VALUE rb_proc_dup(VALUE self);

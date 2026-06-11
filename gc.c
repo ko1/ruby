@@ -3668,6 +3668,23 @@ rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *
     }
 }
 
+/* Walk the objects of every living Ractor's objspace. The caller must
+ * hold the VM lock and have issued a barrier: other Ractors' heaps may
+ * only be read while their owners are stopped (RLGCv2 single-writer). */
+void
+rb_objspace_each_objects_all(int (*callback)(void *, void *, size_t, void *), void *data)
+{
+    ASSERT_vm_locking();
+
+    rb_vm_t *vm = GET_VM();
+    rb_ractor_t *r;
+    ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+        if (r->objspace) {
+            rb_gc_impl_each_objects(r->objspace, callback, data);
+        }
+    }
+}
+
 static void
 gc_ref_update_array(void *objspace, VALUE v)
 {

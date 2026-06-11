@@ -202,11 +202,16 @@ typedef struct rb_global_objspace {
 親の local GC からは root が無い(親の物ではないから)、という宙ぶらりんになり、
 use-after-free の温床になる。規則:
 
-- 子 Ractor 専用の VM インフラ(スレッドの割り込みキューや mask スタック、fiber 関連、
-  Ractor-local storage の器、…)は、**子のスレッドが起動してから子の objspace に確保する**
-  (親が先に作る必要がある物は、子側で作り直す)。
-- やむを得ず親側に残る物(例: 子の root fiber の wrapper オブジェクト)は、子の root 表
-  から**直接**辿れるようにする(§2.1 手順 3.a)。
+- 子 Ractor 専用の VM インフラは**子の objspace に確保する**。手段は 2 つ:
+  1. **親が子の objspace へ直接確保する**(推奨)。子のスレッドが起動するまで子の
+     objspace の writer は親だけなので、生成時に一時的に割り当て先を子へ切り替えるのは
+     single-writer を破らない(stress GC が走っても、封じ込めガードにより空ヒープへの
+     誤 root GC は no-op)。Thread / root Fiber の wrapper はこの方法で生成時から
+     子の物にする — **オブジェクトの同一性が生涯変わらない**ことが重要
+     (途中で作り直すと、起動初期に C レベルで掴まれた旧 wrapper と以後の wrapper が
+     別オブジェクトになり、thread instrumentation のような identity ベースの API が壊れる)。
+  2. 親の objspace に作られた物を**子の起動時に子側で作り直す**(割り込みキュー・
+     mask スタックなど、identity が外部に出ない物はこちらで足りる)。
 - Ractor 関連のインフラを新設するときは必ず「これはどの objspace に入り、誰の root から
   辿られるか」を確認する。レビュー観点として固定する。
 

@@ -238,6 +238,10 @@ void rb_objspace_each_objects(
     int (*callback)(void *start, void *end, size_t stride, void *data),
     void *data);
 
+void rb_objspace_each_objects_all(
+    int (*callback)(void *start, void *end, size_t stride, void *data),
+    void *data);
+
 size_t rb_gc_obj_slot_size(VALUE obj);
 
 VALUE rb_gc_disable_no_rest(void);
