@@ -676,7 +676,45 @@ ractor_sync_mark(rb_ractor_t *r)
         st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
     }
 
+    /* snapshot being materialized by a receive (basket already popped) */
+    rb_gc_mark(r->sync.in_flight_materializing);
+
     ractor_mark_monitors(r);
+}
+
+static void
+ractor_queue_repin_in_flight(const struct ractor_queue *rq)
+{
+    const struct ractor_basket *b;
+    ccan_list_for_each(&rq->set, b, node) {
+        if (b->type == basket_type_copy || b->type == basket_type_move) {
+            rb_gc_pin_in_flight_message(b->p.v);
+        }
+    }
+}
+
+static int
+ractor_repin_ports_i(st_data_t key, st_data_t val, st_data_t data)
+{
+    ractor_queue_repin_in_flight((struct ractor_queue *)val);
+    return ST_CONTINUE;
+}
+
+/* RLGCv2 (design_v2.md §2.2 step 6): the global GC clears all shref bits,
+ * so every in-flight payload (queued baskets and the snapshot a receive
+ * is currently materializing) must be re-pinned before the unified mark.
+ * Runs on the driver under the barrier. */
+void
+rb_ractor_repin_in_flight(rb_ractor_t *r)
+{
+    if (r->sync.ports) {
+        ractor_queue_repin_in_flight(r->sync.recv_queue);
+        st_foreach(r->sync.ports, ractor_repin_ports_i, 0);
+    }
+    if (r->sync.in_flight_materializing &&
+        !RB_SPECIAL_CONST_P(r->sync.in_flight_materializing)) {
+        rb_gc_pin_in_flight_message(r->sync.in_flight_materializing);
+    }
 }
 
 static int
@@ -863,7 +901,7 @@ ractor_basket_value(struct ractor_basket *b)
     switch (b->type) {
       case basket_type_ref:
         break;
-      case basket_type_copy:
+      case basket_type_copy: {
         /* RLGCv2 M3 (design_v2.md §4.2): materialize the sender-side
          * snapshot into the receiving Ractor's objspace. Handing the
          * sender-resident graph over by reference would create
@@ -872,7 +910,13 @@ ractor_basket_value(struct ractor_basket *b)
          * owner's write barrier accounting). The snapshot stays pinned
          * (in-flight shref) in the sender's objspace and becomes garbage
          * there once this copy is made. Marshal.load allocates through
-         * the ordinary newobj/write-barrier paths of this Ractor. */
+         * the ordinary newobj/write-barrier paths of this Ractor.
+         * The basket is already off the queue, so the materializing slot
+         * is what keeps the snapshot rooted (and re-pinnable by a global
+         * GC) for the duration of the copy. */
+        rb_ractor_t *cr = rb_ec_ractor_ptr(rb_current_ec_noinline());
+        VM_ASSERT(UNDEF_P(cr->sync.in_flight_materializing) || cr->sync.in_flight_materializing == Qfalse);
+        cr->sync.in_flight_materializing = b->p.v;
         if (b->p.marshaled) {
             b->p.v = rb_marshal_load(b->p.v);
         }
@@ -881,8 +925,10 @@ ractor_basket_value(struct ractor_basket *b)
             if (UNDEF_P(v)) rb_bug("ractor_basket_value: native snapshot not natively copyable");
             b->p.v = v;
         }
+        cr->sync.in_flight_materializing = Qfalse;
         ractor_reset_belonging(b->p.v);
         break;
+      }
       case basket_type_move:
         /* TODO(M3): a moved graph is still handed over by reference and
          * stays in the sender's objspace (kept by the in-flight pin).
