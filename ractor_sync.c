@@ -819,6 +819,68 @@ ractor_make_remote_exception(VALUE cause, VALUE sender)
     return err;
 }
 
+static int
+pin_inherited_storage_i(st_data_t key, st_data_t val, st_data_t arg)
+{
+    if (!SPECIAL_CONST_P((VALUE)val)) {
+        rb_gc_pin_in_flight_message((VALUE)val);
+    }
+    return ST_CONTINUE;
+}
+
+/* RLGCv2 (design_v2.md section 4.3): after Ractor#value absorbed the
+ * dead Ractor's objspace, everything still referenced from its C struct
+ * (the legacy value for repeat #value calls, its stdio, its local
+ * storage) belongs to the CALLER's objspace but is reachable only
+ * through the Ractor object, which usually lives in some other
+ * Ractor's objspace -- whose marks foreign-skip our objects, while our
+ * own GC never traverses the foreign Ractor object. Pin each top-level
+ * slot with the shref bit: our pages, our thread, plain stores. Their
+ * children survive through the normal root traversal, and the global
+ * GC re-derives these exact bits from the shareable Ractor object's
+ * s->u edges for as long as the Ractor object lives. */
+void
+rb_ractor_pin_inherited_parts(rb_ractor_t *r)
+{
+    VALUE slots[] = {
+        r->sync.legacy,
+        r->r_stdin, r->r_stdout, r->r_stderr,
+        r->verbose, r->debug,
+    };
+    for (size_t i = 0; i < numberof(slots); i++) {
+        if (!SPECIAL_CONST_P(slots[i])) {
+            rb_gc_pin_in_flight_message(slots[i]);
+        }
+    }
+    if (r->local_storage) {
+        st_foreach(r->local_storage, pin_inherited_storage_i, 0);
+    }
+
+    /* The dead Ractor's main thread stays on its threads list, and its
+     * Thread/Fiber wrapper objects were born in the dead objspace
+     * (thread.c, rb_thread_create_ractor) -- inherited with everything
+     * else. Pinning the wrappers is enough: their dmarks reach the rest
+     * of the thread state (th->value and friends) transitively. */
+    rb_thread_t *th = 0;
+    ccan_list_for_each(&r->threads.set, th, lt_node) {
+        if (th->self && !SPECIAL_CONST_P(th->self)) {
+            rb_gc_pin_in_flight_message(th->self);
+        }
+        if (th->root_fiber) {
+            VALUE fself = rb_fiberptr_self(th->root_fiber);
+            if (fself && !SPECIAL_CONST_P(fself)) {
+                rb_gc_pin_in_flight_message(fself);
+            }
+        }
+        if (th->ec && th->ec->fiber_ptr) {
+            VALUE fself = rb_fiberptr_self(th->ec->fiber_ptr);
+            if (fself && !SPECIAL_CONST_P(fself)) {
+                rb_gc_pin_in_flight_message(fself);
+            }
+        }
+    }
+}
+
 static VALUE
 ractor_value(rb_execution_context_t *ec, VALUE self)
 {
@@ -839,6 +901,17 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
             rb_thread_schedule();
         }
         rb_gc_objspace_absorb_into_current(&r->objspace);
+
+        /* The inherited objects are now ours, but the only path to them
+         * is the dead Ractor's C struct, traversed only by whoever owns
+         * the Ractor OBJECT -- usually a different Ractor, whose mark
+         * foreign-skips our objects. Pin them with the shref bit (we own
+         * their pages now, so plain stores): our local GC then roots
+         * them, and the next global GC re-derives the same bits from the
+         * shareable-Ractor-object -> unshareable edges for as long as
+         * the Ractor object itself survives, which is exactly their
+         * lifetime. */
+        rb_ractor_pin_inherited_parts(r);
 
         ractor_reset_belonging(r->sync.legacy);
 
