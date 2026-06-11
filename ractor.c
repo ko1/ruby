@@ -238,14 +238,32 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
      * updated in ractor_update_references) */
     if (r->mark_object_ary) rb_gc_mark_movable(r->mark_object_ary);
 
+    /* Single VALUE slots: stable enough for any GC to read (written by
+     * the owner as one aligned word; their referents are foreign to a
+     * foreign marker and skipped by containment anyway). */
     rb_gc_mark(r->r_stdin);
     rb_gc_mark(r->r_stdout);
     rb_gc_mark(r->r_stderr);
     rb_gc_mark(r->verbose);
     rb_gc_mark(r->debug);
 
-    // mark received messages
+    // mark received messages (gates its owner-mutated structures itself)
     ractor_sync_mark(r);
+
+    /* RLGCv2 M1b: everything below reads structures the owner mutates
+     * while running -- thread structs / ECs / fibers are even freed
+     * concurrently (design_v2.md section 2.1: never walk other
+     * Ractors' stacks), and the hook and storage tables are resized in
+     * place. Walk them only when no concurrent owner can exist: our
+     * own Ractor, a terminated one (the status is set after the
+     * teardown's last access), or under the global GC's barrier.
+     * Nothing is lost for a live foreign Ractor: it roots its own
+     * belongings via rb_ractor_mark_local_roots, and their contents
+     * are foreign to the marking objspace anyway. */
+    rb_ractor_t *cr = rb_current_ractor_raw(false);
+    if (!(r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p())) {
+        return;
+    }
 
     rb_hook_list_mark(&r->pub.hooks);
     if (r->pub.targeted_hooks.num_entries) {
