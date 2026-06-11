@@ -511,9 +511,9 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         cr->newobj_cache = NULL;
 
         /* RLGCv2: the objspace loses its owner thread here; keep it
-         * enumerable for the global GC until M4 inheritance merges it. */
+         * enumerable for the global GC until inheritance merges it. */
         if (cr->objspace) {
-            rb_gc_objspace_retire(cr->objspace);
+            rb_gc_objspace_retire(&cr->objspace);
         }
 
         ractor_status_set(cr, ractor_terminated);
@@ -584,7 +584,7 @@ rb_ractor_terminate_atfork(rb_vm_t *vm, rb_ractor_t *r)
      * becomes terminated-unjoined; keep its objspace enumerable so the
      * GC passes see it, until a join or the global GC merges it. */
     if (r->objspace) {
-        rb_gc_objspace_retire(r->objspace);
+        rb_gc_objspace_retire(&r->objspace);
     }
     ractor_sync_terminate_atfork(vm, r);
 }
@@ -994,6 +994,12 @@ rb_ractor_terminate_all(void)
         }
     }
     RB_VM_UNLOCK();
+
+    /* RLGCv2 (design decision 9): every other Ractor is dead now; main
+     * inherits all their uninherited objspaces, so the at-exit passes
+     * that follow (finalizers, IO flush, free-at-exit) see every object
+     * as before per-Ractor objspaces existed. */
+    rb_gc_objspace_absorb_all_zombies();
 }
 
 rb_execution_context_t *
