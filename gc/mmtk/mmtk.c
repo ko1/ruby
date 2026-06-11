@@ -1752,3 +1752,9 @@ rb_gc_impl_during_global_gc_p(void *objspace_ptr)
 {
     return false;
 }
+
+void
+rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
+{
+    /* single objspace */
+}
