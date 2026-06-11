@@ -1083,12 +1083,19 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
      * the thread is made of objects it owns and its identity never
      * changes. The child has not started yet, so the parent is the only
      * writer of that objspace; a stress-triggered GC over the still-empty
-     * child heap is a no-op thanks to the containment guards. */
+     * child heap is a no-op thanks to the containment guards.
+     * The retargeting must be invisible to others: cr->objspace doubles as
+     * "where this Ractor's objects live" for whole-VM walks
+     * (rb_objspace_each_objects_all), so swap under the VM lock -- a
+     * barrier-protected walker can then never observe the swapped state. */
+    VALUE thval;
     rb_ractor_t *cr = GET_RACTOR();
-    void *const parent_objspace = cr->objspace;
-    cr->objspace = r->objspace;
-    VALUE thval = rb_thread_alloc(rb_cThread);
-    cr->objspace = parent_objspace;
+    RB_VM_LOCKING() {
+        void *const parent_objspace = cr->objspace;
+        cr->objspace = r->objspace;
+        thval = rb_thread_alloc(rb_cThread);
+        cr->objspace = parent_objspace;
+    }
 
     return thread_create_core(thval, &params);
 }
