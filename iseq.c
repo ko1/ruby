@@ -1582,7 +1582,10 @@ remove_coverage_i(void *vstart, void *vend, size_t stride, void *data)
 void
 rb_iseq_remove_coverage_all(void)
 {
-    rb_objspace_each_objects(remove_coverage_i, NULL);
+    RB_VM_LOCKING() {
+        rb_vm_barrier();
+        rb_objspace_each_objects_all(remove_coverage_i, NULL);
+    }
 }
 
 /* define wrapper class methods (RubyVM::InstructionSequence) */
@@ -4265,7 +4268,10 @@ clear_attr_ccs_i(void *vstart, void *vend, size_t stride, void *data)
 void
 rb_clear_attr_ccs(void)
 {
-    rb_objspace_each_objects(clear_attr_ccs_i, NULL);
+    RB_VM_LOCKING() {
+        rb_vm_barrier();
+        rb_objspace_each_objects_all(clear_attr_ccs_i, NULL);
+    }
 }
 
 static int
@@ -4284,7 +4290,8 @@ clear_bf_ccs_i(void *vstart, void *vend, size_t stride, void *data)
 void
 rb_clear_bf_ccs(void)
 {
-    rb_objspace_each_objects(clear_bf_ccs_i, NULL);
+    ASSERT_vm_locking_with_barrier();
+    rb_objspace_each_objects_all(clear_bf_ccs_i, NULL);
 }
 
 static int
@@ -4313,7 +4320,10 @@ trace_set_i(void *vstart, void *vend, size_t stride, void *data)
 void
 rb_iseq_trace_set_all(rb_event_flag_t turnon_events)
 {
-    rb_objspace_each_objects(trace_set_i, &turnon_events);
+    RB_VM_LOCKING() {
+        rb_vm_barrier();
+        rb_objspace_each_objects_all(trace_set_i, &turnon_events);
+    }
 }
 
 VALUE
