@@ -1,0 +1,41 @@
+# ThreadSanitizer suppressions for RLGCv2 (classified-benign reports).
+#
+# Usage:
+#   TSAN_OPTIONS="suppressions=RLGC_DOC/tsan_suppressions.txt" ./ruby ...
+#
+# Every entry here was triaged during M1b(4) (see that commit message);
+# anything NOT matched below is a new finding and must be investigated.
+
+# --- upstream, present without RLGC ---------------------------------
+
+# VM lock internals: lock_owner / lock_rec speculative reads.
+race:vm_locked
+race:vm_lock_enter
+race:rb_ec_vm_lock_rec
+
+# rb_vm_barrier acquires the scheduler lock under the VM lock by
+# design; the reverse edge lives in the thread scheduler. Pre-existing
+# lock-order report, not reachable as an actual deadlock through the
+# barrier protocol.
+deadlock:rb_ractor_sched_barrier_start
+
+# Shape tree lock-free readers (upstream lock-free design).
+race:shape_get_next
+
+# --- RLGCv2, benign by design ---------------------------------------
+
+# Inline method cache stores (any executing Ractor) vs the owner's GC
+# marking the iseq's call data: a VALUE-sized slot read returns the old
+# or the new callcache, both valid objects; liveness is guaranteed by
+# the born-shareable pin, not by this read.
+race:vm_search_method_slowpath0
+race:vm_search_method_fastpath
+race:rb_iseq_mark_and_move
+
+# Heuristic counter reads (vm->ractor.cnt, zombie count): main reads
+# them under its no-barrier VM lock; workers can only observe cnt >= 2,
+# so every decision maker sees a consistent value.
+race:rb_gc_single_objspace_p
+race:rlgc_global_wanted_p
+race:vm_remove_ractor
+race:vm_insert_ractor0
