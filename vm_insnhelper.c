@@ -513,10 +513,28 @@ NOINLINE(static void vm_env_write_slowpath(const VALUE *ep, int index, VALUE v))
 static void
 vm_env_write_slowpath(const VALUE *ep, int index, VALUE v)
 {
-    /* remember env value forcely */
-    rb_gc_writebarrier_remember(VM_ENV_ENVVAL(ep));
-    VM_FORCE_WRITE(&ep[index], v);
-    VM_ENV_FLAGS_UNSET(ep, VM_ENV_FLAG_WB_REQUIRED);
+    const VALUE envval = VM_ENV_ENVVAL(ep);
+
+    if (RB_FL_TEST_RAW(envval, RUBY_FL_SHAREABLE)) {
+        /* RLGCv2 (design_v2.md section 2.1): writing into a SHAREABLE
+         * env (an isolated proc's -- e.g. its svar slot, written on
+         * every regexp match inside it) makes an s->u edge whenever v
+         * is unshareable. Only the full barrier sets the shref bit
+         * that keeps v alive for its owner's local GC; the bare
+         * remember below does not. And WB_REQUIRED must STAY set:
+         * every future store into this env needs the same barrier,
+         * not the remembered-until-next-GC fast path. */
+        if (!SPECIAL_CONST_P(v)) {
+            rb_gc_writebarrier(envval, v);
+        }
+        VM_FORCE_WRITE(&ep[index], v);
+    }
+    else {
+        /* remember env value forcely */
+        rb_gc_writebarrier_remember(envval);
+        VM_FORCE_WRITE(&ep[index], v);
+        VM_ENV_FLAGS_UNSET(ep, VM_ENV_FLAG_WB_REQUIRED);
+    }
     RB_DEBUG_COUNTER_INC(lvar_set_slowpath);
 }
 
@@ -581,12 +599,32 @@ vm_svar_valid_p(VALUE svar)
 }
 #endif
 
+/* RLGCv2: should this frame's special variables live in the env's svar
+ * slot? A SHAREABLE env (an isolated proc's) is invoked from many
+ * Ractors at once: its svar slot would be cross-Ractor shared mutable
+ * state, holding young foreign objects (the caller's MatchData) that no
+ * objspace roots -- and $~/$_ would leak between Ractors sharing the
+ * proc. Keep such frames' special variables in the per-EC slot instead;
+ * the env slot keeps holding the cref chain untouched. */
+static inline bool
+lep_svar_in_env_p(const rb_execution_context_t *ec, const VALUE *lep)
+{
+    if (!lep) return false;
+    if (ec == NULL) return true;
+    if (ec->root_lep == lep) return false;
+    if (VM_ENV_ESCAPED_P(lep) &&
+            RB_FL_TEST_RAW(VM_ENV_ENVVAL(lep), RUBY_FL_SHAREABLE)) {
+        return false;
+    }
+    return true;
+}
+
 static inline struct vm_svar *
 lep_svar(const rb_execution_context_t *ec, const VALUE *lep)
 {
     VALUE svar;
 
-    if (lep && (ec == NULL || ec->root_lep != lep)) {
+    if (lep_svar_in_env_p(ec, lep)) {
         svar = lep[VM_ENV_DATA_INDEX_ME_CREF];
     }
     else {
@@ -603,7 +641,7 @@ lep_svar_write(const rb_execution_context_t *ec, const VALUE *lep, const struct 
 {
     VM_ASSERT(vm_svar_valid_p((VALUE)svar));
 
-    if (lep && (ec == NULL || ec->root_lep != lep)) {
+    if (lep_svar_in_env_p(ec, lep)) {
         vm_env_write(lep, VM_ENV_DATA_INDEX_ME_CREF, (VALUE)svar);
     }
     else {

@@ -2372,6 +2372,7 @@ ractor_local_storage_mark_i(st_data_t key, st_data_t val, st_data_t dmy)
     return ST_CONTINUE;
 }
 
+
 static enum rb_id_table_iterator_result
 idkey_local_storage_mark_i(VALUE val, void *dmy)
 {
