@@ -55,8 +55,6 @@ enum rb_gc_vm_weak_tables {
 
 #define RB_GC_VM_LOCK() rb_gc_vm_lock(__FILE__, __LINE__)
 #define RB_GC_VM_UNLOCK(lev) rb_gc_vm_unlock(lev, __FILE__, __LINE__)
-#define RB_GC_CR_LOCK() rb_gc_cr_lock(__FILE__, __LINE__)
-#define RB_GC_CR_UNLOCK(lev) rb_gc_cr_unlock(lev, __FILE__, __LINE__)
 #define RB_GC_VM_LOCK_NO_BARRIER() rb_gc_vm_lock_no_barrier(__FILE__, __LINE__)
 #define RB_GC_VM_UNLOCK_NO_BARRIER(lev) rb_gc_vm_unlock_no_barrier(lev, __FILE__, __LINE__)
 
@@ -85,8 +83,6 @@ void rb_gc_verify_shareable(VALUE);
 
 MODULAR_GC_FN unsigned int rb_gc_vm_lock(const char *file, int line);
 MODULAR_GC_FN void rb_gc_vm_unlock(unsigned int lev, const char *file, int line);
-MODULAR_GC_FN unsigned int rb_gc_cr_lock(const char *file, int line);
-MODULAR_GC_FN void rb_gc_cr_unlock(unsigned int lev, const char *file, int line);
 MODULAR_GC_FN unsigned int rb_gc_vm_lock_no_barrier(const char *file, int line);
 MODULAR_GC_FN void rb_gc_vm_unlock_no_barrier(unsigned int lev, const char *file, int line);
 MODULAR_GC_FN void rb_gc_vm_barrier(void);

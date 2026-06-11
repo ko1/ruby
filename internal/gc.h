@@ -301,6 +301,7 @@ void rb_gc_init_global_locks(void);
 void rb_gc_atfork_global_locks(void);
 void rb_gc_registered_globals_lock(void);
 void rb_gc_registered_globals_unlock(void);
+bool rb_gc_during_global_gc_p(void);
 const char *rb_obj_info(VALUE obj);
 void ruby_annotate_mmap(const void *addr, unsigned long size, const char *name);
 
