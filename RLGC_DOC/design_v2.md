@@ -298,8 +298,14 @@ shareable は unshareable を参照しない)なので、「WB を通らない s
 
 minor / major とも自スレッドで実行し、ロックもバリアも取らない。master の GC との差分に
 ★を付ける。
-(実装は 2 段階: M1a では従来どおり VM lock + barrier の下で動かして封じ込めの正しさを
-固め、「ロックもバリアも取らない」は M1b で達成する — §5 の順序と理由を参照。)
+(実装は 2 段階を踏んだ: M1a では従来どおり VM lock + barrier の下で動かして封じ込めの
+正しさを固め、「ロックもバリアも取らない」は M1b で達成済み — §5 の順序と理由を参照。
+例外が 2 つだけ残る: main objspace の local GC は VM グローバル root を歩くため
+no-barrier の VM lock を取る(worker は止めない)。global GC は lock + barrier を取る。
+GC の内側では VM lock を決して取らない — 待機者は保留中バリアに合流するので、
+mark/sweep 途中の合流は半回収ヒープを global GC に晒す。GC 経路が触る VM 共有構造は
+専用の native mutex(id2ref・registered globals・generic fields)かページプールの
+ロックで守る。)
 
 0. 前提: 自分の lazy sweep が残っていれば先に完走させる(master と同じ)。`during_gc` を
    立てて再入を防ぐ。incremental marking は objspace が複数ある間は使わない★
@@ -742,6 +748,11 @@ send 系に入れないこと。なお `Ractor#value` がコピー無しで済�
   4. **機能完結が先。** M2 / M4 が無い間は shareable と終了 Ractor の objspace が
      貯まり続ける。その状態で性能を測っても「リークする処理系の速度」になり、
      チューニングの判断材料にならない。
+  【達成済み 2026-06-11】上記の読みどおり、開いた競合面から実バグ 8 件が出た(Ractor
+  オブジェクトの dmark が他 Ractor の owner 変異構造を歩く 2 面、shape edge 表の
+  born-shareable 漏れ、deleted-key 機構の STW 前提、main 判定の swap 揺れ、process-wide
+  static の再書込、interrupt queue の create→start 窓、linkage)。TSan/ASAN が決め手。
+  性能は 8 Ractor 割り当て負荷で実効 ~7.7 コア(M1a 比 4 倍超)。
   なお M0 時点で master と同等性能(割り当て経路に退行なし)は確認済み。性能の伸び代は
   M1b 完了後にまとめて測り直す。
 - **M5 堅牢化・調整**: 既知のクラッシュ再現スクリプト群(`rlgc_repro/`)と多 Ractor
