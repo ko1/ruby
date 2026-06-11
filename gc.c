@@ -3092,15 +3092,25 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     MARK_CHECKPOINT("vm_registered_objects");
     rb_vm_mark_registered_global_objects(vm);
 
+    /* Same shape: a worker's at_exit/END proc sits in the VM-global
+     * end_procs C list but lives in the worker's objspace, where only
+     * this walk can root it. */
+    MARK_CHECKPOINT("end_proc");
+    rb_mark_end_proc();
+
+    /* And a worker's String trap handler sits in the VM-global
+     * vm->trap_list.cmd[] slots. A fixed array of aligned VALUE stores
+     * (signal.c uses ACCESS_ONCE): no lock needed, a racing walk reads
+     * the old or the new handler, both alive. */
+    MARK_CHECKPOINT("trap_list");
+    rb_gc_mark_values(RUBY_NSIG, vm->trap_list.cmd);
+
     /* VM-global roots belong to the main Ractor's objspace (that is where
      * boot-time objects live); a worker's confined GC does not scan them.
      * The global GC scans everything. */
     if (global_gc || objspace == vm->ractor.main_ractor->objspace) {
         MARK_CHECKPOINT("vm");
         rb_vm_mark(vm);
-
-        MARK_CHECKPOINT("end_proc");
-        rb_mark_end_proc();
 
         MARK_CHECKPOINT("global_tbl");
         rb_gc_mark_global_tbl();

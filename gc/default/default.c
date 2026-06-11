@@ -6672,7 +6672,7 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
                        "objspace->rincgc.step_slots: %"PRIdSIZE", \n",
                        objspace->marked_slots, objspace->rincgc.pooled_slots, objspace->rincgc.step_slots);
         objspace->flags.during_minor_gc = FALSE;
-        if (ruby_enable_autocompact) {
+        if (ruby_enable_autocompact && rb_gc_single_objspace_p()) {
             objspace->flags.during_compacting |= TRUE;
         }
         objspace->profile.major_gc_count++;
@@ -7446,8 +7446,12 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
         objspace->flags.during_incremental_marking = do_full_mark;
     }
 
-    /* Explicitly enable compaction (GC.compact) */
-    if (do_full_mark && ruby_enable_autocompact) {
+    /* Explicitly enable compaction (GC.compact).
+     * RLGCv2: compaction moves objects, which is incompatible with
+     * per-Ractor objspaces (cross-objspace references, the no-move
+     * shareable invariant, page-resident bitmaps), so it only runs in
+     * the single-objspace world. */
+    if (do_full_mark && ruby_enable_autocompact && rb_gc_single_objspace_p()) {
         objspace->flags.during_compacting = TRUE;
 #if RGENGC_CHECK_MODE
         objspace->rcompactor.compare_func = ruby_autocompact_compare_func;
@@ -8287,6 +8291,14 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
 
     int full_marking_p = gc_config_full_mark_val;
     gc_config_full_mark_set(TRUE);
+
+    /* RLGCv2: compaction moves objects -- incompatible with per-Ractor
+     * objspaces (cross-objspace references, the no-move shareable
+     * invariant). GC.compact / GC.verify_compaction_references degrade
+     * to a plain full GC while more than one objspace exists. */
+    if (compact) {
+        compact = rb_gc_single_objspace_p();
+    }
 
     /* For now, compact implies full mark / sweep, so ignore other flags */
     if (compact) {
@@ -11005,6 +11017,15 @@ gc_verify_compaction_references(int argc, VALUE* argv, VALUE self)
     bool expand_heap = (kwarg_count > 1 && RTEST(arguments[1])) || (kwarg_count > 2 && RTEST(arguments[2]));
 
     rb_objspace_t *objspace = rb_gc_get_objspace();
+
+    /* RLGCv2: compaction does not run with per-Ractor objspaces (see
+     * rb_gc_impl_start); degrade the whole verification -- including the
+     * heap expansion and the moved-reference walks -- to a plain full
+     * GC, like GC.compact does. */
+    if (!rb_gc_single_objspace_p()) {
+        rb_gc_impl_start(objspace, true, true, true, false);
+        return gc_compact_stats(self);
+    }
 
     /* Clear the heap. */
     rb_gc_impl_start(objspace, true, true, true, false);
