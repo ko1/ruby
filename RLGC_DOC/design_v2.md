@@ -544,6 +544,17 @@ local GC はロックを取らずに走るため、「local GC のコードパ�
 
 実装では「local GC から触る VM 共有構造」を列挙し、必ずこの 3 分類のどれかに割り当てる。
 
+補足: **VM 全体のヒープ走査**が要る操作のために `rb_objspace_each_objects_all`
+(VM lock + barrier 必須、`vm->ractor.set` の全 objspace を順に走査)を用意した。
+TracePoint の iseq 計装(`rb_iseq_trace_set_all`)・attr/bf コールキャッシュの一掃・
+coverage 削除はこれを使う(per-objspace 走査のままだと「worker で TracePoint を
+enable しても main の iseq が計装されない」)。なお Ruby レベルの
+`ObjectSpace.each_object` は現状 per-objspace 走査のまま(multi-Ractor 時は従来どおり
+shareable のみ yield)で、「全 objspace の shareable を見せる」master 互換にするかは
+M2 で決める。注意: `cr->objspace` はこの走査の入力なので、一時的に差し替える処理
+(Ractor 生成時の子 objspace への割り当て)は必ず VM lock 下で行い、barrier を張った
+walker から差し替え中の状態が見えないようにする。
+
 ### 2.5 compaction
 
 objspace が複数ある間は不可(オブジェクトを動かすと、他 objspace からの参照・shref_bits・

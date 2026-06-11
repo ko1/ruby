@@ -4010,6 +4010,15 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 break;
 
               default:
+                /* RLGC_DEBUG: a confined GC must never free a pinned slot. */
+                if (rb_gc_multi_ractor_p() &&
+                    (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(vp), vp) ||
+                     MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp))) {
+                    rb_bug("page_sweep: freeing pinned slot %s (shareable=%d shref=%d)",
+                           rb_obj_info(vp),
+                           (int)!!MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(vp), vp),
+                           (int)!!MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp));
+                }
 #if RGENGC_CHECK_MODE
                 if (!is_full_marking(objspace)) {
                     if (RVALUE_OLD_P(objspace, vp)) rb_bug("page_sweep: %p - old while minor GC.", (void *)p);
@@ -5215,12 +5224,26 @@ gc_mark_set_parent_invalid(rb_objspace_t *objspace)
     asan_poison_memory_region(&objspace->rgengc.parent_object_old_p, sizeof(objspace->rgengc.parent_object_old_p));
 }
 
+static void rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap);
+
 static void
 mark_roots(rb_objspace_t *objspace, const char **categoryp)
 {
 #define MARK_CHECKPOINT(category) do { \
     if (categoryp) *categoryp = category; \
 } while (0)
+
+    /* RLGCv2 (design_v2.md §2.1 step 3.f): the shareable/shref pin is part
+     * of the root set, so it must run in every root scan -- in particular
+     * also in the final incremental re-scan (gc_marks_finish), or an
+     * object that became shareable during the incremental window and is
+     * only reachable through a foreign container stays white. */
+    if (rb_gc_multi_ractor_p()) {
+        MARK_CHECKPOINT("rlgc_pinned");
+        for (int i = 0; i < HEAP_COUNT; i++) {
+            rlgc_pinned_roots_mark(objspace, &heaps[i]);
+        }
+    }
 
     MARK_CHECKPOINT("objspace");
     gc_mark_set_parent_raw(objspace, Qundef, false);
@@ -6515,12 +6538,6 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
         }
     }
 
-    if (rb_gc_multi_ractor_p()) {
-        for (int i = 0; i < HEAP_COUNT; i++) {
-            rlgc_pinned_roots_mark(objspace, &heaps[i]);
-        }
-    }
-
     mark_roots(objspace, NULL);
 
     gc_report(1, objspace, "gc_marks_start: (%s) end, stack in %"PRIdSIZE"\n",
@@ -7211,7 +7228,12 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
 
     if (objspace->flags.dont_incremental ||
             reason & GPR_FLAG_IMMEDIATE_MARK ||
-            ruby_gc_stressful) {
+            ruby_gc_stressful ||
+            /* RLGCv2 (design_v2.md §2.1 step 0): no incremental marking
+             * while there are multiple objspaces. The windows between
+             * incremental steps let other Ractors create/share objects
+             * this objspace's root scan has already passed over. */
+            rb_gc_multi_ractor_p()) {
         objspace->flags.during_incremental_marking = FALSE;
     }
     else {
