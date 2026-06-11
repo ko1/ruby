@@ -624,6 +624,22 @@ typedef struct rb_objspace {
     /* RLGCv2: was per-newobj-cache; there is one allocator per objspace now. */
     size_t incremental_mark_step_allocated_slots;
 
+    /* RLGCv2 (design_v2.md §2.2): inputs for the global GC trigger, all
+     * owned by this objspace's thread. shareable_objects counts
+     * born-shareable allocations and RB_OBJ_SET_SHAREABLE promotions; a
+     * local GC never frees shareables, so between global GCs this is the
+     * exact live count plus the dead ones a global GC would reclaim. The
+     * global sweep recounts the survivors (popcount over shareable_bits)
+     * and resets the limit to survivors x factor, with a floor.
+     * stalled_shareables is the number of objects the shareable/shref
+     * root walk freshly marked in the last local GC -- an upper bound on
+     * "garbage only the global GC can take" (trigger 2, tuned in M5). */
+    struct {
+        size_t shareable_objects;
+        size_t shareable_objects_limit;
+        size_t stalled_shareables;
+    } rlgc;
+
     struct {
         rb_darray(struct heap_page *) sorted;
 
@@ -784,6 +800,13 @@ typedef struct rb_global_objspace {
 
 static rb_global_objspace_t rb_global_objspace_instance;
 static rb_global_objspace_t *global_objspace = NULL;
+
+/* RLGCv2 (design_v2.md §2.2): the floor keeps a fresh Ractor pair from
+ * firing a global GC the moment a few shareables exist, and the factor
+ * mirrors the old-generation limit rule. Tuned in M5. */
+#define RLGC_SHAREABLE_LIMIT_MIN (1 << 16)
+#define RLGC_SHAREABLE_LIMIT_FACTOR 2.0
+#define RLGC_ZOMBIE_OBJSPACES_TRIGGER 8
 
 /* RLGCv2 global GC (design_v2.md §2.2). Mark/sweep predicates consult the
  * per-objspace during_global_gc flag; this is only the driver's iteration
@@ -2580,6 +2603,7 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
         struct heap_page *page = GET_HEAP_PAGE(obj);
         _MARK_IN_BITMAP(page->shareable_bits, page, obj);
         page->has_shareable_objects = TRUE;
+        objspace->rlgc.shareable_objects++;
     }
 
 #if RGENGC_CHECK_MODE
@@ -5293,9 +5317,13 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
      * and the pin would keep every dead shareable alive (§2.2 step 9). */
     if (rb_gc_multi_ractor_p() && !objspace->during_global_gc) {
         MARK_CHECKPOINT("rlgc_pinned");
+        size_t marked_before = objspace->marked_slots;
         for (int i = 0; i < HEAP_COUNT; i++) {
             rlgc_pinned_roots_mark(objspace, &heaps[i]);
         }
+        /* freshly pinned-marked = not reachable from our own roots =
+         * upper bound on garbage only the global GC can reclaim */
+        objspace->rlgc.stalled_shareables = objspace->marked_slots - marked_before;
     }
 
     MARK_CHECKPOINT("objspace");
@@ -6941,8 +6969,10 @@ rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
     /* RLGCv2: an object becomes shareable on its owner's thread
      * (containment), so this page update is single-writer. */
     struct heap_page *page = GET_HEAP_PAGE(obj);
+    if (_MARKED_IN_BITMAP(page->shareable_bits, page, obj)) return;
     _MARK_IN_BITMAP(page->shareable_bits, page, obj);
     page->has_shareable_objects = TRUE;
+    page->objspace->rlgc.shareable_objects++;
 }
 
 void
@@ -7218,6 +7248,21 @@ gc_reset_malloc_info(rb_objspace_t *objspace, bool full_mark)
 #endif
 }
 
+static void rlgc_global_gc(rb_objspace_t *driver);
+
+/* RLGCv2 (design_v2.md §2.2): does this collection have to be the global
+ * one? A local GC cannot reclaim shareables or zombie objspaces, so once
+ * they outgrow their limits only the global GC makes progress. All
+ * inputs are this objspace's own. */
+static bool
+rlgc_global_wanted_p(rb_objspace_t *objspace)
+{
+    if (!rb_gc_multi_ractor_p()) return false;
+    if (objspace->rlgc.shareable_objects > objspace->rlgc.shareable_objects_limit) return true;
+    if (rb_gc_vm_zombie_objspaces_count() >= RLGC_ZOMBIE_OBJSPACES_TRIGGER) return true;
+    return false;
+}
+
 static int
 garbage_collect(rb_objspace_t *objspace, unsigned int reason)
 {
@@ -7235,7 +7280,13 @@ garbage_collect(rb_objspace_t *objspace, unsigned int reason)
         objspace->profile.prepare_time = getrusage_time() - objspace->profile.prepare_time;
 #endif
 
-        ret = gc_start(objspace, reason);
+        if (rlgc_global_wanted_p(objspace)) {
+            rlgc_global_gc(objspace);
+            ret = TRUE;
+        }
+        else {
+            ret = gc_start(objspace, reason);
+        }
     }
     RB_GC_VM_UNLOCK(lev);
 
@@ -7843,6 +7894,27 @@ rlgc_global_gc(rb_objspace_t *driver)
         gc_sweep(os);
         os->flags.immediate_sweep = prev_immediate;
     }
+
+    /* recount the surviving shareables (the sweep already folded dead
+     * ones out of shareable_bits) and reset each trigger limit */
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        rb_objspace_t *objspace = rlgc_global.list[i];
+        size_t survivors = 0;
+        for (int h = 0; h < HEAP_COUNT; h++) {
+            struct heap_page *page = NULL;
+            ccan_list_for_each(&heaps[h].pages, page, page_node) {
+                if (!page->has_shareable_objects) continue;
+                for (int j = 0; j < HEAP_PAGE_BITMAP_LIMIT; j++) {
+                    survivors += rb_popcount_intptr(page->shareable_bits[j]);
+                }
+            }
+        }
+        objspace->rlgc.shareable_objects = survivors;
+        size_t new_limit = (size_t)(survivors * RLGC_SHAREABLE_LIMIT_FACTOR);
+        if (new_limit < RLGC_SHAREABLE_LIMIT_MIN) new_limit = RLGC_SHAREABLE_LIMIT_MIN;
+        objspace->rlgc.shareable_objects_limit = new_limit;
+    }
+    driver->profile.count++;
 
     /* step 10 */
     for (size_t i = 0; i < rlgc_global.count; i++) {
@@ -10824,6 +10896,7 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
 
     objspace->flags.measure_gc = true;
     malloc_limit = gc_params.malloc_limit_min;
+    objspace->rlgc.shareable_objects_limit = RLGC_SHAREABLE_LIMIT_MIN;
 #ifdef MALLOC_COUNTERS_NEED_LOCK
     rb_native_mutex_initialize(&objspace->malloc_counters.lock);
 #endif

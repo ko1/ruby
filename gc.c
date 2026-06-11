@@ -3724,6 +3724,12 @@ rb_gc_objspace_retire(void *objspace)
     vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = objspace;
 }
 
+size_t
+rb_gc_vm_zombie_objspaces_count(void)
+{
+    return GET_VM()->gc.zombie_objspaces_count;
+}
+
 struct each_objects_all_data {
     int (*callback)(void *, void *, size_t, void *);
     void *data;
