@@ -404,6 +404,36 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  # Per-Ractor GC: a finalizer's registration, table and execution all
+  # belong to the object's Ractor; defining one on another Ractor's
+  # object (shareable ones included) is rejected.
+  def test_define_finalizer_on_foreign_object
+    assert_separately([], __FILE__, __LINE__, <<-'RUBY')
+      Warning[:experimental] = false
+      r = Ractor.new do
+        results = []
+        own = Object.new
+        ObjectSpace.define_finalizer(own, proc {})
+        results << :own_ok
+        begin
+          ObjectSpace.define_finalizer(String, proc {})  # main's class
+          results << :define_did_not_raise
+        rescue Ractor::IsolationError
+          results << :define_raised
+        end
+        begin
+          ObjectSpace.undefine_finalizer(String)
+          results << :undefine_did_not_raise
+        rescue Ractor::IsolationError
+          results << :undefine_raised
+        end
+        results
+      end
+      assert_equal [:own_ok, :define_raised, :undefine_raised], r.value
+      GC.verify_internal_consistency
+    RUBY
+  end
+
   def assert_make_shareable(obj)
     refute Ractor.shareable?(obj), "object was already shareable"
     Ractor.make_shareable(obj)
