@@ -151,15 +151,15 @@ ractor_port_closed_p(rb_execution_context_t *ec, VALUE self)
     bool closed;
 
     if (rb_ec_ractor_ptr(ec) == r) {
-        /* The owner's threads are serialized by the ractor GVL, so the ports
-         * table can't change under this lookup. */
+        /* the owner's threads are serialized by the ractor's GVL, so
+         * the table cannot be mutated under this lookup */
         closed = ractor_closed_port_p(ec, r, rp);
     }
     else {
-        /* A foreign Ractor races the owner's st_insert/st_delete on the ports
-         * table; take the lock like every other foreign reader. ractor_closed_port_p
-         * asserts the lock is held for foreign access, and Port#closed? was the
-         * only path reaching it without the lock. */
+        /* a foreign Ractor runs in parallel with the owner's
+         * st_insert/st_delete on the ports table: lock, like every
+         * other foreign reader (Port#closed? was the one unlocked
+         * path; TSan: rb_st_lookup vs rb_st_insert/st_general_delete) */
         RACTOR_LOCK(r);
         {
             closed = ractor_closed_port_p(ec, r, rp);
@@ -538,14 +538,14 @@ struct ractor_monitor {
     struct ccan_list_node node;
 };
 
-static void
-ractor_mark_monitors(rb_ractor_t *r)
-{
-    const struct ractor_monitor *rm;
-    ccan_list_for_each(&r->sync.monitors, rm, node) {
-        rb_gc_mark(rm->port.r->pub.self);
-    }
-}
+/* No GC mark walks r->sync.monitors. The entries only carry a copied
+ * port (a ractor pointer + ids, no VALUEs), and the watcher Ractor's
+ * object -- the only thing the old walk marked -- is rooted from the
+ * VM's ractor set for as long as the watcher lives. Walking here was
+ * also unsound: FOREIGN Ractors register/unregister themselves in this
+ * list (under r's sync lock), so the owner's lock-free local GC raced
+ * their ccan-list pointer updates (TSan: ractor_mark_monitors vs
+ * ractor_monitor). */
 
 static VALUE
 ractor_exit_token(bool exc)
@@ -690,8 +690,8 @@ ractor_sync_mark(rb_ractor_t *r)
             ractor_queue_mark(r->sync.recv_queue);
             st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
         }
-
-        ractor_mark_monitors(r);
+        /* monitors are not walked -- see the comment above
+         * ractor_monitor's data structures */
     }
 }
 

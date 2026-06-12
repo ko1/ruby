@@ -12,12 +12,17 @@ Warning[:experimental] = false
 begin
   require "objspace"
 rescue LoadError
-  # in-tree run without ext load paths: re-exec with them
+  # in-tree run without ext load paths: re-exec with them. The .ext
+  # tree lives next to the running binary (the BUILD dir -- not
+  # necessarily this script's source dir, e.g. sanitizer builds).
   srcdir = File.expand_path("..", __dir__)
-  extdir = Dir[File.join(srcdir, ".ext", "*-*")].reject { |d| d.end_with?("include") }.first
+  builddir = File.dirname(File.readlink("/proc/self/exe")) rescue srcdir
+  base = [builddir, srcdir].find { |d| Dir.exist?(File.join(d, ".ext")) }
+  abort "objspace ext not built" unless base
+  extdir = Dir[File.join(base, ".ext", "*-*")].reject { |d| d.end_with?("include") }.first
   abort "objspace ext not built" unless extdir
   exec "/proc/self/exe", "--disable-gems", "-I#{extdir}",
-       "-I#{File.join(srcdir, '.ext', 'common')}", "-I#{File.join(srcdir, 'lib')}",
+       "-I#{File.join(base, '.ext', 'common')}", "-I#{File.join(srcdir, 'lib')}",
        __FILE__, *ARGV
 end
 
