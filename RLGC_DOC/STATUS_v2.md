@@ -68,11 +68,8 @@
    ベース(retire/併合で増減)。閾値・下限の既定値はここで決める
 2. **mark_func_data の per-Ractor 化(§1.3 どおりへ)**: 現実装は VM 共有 + during_gc ゲート
    (M5(3))の暫定。per-Ractor 化でゲート自体を不要にする
-3. **決定 12(foreign define_finalizer のエラー化)**: デザイン詰め中 — 未決 2 点
-   (shareable も一律拒否でよいか / clone・dup は cross-objspace では finalizer を引き継がない、
-   でよいか)の判断待ち → 確定後に実装(現状は不発・dangling entry の不整合経路が残存)
-4. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
-5. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
-6. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
-7. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
-8. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
+3. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
+4. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
+5. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
+6. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
+7. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
