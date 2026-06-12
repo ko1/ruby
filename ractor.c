@@ -471,6 +471,14 @@ vm_insert_ractor0(rb_vm_t *vm, rb_ractor_t *r, bool single_ractor_mode)
     RUBY_DEBUG_LOG("r:%u ractor.cnt:%u++", r->pub.id, vm->ractor.cnt);
     VM_ASSERT(single_ractor_mode || RB_VM_LOCKED_P());
 
+    /* RLGCv2: becoming multi-objspace. Incremental marking only runs in
+     * the single-objspace world, so finish an in-flight cycle while the
+     * current objspace still is that world (nothing below allocates
+     * before the count flips). */
+    if (vm->ractor.cnt == 1) {
+        rb_gc_finish_in_flight_gc();
+    }
+
     ccan_list_add_tail(&vm->ractor.set, &r->vmlr_node);
     vm->ractor.cnt++;
 

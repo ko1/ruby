@@ -611,6 +611,7 @@ typedef struct gc_function_map {
     void (*gc_enable)(void *objspace_ptr);
     void (*gc_disable)(void *objspace_ptr, bool finish_current_gc);
     bool (*gc_enabled_p)(void *objspace_ptr);
+    void (*gc_rest)(void *objspace_ptr);
     VALUE (*config_get)(void *objpace_ptr);
     void (*config_set)(void *objspace_ptr, VALUE hash);
     void (*stress_set)(void *objspace_ptr, VALUE flag);
@@ -794,6 +795,7 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(gc_enable);
     load_modular_gc_func(gc_disable);
     load_modular_gc_func(gc_enabled_p);
+    load_modular_gc_func(gc_rest);
     load_modular_gc_func(config_set);
     load_modular_gc_func(config_get);
     load_modular_gc_func(stress_set);
@@ -886,6 +888,7 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_gc_enable rb_gc_functions.gc_enable
 # define rb_gc_impl_gc_disable rb_gc_functions.gc_disable
 # define rb_gc_impl_gc_enabled_p rb_gc_functions.gc_enabled_p
+# define rb_gc_impl_gc_rest rb_gc_functions.gc_rest
 # define rb_gc_impl_config_get rb_gc_functions.config_get
 # define rb_gc_impl_config_set rb_gc_functions.config_set
 # define rb_gc_impl_stress_set rb_gc_functions.stress_set
@@ -3837,6 +3840,19 @@ size_t
 rb_gc_vm_zombie_objspaces_count(void)
 {
     return GET_VM()->gc.zombie_objspaces_count;
+}
+
+/* RLGCv2 (design_v2.md section 2.1 step 0): incremental marking runs
+ * only in the single-objspace world. vm_insert_ractor0 calls this right
+ * before a second Ractor becomes visible, finishing the only objspace's
+ * in-flight cycle while it still is the whole world: the global GC's
+ * settle pass cannot resume a foreign half-done mark (clearing the flag
+ * would leave the gray stack behind), and objspace inheritance must not
+ * splice pages into a half-marked heap. */
+void
+rb_gc_finish_in_flight_gc(void)
+{
+    rb_gc_impl_gc_rest(rb_gc_get_objspace());
 }
 
 /* RLGCv2: true when only one objspace exists in the whole process (one

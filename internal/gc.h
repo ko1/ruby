@@ -297,6 +297,7 @@ void rb_gc_objspace_retire(void **objspace_slot);
 void rb_gc_objspace_absorb_into_current(void **objspace_slot);
 void rb_gc_objspace_absorb_all_zombies(void);
 void rb_gc_objspace_orphaned(void *objspace);
+void rb_gc_finish_in_flight_gc(void);
 void rb_gc_init_global_locks(void);
 void rb_gc_atfork_global_locks(void);
 void rb_gc_registered_globals_lock(void);

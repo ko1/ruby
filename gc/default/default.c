@@ -1956,6 +1956,15 @@ rb_gc_impl_gc_disable(void *objspace_ptr, bool finish_current_gc)
     dont_gc_on();
 }
 
+/* RLGCv2: finish an in-flight incremental mark / lazy sweep without
+ * touching the enabled state (gc.c uses it to settle the only objspace
+ * right before the world turns multi-objspace). */
+void
+rb_gc_impl_gc_rest(void *objspace_ptr)
+{
+    gc_rest(objspace_ptr);
+}
+
 /*
   --------------------------- ObjectSpace -----------------------------
 */
@@ -8002,6 +8011,13 @@ rlgc_global_gc(rb_objspace_t *driver)
      * thread runs all of their phases). */
     for (size_t i = 0; i < rlgc_global.count; i++) {
         rb_objspace_t *objspace = rlgc_global.list[i];
+        /* No objspace can be mid-incremental-mark here: incremental
+         * marking only runs single-objspace, and the single->multi
+         * transition (vm_insert_ractor0) settles it. Clearing the flag
+         * in step 5 while the gray stack kept its snapshot would wreck
+         * the owner's GC state machine. */
+        GC_ASSERT(!is_incremental_marking(objspace));
+        GC_ASSERT(is_mark_stack_empty(&objspace->mark_stack));
         rb_gc_initialize_vm_context(&objspace->vm_context);
         if (objspace != driver) during_gc = TRUE;
         gc_sweep_rest(objspace);
@@ -8132,15 +8148,13 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
 
     /* settle dst first: appending pages while its lazy sweep cursor is
      * walking the heap lists would sweep the merged pages against src's
-     * stale mark bits and free live objects */
-    {
-        rb_objspace_t *objspace = dst;
-        if (is_lazy_sweeping(objspace)) {
-            during_gc = TRUE;
-            gc_sweep_rest(objspace);
-            during_gc = FALSE;
-        }
-    }
+     * stale mark bits and free live objects. gc_rest also finishes an
+     * in-flight incremental mark -- splicing pages into a half-marked
+     * heap would let that cycle's sweep run over them with src's stale
+     * bits. (Normally already settled: the single->multi settle in
+     * vm_insert_ractor0 means no objspace is mid-incremental while a
+     * zombie exists to absorb.) */
+    gc_rest(dst);
 
     /* settle src: no lazy sweep, no allocation page in flight */
     {
