@@ -44,9 +44,18 @@
 
 ## 検証手段
 
-- **repro スイート**: `rlgc_repro/v2_*.rb`(自己完結 8 本 — mix / gen / fstring / clone-freeze /
-  shutdown-flush + incremental×multi + orphan-pjob + **verify**(`v2_verify_consistency.rb`))
+- **repro スイート**: `rlgc_repro/v2_*.rb`(自己完結 10 本)+ ランナー
+  `rlgc_repro/run_v2_suite.sh [RUBY] [plain|stress|tiny|stress-tiny]`(exit = 失敗本数。
+  sanitizer ビルドの ruby を渡せばそのまま ASAN/TSan バッテリになる)
   + v1 オラクル `rlgc_repro/b7–b11`(65 本)。
+- **per-test verify モード**: `RUBY_TEST_GC_VERIFY=N make test-all TESTOPTS=-j16` — 各テスト
+  終端で N 個毎に GC.verify_internal_consistency(素数 N + ランダム順で回毎に別標本)。
+  CI 候補ジョブ: N=7 / j16 で 1 ラウンド ~15 分。
+- **sanitizer 環境(ディスク常設)**: src worktree `~/ruby/src/wt-sani` +
+  build `~/ruby/build/v2-tsan`(clang-18 `-fsanitize=thread -O1`)/ `v2-asan`。
+  **TSan はビルド時も** `TSAN_OPTIONS="suppressions=…/tsan_suppressions.txt exitcode=0"`
+  が必要(mkmf が system() を呼び、miniruby の TSan 既定 exit 66 で ext configure が落ちる)。
+  バッテリ実行は exitcode 既定(未分類レース = 即失敗)で run_v2_suite.sh を流す。
 - **RLGC 不変条件 verifier**: `GC.verify_internal_consistency` が s→u=shref 検査・
   shref⟹unshareable・bitmap⟺FL_SHAREABLE・T_NONE ビット衛生・封じ込め(u→外部 u 禁止、
   例外 box->top_self)・呼び出し Ractor の root スコープ(machine_context と設計上
