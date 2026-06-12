@@ -265,7 +265,11 @@ shareable は unshareable を参照しない)なので、「WB を通らない s
 
 - **Class / Module のインスタンス変数・定数**に入る unshareable 値。これらは main Ractor
   からしかアクセスできない(既存の Ractor 仕様)ので「main の unshareable」であり、書くのも
-  main 自身 → **shref**(WB が main のページに立てる。上の規律どおり)。
+  main 自身 → **shref**(WB が main のページに立てる。上の規律どおり)。同型(WB が書く
+  s→u → shref)のものに: **定数インラインキャッシュ**(ice->value)、**singleton class →
+  attached object**、**bmethod の cme → unshareable proc**(define_method。起動は定義
+  Ractor のみ)。verifier(GC.verify_internal_consistency)はこれらの辺を辿り、
+  unshareable 側に shref 記録があることを検査する。
 - **送信中メッセージ**(§4.2): 受信側のキューから、送信側 objspace の snapshot への参照。
   → **shref**(送信時に送信側が自分のページに立てる)。
 - **Ractor オブジェクト**(shareable)は、その Ractor 専属の unshareable(`Ractor#[]` の
@@ -283,6 +287,13 @@ shareable は unshareable を参照しない)なので、「WB を通らない s
   実装時に「shareable の mark 関数が辿る先」を監査し、見つけたものはこのリストに追加して
   「shareable にする / shref で守る(WB で書かれる物)/ root で守る(所有者の構造から
   辿れる物)」のどれかに割り当てる。
+
+shref のライフサイクル: **オブジェクトが shareable に昇格したら shref 記録は廃止**
+(rb_gc_impl_obj_became_shareable がクリアする — 以後は shareable pin が生存を担い、
+shref は常に「unshareable を指す」を保つ)。なお u→u の機械的例外が一つ:
+**box->top_self**(全 thread の th->top_self が objspace を跨いで参照する VM 永続
+オブジェクト。box の root が生涯 root するので生存は独立に保証され、verifier は
+明示的に許可する)。
 
 **sweep**: lazy でよい。ただし:
 

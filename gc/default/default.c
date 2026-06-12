@@ -5791,6 +5791,7 @@ struct verify_internal_consistency_struct {
     size_t zombie_object_count;
 
     VALUE parent;
+    bool parent_shareable;
     size_t old_object_count;
     size_t remembered_shady_count;
 };
@@ -5835,9 +5836,27 @@ check_children_i(const VALUE child, void *ptr)
 {
     struct verify_internal_consistency_struct *data = (struct verify_internal_consistency_struct *)ptr;
 
-    /* RLGCv2: consistency rules are per-objspace; a foreign child is
-     * checked by its owner. */
-    if (GET_HEAP_OBJSPACE(child) != data->objspace) return;
+    if (GET_HEAP_OBJSPACE(child) != data->objspace) {
+        /* RLGCv2 containment (design_v2.md section 1.4): the only legal
+         * cross-objspace edges start at a shareable. An unshareable
+         * parent holding a foreign unshareable child is invisible to
+         * both owners' confined GCs -- the v1 crash family.
+         * Documented exception: the box's top_self (every thread's
+         * th->top_self points at it; it is VM-permanent, rooted by the
+         * box for the process lifetime). */
+        if (!data->parent_shareable &&
+            child != rb_vm_top_self() &&
+            !MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child)) {
+            fprintf(stderr, "check_children_i: containment violation: "
+                    "unshareable %s (objspace %p) -> foreign unshareable %s (objspace %p)\n",
+                    rb_obj_info(data->parent), (void *)data->objspace,
+                    rb_obj_info(child), (void *)GET_HEAP_OBJSPACE(child));
+            data->err_count++;
+        }
+
+        /* the rest of the per-objspace health rules are the owner's job */
+        return;
+    }
 
     if (check_rvalue_consistency_force(data->objspace, child, FALSE) != 0) {
         fprintf(stderr, "check_children_i: %s has error (referenced from %s)",
@@ -5863,6 +5882,37 @@ gc_slot_live_object_p(rb_objspace_t *objspace, VALUE obj)
     }
 }
 
+/* RLGCv2 root scoping (design_v2.md section 2.1): the calling Ractor's
+ * exact roots may only name shareables, objects of its own objspace, or
+ * shref-recorded in-flight payloads. Exempt: the conservative machine
+ * scan (stale slots; it only ever roots the scanning Ractor's own GC)
+ * and the VM-global containers that are cross-rooted by design (every
+ * objspace walks them and the marker skips foreign entries). */
+static void
+root_scope_check_i(const char *category, VALUE obj, void *ptr)
+{
+    struct verify_internal_consistency_struct *data = ptr;
+
+    if (RB_SPECIAL_CONST_P(obj)) return;
+    if (strcmp(category, "machine_context") == 0 ||
+        strcmp(category, "vm_registered_objects") == 0 ||
+        strcmp(category, "end_proc") == 0 ||
+        strcmp(category, "trap_list") == 0) {
+        return;
+    }
+
+    if (GET_HEAP_OBJSPACE(obj) == data->objspace) return;
+    if (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(obj), obj)) return;
+    if (MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj)) return;
+    if (obj == rb_vm_top_self()) return;  /* VM-permanent (see check_children_i) */
+
+    fprintf(stderr, "root_scope_check_i: root category \"%s\" names a foreign "
+            "unshareable without a shref record: %s (owner %p, self %p)\n",
+            category, rb_obj_info(obj),
+            (void *)GET_HEAP_OBJSPACE(obj), (void *)data->objspace);
+    data->err_count++;
+}
+
 static int
 verify_internal_consistency_i(void *page_start, void *page_end, size_t stride,
                               struct verify_internal_consistency_struct *data)
@@ -5872,10 +5922,28 @@ verify_internal_consistency_i(void *page_start, void *page_end, size_t stride,
 
     for (obj = (VALUE)page_start; obj != (VALUE)page_end; obj += stride) {
         asan_unpoisoning_object(obj) {
+            bool sh_bit = MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(obj), obj) != 0;
+            bool sr_bit = MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj) != 0;
+
             if (gc_slot_live_object_p(objspace, obj)) {
                 /* count objects */
                 data->live_object_count++;
                 data->parent = obj;
+                data->parent_shareable = sh_bit;
+
+                /* RLGCv2 bitmap invariants (design_v2.md section 1.4):
+                 * the page bitmap mirrors FL_SHAREABLE exactly, and a
+                 * shref record only ever names an unshareable. */
+                if (sh_bit != !!RB_OBJ_SHAREABLE_P(obj)) {
+                    fprintf(stderr, "verify_internal_consistency_i: shareable bit %d "
+                            "disagrees with FL_SHAREABLE on %s\n", (int)sh_bit, rb_obj_info(obj));
+                    data->err_count++;
+                }
+                if (sr_bit && sh_bit) {
+                    fprintf(stderr, "verify_internal_consistency_i: shref bit on a shareable: %s\n",
+                            rb_obj_info(obj));
+                    data->err_count++;
+                }
 
                 /* Normally, we don't expect T_MOVED objects to be in the heap.
                 * But they can stay alive on the stack, */
@@ -5907,6 +5975,15 @@ verify_internal_consistency_i(void *page_start, void *page_end, size_t stride,
                 }
             }
             else {
+                /* RLGCv2: a freed slot must not carry stale pin bits into
+                 * its next life (a lazily-unswept dead object still
+                 * legitimately carries them until the sweep visits it). */
+                if (BUILTIN_TYPE(obj) == T_NONE && (sh_bit || sr_bit)) {
+                    fprintf(stderr, "verify_internal_consistency_i: T_NONE slot carries "
+                            "shareable=%d shref=%d bits\n", (int)sh_bit, (int)sr_bit);
+                    data->err_count++;
+                }
+
                 if (BUILTIN_TYPE(obj) == T_ZOMBIE) {
                     data->zombie_object_count++;
 
@@ -6047,6 +6124,12 @@ gc_verify_internal_consistency_(rb_objspace_t *objspace)
         uintptr_t end = start + page->total_slots * slot_size;
 
         verify_internal_consistency_i((void *)start, (void *)end, slot_size, &data);
+    }
+
+    /* RLGCv2: check the calling Ractor's root scoping (the walk roots
+     * the CURRENT objspace, so only when that is the one under test) */
+    if (!rb_gc_single_objspace_p() && objspace == rb_gc_get_objspace()) {
+        rb_objspace_reachable_objects_from_root(root_scope_check_i, &data);
     }
 
     if (data.err_count != 0) {
@@ -7094,6 +7177,14 @@ rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
     _MARK_IN_BITMAP(page->shareable_bits, page, obj);
     page->has_shareable_objects = TRUE;
     page->objspace->rlgc.shareable_objects++;
+
+    /* a shref record from its unshareable days is obsolete now (the
+     * shareable pin covers it); shref only ever names an unshareable.
+     * The shref writers are also owner-thread (write barrier and
+     * in-flight pin under containment), so a plain clear is enough. */
+    if (_MARKED_IN_BITMAP(page->shref_bits, page, obj)) {
+        _CLEAR_IN_BITMAP(page->shref_bits, page, obj);
+    }
 }
 
 void
@@ -7966,6 +8057,15 @@ rb_gc_impl_during_global_gc_p(void *objspace_ptr)
     return objspace->during_global_gc != 0;
 }
 
+/* RLGCv2: is obj recorded as a shareable-referenced unshareable?
+ * (Verifier use: the consistency checks accept a shareable -> unshareable
+ * edge only when the write barrier recorded it here.) */
+bool
+rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
+{
+    return MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj) != 0;
+}
+
 static void
 rlgc_global_objspaces_i(void *os, void *data)
 {
@@ -8464,6 +8564,12 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
     wb_unprotected = RVALUE_WB_UNPROTECTED(objspace, src);
     uncollectible = RVALUE_UNCOLLECTIBLE(objspace, src);
     bool remembered = RVALUE_REMEMBERED(objspace, src);
+    /* RLGCv2: the pin bits travel with the object. Losing them across a
+     * (single-objspace-world) compaction would silently disarm the pin
+     * once the world turns multi-objspace: a confined GC could then
+     * free a cross-Ractor-referenced method entry or shref target. */
+    bool shareable = MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(src), src) != 0;
+    bool shref = MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(src), src) != 0;
     age = RVALUE_AGE_GET(src);
 
     /* Clear bits for eventual T_MOVED */
@@ -8471,6 +8577,8 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
     CLEAR_IN_BITMAP(GET_HEAP_WB_UNPROTECTED_BITS(src), src);
     CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(src), src);
     CLEAR_IN_BITMAP(GET_HEAP_PAGE(src)->remembered_bits, src);
+    CLEAR_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(src), src);
+    CLEAR_IN_BITMAP(GET_HEAP_SHREF_BITS(src), src);
 
     /* Move the object */
     memcpy((void *)dest, (void *)src, MIN(src_slot_size, slot_size));
@@ -8516,6 +8624,22 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
     }
     else {
         CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(dest), dest);
+    }
+
+    if (shareable) {
+        MARK_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(dest), dest);
+        GET_HEAP_PAGE(dest)->has_shareable_objects = TRUE;
+    }
+    else {
+        CLEAR_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(dest), dest);
+    }
+
+    if (shref) {
+        MARK_IN_BITMAP(GET_HEAP_SHREF_BITS(dest), dest);
+        GET_HEAP_PAGE(dest)->has_shref_objects = TRUE;
+    }
+    else {
+        CLEAR_IN_BITMAP(GET_HEAP_SHREF_BITS(dest), dest);
     }
 
     RVALUE_AGE_SET(dest, age);

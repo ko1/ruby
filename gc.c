@@ -2852,10 +2852,11 @@ mark_const_entry_i(VALUE value, void *objspace)
 {
     const rb_const_entry_t *ce = (const rb_const_entry_t *)value;
 
-    if (!rb_gc_checking_shareable()) {
-        gc_mark_internal(ce->value);
-        gc_mark_internal(ce->file); // TODO: ce->file should be shareable?
-    }
+    /* unshareable constant values carry the shref record (design_v2.md
+     * section 2.4-1), so the shareable-constraint check walks them */
+    gc_mark_internal(ce->value);
+    gc_mark_internal(ce->file); // TODO: ce->file should be shareable?
+
     return ID_TABLE_CONTINUE;
 }
 
@@ -3167,11 +3168,11 @@ gc_mark_classext_module(rb_classext_t *ext, bool prime, VALUE box_value, void *a
     }
     mark_m_tbl(objspace, RCLASSEXT_M_TBL(ext));
 
-    if (!rb_gc_checking_shareable()) {
-        // unshareable
-        gc_mark_internal(RCLASSEXT_FIELDS_OBJ(ext));
-        gc_mark_internal(RCLASSEXT_CVC_TBL(ext));
-    }
+    /* class-level fields and class-variable caches may be unshareable;
+     * the write barrier records them as shrefs (design_v2.md section
+     * 2.4-1), so the shareable-constraint check walks them */
+    gc_mark_internal(RCLASSEXT_FIELDS_OBJ(ext));
+    gc_mark_internal(RCLASSEXT_CVC_TBL(ext));
 
     if (!RCLASSEXT_SHARED_CONST_TBL(ext) && RCLASSEXT_CONST_TBL(ext)) {
         mark_const_tbl(objspace, RCLASSEXT_CONST_TBL(ext));
@@ -3269,8 +3270,9 @@ rb_gc_mark_children(void *objspace, VALUE obj)
 
     switch (BUILTIN_TYPE(obj)) {
       case T_CLASS:
-        if (FL_TEST_RAW(obj, FL_SINGLETON) &&
-            !rb_gc_checking_shareable()) {
+        if (FL_TEST_RAW(obj, FL_SINGLETON)) {
+            /* the attached object of a (shareable) singleton class can
+             * be unshareable; the shref record covers it */
             gc_mark_internal(RCLASS_ATTACHED_OBJECT(obj));
         }
         // Continue to the shared T_CLASS/T_MODULE
@@ -5968,11 +5970,21 @@ check_shareable_i(const VALUE child, void *ptr)
     struct check_shareable_data *data = (struct check_shareable_data *)ptr;
 
     if (!rb_gc_obj_shareable_p(child)) {
+        /* A shareable may reference an unshareable only when the write
+         * barrier recorded the edge in the target's shref bit -- that
+         * record is what keeps the target alive across its owner's
+         * confined GCs (design_v2.md section 2.1). Mark functions hide
+         * the root-treated exceptions (Ractor private fields, cref,
+         * JIT payloads) while rb_gc_checking_shareable() is true. */
+        if (rb_gc_impl_shref_marked_p(rb_gc_get_objspace(), child)) {
+            return;
+        }
+
         fprintf(stderr, "(a) ");
         rb_gc_rp(data->parent);
         fprintf(stderr, "(b) ");
         rb_gc_rp(child);
-        fprintf(stderr, "check_shareable_i: shareable (a) -> unshareable (b)\n");
+        fprintf(stderr, "check_shareable_i: shareable (a) -> unshareable (b) without a shref record\n");
 
         data->err_count++;
         rb_bug("!! violate shareable constraint !!");

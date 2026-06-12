@@ -1753,6 +1753,13 @@ rb_gc_impl_during_global_gc_p(void *objspace_ptr)
     return false;
 }
 
+bool
+rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
+{
+    /* single objspace: no cross-objspace pin bookkeeping */
+    return false;
+}
+
 void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
