@@ -135,6 +135,14 @@ struct rb_ractor_struct {
      * objspace in rb_objspace_alloc; non-main Ractors share the main
      * objspace (NULL here) until M1 gives each Ractor its own. */
     void *objspace;
+
+    /* RLGCv2 (design_v2.md section 1.3): the mark redirect installed by
+     * this Ractor's object-traversal API call, if any. Per Ractor so
+     * that a foreign Ractor's concurrent real GC never sees it; the
+     * redirect branch parks it to NULL around each callback, so this
+     * Ractor's own real GC (triggered by a callback's allocation)
+     * cannot be hijacked either. */
+    struct gc_mark_func_data_struct *mark_func_data;
 }; // rb_ractor_t is defined in vm_core.h
 
 /* RLGCv2: mark Ractor r's GC roots from its C structure (gc.c root scan). */
