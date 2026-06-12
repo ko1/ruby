@@ -6,6 +6,7 @@
 #ifndef _WIN32
 # include <sys/mman.h>
 # include <unistd.h>
+# include <fcntl.h>
 # ifdef HAVE_SYS_PRCTL_H
 #  include <sys/prctl.h>
 # endif
@@ -5796,6 +5797,8 @@ struct verify_internal_consistency_struct {
     size_t remembered_shady_count;
 };
 
+static bool verify_pointer_in_any_heap_p(const void *ptr);
+
 static void
 check_generation_i(const VALUE child, void *ptr)
 {
@@ -5836,6 +5839,41 @@ check_children_i(const VALUE child, void *ptr)
 {
     struct verify_internal_consistency_struct *data = (struct verify_internal_consistency_struct *)ptr;
 
+    /* fast path: a child of this objspace (99.99% of edges) */
+    if (RB_LIKELY(is_pointer_to_heap(data->objspace, (void *)child))) {
+        if (check_rvalue_consistency_force(data->objspace, child, FALSE) != 0) {
+            fprintf(stderr, "check_children_i: %s has error (referenced from %s)",
+                    rb_obj_info(child), rb_obj_info(data->parent));
+            data->err_count++;
+        }
+        return;
+    }
+
+    /* A non-heap child can only reach this callback through a plain
+     * rb_gc_mark of a stale field -- so far seen only on dmarks of
+     * live-but-unreachable wrappers whose sibling struct was freed
+     * first (the real marker never visits those). Report-and-continue:
+     * the first words of the target (read fault-safely; it may be
+     * unmapped) identify the culprit field across soak rounds without
+     * aborting them. */
+    if (!verify_pointer_in_any_heap_p((void *)child)) {
+        VALUE w[2] = {0, 0};
+        bool readable = false;
+#ifndef _WIN32
+        int fd = open("/proc/self/mem", O_RDONLY);
+        if (fd >= 0) {
+            if (pread(fd, w, sizeof(w), (off_t)child) == (ssize_t)sizeof(w)) {
+                readable = true;
+            }
+            close(fd);
+        }
+#endif
+        fprintf(stderr, "VERIFY-NOTE: non-heap child %p (from %s) readable=%d w0=%p w1=%p\n",
+                (void *)child, rb_obj_info(data->parent), (int)readable,
+                (void *)w[0], (void *)w[1]);
+        return;
+    }
+
     if (GET_HEAP_OBJSPACE(child) != data->objspace) {
         /* RLGCv2 containment (design_v2.md section 1.4): the only legal
          * cross-objspace edges start at a shareable. An unshareable
@@ -5857,12 +5895,19 @@ check_children_i(const VALUE child, void *ptr)
         /* the rest of the per-objspace health rules are the owner's job */
         return;
     }
+}
 
-    if (check_rvalue_consistency_force(data->objspace, child, FALSE) != 0) {
-        fprintf(stderr, "check_children_i: %s has error (referenced from %s)",
-                rb_obj_info(child), rb_obj_info(data->parent));
+struct verify_any_heap_query {
+    const void *ptr;
+    bool found;
+};
 
-        data->err_count++;
+static void
+verify_pointer_in_any_heap_i(void *os, void *data)
+{
+    struct verify_any_heap_query *q = data;
+    if (!q->found && is_pointer_to_heap((rb_objspace_t *)os, q->ptr)) {
+        q->found = true;
     }
 }
 
@@ -5882,6 +5927,16 @@ gc_slot_live_object_p(rb_objspace_t *objspace, VALUE obj)
     }
 }
 
+/* verifier-only: does ptr name a live slot in ANY objspace? (The caller
+ * holds the VM lock and the barrier, so the enumeration is stable.) */
+static bool
+verify_pointer_in_any_heap_p(const void *ptr)
+{
+    struct verify_any_heap_query q = { .ptr = ptr, .found = false };
+    rb_gc_vm_each_objspace(verify_pointer_in_any_heap_i, &q);
+    return q.found;
+}
+
 /* RLGCv2 root scoping (design_v2.md section 2.1): the calling Ractor's
  * exact roots may only name shareables, objects of its own objspace, or
  * shref-recorded in-flight payloads. Exempt: the conservative machine
@@ -5898,6 +5953,13 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
         strcmp(category, "vm_registered_objects") == 0 ||
         strcmp(category, "end_proc") == 0 ||
         strcmp(category, "trap_list") == 0) {
+        return;
+    }
+
+    if (!verify_pointer_in_any_heap_p((void *)obj)) {
+        fprintf(stderr, "root_scope_check_i: root category \"%s\" names a non-heap pointer %p\n",
+                category, (void *)obj);
+        data->err_count++;
         return;
     }
 

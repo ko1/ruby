@@ -3911,7 +3911,15 @@ thread_mark(void *ptr)
         break;
     }
 
-    rb_gc_mark(rb_ractor_self(th->ractor));
+    /* An exited thread (root fiber released, th->ec == NULL) can
+     * outlive its rb_ractor_t: the struct is freed when the Ractor
+     * object is collected, while this wrapper may stay (inherited via
+     * Ractor#value, or merely awaiting its sweep -- the consistency
+     * verifier walks those too). A live Ractor's object is rooted from
+     * the VM's ractor set anyway, so skipping the edge loses nothing. */
+    if (th->ec) {
+        rb_gc_mark(rb_ractor_self(th->ractor));
+    }
     rb_gc_mark(th->thgroup);
     rb_gc_mark(th->value);
     rb_gc_mark(th->pending_interrupt_queue);
