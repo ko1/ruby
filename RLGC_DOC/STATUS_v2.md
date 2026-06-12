@@ -1,4 +1,4 @@
-# RLGCv2 現状サマリ(2026-06-11)
+# RLGCv2 現状サマリ(2026-06-12)
 
 設計の正典は `design_v2.md`。本書は「いまどこまで出来ていて、何が残っていて、どう検証するか」だけをまとめる。v1 の記録は `RACTOR_LOCAL_GC_DESIGN.md` / `RLGC_STATUS.md`(凍結)。
 
@@ -13,8 +13,12 @@
 | M4 終了と引き継ぎ(value 併合 / orphan / shutdown) | 完了 | 1f8318f1f, b977ac426, 80f227d52 |
 | **M1b local GC 並行化(バリア外し)** | **完了** | 2bc3fc1b6〜df4f2e0b3 |
 | M5 堅牢化・調整 | 主要部完了 | e3bd4e939〜d2f855dcf |
+| origin/master 追従 rebase(b765d9489 = upstream バンプポインタ・アロケータ) | 完了 | 全 36 コミット転写 |
+| 決定 18: Ractor 宛て postponed job | 完了 | 独立ブランチ ractor-targeted-pjob 5f537434c(upstream 提案用)+ v2 へ cherry-pick 70cf4b6df |
+| incremental marking × 単一→複数遷移の整合(設計 2.1 step 0 の未実装文) | 完了 | 730392475 |
+| キュー2: orphan 併合の pjob 化(+ absorb GC 禁止ガード) | 完了 | ae6a8da90 |
 
-すべてのコミットは full gate(`make btest` 2050 + `make test-all` 34892/0F/0E)を通過してから入れている。
+すべてのコミットは full gate(`make btest` 2050 + `make test-all` 34892〜34904/0F/0E)を通過してから入れている。
 
 ## 性能(merge-base `aa4d4c450` 対照、10M iter 割り当て churn)
 
@@ -40,7 +44,9 @@
 
 ## 検証手段
 
-- **repro スイート**: `rlgc_repro/v2_*.rb`(自己完結 5 本)+ v1 オラクル `rlgc_repro/b7–b11`(65 本)。
+- **repro スイート**: `rlgc_repro/v2_*.rb`(自己完結 7 本 — mix / gen / fstring / clone-freeze /
+  shutdown-flush + incremental×multi(`v2_incremental_vs_multi_objspace.rb`)+ orphan-pjob
+  (`v2_orphan_merge_pjob.rb`))+ v1 オラクル `rlgc_repro/b7–b11`(65 本)。
   最終掃引: **ok 57 / timeout 8 / crash 0**(timeout は cpu≈wall の全力 spin = adversarial 設計、v1 期から master でも完走しない)
 - **TSan**: worktree ビルド(`git worktree add` → clang-18 `-fsanitize=thread -O1`; in-tree srcdir 直は VPATH が in-tree .o を拾い破綻)。
   `TSAN_OPTIONS="suppressions=RLGC_DOC/tsan_suppressions.txt"` で**未分類 0**(suppression は全件根拠コメント付き; 非マッチ=新規=要調査)
@@ -54,21 +60,15 @@
 
 ## 残項目(2026-06-11 設計合意済みの実装キュー — 上から順に)
 
-1. **Ractor 宛て postponed job(決定 18)**: 汎用 VM 機構として独立実装・独立コミット。
-   per-Ractor triggered マスク + 宛先 EC への割込みフラグ(ubf では起こさない)
-2. **orphan 併合の pjob 化(§2.3 改稿済み)**: cycle 内 main 併合 → main 宛て pjob へ。
-   zombie entry の owner slot を ractor_free で NULL 化、shutdown 一括併合の slotless 対応、
-   fork 子での再トリガ。**absorb 全体の GC 禁止ガード**(表挿入の確保が継承側 local GC を
-   ページ半繋ぎで誘発し得る潜在ハザード)も同時に
-3. **zombie トリガのページ量化(§2.2 トリガ 3 改稿済み)**: 個数 8 → `vm->gc.zombie_total_pages`
+1. **zombie トリガのページ量化(§2.2 トリガ 3 改稿済み)**: 個数 8 → `vm->gc.zombie_total_pages`
    ベース(retire/併合で増減)。閾値・下限の既定値はここで決める
-4. **mark_func_data の per-Ractor 化(§1.3 どおりへ)**: 現実装は VM 共有 + during_gc ゲート
+2. **mark_func_data の per-Ractor 化(§1.3 どおりへ)**: 現実装は VM 共有 + during_gc ゲート
    (M5(3))の暫定。per-Ractor 化でゲート自体を不要にする
-5. **決定 12(foreign define_finalizer のエラー化)**: デザイン詰め中 — 未決 2 点
+3. **決定 12(foreign define_finalizer のエラー化)**: デザイン詰め中 — 未決 2 点
    (shareable も一律拒否でよいか / clone・dup は cross-objspace では finalizer を引き継がない、
    でよいか)の判断待ち → 確定後に実装(現状は不発・dangling entry の不整合経路が残存)
-6. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
-7. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
-8. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
-9. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
-10. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
+4. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
+5. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
+6. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
+7. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
+8. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)

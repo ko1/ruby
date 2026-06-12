@@ -511,16 +511,26 @@ local GC では回収できず、global GC まで滞留し続けるからであ�
   (§4.3)。併合は自分のヒープへの書き込みなので single writer はそのまま守られる。
   value の呼び出し自体が引き継ぎの実行場所であり、受け渡しの仕掛けは何も要らない。
 - **join されないまま Ractor オブジェクトが回収された場合**: Ractor オブジェクトは
-  shareable なので、回収するのは必ず global GC(STW 中)= ここが「もう誰も join
-  できない」ことの判定を兼ねる。ractor_free はその objspace を侵入リスト(orphan
-  chain)に積むだけにし(sweep 内なので確保はできない)、cycle の末尾で **main 宛て
-  postponed job(決定 18)をトリガ**する。実際の併合は main が自分の次の safepoint で
-  **main 自身のスレッド**として行う。これで 3 経路すべて(value = joiner / orphan =
-  main / shutdown = main)が「併合は継承者自身のスレッドで」という同一の形になり、
-  「STW 中だけ single writer が免除される」という特例が設計から消える。
-  併合されるまでの間も orphan は zombie 帳簿(下記)に残り、global GC の列挙から
-  漏れない。fork の子では chain が残っていれば子の main へ再トリガする。shutdown は
-  chain と zombie をまとめて main が併合する。
+  shareable なので、回収するのは通常 global GC(STW 中)= ここが「もう誰も join
+  できない」ことの判定を兼ねる。ractor_free は zombie 帳簿(下記)の entry の
+  owner slot を NULL にする(= disown; 専用の侵入リストは持たない)だけにし、
+  **main 宛て postponed job(決定 18)をトリガ**する。実際の併合は main が自分の
+  次の safepoint で **main 自身のスレッド**として行う。これで 3 経路すべて
+  (value = joiner / orphan = main / shutdown = main)が「併合は継承者自身の
+  スレッドで」という同一の形になり、「STW 中だけ single writer が免除される」
+  という特例が設計から消える。併合されるまでの間も disown 済み objspace は
+  zombie 帳簿に残り、global GC の列挙から漏れない。fork の子では disown 済み
+  entry が残っていれば子の main へ再トリガする。shutdown は disown 済みを同期
+  drain してから、残り(owner slot 付き)を従来どおり併合する。
+
+  例外が一つ: **起動前に生成が失敗した Ractor**(objspace は出来たがスレッドは
+  一度も走らなかった)は retire を経ないので帳簿に居らず、しかも単一 objspace の
+  世界で local GC に回収され得る。この場合は ractor_free が sweep 内から slot 無し
+  entry を帳簿へ直接 push する(帳簿は plain realloc で伸ばす — sweep 内では
+  会計付きアロケータを使えない)。push の瞬間に世界が複数 objspace 扱いへ変わる
+  ため、sweep の pinned-free 検査は「いまの世界」ではなく「この cycle の mark が
+  pin walk を実行したか」(`rlgc.last_cycle_pinned`; global の統一 mark は pin
+  しないので global cycle が各 objspace で 0 化)に束縛している。
 
 併合の作業内容はどちらも同じ: ページを size pool ごとに引き継ぎ側のヒープへ繋ぎ替え、
 各ページの `page->objspace` を書き換え、finalizer テーブル・zombie・カウンタ類を併合し、
