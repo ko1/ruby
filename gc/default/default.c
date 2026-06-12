@@ -3338,6 +3338,16 @@ rb_gc_impl_define_finalizer(void *objspace_ptr, VALUE obj, VALUE block)
 
     GC_ASSERT(!OBJ_FROZEN(obj));
 
+    /* RLGCv2 (design_v2.md decision 12): registration, table and
+     * execution all belong to the object's objspace. Defining a
+     * finalizer on another Ractor's object -- shareable ones included
+     * -- is rejected: the entry would land in a table that the owner's
+     * sweep never consults. */
+    if (GET_HEAP_OBJSPACE(obj) != objspace) {
+        rb_raise(rb_eRactorIsolationError,
+                 "can not define a finalizer for an object of another Ractor");
+    }
+
     RBASIC(obj)->flags |= FL_FINALIZE;
 
     unsigned int lev = RB_GC_VM_LOCK();
@@ -3382,6 +3392,12 @@ rb_gc_impl_undefine_finalizer(void *objspace_ptr, VALUE obj)
 
     GC_ASSERT(!OBJ_FROZEN(obj));
 
+    /* decision 12, symmetrical with define */
+    if (GET_HEAP_OBJSPACE(obj) != objspace) {
+        rb_raise(rb_eRactorIsolationError,
+                 "can not undefine a finalizer of an object of another Ractor");
+    }
+
     st_data_t data = obj;
 
     int lev = RB_GC_VM_LOCK();
@@ -3394,24 +3410,22 @@ rb_gc_impl_undefine_finalizer(void *objspace_ptr, VALUE obj)
 void
 rb_gc_impl_copy_finalizer(void *objspace_ptr, VALUE dest, VALUE obj)
 {
-    /* RLGCv2: finalizers are kept in the table of the objspace that owns
-     * the object. dest was just allocated by the running Ractor, so its
-     * entry goes into the current objspace's table, but obj may be a
-     * foreign (e.g. shareable) object whose entry lives in its owner's
-     * table. All finalizer_table accesses run under the VM lock.
-     * (The finalizer_table macro reads the local "objspace" variable,
-     * which is repointed from obj's owner to dest's objspace below.) */
-    rb_objspace_t *objspace = GET_HEAP_OBJSPACE(obj);
+    /* RLGCv2 (design_v2.md decision 12): finalizers do not cross
+     * objspaces -- a copy of another Ractor's object starts without
+     * one. (No in-tree caller copies across; this guards the public
+     * rb_gc_copy_finalizer C API. Same-objspace copies keep the
+     * traditional behavior; the table access runs under the VM lock.) */
+    rb_objspace_t *objspace = objspace_ptr;
     VALUE table;
     st_data_t data;
 
     if (!FL_TEST(obj, FL_FINALIZE)) return;
+    if (GET_HEAP_OBJSPACE(obj) != objspace) return;
 
     int lev = RB_GC_VM_LOCK();
     if (RB_LIKELY(st_lookup(finalizer_table, obj, &data))) {
         table = rb_ary_dup((VALUE)data);
         RARRAY_ASET(table, 0, rb_obj_id(dest));
-        objspace = objspace_ptr;
         st_insert(finalizer_table, dest, table);
         FL_SET(dest, FL_FINALIZE);
     }
