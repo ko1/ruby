@@ -64,10 +64,8 @@
 
 ## 残項目(2026-06-11 設計合意済みの実装キュー — 上から順に)
 
-1. **mark_func_data の per-Ractor 化(§1.3 どおりへ)**: 現実装は VM 共有 + during_gc ゲート
-   (M5(3))の暫定。per-Ractor 化でゲート自体を不要にする
-3. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
-3. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
-4. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
-5. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
-6. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
+1. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
+2. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
+3. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
+4. ASAN/TSan の CI 常設化(レシピ・suppression は完備)+ v1 オラクル 65 本の再掃引
+5. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
