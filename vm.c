@@ -3911,15 +3911,14 @@ thread_mark(void *ptr)
         break;
     }
 
-    /* An exited thread (root fiber released, th->ec == NULL) can
-     * outlive its rb_ractor_t: the struct is freed when the Ractor
-     * object is collected, while this wrapper may stay (inherited via
-     * Ractor#value, or merely awaiting its sweep -- the consistency
-     * verifier walks those too). A live Ractor's object is rooted from
-     * the VM's ractor set anyway, so skipping the edge loses nothing. */
-    if (th->ec) {
-        rb_gc_mark(rb_ractor_self(th->ractor));
-    }
+    /* No mark through th->ractor: a thread wrapper can outlive its
+     * rb_ractor_t (the struct dies with the Ractor object, while the
+     * wrapper of a dead Ractor's thread can be inherited through
+     * Ractor#value or linger until its own sweep -- with a live ec, if
+     * the root fiber wrapper is alive too). A live Ractor's object is
+     * rooted from the VM's ractor set, so this edge never carried any
+     * liveness; chasing the pointer here crashed real marks on merged
+     * dead-Ractor heaps. */
     rb_gc_mark(th->thgroup);
     rb_gc_mark(th->value);
     rb_gc_mark(th->pending_interrupt_queue);
@@ -3947,6 +3946,15 @@ thread_free(void *ptr)
 {
     rb_thread_t *th = ptr;
     RUBY_FREE_ENTER("thread");
+
+    /* RLGCv2: detach from the root fiber before this struct dies; if
+     * the fiber wrapper outlives us, its fiber_free must not chase a
+     * freed thread through saved_ec.thread_ptr (the mirror of the
+     * detach fiber_free performs in the reverse sweep order). */
+    if (th->ec && th->ec->fiber_ptr &&
+        th->ec == rb_fiberptr_get_ec(th->ec->fiber_ptr)) {
+        rb_fiberptr_detach_thread(th->ec->fiber_ptr);
+    }
 
     rb_threadptr_sched_free(th);
     // destroyed here rather than during teardown: nothing can interrupt a
