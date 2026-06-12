@@ -3772,6 +3772,34 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
     }
 }
 
+/* The merge of a disowned zombie objspace (its Ractor object was
+ * collected) into main runs as a main-targeted postponed job, at
+ * main's next safepoint -- not inside whatever GC cycle noticed the
+ * orphan (design_v2.md section 2.3, decision 18). */
+static rb_postponed_job_handle_t rlgc_orphan_merge_pjob = POSTPONED_JOB_HANDLE_INVALID;
+
+static void rlgc_orphan_merge_job(void *unused);
+
+/* Grown with plain realloc: rb_gc_objspace_disown pushes from inside a
+ * global GC's sweep, where the accounted allocators are forbidden. The
+ * ledger is VM-lifetime metadata, a few dozen entries at most. */
+static void
+zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot)
+{
+    if (vm->gc.zombie_objspaces_count == vm->gc.zombie_objspaces_capa) {
+        size_t new_capa = vm->gc.zombie_objspaces_capa ? vm->gc.zombie_objspaces_capa * 2 : 16;
+        struct rb_objspace_zombie *grown =
+            realloc(vm->gc.zombie_objspaces, new_capa * sizeof(struct rb_objspace_zombie));
+        if (grown == NULL) rb_bug("zombie_objspaces_push: out of memory");
+        vm->gc.zombie_objspaces = grown;
+        vm->gc.zombie_objspaces_capa = new_capa;
+    }
+    vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = (struct rb_objspace_zombie){
+        .objspace = objspace,
+        .owner_slot = owner_slot,
+    };
+}
+
 /* Called when a Ractor terminates without having been joined: its
  * objspace no longer has an owner thread, but its pages still hold
  * shareable objects reachable from other Ractors. Keep it enumerable
@@ -3784,26 +3812,62 @@ rb_gc_objspace_retire(void **objspace_slot)
     rb_vm_t *vm = GET_VM();
 
     RB_VM_LOCKING() {
-        if (vm->gc.zombie_objspaces_count == vm->gc.zombie_objspaces_capa) {
-            size_t new_capa = vm->gc.zombie_objspaces_capa ? vm->gc.zombie_objspaces_capa * 2 : 16;
-            SIZED_REALLOC_N(vm->gc.zombie_objspaces, struct rb_objspace_zombie, new_capa, vm->gc.zombie_objspaces_capa);
-            vm->gc.zombie_objspaces_capa = new_capa;
+        /* shared with every retire/disown path; preregistering twice is
+         * idempotent (same func + data dedupes) */
+        if (rlgc_orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+            rlgc_orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
+            if (rlgc_orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+                rb_bug("Could not preregister postponed job for GC");
+            }
         }
-        vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = (struct rb_objspace_zombie){
-            .objspace = *objspace_slot,
-            .owner_slot = objspace_slot,
-        };
+        zombie_objspaces_push(vm, *objspace_slot, objspace_slot);
     }
 }
 
 /* The Ractor object owning this objspace has been collected: nobody
- * can ever join it. Queued from ractor_free (which runs inside a GC
- * sweep, so the impl links it intrusively without allocating) and
- * merged into main by the next global GC cycle. */
+ * can ever join it now. Drop the ledger entry's owner slot (the
+ * rb_ractor_t holding it is about to be freed) and post the merge to
+ * the main Ractor; one of its threads absorbs the objspace at its next
+ * safepoint.
+ *
+ * Called from ractor_free, i.e. inside a sweep: nothing here may use
+ * the accounted allocators. The ledger is stable nonetheless -- a
+ * STARTED Ractor's object is shareable and only a global GC frees it
+ * (everyone parked, VM lock held), while a Ractor that NEVER started
+ * (creation failed after its objspace existed) dies in the
+ * single-objspace world, where no concurrent retire exists. The
+ * never-started one also never went through retire, so push its
+ * slotless entry here; the world turns multi-objspace mid-sweep then,
+ * which is why the sweep's pinned-free assert binds to its own mark
+ * (rlgc.last_cycle_pinned), not to the live world state. */
 void
-rb_gc_objspace_orphaned(void *objspace)
+rb_gc_objspace_disown(void *objspace)
 {
-    rb_gc_impl_objspace_orphaned(objspace);
+    rb_vm_t *vm = GET_VM();
+    bool found = false;
+
+    for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
+        if (vm->gc.zombie_objspaces[i].objspace == objspace) {
+            vm->gc.zombie_objspaces[i].owner_slot = NULL;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        zombie_objspaces_push(vm, objspace, NULL);
+    }
+
+    /* the trigger is wait-free (atomic bit + interrupt flag), safe in
+     * the sweep; before any worker existed there is nothing to disown,
+     * so the handle is preregistered by then (first retire) unless the
+     * Ractor never started -- cover that path too */
+    if (rlgc_orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+        rlgc_orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
+        if (rlgc_orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+            rb_bug("Could not preregister postponed job for GC");
+        }
+    }
+    rb_postponed_job_trigger_for_ractor(rlgc_orphan_merge_pjob, vm->ractor.main_ractor->pub.self);
 }
 
 /* Is a global (stop-the-world) GC cycle running? Only its driver can
@@ -3813,13 +3877,6 @@ bool
 rb_gc_during_global_gc_p(void)
 {
     return rb_gc_impl_during_global_gc_p(rb_gc_get_objspace());
-}
-
-/* helpers for the global GC's orphan merge (design_v2.md section 2.3) */
-void *
-rb_gc_vm_main_objspace(void)
-{
-    return GET_VM()->ractor.main_ractor->objspace;
 }
 
 void
@@ -3870,6 +3927,19 @@ rb_gc_single_objspace_p(void)
  * into the calling Ractor's one. Takes the owning slot so that clearing
  * it and freeing the objspace happen under one VM-lock critical section
  * (the dying thread's teardown reads the slot under the same lock). */
+/* design_v2.md section 2.3: the merge reallocates dst bookkeeping (the
+ * sorted page array, the finalizer table), and an allocation-triggered
+ * GC of dst would run over the half-spliced heap lists. No GC may
+ * start while the merge runs; preserve a user GC.disable. */
+static void
+objspace_absorb_with_gc_disabled(void *dst, void *src)
+{
+    bool was_enabled = rb_gc_impl_gc_enabled_p(dst);
+    if (was_enabled) rb_gc_impl_gc_disable(dst, false);
+    rb_gc_impl_objspace_absorb(dst, src);
+    if (was_enabled) rb_gc_impl_gc_enable(dst);
+}
+
 void
 rb_gc_objspace_absorb_into_current(void **objspace_slot)
 {
@@ -3878,7 +3948,55 @@ rb_gc_objspace_absorb_into_current(void **objspace_slot)
         if (objspace != NULL) {
             *objspace_slot = NULL;
             rb_gc_vm_forget_zombie(objspace);
-            rb_gc_impl_objspace_absorb(rb_gc_get_objspace(), objspace);
+            objspace_absorb_with_gc_disabled(rb_gc_get_objspace(), objspace);
+        }
+    }
+}
+
+/* Merge every disowned zombie objspace (owner slot gone: its Ractor
+ * object was collected) into the current Ractor's objspace. Runs on a
+ * main-Ractor thread as the postponed job; the VM shutdown path calls
+ * it directly. */
+static void
+objspace_absorb_disowned_zombies(void)
+{
+    rb_vm_t *vm = GET_VM();
+
+    RB_VM_LOCKING() {
+        size_t i = 0;
+        while (i < vm->gc.zombie_objspaces_count) {
+            if (vm->gc.zombie_objspaces[i].owner_slot == NULL) {
+                void *zombie = vm->gc.zombie_objspaces[i].objspace;
+                vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count - 1];
+                vm->gc.zombie_objspaces_count--;
+                objspace_absorb_with_gc_disabled(rb_gc_get_objspace(), zombie);
+            }
+            else {
+                i++;
+            }
+        }
+    }
+}
+
+static void
+rlgc_orphan_merge_job(void *unused)
+{
+    (void)unused;
+    objspace_absorb_disowned_zombies();
+}
+
+/* Re-aim a pending orphan merge after fork: the job may have targeted
+ * the parent's main Ractor, whose per-Ractor trigger mask did not come
+ * along unless it was the forking one. Called in the child. */
+void
+rb_gc_zombie_objspaces_atfork(void)
+{
+    rb_vm_t *vm = GET_VM();
+
+    for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
+        if (vm->gc.zombie_objspaces[i].owner_slot == NULL) {
+            rb_postponed_job_trigger_for_ractor(rlgc_orphan_merge_pjob, vm->ractor.main_ractor->pub.self);
+            break;
         }
     }
 }
@@ -3895,8 +4013,13 @@ rb_gc_objspace_absorb_all_zombies(void)
 {
     rb_vm_t *vm = GET_VM();
 
+    /* entries whose Ractor object is already gone (this IS their
+     * pending merge job, run synchronously) */
+    objspace_absorb_disowned_zombies();
+
     while (vm->gc.zombie_objspaces_count > 0) {
         size_t before = vm->gc.zombie_objspaces_count;
+        GC_ASSERT(vm->gc.zombie_objspaces[0].owner_slot != NULL);
         rb_gc_objspace_absorb_into_current(vm->gc.zombie_objspaces[0].owner_slot);
         if (vm->gc.zombie_objspaces_count >= before) {
             rb_bug("rb_gc_objspace_absorb_all_zombies: zombie list did not shrink");

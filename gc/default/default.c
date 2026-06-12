@@ -636,13 +636,12 @@ typedef struct rb_objspace {
         size_t shareable_objects;
         size_t shareable_objects_limit;
         size_t stalled_shareables;
+        /* did this objspace's LAST mark run the pinned walk? The sweep
+         * assert binds to it: what the mark pinned, the sweep must not
+         * free -- and what a single-world mark legitimately left
+         * unmarked, a mid-sweep world change must not re-arm. */
+        unsigned char last_cycle_pinned;
     } rlgc;
-
-    /* RLGCv2 (design_v2.md section 2.3): intrusive link for the orphan
-     * chain -- objspaces whose Ractor object was collected unjoined.
-     * Linked from ractor_free, which runs inside a GC sweep where no
-     * allocation is possible, hence intrusive. */
-    struct rb_objspace *rlgc_orphan_next;
 
     struct {
         rb_darray(struct heap_page *) sorted;
@@ -821,8 +820,6 @@ static struct {
     size_t count, capa;
 } rlgc_global;
 
-/* orphaned objspaces awaiting their merge into main (section 2.3) */
-static rb_objspace_t *rlgc_orphaned_head;
 static void rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
 /* The MAIN objspace, for gc_enter's locking policy. A stable pointer on
@@ -4148,10 +4145,11 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 if (ctx->check_pinned_free &&
                     (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(vp), vp) ||
                      MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp))) {
-                    rb_bug("page_sweep: freeing pinned slot %s (shareable=%d shref=%d)",
+                    rb_bug("page_sweep: freeing pinned slot %s (shareable=%d shref=%d single_now=%d)",
                            rb_obj_info(vp),
                            (int)!!MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(vp), vp),
-                           (int)!!MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp));
+                           (int)!!MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp),
+                           (int)rb_gc_single_objspace_p());
                 }
 #if RGENGC_CHECK_MODE
                 if (!is_full_marking(objspace)) {
@@ -4622,11 +4620,14 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
     gc_prof_sweep_timer_start(objspace);
 #endif
 
-    /* hoisted for the per-slot pinned-free assert; see gc_sweep_context.
-     * A Ractor-count transition mid-sweep only relaxes the check for the
-     * remainder (the pin invariants still hold for this cycle's marks). */
-    const unsigned char check_pinned_free =
-        !rb_gc_single_objspace_p() && !objspace->during_global_gc;
+    /* For the per-slot pinned-free assert (see gc_sweep_context): check
+     * exactly when this cycle's mark ran the pinned walk. The live world
+     * state would misfire: a single-world cycle legitimately leaves dead
+     * shareables unmarked, and its own sweep can flip the world to
+     * multi-objspace mid-way (collecting a never-started Ractor object
+     * disowns its objspace into the zombie ledger). The global GC's
+     * exact mark never pins, so it stays exempt automatically. */
+    const unsigned char check_pinned_free = objspace->rlgc.last_cycle_pinned;
 
     do {
         RUBY_DEBUG_LOG("sweep_page:%p", (void *)sweep_page);
@@ -6299,7 +6300,9 @@ gc_marks_finish(rb_objspace_t *objspace)
      * pin (its unified mark is exact reachability, §2.2 step 9).
      * (RGENGC_CHECK_MODE >= 4's allrefs comparison does not model this
      * pin and would flag the pinned-unreachable objects.) */
+    objspace->rlgc.last_cycle_pinned = 0;
     if (!rb_gc_single_objspace_p() && !objspace->during_global_gc) {
+        objspace->rlgc.last_cycle_pinned = 1;
         size_t marked_before = objspace->marked_slots;
         gc_mark_set_parent_raw(objspace, Qundef, false);
         for (int i = 0; i < HEAP_COUNT; i++) {
@@ -8036,6 +8039,9 @@ rlgc_global_gc(rb_objspace_t *driver)
         rb_objspace_t *objspace = rlgc_global.list[i];
         objspace->flags.during_minor_gc = FALSE;
         objspace->flags.during_incremental_marking = FALSE;
+        /* the unified mark is exact and never pins; the per-objspace
+         * sweeps below must not re-check against a stale local cycle */
+        objspace->rlgc.last_cycle_pinned = 0;
         objspace->rgengc.uncollectible_wb_unprotected_objects = 0;
         objspace->rgengc.old_objects = 0;
         objspace->rgengc.last_major_gc = objspace->profile.count;
@@ -8102,25 +8108,11 @@ rlgc_global_gc(rb_objspace_t *driver)
     }
     rlgc_global.active = false;
 
-    /* step 9 cleanup (design_v2.md section 2.3): the sweep above may
-     * have collected Ractor objects whose objspaces were never joined;
-     * ractor_free queued them, and everyone is still stopped, so merge
-     * them into main now. (After the flags are down: the merge frees
-     * those objspace shells, which must no longer be in any pass. The
-     * GC work is finished, so lift during_gc around the merge -- it
-     * reallocates bookkeeping arrays, which the malloc guard forbids
-     * inside a GC.) */
-    {
-        rb_objspace_t *objspace = driver;
-        during_gc = FALSE;
-        while (rlgc_orphaned_head) {
-            rb_objspace_t *orphan = rlgc_orphaned_head;
-            rlgc_orphaned_head = orphan->rlgc_orphan_next;
-            rb_gc_vm_forget_zombie(orphan);
-            rlgc_objspace_absorb(rb_gc_vm_main_objspace(), orphan);
-        }
-        during_gc = TRUE; /* for gc_exit's accounting */
-    }
+    /* If the sweep above collected unjoined Ractor objects, ractor_free
+     * disowned their zombie-ledger entries and posted the merge to the
+     * main Ractor as a postponed job (design_v2.md section 2.3,
+     * decision 18); the objspaces stay enumerable in the ledger until
+     * main absorbs them at its next safepoint. */
 
     gc_exit(driver, gc_enter_event_global, &lock_lev);
 }
@@ -8312,16 +8304,6 @@ void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
     rlgc_objspace_absorb(dst_ptr, src_ptr);
-}
-
-/* Queue an ownerless objspace whose Ractor object has just been freed.
- * Runs inside a GC sweep: must not allocate. */
-void
-rb_gc_impl_objspace_orphaned(void *objspace_ptr)
-{
-    rb_objspace_t *objspace = objspace_ptr;
-    objspace->rlgc_orphan_next = rlgc_orphaned_head;
-    rlgc_orphaned_head = objspace;
 }
 
 void
