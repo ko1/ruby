@@ -44,9 +44,13 @@
 
 ## 検証手段
 
-- **repro スイート**: `rlgc_repro/v2_*.rb`(自己完結 7 本 — mix / gen / fstring / clone-freeze /
-  shutdown-flush + incremental×multi(`v2_incremental_vs_multi_objspace.rb`)+ orphan-pjob
-  (`v2_orphan_merge_pjob.rb`))+ v1 オラクル `rlgc_repro/b7–b11`(65 本)。
+- **repro スイート**: `rlgc_repro/v2_*.rb`(自己完結 8 本 — mix / gen / fstring / clone-freeze /
+  shutdown-flush + incremental×multi + orphan-pjob + **verify**(`v2_verify_consistency.rb`))
+  + v1 オラクル `rlgc_repro/b7–b11`(65 本)。
+- **RLGC 不変条件 verifier**: `GC.verify_internal_consistency` が s→u=shref 検査・
+  shref⟹unshareable・bitmap⟺FL_SHAREABLE・T_NONE ビット衛生・封じ込め(u→外部 u 禁止、
+  例外 box->top_self)・呼び出し Ractor の root スコープ(machine_context と設計上
+  クロスルートな VM 大域は除外)を検査する。
   最終掃引: **ok 57 / timeout 8 / crash 0**(timeout は cpu≈wall の全力 spin = adversarial 設計、v1 期から master でも完走しない)
 - **TSan**: worktree ビルド(`git worktree add` → clang-18 `-fsanitize=thread -O1`; in-tree srcdir 直は VPATH が in-tree .o を拾い破綻)。
   `TSAN_OPTIONS="suppressions=RLGC_DOC/tsan_suppressions.txt"` で**未分類 0**(suppression は全件根拠コメント付き; 非マッチ=新規=要調査)
