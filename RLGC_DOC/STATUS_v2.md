@@ -40,7 +40,9 @@
 
 1. shareable 増加: `shareable_objects > limit`(survivors×2.0、下限 1<<16)
 2. 滞留: `stalled_shareables > limit/2` — mark 完了後の pin walk が数える「自 root から届かない shareable」(M5(7) で pin を gc_marks_finish へ移設し意味を厳密化)
-2. zombie objspace 堆積 ≥ 8
+3. zombie 保持ページ ≥ 256(`vm->gc.zombie_total_pages` — retire 時記録、global cycle がバリア内で実測 refresh。a6d47bd3d で個数 8 から置換)
+
+評価は **gc_start 冒頭**(割り当てスローパス含む全 GC 入口の合流点 — a6d47bd3d で配線漏れ修正)。
 
 ## 検証手段
 
