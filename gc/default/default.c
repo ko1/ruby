@@ -5882,8 +5882,18 @@ check_children_i(const VALUE child, void *ptr)
             close(fd);
         }
 #endif
-        fprintf(stderr, "VERIFY-NOTE: non-heap child %p (from %s) readable=%d w0=%p w1=%p\n",
-                (void *)child, rb_obj_info(data->parent), (int)readable,
+        /* if the parent is a Thread wrapper, identify the field by raw
+         * pointer equality (no dereference of the stale target) */
+        const char *field = "?";
+        if (rb_obj_is_kind_of(data->parent, rb_cThread)) {
+            const rb_thread_t *pth = rb_thread_ptr(data->parent);
+            if (child == (VALUE)pth->ractor) field = "th->ractor";
+            else if (child == (VALUE)pth->root_fiber) field = "th->root_fiber";
+            else if (child == (VALUE)pth->ec) field = "th->ec";
+            else if (child == (VALUE)pth->nt) field = "th->nt";
+        }
+        fprintf(stderr, "VERIFY-NOTE: non-heap child %p (from %s field=%s) readable=%d w0=%p w1=%p\n",
+                (void *)child, rb_obj_info(data->parent), field, (int)readable,
                 (void *)w[0], (void *)w[1]);
         return;
     }

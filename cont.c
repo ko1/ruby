@@ -1293,6 +1293,21 @@ fiber_free(void *ptr)
 
     if (DEBUG) fprintf(stderr, "fiber_free: %p[%p]\n", (void *)fiber, fiber->stack.base);
 
+    /* RLGCv2: if this is a thread's root fiber, the thread's ec points
+     * INTO this struct (&fiber->cont.saved_ec). Detach before freeing:
+     * the thread wrapper can outlive this one (their sweep order is
+     * arbitrary), and its dmark must not walk a freed ec -- the
+     * consistency verifier visits such wrappers even when no real mark
+     * ever would. (thread_free clears our thread_ptr in the reverse
+     * order, so this dereference is safe.) */
+    {
+        rb_thread_t *th = fiber->cont.saved_ec.thread_ptr;
+        if (th && th->ec == &fiber->cont.saved_ec) {
+            th->ec = NULL;
+            if (th->root_fiber == fiber) th->root_fiber = NULL;
+        }
+    }
+
     if (fiber->cont.saved_ec.local_storage) {
         rb_id_table_free(fiber->cont.saved_ec.local_storage);
     }
@@ -1507,6 +1522,13 @@ cont_init_jit_cont(rb_context_t *cont)
     VM_ASSERT(cont->jit_cont == NULL);
     // We always allocate this since YJIT may be enabled later
     cont->jit_cont = jit_cont_new(&(cont->saved_ec));
+}
+
+void
+rb_fiberptr_detach_thread(struct rb_fiber_struct *fiber)
+{
+    /* the owning thread struct is being freed (see thread_free) */
+    fiber->cont.saved_ec.thread_ptr = NULL;
 }
 
 struct rb_execution_context_struct *
