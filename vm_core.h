@@ -822,9 +822,17 @@ typedef struct rb_vm_struct {
         struct rb_objspace_zombie {
             void *objspace;
             void **owner_slot;
+            /* heap pages the zombie held when last measured (at retire;
+             * refreshed by each global cycle under the barrier). The
+             * aggregate below stays in exact entry-by-entry sync. */
+            size_t pages;
         } *zombie_objspaces;
         size_t zombie_objspaces_count;
         size_t zombie_objspaces_capa;
+        /* design_v2.md section 2.2 trigger 3: sum of .pages over the
+         * ledger. Between global cycles it is an upper bound (a
+         * zombie's heap never grows; only a global cycle shrinks it). */
+        size_t zombie_total_pages;
 
 #if USE_MODULAR_GC
         struct gc_mark_func_data_struct *mark_func_data;

@@ -810,7 +810,11 @@ static rb_global_objspace_t *global_objspace = NULL;
  * mirrors the old-generation limit rule. Tuned in M5. */
 #define RLGC_SHAREABLE_LIMIT_MIN (1 << 16)
 #define RLGC_SHAREABLE_LIMIT_FACTOR 2.0
-#define RLGC_ZOMBIE_OBJSPACES_TRIGGER 8
+/* design_v2.md section 2.2 trigger 3: global GC when terminated,
+ * uninherited Ractors retain this many heap pages (a tiny Ractor's
+ * objspace is ~13 pages, so mass-disposable workloads stay under the
+ * bar; one fat zombie trips it promptly). */
+#define RLGC_ZOMBIE_PAGES_TRIGGER 256
 
 /* RLGCv2 global GC (design_v2.md §2.2). Mark/sweep predicates consult the
  * per-objspace during_global_gc flag; this is only the driver's iteration
@@ -7562,7 +7566,11 @@ rlgc_global_wanted_p(rb_objspace_t *objspace)
 {
     if (rb_gc_single_objspace_p()) return false;
     if (objspace->rlgc.shareable_objects > objspace->rlgc.shareable_objects_limit) return true;
-    if (rb_gc_vm_zombie_objspaces_count() >= RLGC_ZOMBIE_OBJSPACES_TRIGGER) return true;
+    /* design_v2.md section 2.2 trigger 3: zombies hold heap PAGES, not
+     * heads -- a thousand tiny disposable Ractors are cheaper than one
+     * fat one. The global cycle both collects their garbage and (for
+     * disowned ones) lets the merge reclaim the shells. */
+    if (rb_gc_vm_zombie_total_pages() >= RLGC_ZOMBIE_PAGES_TRIGGER) return true;
     /* design_v2.md §2.2 trigger 2: retention. Shareables unreachable
      * from our own roots (counted by the end-of-mark pin) have piled up
      * to the scale of the last global cycle's survivor count
@@ -7591,13 +7599,9 @@ garbage_collect(rb_objspace_t *objspace, unsigned int reason)
     objspace->profile.prepare_time = getrusage_time() - objspace->profile.prepare_time;
 #endif
 
-    if (rlgc_global_wanted_p(objspace)) {
-        rlgc_global_gc(objspace);
-        ret = TRUE;
-    }
-    else {
-        ret = gc_start(objspace, reason);
-    }
+    /* the global-vs-local decision lives at the top of gc_start, the
+     * single point every entry (incl. the allocation slow path) passes */
+    ret = gc_start(objspace, reason);
 
     return ret;
 }
@@ -7609,6 +7613,18 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
 
     if (!rb_darray_size(objspace->heap_pages.sorted)) return TRUE; /* heap is not ready */
     if (!(reason & GPR_FLAG_METHOD) && !ready_to_gc(objspace)) return TRUE; /* GC is not allowed */
+
+    /* RLGCv2 (design_v2.md section 2.2): every local-GC entry asks
+     * whether the shareable world needs the global cycle instead --
+     * including the allocation slow path, which reaches gc_start
+     * directly without passing garbage_collect. Only the global cycle
+     * reclaims dead shareables, stalled retentions and zombie pages;
+     * deciding only on explicit/malloc-triggered GCs would let an
+     * allocation-driven workload sail past every threshold. */
+    if (rlgc_global_wanted_p(objspace)) {
+        rlgc_global_gc(objspace);
+        return TRUE;
+    }
 
     rb_gc_initialize_vm_context(&objspace->vm_context);
 
@@ -8152,6 +8168,15 @@ rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
     return MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj) != 0;
 }
 
+/* current heap page count (the zombie-ledger page accounting,
+ * design_v2.md section 2.2 trigger 3) */
+size_t
+rb_gc_impl_heap_page_count(void *objspace_ptr)
+{
+    rb_objspace_t *objspace = objspace_ptr;
+    return rb_darray_size(objspace->heap_pages.sorted);
+}
+
 static void
 rlgc_global_objspaces_i(void *os, void *data)
 {
@@ -8293,6 +8318,13 @@ rlgc_global_gc(rb_objspace_t *driver)
         if (objspace != driver) during_gc = FALSE;
     }
     rlgc_global.active = false;
+
+    /* Re-measure the zombie ledger now that their garbage is gone --
+     * still inside the barrier, so the entries are stable. Without
+     * this the page trigger above would keep firing on the stale
+     * retire-time numbers of joinable (slotted) zombies, which no pass
+     * merges away. */
+    rb_gc_vm_refresh_zombie_pages();
 
     /* If the sweep above collected unjoined Ractor objects, ractor_free
      * disowned their zombie-ledger entries and posted the merge to the

@@ -1760,6 +1760,13 @@ rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
     return false;
 }
 
+size_t
+rb_gc_impl_heap_page_count(void *objspace_ptr)
+{
+    /* single objspace: the zombie ledger is always empty */
+    return 0;
+}
+
 void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {

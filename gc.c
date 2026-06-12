@@ -3796,10 +3796,13 @@ zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot)
         vm->gc.zombie_objspaces = grown;
         vm->gc.zombie_objspaces_capa = new_capa;
     }
+    size_t pages = rb_gc_impl_heap_page_count(objspace);
     vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = (struct rb_objspace_zombie){
         .objspace = objspace,
         .owner_slot = owner_slot,
+        .pages = pages,
     };
+    vm->gc.zombie_total_pages += pages;
 }
 
 /* Called when a Ractor terminates without having been joined: its
@@ -3888,6 +3891,7 @@ rb_gc_vm_forget_zombie(void *objspace)
     size_t n = vm->gc.zombie_objspaces_count;
     for (size_t i = 0; i < n; i++) {
         if (vm->gc.zombie_objspaces[i].objspace == objspace) {
+            vm->gc.zombie_total_pages -= vm->gc.zombie_objspaces[i].pages;
             vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[n - 1];
             vm->gc.zombie_objspaces_count = n - 1;
             break;
@@ -3895,10 +3899,30 @@ rb_gc_vm_forget_zombie(void *objspace)
     }
 }
 
+/* design_v2.md section 2.2 trigger 3. Between global cycles this is an
+ * upper bound (zombie heaps never grow); each global cycle re-measures
+ * under its barrier (rb_gc_vm_refresh_zombie_pages), so the shrink from
+ * collecting a zombie's garbage is reflected and the trigger cannot
+ * re-fire on stale numbers. The lock-free read of the plain size_t from
+ * a deciding local GC is benign: at worst one cycle early or late. */
 size_t
-rb_gc_vm_zombie_objspaces_count(void)
+rb_gc_vm_zombie_total_pages(void)
 {
-    return GET_VM()->gc.zombie_objspaces_count;
+    return GET_VM()->gc.zombie_total_pages;
+}
+
+/* called by the global cycle, inside the barrier */
+void
+rb_gc_vm_refresh_zombie_pages(void)
+{
+    rb_vm_t *vm = GET_VM();
+    size_t total = 0;
+    for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
+        size_t pages = rb_gc_impl_heap_page_count(vm->gc.zombie_objspaces[i].objspace);
+        vm->gc.zombie_objspaces[i].pages = pages;
+        total += pages;
+    }
+    vm->gc.zombie_total_pages = total;
 }
 
 /* RLGCv2 (design_v2.md section 2.1 step 0): incremental marking runs

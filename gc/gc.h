@@ -87,7 +87,8 @@ MODULAR_GC_FN unsigned int rb_gc_vm_lock_no_barrier(const char *file, int line);
 MODULAR_GC_FN void rb_gc_vm_unlock_no_barrier(unsigned int lev, const char *file, int line);
 MODULAR_GC_FN void rb_gc_vm_barrier(void);
 MODULAR_GC_FN void rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data);
-MODULAR_GC_FN size_t rb_gc_vm_zombie_objspaces_count(void);
+MODULAR_GC_FN size_t rb_gc_vm_zombie_total_pages(void);
+MODULAR_GC_FN void rb_gc_vm_refresh_zombie_pages(void);
 /* no MODULAR_GC_FN: also called from VM code (ractor.c), so it must keep
  * external linkage in non-modular builds too (see internal/gc.h) */
 bool rb_gc_single_objspace_p(void);
