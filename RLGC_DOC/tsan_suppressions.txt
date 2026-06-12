@@ -22,6 +22,13 @@ deadlock:rb_ractor_sched_barrier_start
 # Shape tree lock-free readers (upstream lock-free design).
 race:shape_get_next
 
+# The timer thread peeks ubf_list_head emptiness without ubf_list_lock
+# (ubf_threads_empty <- timer_thread_set_timeout); a stale read only
+# defers the unblock sweep by one timer tick. Upstream pattern in
+# thread_pthread.c, untouched by RLGC (caught during a TSan build's
+# mkmf, which runs system()).
+race:ubf_threads_empty
+
 # --- RLGCv2, benign by design ---------------------------------------
 
 # Inline method cache stores (any executing Ractor) vs the owner's GC
@@ -53,3 +60,38 @@ race:rb_thread_sched_mark_zombies
 # objspace, so either value compares false. gc_enter itself keys off
 # the stable rlgc_main_objspace instead.
 race:rb_thread_create_ractor
+
+# Ractor status byte: lock-free readers (Ractor#inspect, terminated?
+# polls, blocking-cnt bookkeeping peeks) tolerate any momentary value;
+# every decision made on it is re-validated under the ractor/VM lock.
+race:ractor_status_set
+
+# The global call-cache cache (gccct, vm_eval.c) reads entries
+# speculatively and refills under the VM lock -- upstream's lock-free
+# design. Either the old or the new cc is observed; both stay alive in
+# RLGCv2 via the born-shareable pin.
+race:gccct_method_search
+
+# The owner's GC ages an object by an RMW on its flags word while
+# foreign Ractors read IMMUTABLE bits of the same word lock-free
+# (vm_ic_hit_p reading a shareable constcache's flags). The read sees
+# the old or the new word; the bits it consults are identical in both.
+# No write-write pairing exists: the constcache's own flag writes
+# (`flags |= IMEMO_CONST_CACHE_SHAREABLE`) happen on the freshly
+# allocated, not-yet-published entry, and every refill replaces the
+# entry wholesale.
+race:RVALUE_AGE_SET
+
+# Method call-cache fastpath install (vm_cc_call_set): any executing
+# Ractor stores the same function pointer for the same cme; readers
+# see the uninitialized-slow or the installed-fast value, both valid.
+# Sibling of the inline-cache-store family above; liveness of the cc
+# is the born-shareable pin's job.
+race:vm_cc_call_set
+
+# The owner's GC re-asserts WB_REQUIRED on an escaped (shareable proc)
+# env frame while a foreign Ractor executing that proc walks the env
+# pointers (rb_vm_svar_lep reads VM_ENV_FLAG_LOCAL of the same flags
+# word). The walked bits are immutable after escape; the RMW's bit is
+# not consulted by the walker.
+race:VM_ENV_FLAGS_SET
