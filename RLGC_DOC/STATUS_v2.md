@@ -40,7 +40,7 @@
 
 1. shareable 増加: `shareable_objects > limit`(survivors×2.0、下限 1<<16)
 2. 滞留: `stalled_shareables > limit/2` — mark 完了後の pin walk が数える「自 root から届かない shareable」(M5(7) で pin を gc_marks_finish へ移設し意味を厳密化)
-3. zombie objspace 堆積 ≥ 8
+2. zombie objspace 堆積 ≥ 8
 
 ## 検証手段
 
@@ -64,12 +64,10 @@
 
 ## 残項目(2026-06-11 設計合意済みの実装キュー — 上から順に)
 
-1. **zombie トリガのページ量化(§2.2 トリガ 3 改稿済み)**: 個数 8 → `vm->gc.zombie_total_pages`
-   ベース(retire/併合で増減)。閾値・下限の既定値はここで決める
-2. **mark_func_data の per-Ractor 化(§1.3 どおりへ)**: 現実装は VM 共有 + during_gc ゲート
+1. **mark_func_data の per-Ractor 化(§1.3 どおりへ)**: 現実装は VM 共有 + during_gc ゲート
    (M5(3))の暫定。per-Ractor 化でゲート自体を不要にする
 3. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
-4. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
-5. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
-6. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
-7. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
+3. move の re-homing 方式(§4.4): コピー+無効化 vs dmove 特別扱い — ユーザ判断待ち
+4. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
+5. ASAN/TSan の CI 常設化(レシピ・suppression は完備)
+6. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
