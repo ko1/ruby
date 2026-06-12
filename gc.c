@@ -2977,19 +2977,18 @@ ruby_stack_check(void)
 
 /* ==================== Marking ==================== */
 
-/* RLGCv2: mark_func_data is VM-GLOBAL, but the redirect belongs only to
- * the thread that installed it (a traversal API holding the VM lock,
- * never inside a real GC). A concurrent lock-free local GC on another
- * thread must keep actually marking while a redirect is installed --
- * taking the traverse branch there would feed its objects to a foreign
- * callback and leave them unmarked (freed alive). during_gc on the
- * CURRENT objspace tells the two apart. */
+/* RLGCv2 (design_v2.md section 1.3): the mark redirect is PER RACTOR.
+ * A traversal API's redirect is visible only to the installing Ractor,
+ * so another Ractor's concurrent lock-free local GC keeps actually
+ * marking by construction -- the old VM-global field needed a
+ * during_gc gate for that. The redirect branch parks the pointer to
+ * NULL around each callback, so a real GC triggered by the callback's
+ * own allocations actually marks as well. */
 #define RB_GC_MARK_OR_TRAVERSE(func, obj_or_ptr, obj, check_obj) do { \
     if (!RB_SPECIAL_CONST_P(obj)) { \
-        rb_vm_t *vm = GET_VM(); \
+        rb_ractor_t *mfd_cr = GET_RACTOR(); \
         void *objspace = rb_gc_get_objspace(); \
-        if (LIKELY(vm->gc.mark_func_data == NULL) || \
-                rb_gc_impl_during_gc_p(objspace)) { \
+        if (LIKELY(mfd_cr->mark_func_data == NULL)) { \
             GC_ASSERT(rb_gc_impl_during_gc_p(objspace)); \
             (func)(objspace, (obj_or_ptr)); \
         } \
@@ -2998,10 +2997,10 @@ ruby_stack_check(void)
                     !rb_gc_impl_garbage_object_p(objspace, obj) : \
                 true) { \
             GC_ASSERT(!rb_gc_impl_during_gc_p(objspace)); \
-            struct gc_mark_func_data_struct *mark_func_data = vm->gc.mark_func_data; \
-            vm->gc.mark_func_data = NULL; \
+            struct gc_mark_func_data_struct *mark_func_data = mfd_cr->mark_func_data; \
+            mfd_cr->mark_func_data = NULL; \
             mark_func_data->mark_func((obj), mark_func_data->data); \
-            vm->gc.mark_func_data = mark_func_data; \
+            mfd_cr->mark_func_data = mark_func_data; \
         } \
     } \
 } while (0)
@@ -5329,16 +5328,16 @@ rb_objspace_reachable_objects_from(VALUE obj, void (func)(VALUE, void *), void *
         if (rb_gc_impl_during_gc_p(rb_gc_get_objspace())) rb_bug("rb_objspace_reachable_objects_from() is not supported while during GC");
 
         if (!RB_SPECIAL_CONST_P(obj)) {
-            rb_vm_t *vm = GET_VM();
-            struct gc_mark_func_data_struct *prev_mfd = vm->gc.mark_func_data;
+            rb_ractor_t *cr = GET_RACTOR();
+            struct gc_mark_func_data_struct *prev_mfd = cr->mark_func_data;
             struct gc_mark_func_data_struct mfd = {
                 .mark_func = func,
                 .data = data,
             };
 
-            vm->gc.mark_func_data = &mfd;
+            cr->mark_func_data = &mfd;
             rb_gc_mark_children(rb_gc_get_objspace(), obj);
-            vm->gc.mark_func_data = prev_mfd;
+            cr->mark_func_data = prev_mfd;
         }
     }
 }
@@ -5361,23 +5360,22 @@ rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE,
 {
     if (rb_gc_impl_during_gc_p(rb_gc_get_objspace())) rb_bug("rb_gc_impl_objspace_reachable_objects_from_root() is not supported while during GC");
 
-    rb_vm_t *vm = GET_VM();
-
     struct root_objects_data data = {
         .func = func,
         .data = passing_data,
     };
 
-    struct gc_mark_func_data_struct *prev_mfd = vm->gc.mark_func_data;
+    rb_ractor_t *cr = GET_RACTOR();
+    struct gc_mark_func_data_struct *prev_mfd = cr->mark_func_data;
     struct gc_mark_func_data_struct mfd = {
         .mark_func = root_objects_from,
         .data = &data,
     };
 
-    vm->gc.mark_func_data = &mfd;
+    cr->mark_func_data = &mfd;
     rb_gc_save_machine_context();
     rb_gc_mark_roots(rb_gc_get_objspace(), &data.category);
-    vm->gc.mark_func_data = prev_mfd;
+    cr->mark_func_data = prev_mfd;
 }
 
 /*

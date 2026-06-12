@@ -679,6 +679,16 @@ typedef struct rb_hook_list_struct {
 // see builtin.h for definition
 typedef const struct rb_builtin_function *RB_BUILTIN;
 
+/* The mark redirect used by the object-traversal APIs
+ * (rb_objspace_reachable_objects_from etc.). The field lives per
+ * Ractor (rb_ractor_t, design_v2.md section 1.3): an installed
+ * redirect belongs to the installing Ractor alone, and another
+ * Ractor's concurrent real GC must never see it. */
+struct gc_mark_func_data_struct {
+    void *data;
+    void (*mark_func)(VALUE v, void *data);
+};
+
 typedef struct rb_vm_struct {
     VALUE self;
 
@@ -826,10 +836,6 @@ typedef struct rb_vm_struct {
          * zombie's heap never grows; only a global cycle shrinks it). */
         size_t zombie_total_pages;
 
-        struct gc_mark_func_data_struct {
-            void *data;
-            void (*mark_func)(VALUE v, void *data);
-        } *mark_func_data;
     } gc;
 
     rb_at_exit_list *at_exit;
