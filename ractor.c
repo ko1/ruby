@@ -367,8 +367,9 @@ ractor_free(void *ptr)
      * its handle is now gone, so nobody can ever inherit its objspace
      * through Ractor#value. Only the global GC collects Ractor objects
      * (they are shareable), so we are inside its sweep, under the
-     * barrier: queue the objspace; the cycle merges it into main right
-     * after the sweep.
+     * barrier: disown the zombie-ledger entry (this struct is freed
+     * below) and post the merge to the main Ractor as a postponed job;
+     * main absorbs the objspace at its next safepoint.
      *
      * The main Ractor gets here only from the free-at-exit walk
      * (rb_objspace_free_objects), which is driven by the main objspace
@@ -376,7 +377,7 @@ ractor_free(void *ptr)
      * r->objspace set so rb_gc_get_objspace() stays valid for the
      * remaining dfree calls of the walk. */
     if (r->objspace && !r->main_ractor) {
-        rb_gc_objspace_orphaned(r->objspace);
+        rb_gc_objspace_disown(r->objspace);
         r->objspace = NULL;
     }
 
