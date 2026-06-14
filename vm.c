@@ -3886,17 +3886,18 @@ thread_compact(void *ptr)
     th->self = rb_gc_location(th->self);
 }
 
-static void
-thread_mark(void *ptr)
+/* Mark the heap-object roots a thread owns, other than its ec and fibers
+ * (the caller marks those). Factored out of thread_mark so that the RLGCv2
+ * confined GC can root these directly from a Ractor's local roots
+ * (rb_ractor_mark_local_roots): a Ractor's main Thread wrapper may live in
+ * the *creating* Ractor's objspace, so thread_mark never runs in this
+ * thread's own local GC, and any of these roots allocated in the thread's
+ * own objspace (the thgroup, born at thread_do_start_proc) would otherwise
+ * be freed mid-run and crash the next global mark. Keeping this the single
+ * list of a thread's owned roots stops the two markers from drifting. */
+void
+rb_thread_mark_owned_roots(rb_thread_t *th)
 {
-    rb_thread_t *th = ptr;
-    RUBY_MARK_ENTER("thread");
-
-    // ec is null when setting up the thread in rb_threadptr_root_fiber_setup
-    if (th->ec) {
-        rb_fiber_mark_self(th->ec->fiber_ptr);
-    }
-
     /* mark ruby objects */
     switch (th->invoke_type) {
       case thread_invoke_type_proc:
@@ -3911,6 +3912,31 @@ thread_mark(void *ptr)
         break;
     }
 
+    rb_gc_mark(th->thgroup);
+    rb_gc_mark(th->value);
+    rb_gc_mark(th->pending_interrupt_queue);
+    rb_gc_mark(th->pending_interrupt_mask_stack);
+    rb_gc_mark(th->top_self);
+    rb_gc_mark(th->top_wrapper);
+    rb_gc_mark(th->last_status);
+    rb_gc_mark(th->locking_mutex);
+    rb_gc_mark(th->name);
+    rb_gc_mark(th->scheduler);
+
+    rb_threadptr_interrupt_exec_task_mark(th);
+}
+
+static void
+thread_mark(void *ptr)
+{
+    rb_thread_t *th = ptr;
+    RUBY_MARK_ENTER("thread");
+
+    // ec is null when setting up the thread in rb_threadptr_root_fiber_setup
+    if (th->ec) {
+        rb_fiber_mark_self(th->ec->fiber_ptr);
+    }
+
     /* No mark through th->ractor: a thread wrapper can outlive its
      * rb_ractor_t (the struct dies with the Ractor object, while the
      * wrapper of a dead Ractor's thread can be inherited through
@@ -3919,22 +3945,11 @@ thread_mark(void *ptr)
      * rooted from the VM's ractor set, so this edge never carried any
      * liveness; chasing the pointer here crashed real marks on merged
      * dead-Ractor heaps. */
-    rb_gc_mark(th->thgroup);
-    rb_gc_mark(th->value);
-    rb_gc_mark(th->pending_interrupt_queue);
-    rb_gc_mark(th->pending_interrupt_mask_stack);
-    rb_gc_mark(th->top_self);
-    rb_gc_mark(th->top_wrapper);
     if (th->root_fiber) rb_fiber_mark_self(th->root_fiber);
 
     RUBY_ASSERT(th->ec == NULL || th->ec == rb_fiberptr_get_ec(th->ec->fiber_ptr));
-    rb_gc_mark(th->last_status);
-    rb_gc_mark(th->locking_mutex);
-    rb_gc_mark(th->name);
 
-    rb_gc_mark(th->scheduler);
-
-    rb_threadptr_interrupt_exec_task_mark(th);
+    rb_thread_mark_owned_roots(th);
 
     RUBY_MARK_LEAVE("thread");
 }
