@@ -295,6 +295,15 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
                 VALUE fiber_self = rb_fiberptr_self(th->ec->fiber_ptr);
                 if (fiber_self) rb_gc_mark(fiber_self);
             }
+
+            /* RLGCv2: thread_mark does not run in this thread's own local
+             * GC when its wrapper lives in another objspace (above), so the
+             * rest of the thread's owned roots are unreachable from here
+             * unless marked directly.  The thgroup is allocated in this
+             * Ractor's own objspace at thread_do_start_proc and is rooted
+             * from nowhere else; without this the owner's local GC frees it
+             * mid-run and the next global mark hits a T_NONE thgroup. */
+            rb_thread_mark_owned_roots(th);
         }
     }
 
