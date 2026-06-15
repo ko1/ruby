@@ -446,9 +446,10 @@ rb_immutable_obj_clone(int argc, VALUE *argv, VALUE obj)
 VALUE
 rb_get_freeze_opt(int argc, VALUE *argv)
 {
-    /* idFreeze (== :freeze) is preinterned before any Ruby code runs, so use it
-     * directly instead of lazily initializing a shared static, which races when
-     * Ractors run this concurrently. */
+    /* idFreeze is a predefined id (== :freeze), set up at boot before any
+     * Ruby code runs. Using it directly avoids the lazy `if (!keyword_ids[0])
+     * CONST_ID(...)` on a process-wide static, whose unsynchronized init
+     * raced (benignly, same value) across parallel Ractors under RLGCv2. */
     const ID keyword_ids[1] = { idFreeze };
     VALUE opt;
     VALUE kwfreeze = Qnil;
