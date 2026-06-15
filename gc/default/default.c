@@ -2017,6 +2017,18 @@ rb_gc_impl_garbage_object_p(void *objspace_ptr, VALUE ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
+    /* RLGCv2 containment: a foreign object is a live leaf from here -- its
+     * liveness and collection are its owner's business, and reading its
+     * type / before_sweep / mark bits would race the owner's concurrent
+     * local GC. Outside the global GC's barrier, never report it garbage.
+     * The fstring / symbol weak-set lookups (rb_concurrent_set_find) query
+     * this cross-objspace; their entries are born-shareable and only ever
+     * collectable under the global STW, when no mutator runs the lookup, so
+     * "not garbage" is the correct answer here. */
+    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(ptr) != objspace) && !objspace->during_global_gc) {
+        return false;
+    }
+
     /* Asking whether a freed (T_NONE), moved (T_MOVED), or finalized (T_ZOMBIE)
      * object is garbage gives an unreliable answer: the slot may since have been
      * reused for an unrelated object. A reference to one of these is stale and a
