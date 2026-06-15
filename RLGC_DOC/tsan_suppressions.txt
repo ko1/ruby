@@ -95,3 +95,35 @@ race:vm_cc_call_set
 # word). The walked bits are immutable after escape; the RMW's bit is
 # not consulted by the walker.
 race:VM_ENV_FLAGS_SET
+
+# --- RLGCv2, classified in the 10h verification campaign (2026-06-15) ---
+# (The campaign also produced real fixes -- garbage_object_p containment,
+# postponed-job atomic read, rb_get_freeze_opt idFreeze -- which removed
+# their race families outright; the entries below are the genuinely benign
+# remainder.)
+
+# Inline constant cache. getconstant_path loads ic->entry and reads the
+# entry's flags/value lock-free, while another Ractor publishes a fresh
+# entry (vm_ic_update's RB_OBJ_WRITE) and the old one is freed+reused later.
+# A reader runs entirely between two safepoints with no GC in between, and
+# the global GC that frees a (born-shareable) entry first waits for every
+# Ractor to reach a safepoint -- so a reader never observes a freed entry;
+# the free and the slot reuse are sequenced after the read by the STW
+# barrier, which TSan cannot model. Even if a stale entry were read, the
+# hit check fails (reused slot lacks IMEMO_CONST_CACHE_SHAREABLE) -> miss ->
+# recompute. Sibling of the vm_search_method / RVALUE_AGE_SET families.
+race:rb_vm_opt_getconstant_path
+race:vm_ic_hit_p
+
+# Call-cache builtin-function fastpath install: vm_cc_bf_set stores cc->bf
+# (the same bf for the same cme) while an executing Ractor reads it. Same
+# benign pattern as vm_cc_call_set; liveness via the born-shareable pin.
+race:vm_cc_bf_set
+
+# Terminated Ractor's heap absorb (rlgc_objspace_absorb) rewrites
+# page->objspace while a concurrent marker on a *third* Ractor reads it for
+# the containment check (gc_mark). The marker is neither the absorbing
+# Ractor (dst, which performs the absorb single-threaded) nor the dead src,
+# so page->objspace compares foreign whichever value is observed -> the
+# object is treated as a live leaf and skipped either way. Benign.
+race:rlgc_objspace_absorb
