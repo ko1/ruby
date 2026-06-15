@@ -1987,8 +1987,11 @@ rb_postponed_job_flush(rb_vm_t *vm)
             while (triggered_bits) {
                 unsigned int i = bit_length(triggered_bits) - 1;
                 triggered_bits ^= ((1UL) << i); /* toggle ith bit off */
-                /* Read atomically to pair with the atomic CAS/EXCHANGE stores in
-                 * rb_postponed_job_preregister, which can run on another thread. */
+                /* Read atomically to pair with rb_postponed_job_preregister's
+                 * atomic CAS/EXCHANGE stores: under RLGCv2 every Ractor's
+                 * objspace init re-preregisters the shared GC finalize job
+                 * (same func/data), so a flush on one Ractor races those
+                 * stores on another. */
                 rb_postponed_job_func_t func = (rb_postponed_job_func_t)(uintptr_t)RUBY_ATOMIC_PTR_LOAD(pjq->table[i].func);
                 void *data = RUBY_ATOMIC_PTR_LOAD(pjq->table[i].data);
                 (func)(data);
