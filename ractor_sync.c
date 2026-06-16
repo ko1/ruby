@@ -1048,16 +1048,19 @@ ractor_basket_value(struct ractor_basket *b)
         rb_ractor_t *cr = rb_ec_ractor_ptr(rb_current_ec_noinline());
         VM_ASSERT(UNDEF_P(cr->sync.in_flight_materializing) || cr->sync.in_flight_materializing == Qfalse);
         cr->sync.in_flight_materializing = b->p.v;
+        VALUE result;
         if (b->p.marshaled) {
-            b->p.v = rb_marshal_load(b->p.v);
+            result = rb_marshal_load(b->p.v);
         }
         else {
-            VALUE v = ractor_copy_native_try(b->p.v);
-            if (UNDEF_P(v)) rb_bug("ractor_basket_value: native snapshot not natively copyable");
-            b->p.v = v;
+            result = ractor_copy_native_try(b->p.v);
+            if (UNDEF_P(result)) rb_bug("ractor_basket_value: native snapshot not natively copyable");
         }
         cr->sync.in_flight_materializing = Qfalse;
-        ractor_reset_belonging(b->p.v);
+        /* keep the result stack-rooted past the in_flight slot being cleared */
+        ractor_reset_belonging(result);
+        b->p.v = result;
+        RB_GC_GUARD(result);
         break;
       }
       case basket_type_move: {
@@ -1073,11 +1076,19 @@ ractor_basket_value(struct ractor_basket *b)
         VM_ASSERT(cr->sync.in_flight_courier == NULL);
         struct rb_ractor_move_courier *courier = b->p.move_courier;
         cr->sync.in_flight_courier = courier;
-        b->p.v = ractor_move_courier_materialize(courier);
+        /* Keep the materialized graph on the machine stack (result) across the
+         * whole post-materialize sequence. Once in_flight_courier is cleared it
+         * is the ONLY root for the graph until it reaches the caller's stack;
+         * ractor_move_courier_free walks a big free-loop here, a wide enough
+         * window for a concurrent global GC (main's GC.start(full)) to collect
+         * the graph if it lived only in the malloc'd basket's p.v. */
+        VALUE result = ractor_move_courier_materialize(courier);
         cr->sync.in_flight_courier = NULL;
         ractor_move_courier_free(courier);
         b->p.move_courier = NULL;
-        ractor_reset_belonging(b->p.v);
+        ractor_reset_belonging(result);
+        b->p.v = result;
+        RB_GC_GUARD(result);
         break;
       }
       default:
