@@ -765,6 +765,56 @@ objspace の unshareable T_DATA への生ポインタが残る」ことを意味
 send 系に入れないこと。なお `Ractor#value` がコピー無しで済むのはすり抜けではなく、
 参照を返す前に objspace ごと併合するからである(§4.3)。
 
+### 4.5 move は「off-heap courier(変則 Marshal)」で運ぶ(2026-06-16 確定)
+
+#### 旧案(二段 traverse)が破綻した理由
+
+当初は「send 時に送信側 objspace へ snapshot を作り(move_enter+move_leave)、
+receive 時にもう一度 move traverse して受信側へ再ホーム」する二段案だった。しかし
+M1b(local GC のバリア外し)では破綻する:
+
+- snapshot は**送信側 objspace の GC オブジェクト**で、送信中ピン(shref)で延命する。
+- shref オブジェクトは送信側 local GC の **`rlgc_pinned_roots_mark` がルートとして
+  descend(traverse)** し、compaction では**移動もされ得る**(shref ビットは gc_move で
+  移送される)。
+- ところが receive 側の二段目 traverse は **snapshot をその場で書き換える**
+  (`obj_traverse_replace_i` の move 枝で `RB_OBJ_WRITE`、`rb_ary_cancel_sharing` 等)。
+- 結果、**送信側 GC が snapshot を辿る × 受信側が書き換える** のデータ競合(TSan 実証)
+  と、compaction による移動で受信側の生ポインタが dangling、が起きる。VM バリアは
+  local GC を止めないので無力。flat-mark(descend しない延命)も世代別 GC の
+  re-mark 規則と噛み合わず young 子が解放される。
+
+#### 確定案:in-flight ペイロードを GC オブジェクトにしない
+
+> **送信中の move ペイロードを「どの objspace のヒープにも置かない」**=
+> xmalloc した off-heap の **move courier** に直列化する。
+
+in-flight が GC オブジェクトでなくなるので、**延命・競合・compaction の問題が一括で
+消滅**する(送信側 GC は courier を mark/sweep/move しない)。実体は「**変則 Marshal**」:
+
+- グラフ構造をノード配列に直列化。ノード間参照は **node id**(src→id の dedup マップで
+  **共有部分グラフと循環参照を解決**)。
+- malloc バッファは**コピーせずポインタ移管**(String の char バッファ、IO の fd/fptr)
+  — move のゼロコピー性をここで担保。
+- ユーザの `marshal_dump`/`_dump` フックは**呼ばない**(決定 11 と同じ)。
+- 原本は捕捉と同時に **RactorMovedObject 化**(move 意味論)。
+
+**送信**(`ractor_move_courier_build`): obj を辿って courier を構築、各原本を husk 化。
+**受信**(`ractor_move_courier_materialize`): 受信側 objspace で **2 パス**
+(全ノードのシェルを確保 → 中身を充填)で再構築し循環を解く。完了後 `xfree`。
+courier が保持する VALUE は **shareable/immediate のみ**(REF ノードとクラス)なので、
+それだけを mark すれば足り(`ractor_move_courier_mark`、basket / in_flight_courier
+経由)、shareable の mark は read-only で競合しない。
+
+対応型: String / Array / Hash / Object / Struct / MatchData / IO / immediate・shareable、
++ インスタンス/汎用 ivar(全型共通)/ 凍結 / 共有特異クラスの再アタッチ。MatchData は
+re.c に専用ヘルパ(`rb_match_move_dump`/`_alloc`/`_load`/`_free`)を置き、レジスタを
+onig 非依存の blob に取り出して再構築する。
+
+**コンテナ buffer 流用**(Array の `VALUE*`、Hash の st_table、Object の ivar buffer を
+ポインタ移管して受信側で再利用)は**後続の最適化**(現状は構造を再構築し、String/IO
+のみゼロコピー)。
+
 ## 5. 実装計画(origin/master から。各段で全テスト green)
 
 順序は **M0 → M1a → M3 → M2 → M4 → M1b → M5**。local GC の並行化(M1b)を
