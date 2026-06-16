@@ -18,6 +18,12 @@ static VALUE ractor_send(rb_execution_context_t *ec, const struct ractor_port *r
 static VALUE ractor_try_send(rb_execution_context_t *ec, const struct ractor_port *rp, VALUE obj, VALUE move);
 static void ractor_add_port(rb_ractor_t *r, st_data_t id);
 
+// RLGCv2 (design_v2.md §4.5): off-heap move courier, defined in ractor.c
+struct rb_ractor_move_courier *ractor_move_courier_build(VALUE obj);
+VALUE ractor_move_courier_materialize(struct rb_ractor_move_courier *c);
+void ractor_move_courier_free(struct rb_ractor_move_courier *c);
+void ractor_move_courier_mark(struct rb_ractor_move_courier *c);
+
 static void
 ractor_port_mark(void *ptr)
 {
@@ -211,6 +217,9 @@ struct ractor_basket {
          * does not support); the receiver materializes it with
          * Marshal.load instead of the native traversal. */
         bool marshaled;
+        /* RLGCv2 (design_v2.md §4.5): for basket_type_move, the off-heap
+         * (xmalloc'd) move courier; v is unused for move baskets. */
+        struct rb_ractor_move_courier *move_courier;
     } p; // payload
 
     struct ccan_list_node node;
@@ -233,12 +242,23 @@ ractor_basket_none_p(const struct ractor_basket *b)
 static void
 ractor_basket_mark(const struct ractor_basket *b)
 {
-    rb_gc_mark(b->p.v);
+    if (b->type == basket_type_move) {
+        /* the courier is off-heap; mark only the shareable VALUEs it carries */
+        ractor_move_courier_mark(b->p.move_courier);
+    }
+    else {
+        rb_gc_mark(b->p.v);
+    }
 }
 
 static void
 ractor_basket_free(struct ractor_basket *b)
 {
+    if (b->type == basket_type_move && b->p.move_courier) {
+        /* an unconsumed move courier (e.g. the queue is being torn down) */
+        ractor_move_courier_free(b->p.move_courier);
+        b->p.move_courier = NULL;
+    }
     SIZED_FREE(b);
 }
 
@@ -669,23 +689,29 @@ ractor_mark_ports_i(st_data_t key, st_data_t val, st_data_t data)
 static void
 ractor_sync_mark(rb_ractor_t *r)
 {
-    /* Single VALUE slots are stable (set once at creation, or written
-     * by the owner as one aligned word): safe to read from any GC. */
+    /* default_port_value is a stable single slot (set once at creation,
+     * written by the owner as one aligned word): safe to read from any GC. */
     rb_gc_mark(r->sync.default_port_value);
 
-    /* snapshot being materialized by a receive (basket already popped) */
-    rb_gc_mark(r->sync.in_flight_materializing);
-
-    /* RLGCv2 M1b: the queues, the port table and the monitor list are
-     * mutated by the owner under its sync lock, so a lock-free foreign
-     * mark (main's local GC traversing this Ractor object) reads them
-     * torn -- and by containment everything in them is foreign to that
-     * marker anyway (payload snapshots stay alive through the sender's
-     * shref pin, ports through the shareable pin). Walk them only when
-     * no concurrent owner can exist: our own Ractor, a terminated one,
+    /* RLGCv2 M1b: the queues, the port table, the monitor list AND the
+     * in_flight_materializing slot are mutated by the owner under its sync
+     * lock (or, for in_flight_materializing, written by the owner during a
+     * receive), so a lock-free foreign mark (main's local GC traversing this
+     * Ractor object) reads them torn -- and by containment everything in
+     * them is foreign to that marker anyway (payload snapshots stay alive
+     * through the sender's in-flight pin: the shref for copy, the move
+     * manager for move; ports through the shareable pin). Walk them only
+     * when no concurrent owner can exist: our own Ractor, a terminated one,
      * or under the global GC's barrier. */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p()) {
+        /* snapshot/manager being materialized by a receive (basket already
+         * popped); off the queue, rooted only here for the global GC's
+         * re-pin. A foreign marker must not read this slot. */
+        rb_gc_mark(r->sync.in_flight_materializing);
+        /* the move courier being materialized is off-heap; mark the shareable
+         * VALUEs it carries so a concurrent global GC keeps them */
+        ractor_move_courier_mark(r->sync.in_flight_courier);
         if (r->sync.ports) {
             ractor_queue_mark(r->sync.recv_queue);
             st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
@@ -700,7 +726,9 @@ ractor_queue_repin_in_flight(const struct ractor_queue *rq)
 {
     const struct ractor_basket *b;
     ccan_list_for_each(&rq->set, b, node) {
-        if (b->type == basket_type_copy || b->type == basket_type_move) {
+        /* move baskets carry an off-heap courier (no shref to re-pin); their
+         * shareable VALUEs are marked through ractor_basket_mark instead. */
+        if (b->type == basket_type_copy) {
             rb_gc_pin_in_flight_message(b->p.v);
         }
     }
@@ -921,7 +949,6 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
     }
 }
 
-static VALUE ractor_move(VALUE obj);            // in ractor.c
 static VALUE ractor_copy_native_try(VALUE obj); // in ractor.c
 
 static VALUE
@@ -943,8 +970,6 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
     switch (*ptype) {
       case basket_type_ref:
         return obj;
-      case basket_type_move:
-        return ractor_move(obj);
       default:
         if (rb_ractor_shareable_p(obj)) {
             *ptype = basket_type_ref;
@@ -972,21 +997,32 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
 static struct ractor_basket *
 ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type type, bool exc)
 {
-    bool marshaled = false;
-    VALUE v = ractor_prepare_payload(ec, obj, &type, &marshaled);
-
-    if (type == basket_type_copy || type == basket_type_move) {
-        /* RLGCv2: the snapshot (native copy graph or Marshal string)
-         * lives in the sender's objspace until the receiver materializes
-         * it.  Pin it (shref) so the sender's confined GC keeps it. */
-        rb_gc_pin_in_flight_message(v);
-    }
-
     struct ractor_basket *b = ractor_basket_alloc();
-    b->type = type;
-    b->p.v = v;
     b->p.exception = exc;
-    b->p.marshaled = marshaled;
+    b->p.marshaled = false;
+    b->p.move_courier = NULL;
+
+    if (type == basket_type_move) {
+        /* RLGCv2 (design_v2.md §4.5): serialize the graph into an off-heap
+         * courier; the originals become RactorMovedObject. Nothing in flight
+         * is a GC object, so the sender's GC never marks/sweeps/moves it. */
+        b->type = basket_type_move;
+        b->p.v = Qfalse;
+        b->p.move_courier = ractor_move_courier_build(obj);
+    }
+    else {
+        bool marshaled = false;
+        VALUE v = ractor_prepare_payload(ec, obj, &type, &marshaled);
+        if (type == basket_type_copy) {
+            /* RLGCv2: the copy snapshot (native graph or Marshal string)
+             * lives in the sender's objspace until the receiver materializes
+             * it.  Pin it (shref) so the sender's confined GC keeps it. */
+            rb_gc_pin_in_flight_message(v);
+        }
+        b->type = type;
+        b->p.v = v;
+        b->p.marshaled = marshaled;
+    }
     return b;
 }
 
@@ -1024,14 +1060,26 @@ ractor_basket_value(struct ractor_basket *b)
         ractor_reset_belonging(b->p.v);
         break;
       }
-      case basket_type_move:
-        /* TODO(M3): a moved graph is still handed over by reference and
-         * stays in the sender's objspace (kept by the in-flight pin).
-         * Materializing it like copy would break dmove-style T_DATA
-         * (e.g. IO fd ownership) and moved-object identity; the move
-         * path needs its own re-homing design. */
+      case basket_type_move: {
+        /* RLGCv2 (design_v2.md §4.5): rebuild the moved graph from the
+         * off-heap courier into THIS Ractor's objspace. The originals are
+         * already RactorMovedObject (set when the courier was built), so
+         * move's snapshot semantics hold. The courier is xmalloc'd, not a GC
+         * object, so the sender's concurrent confined GC never marked, swept,
+         * moved or raced it -- no keep-alive trick, no STW. The only VALUEs it
+         * carries are shareables/immediates; in_flight_courier roots them for
+         * a global GC while we rebuild. */
+        rb_ractor_t *cr = rb_ec_ractor_ptr(rb_current_ec_noinline());
+        VM_ASSERT(cr->sync.in_flight_courier == NULL);
+        struct rb_ractor_move_courier *courier = b->p.move_courier;
+        cr->sync.in_flight_courier = courier;
+        b->p.v = ractor_move_courier_materialize(courier);
+        cr->sync.in_flight_courier = NULL;
+        ractor_move_courier_free(courier);
+        b->p.move_courier = NULL;
         ractor_reset_belonging(b->p.v);
         break;
+      }
       default:
         VM_ASSERT(0); // unreachable
     }
