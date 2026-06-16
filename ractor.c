@@ -2252,7 +2252,7 @@ struct move_node {
         VALUE ref;
         struct { char *ptr; long len; int encidx; } str;        /* courier owns ptr */
         struct { long len; uint32_t *elems; } ary;              /* courier owns elems */
-        struct { long size; uint32_t *kv; bool compare_by_id; } hash; /* owns kv (2*size) */
+        struct { long size; uint32_t *kv; uint32_t ifnone_id; bool compare_by_id; bool proc_default; } hash; /* owns kv (2*size) */
         struct { VALUE klass; } obj;
         struct { long len; uint32_t *elems; VALUE klass; } strct; /* owns elems */
         struct { uint32_t regexp_id, str_id; int num_regs; void *regs; VALUE klass; } match; /* owns regs */
@@ -2391,17 +2391,22 @@ move_capture(struct move_build *b, VALUE obj)
 
     switch (BUILTIN_TYPE(obj)) {
       case T_STRING: {
+        /* Make the source own a private buffer (un-shares a shared string and
+         * copies a static STR_NOFREE one); frozen strings are fine -- this
+         * changes buffer ownership, not content. After this the string is
+         * either embedded or owns an exclusive malloc'd heap buffer. */
+        rb_str_make_independent(obj);
         long len = RSTRING_LEN(obj);
         int encidx = ENCODING_GET(obj);
         char *ptr;
-        if (!STR_EMBED_P(obj) && !STR_SHARED_P(obj)) {
-            /* owns a heap buffer: carry it across by pointer (zero-copy);
-             * the source becomes a shell that never frees it. */
+        if (!STR_EMBED_P(obj)) {
+            /* owns an exclusive heap buffer: carry it across by pointer
+             * (zero-copy); the source becomes a shell that never frees it. */
             ptr = RSTRING(obj)->as.heap.ptr;
         }
         else {
-            /* embedded or shared: copy the bytes into a courier-owned buffer
-             * (the embedded slot / shared root is released the normal way). */
+            /* embedded: copy the bytes into a courier-owned buffer (the slot
+             * is released the normal way when the husk is swept). */
             ptr = ALLOC_N(char, len + 1);
             if (len) memcpy(ptr, RSTRING_PTR(obj), len);
             ptr[len] = '\0';
@@ -2422,14 +2427,18 @@ move_capture(struct move_build *b, VALUE obj)
         b->c->nodes[id].kind = MOVE_K_ARRAY;
         b->c->nodes[id].u.ary.len = len;
         b->c->nodes[id].u.ary.elems = elems;
-        /* release the source's owned heap buffer (children already read) */
-        if (!ARY_EMBED_P(obj) && !ARY_SHARED_P(obj)) {
+        /* Release the source's owned heap buffer (children already read).
+         * Skip embedded (no heap buffer), a sharer (the root owns the buffer),
+         * and a shared-root (other live arrays still point into the buffer --
+         * freeing it would dangle them; they keep it alive instead). */
+        if (!ARY_EMBED_P(obj) && !ARY_SHARED_P(obj) && !ARY_SHARED_ROOT_P(obj)) {
             ruby_xfree((void *)RARRAY_CONST_PTR(obj));
         }
         break;
       }
 
       case T_HASH: {
+        uint32_t ifnone_id = move_capture(b, RHASH_IFNONE(obj));
         long size = RHASH_SIZE(obj);
         uint32_t *kv = size ? ALLOC_N(uint32_t, size * 2) : NULL;
         struct move_hash_ctx hc = { b, kv, 0 };
@@ -2437,7 +2446,9 @@ move_capture(struct move_build *b, VALUE obj)
         b->c->nodes[id].kind = MOVE_K_HASH;
         b->c->nodes[id].u.hash.size = size;
         b->c->nodes[id].u.hash.kv = kv;
+        b->c->nodes[id].u.hash.ifnone_id = ifnone_id;
         b->c->nodes[id].u.hash.compare_by_id = RTEST(rb_hash_compare_by_id_p(obj));
+        b->c->nodes[id].u.hash.proc_default = FL_TEST_RAW(obj, RHASH_PROC_DEFAULT) != 0;
         /* release the source's st-table internals (ar tables are in-slot) */
         rb_hash_free(obj);
         break;
@@ -2581,12 +2592,21 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
                 rb_ary_push(shell, RARRAY_AREF(shells, n->u.ary.elems[j]));
             }
             break;
-          case MOVE_K_HASH:
+          case MOVE_K_HASH: {
             for (long j = 0; j < n->u.hash.size; j++) {
                 rb_hash_aset(shell, RARRAY_AREF(shells, n->u.hash.kv[2 * j]),
                              RARRAY_AREF(shells, n->u.hash.kv[2 * j + 1]));
             }
+            /* restore the default value / default proc (set before freezing) */
+            VALUE ifnone = RARRAY_AREF(shells, n->u.hash.ifnone_id);
+            if (n->u.hash.proc_default) {
+                rb_hash_set_default_proc(shell, ifnone);
+            }
+            else if (ifnone != Qnil) {
+                rb_hash_set_default(shell, ifnone);
+            }
             break;
+          }
           case MOVE_K_STRUCT:
             for (long j = 0; j < n->u.strct.len; j++) {
                 RSTRUCT_SET(shell, (int)j, RARRAY_AREF(shells, n->u.strct.elems[j]));
