@@ -1080,6 +1080,74 @@ match_set_regs(VALUE match, int num_regs, const OnigPosition *beg, const OnigPos
     rm->num_regs = num_regs;
 }
 
+/* RLGCv2 (design_v2.md §4.5): Ractor#send(move:) carries a MatchData across
+ * objspaces through the off-heap move courier (ractor.c). re.c owns the
+ * MatchData internals, so the courier dumps the match's registers into a plain
+ * (onig-free) blob -- releasing the source's malloc'd region/char_offset so the
+ * source can become a RactorMovedObject husk without leaking -- and rebuilds a
+ * match from that blob on the receiving Ractor. The regexp and string travel
+ * as ordinary courier children (they are re-homed like any other reference). */
+void *
+rb_match_move_dump(VALUE match, VALUE *regexp_out, VALUE *str_out, int *num_regs_out)
+{
+    struct RMatch *rm = RMATCH(match);
+    int n = rm->num_regs;
+    *regexp_out = rm->regexp;
+    *str_out = rm->str;
+    *num_regs_out = n;
+
+    OnigPosition *blob = ALLOC_N(OnigPosition, n ? 2 * n : 1);
+    const OnigPosition *beg = RMATCH_BEG_PTR(match);
+    const OnigPosition *end = RMATCH_END_PTR(match);
+    for (int i = 0; i < n; i++) {
+        blob[2 * i] = beg[i];
+        blob[2 * i + 1] = end[i];
+    }
+
+    if (FL_TEST_RAW(match, RMATCH_ONIG)) {
+        onig_region_free(&rm->as.onig, 0);
+        memset(&rm->as.onig, 0, sizeof(rm->as.onig));
+        FL_UNSET_RAW(match, RMATCH_ONIG);
+    }
+    if (rm->char_offset) {
+        ruby_xfree(rm->char_offset);
+        rm->char_offset = NULL;
+        rm->char_offset_num_allocated = 0;
+    }
+    return blob;
+}
+
+VALUE
+rb_match_move_alloc(VALUE klass, int num_regs)
+{
+    return match_alloc_n(klass, num_regs);
+}
+
+void
+rb_match_move_load(VALUE match, VALUE regexp, VALUE str, int num_regs, const void *blob_)
+{
+    const OnigPosition *blob = blob_;
+    struct RMatch *rm = RMATCH(match);
+    RB_OBJ_WRITE(match, &rm->str, str);
+    RB_OBJ_WRITE(match, &rm->regexp, regexp);
+
+    OnigPosition *beg = ALLOC_N(OnigPosition, num_regs ? num_regs : 1);
+    OnigPosition *end = ALLOC_N(OnigPosition, num_regs ? num_regs : 1);
+    for (int i = 0; i < num_regs; i++) {
+        beg[i] = blob[2 * i];
+        end[i] = blob[2 * i + 1];
+    }
+    match_set_regs(match, num_regs, beg, end);
+    ruby_xfree(beg);
+    ruby_xfree(end);
+}
+
+void
+rb_match_move_free(void *blob)
+{
+    ruby_xfree(blob);
+}
+
 typedef struct {
     long byte_pos;
     long char_pos;
