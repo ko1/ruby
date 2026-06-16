@@ -5841,6 +5841,21 @@ check_generation_i(const VALUE child, void *ptr)
      * machinery, not by this objspace's remembered set. */
     if (GET_HEAP_OBJSPACE(child) != data->objspace) return;
 
+    /* RLGCv2: in the multi-objspace world the end-of-mark pinned walk
+     * re-marks every shareable -- and every shref'd child of one -- on
+     * every local cycle, so a shareable parent keeps its young children
+     * alive without a remembered-set entry; the generational O->Y
+     * invariant simply does not bind for it. (In the single-objspace
+     * world the pinned walk does not run, so the ordinary check stays.
+     * Confirmed harmless: the identical churn without the verifier never
+     * freed such a child.) This surfaced only when the verifier ran on a
+     * WORKER's objspace, where born-shareable cc/cme entries age
+     * locally; main's per-test verify never reached it. */
+    if (!rb_gc_single_objspace_p() &&
+        MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(parent), parent)) {
+        return;
+    }
+
     if (!RVALUE_OLD_P(data->objspace, child)) {
         if (!RVALUE_REMEMBERED(data->objspace, parent) &&
             !RVALUE_REMEMBERED(data->objspace, child) &&

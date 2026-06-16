@@ -12,6 +12,10 @@
 // experimental flag because it is not sure it is the common pattern
 #define RUBY_TYPED_FROZEN_SHAREABLE_NO_REC RUBY_FL_FINALIZE
 
+/* RLGCv2 (design_v2.md §4.5): an in-flight move payload, serialized off-heap
+ * (defined in ractor.c). */
+struct rb_ractor_move_courier;
+
 struct rb_ractor_sync {
     // ractor lock
     rb_nativethread_lock_t lock;
@@ -49,6 +53,12 @@ struct rb_ractor_sync {
      * the global GC's in-flight re-pin keep the sender-resident snapshot
      * alive while the copy is running. */
     VALUE in_flight_materializing;
+
+    /* RLGCv2 (design_v2.md §4.5): the move courier currently being
+     * materialized by this Ractor's receive. The courier is xmalloc'd (not a
+     * GC object), so this slot exists only to mark the shareable VALUEs it
+     * carries while the rebuild is running. */
+    struct rb_ractor_move_courier *in_flight_courier;
 };
 
 // created
