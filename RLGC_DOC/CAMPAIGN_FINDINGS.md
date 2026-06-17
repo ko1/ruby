@@ -179,3 +179,182 @@ Next ideas: a dedicated debug build that (a) keeps a C backtrace under TSan, or
 (b) asserts graph integrity at receive-return vs walk-time to bisect the
 window; or instrument newobj/sweep to log when a known in-flight node's slot is
 freed.
+
+---
+
+## 2026-06-16 (session 2): move-courier SEGV characterised further
+
+Non-TSan campaign verdict = CLEAN. The 401 "fails" on the move arm and 306 on
+the nosend arm were ALL ec=126 (text-file-busy): the soaks exec the in-tree
+./ruby while a rebuild relinks it. Zero real crashes across ~24k move runs, ~3.9k
+nosend runs, ASAN 0/862, plain 0, test-all 0 failures. (Campaign hygiene: snapshot
+the binary per arm, or pause arms during rebuild, to stop polluting crash logs.)
+
+The SEGV is RELIABLE under TSan -- it fires in 1-2 oracle runs, not "rare".
+The earlier "rare" reading was plain builds only; TSan widens the window enough
+that it is essentially per-run. So iteration is fast.
+
+Why the C backtrace is always truncated: Ruby's [BUG] reporter RE-FAULTS while
+unwinding -- stderr shows
+  rehome.rb:70: [BUG] Segmentation fault at 0x0
+  SEGV received in SEGV handler
+  ABRT received in SEGV handler
+i.e. the unwinder touches corrupt/freed state and segfaults again. RUBY_ON_BUG
+(gdb attach on crash, ptrace_scope=0 confirmed) also fails: "ptrace: No such
+process" -- the process dies in the recursive fault before gdb attaches. The
+working capture is to run the oracle UNDER gdb so gdb stops at the FIRST SIGSEGV
+at the faulting instruction (in progress).
+
+Ruled OUT this session: write-barrier bypass in materialize. Every reference
+store materialize makes goes through the WB --
+  rb_ary_push / rb_hash_aset / rb_ivar_set : WB ok
+  RSTRUCT_SET -> rb_struct_aset            : WB ok
+  rb_match_move_load                       : RB_OBJ_WRITE (str, regexp) ok
+The rehome:70 crash is a pure nested-array+string graph (all MOVE_K_ARRAY /
+MOVE_K_STRING nodes, no per-type oddity), and the lost child is RANDOM -> points
+to a marking-COVERAGE race in the move window (global GC vs the receiver's local
+GC / stack-scan of `shells`+`result`), not a per-node structural bug. design_v2
+line 722 requires every materialize store to pass the receiver WB (satisfied);
+lines 780-785 record the OLD design's identical symptom ("young children freed,
+re-mark rule mismatch").
+
+HARNESS NOTE: each Bash tool call runs in its own PID namespace (PID 1 = the
+wrapper); backgrounded jobs die when the call returns. Use the Bash tool's
+run_in_background for anything long-lived. The autonomous campaign runs outside
+these namespaces (cron/user session) -- readable via status files, not signalable
+from a tool call.
+
+### RESOLVED 2026-06-16: the "move SEGV / #18 blocker" is a libtsan-internal crash
+
+Ran the move oracle UNDER gdb (ptrace_scope=0) so gdb stops at the FIRST SIGSEGV
+before Ruby's (re-faulting) bug reporter. Captured 3 crashes -- ALL fault inside
+ThreadSanitizer's own runtime, two distinct co-occurring signatures:
+
+  (A) #0 __sanitizer_internal_memcpy   movups %xmm0,(%rax,%rdi,1) rax=0,rdi=0 -> memcpy into NULL
+      #1 __tsan::VarSizeStackTrace::Init
+      #2 __tsan::ReportRace
+      #3 vm_search_method_slowpath0  vm_insnhelper.c:2255  (cd->cc = cc)
+         / vm_lookup_cc             vm_insnhelper.c:2149  (ccs->len)
+      si_addr = 0x0. libtsan's trace reconstruction allocates a NULL buffer and
+      memcpys into it while building a race report -- under many Ractors reporting
+      concurrently (several threads simultaneously inside __tsan::ReportRace).
+
+  (B) #0 __tsan_func_entry           (per-call shadow-stack push)
+      #1 rb_current_ec_noinline  vm.c:688  <- ractor_unlock_self <- ractor_wait
+      si_addr ~ 0x7fffdb57fff8 (8 bytes below a page boundary = shadow-stack edge);
+      another thread in __tsan::DD::GetReport (deadlock detector). libtsan's own
+      shadow-stack / bookkeeping faulting.
+
+The race in (A) is the benign lock-free inline method/call cache (cd->cc), ALREADY
+in tsan_suppressions.txt (race:vm_search_method_slowpath0 / _fastpath /
+rb_iseq_mark_and_move). A runtime suppression CANNOT prevent this crash: libtsan
+builds the report's stack traces BEFORE checking suppressions, and dies during the
+build.
+
+This is NOT a Ruby / RLGCv2 / move-courier bug:
+ - the move-courier graph is valid (the materialize-end integrity check never
+   fired across many crashing runs);
+ - ASAN build clean 0/862, plain build clean ~45k runs -- the SAME Ruby code is
+   memory-safe; the crash exists ONLY when libtsan is linked;
+ - every fault is inside libtsan's own internal memory (its NULL trace buffer, its
+   shadow stack) -- addresses Ruby never writes; a wild Ruby write there would show
+   under ASAN, which is clean.
+ - toolchain is STABLE clang 18.1.3 / compiler-rt (not experimental) -- so this is
+   a genuine libtsan capacity/robustness limit under the RLGCv2 multi-Ractor
+   workload (8 Ractors, rapid create/destroy, heavy shared-ISeq dispatch + GC
+   stress), not a flaky build.
+
+Mitigation tried: added RLGC_DOC/tsan_ignorelist.txt and rebuilt vm.o (where
+vm_insnhelper.c is #included) with -fsanitize-ignorelist=... to EXCLUDE the benign
+IC accessors from instrumentation (no shadow access recorded -> no report built ->
+reporter (A) never runs). This removed signature (A), but signature (B)
+(__tsan_func_entry / shadow stack) still fires at a similar rate -> libtsan remains
+unstable on these heavy oracles regardless.
+
+RECOMMENDATION (for the GC author to decide):
+ - Treat the move/churn/rehome oracles as covered by ASAN + plain (both clean) and
+   the courier as DONE. Reserve TSan for LIGHTER oracles (fewer Ractors / less
+   dispatch volume) where libtsan stays stable and its race-detection is trustworthy.
+ - Keep or drop the ignorelist (it cleans up signature (A) noise on a known-benign
+   race; it slightly narrows IC-function coverage, all already classified benign).
+ - Optional: try a newer compiler-rt, lower history_size, or fewer concurrent
+   Ractors in the heavy oracles, to see if libtsan's internal crashes abate.
+
+### CONFIRMED FIX 2026-06-17: coroutine TSan-fiber annotations eliminate the SEGV
+
+Root cause of (B)/(C) confirmed by the minimal fix working: Ruby's coroutine
+context switches (Context_swap via coroutine_transfer, co_start) are not annotated
+for TSan, so libtsan's per-OS-thread shadow stack / trace / stack depot leak across
+switches and overflow -> internal crash. Added (minimal, MN scheduler only):
+  coroutine/amd64/Context.h : COROUTINE_SANITIZE_THREAD guard + void *tsan_fiber;
+      coroutine_initialize -> __tsan_create_fiber; _main -> __tsan_get_current_fiber;
+      coroutine_destroy -> __tsan_destroy_fiber.
+  thread_pthread.c coroutine_transfer0 : __tsan_switch_to_fiber(transfer_to->tsan_fiber,0)
+      before coroutine_transfer (the single switch chokepoint).
+  Makefile cflags : -fsanitize-ignorelist=.../tsan_ignorelist.txt made permanent.
+
+Result on the move oracles under TSan+GC_STRESS:
+  before any fix      : SEGV in 1-2 runs
+  ignorelist only     : still SEGV run 1 (signature B)
+  fiber + ignorelist  : crash 0/40, MOVE_CHURN_OK / MOVE_REHOME_OK printed.
+=> (B)/(C) were the coroutine-annotation gap. NOT a Ruby/RLGC/courier bug.
+
+Cascade (each fix unmasks the next, all now that libtsan is stable):
+ 1. "unlock of an unlocked mutex (or by a wrong thread)" at thread_sched_unlock_
+    <- co_start. The M:N scheduler HANDS OFF sched->lock_ across a coroutine switch
+    (lock before transfer, unlock in the resumed co_start). Same OS thread, valid
+    POSIX, but once fibers are annotated TSan sees lock-on-fiber-A / unlock-on-fiber-B.
+    Suppressed: mutex:thread_sched_unlock_ / mutex:thread_sched_lock_.
+ 2. After that suppression: data races in the scheduler (thread_sched_set_running:692
+    write, thread_sched_wait_running_turn:845 read on sched->running). BOTH sides hold
+    M1 = sched->lock_ -> they ARE mutually excluded; the report is a FALSE POSITIVE.
+    Cause: the wrong-fiber unlock of sched->lock_ corrupts TSan's happens-before model
+    of that mutex, so all sched->lock_-protected state then looks racy. The lock-handoff
+    idiom is fundamentally at odds with TSan's "unlock by the locking thread" model once
+    fibers are visible.
+
+KEY: thread_pthread.c / thread_pthread_mn.c / coroutine/ are NOT modified by RLGC
+(branch diff vs merge-base touches only cont.c + thread.c). The lock-handoff and the
+racing scheduler state are pure UPSTREAM M:N scheduler code; origin/master HEAD ==
+rlgc-v2 merge-base (26f09eb6a). Upstream-vs-RLGC empirical split: building stock
+master+TSan and running a generic 8-Ractor send/receive+GC test (no move:) — in
+progress.
+
+### UPSTREAM-CONFIRMED 2026-06-17: the crash is stock Ruby+TSan, not RLGC
+
+Built clean upstream master (origin/master == rlgc-v2 merge-base 26f09eb6a) with
+TSan (clang-18, -fsanitize=thread -O1 -g), NO RLGC, NO fiber annotation. Ran a
+generic 8-Ractor send/receive + GC.start test (/tmp/claude/generic_ractor.rb,
+public Ractor API only, no move:). Result over 8 runs:
+    crash=3  hang=5  clean=0
+    CRASH: [BUG] Segmentation fault at 0x0            (signature A, libtsan ReportRace)
+    CRASH: [BUG] Segmentation fault at 0x7fffdbb00000 (signature C, libtsan StackDepot)
+    HANG x5 (TSan deadlock / swallowed SIGTERM)
+=> stock upstream Ruby + TSan cannot run a multi-Ractor workload: same crash
+   signatures, zero RLGC code involved. The #18 "move SEGV" is an UPSTREAM
+   Ruby x ThreadSanitizer integration bug (coroutine switches unannotated for
+   TSan). RLGC / the move courier are entirely innocent; the move oracles were
+   merely the workload that exercised the upstream M:N coroutine scheduler.
+
+### STAGE 2 UPSTREAM 2026-06-17: fix works on upstream; handoff races are upstream too
+
+Upstream master + TSan + the full fix (fiber annotation in coroutine/amd64/Context.h
+& thread_pthread.c + -fsanitize-ignorelist for the IC family). Generic 8-Ractor test,
+no suppressions, 8 runs:
+    crash=0  hang=0  all GENERIC_RACTOR_OK
+Distinct TSan reports remaining are ALL upstream:
+  - sched->lock_ handoff false-races: thread_sched_set_running:692,
+    thread_sched_wakeup_running_thread:775, thread_sched_to_ready_common:810,
+    rb_ractor_sched_wakeup:1443  (identical to what RLGC showed -> upstream).
+  - already-classified-benign VM races: gccct_method_search, vm_search_method_fastpath,
+    vm_ic_hit_p, rb_vm_opt_getconstant_path, vm_lock_enter, rb_ec_vm_lock_rec, rb_obj_write.
+
+CONCLUSION: the entire "#18 move SEGV" phenomenon is upstream Ruby x ThreadSanitizer:
+  (1) crash = coroutine switches unannotated for TSan -> reproduces on stock master;
+  (2) fix = the TSan fiber annotation -> works on stock master (crash 0);
+  (3) residual handoff false-races = upstream M:N scheduler lock-handoff vs TSan's
+      fiber-aware mutex model.
+RLGC and the move courier are fully exonerated. The fiber annotation is an
+upstream-valuable contribution (makes TSan usable for any multi-Ractor testing).
+Reproduction artifacts: /tmp/claude/wt-up (clean upstream 26f09eb6a),
+/tmp/claude/build-up-tsan, /tmp/claude/generic_ractor.rb, stage1.sh, stage2.sh.
