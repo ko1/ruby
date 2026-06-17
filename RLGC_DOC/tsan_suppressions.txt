@@ -127,3 +127,16 @@ race:vm_cc_bf_set
 # so page->objspace compares foreign whichever value is observed -> the
 # object is treated as a live leaf and skipped either way. Benign.
 race:rlgc_objspace_absorb
+
+# --- RLGCv2, surfaced after the coroutine TSan-fiber annotations (2026-06-17) ---
+
+# The M:N thread scheduler hands its lock (sched->lock_) ACROSS a coroutine
+# switch by design: it is pthread_mutex_lock'd before coroutine_transfer and
+# pthread_mutex_unlock'd in the resumed coroutine's co_start (thread_sched_unlock_).
+# This is the same OS thread throughout, so the POSIX unlock is valid. Once the
+# coroutine switches are annotated for TSan (__tsan_switch_to_fiber, required to
+# stop libtsan crashing on the move oracles) TSan models each coroutine as a
+# distinct fiber and reports the handoff as "unlock of an unlocked mutex (or by
+# a wrong thread)". Benign: the lock ownership is handed over intentionally.
+mutex:thread_sched_unlock_
+mutex:thread_sched_lock_
