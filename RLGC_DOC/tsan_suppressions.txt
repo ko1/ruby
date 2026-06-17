@@ -179,3 +179,12 @@ race:rb_ractor_sched_wait
 # the dying_th ordering.
 race:rb_threadptr_sched_free
 race:native_thread_assign
+
+# The Ractor sched lock is ACQUIRED across the handoff too (co_start ->
+# thread_sched_lock_), the mirror of the unlock side above. A single-world local
+# GC freeing a just-terminated (e.g. failed-creation) Ractor races the nt's
+# co_start lock-acquire in TSan's view (ractor_free / free vs thread_sched_lock_),
+# again because the handoff hides the happens-before. ASAN (5 GC-stress runs of
+# failed-creation churn) shows NO use-after-free -- the dying_th ordering keeps
+# the free after the nt's teardown; this is the same benign handoff blind spot.
+race:thread_sched_lock_
