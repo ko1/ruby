@@ -2914,6 +2914,16 @@ gc_location_internal(void *objspace, VALUE value)
         return value;
     }
 
+    /* RLGCv2: a reference into ANOTHER objspace's heap does not move during
+     * THIS objspace's compaction -- only the owning objspace relocates it (and
+     * fixes its own incoming references). Leave such a foreign reference
+     * unchanged rather than asserting it belongs to this objspace. (In a
+     * single-objspace VM every valid reference is local, so this is a no-op
+     * there.) */
+    if (!rb_gc_impl_pointer_to_heap_p(objspace, (void *)value)) {
+        return value;
+    }
+
     return rb_gc_impl_location(objspace, value);
 }
 
