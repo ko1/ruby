@@ -6330,21 +6330,70 @@ gc_verify_internal_consistency_(rb_objspace_t *objspace)
     gc_report(5, objspace, "gc_verify_internal_consistency: OK\n");
 }
 
+/* The `during_gc` macro expands the bare identifier to
+ * `objspace->flags.during_gc`, so a foreign objspace's flag cannot be spelled
+ * directly; these helpers reach it through a parameter named `objspace`. */
+static inline unsigned int
+gc_during_gc_get(const rb_objspace_t *objspace)
+{
+    return during_gc;
+}
+
+static inline void
+gc_during_gc_set(rb_objspace_t *objspace, unsigned int v)
+{
+    during_gc = v;
+}
+
+/* Runs the consistency checks with during_gc temporarily cleared on both the
+ * objspace under test and the current Ractor's objspace.
+ *
+ * The internal rb_objspace_reachable_objects_from() traversal the checks use
+ * guards on the *current Ractor's* objspace (rb_gc_get_objspace()), not
+ * objspace_ptr. During a global GC the driver runs the per-objspace verify for
+ * a foreign os, so that guard would still see during_gc set on the driver --
+ * clear the current objspace's flag too. (When cur == objspace this is a
+ * no-op.) */
+static void
+gc_verify_internal_consistency_body(rb_objspace_t *objspace)
+{
+    const unsigned int prev_during_gc = during_gc;
+    during_gc = FALSE; // stop gc here
+
+    rb_objspace_t *const cur = rb_gc_get_objspace();
+    const unsigned int prev_cur_during_gc = (cur != objspace) ? gc_during_gc_get(cur) : 0;
+    if (cur != objspace) gc_during_gc_set(cur, FALSE);
+    {
+        gc_verify_internal_consistency_(objspace);
+    }
+    if (cur != objspace) gc_during_gc_set(cur, prev_cur_during_gc);
+    during_gc = prev_during_gc;
+}
+
 static void
 gc_verify_internal_consistency(void *objspace_ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
+    /* RLGCv2: when invoked mid-collection (during_gc already set on this
+     * objspace) do NOT acquire the VM lock or raise a barrier. A worker's
+     * local GC holds no VM lock, so blocking on it here would let the worker
+     * join a pending global barrier mid-collection (design_v2.md section 2.1:
+     * nothing inside a GC may acquire the VM lock); the global GC would then
+     * clear this objspace's during_gc and sweep a heap the local mark is still
+     * walking. No barrier is needed anyway: the objspace is single-writer and
+     * this verify runs synchronously on its owner's thread (no concurrent
+     * mutation), and the global driver -- which sets during_gc on every
+     * objspace it collects -- already holds the lock and the barrier. */
+    if (during_gc) {
+        gc_verify_internal_consistency_body(objspace);
+        return;
+    }
+
     unsigned int lev = RB_GC_VM_LOCK();
     {
         rb_gc_vm_barrier(); // stop other ractors
-
-        unsigned int prev_during_gc = during_gc;
-        during_gc = FALSE; // stop gc here
-        {
-            gc_verify_internal_consistency_(objspace);
-        }
-        during_gc = prev_during_gc;
+        gc_verify_internal_consistency_body(objspace);
     }
     RB_GC_VM_UNLOCK(lev);
 }
@@ -7952,6 +8001,17 @@ gc_clock_end(struct timespec *ts)
     return 0;
 }
 
+/* Whether a (non-global) local GC of `objspace` holds the no-barrier VM lock
+ * for its duration: always for the main objspace (it walks the VM-global
+ * roots), and under RGENGC_CHECK_MODE for every objspace (so the
+ * mid-collection verify's cross-objspace iteration is lock-safe and no global
+ * GC interleaves). See gc_enter. */
+static inline bool
+gc_local_gc_holds_vm_lock(const rb_objspace_t *objspace)
+{
+    return objspace == rlgc_main_objspace || RGENGC_CHECK_MODE >= 2;
+}
+
 static inline void
 gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_lev)
 {
@@ -7973,7 +8033,16 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
      * waiter joins a pending barrier mid-collection, exposing a
      * half-collected heap to the global GC. The shared structures the
      * GC path touches use their own native mutexes (id2ref,
-     * registered globals, generic fields) or the page-pool lock. */
+     * registered globals, generic fields) or the page-pool lock.
+     *
+     * Under RGENGC_CHECK_MODE a worker's local GC ALSO takes the no-barrier
+     * VM lock (gc_local_gc_holds_vm_lock): the mid-collection verify iterates
+     * every objspace (rb_gc_vm_each_objspace requires the lock), and holding
+     * the lock for the whole GC keeps a global GC from interleaving and
+     * clearing this objspace's during_gc mid-mark. The lock is acquired here
+     * at a safe point, never mid-collection, so it cannot join a pending
+     * barrier in the middle. Production workers (CHECK_MODE off) stay
+     * lock-free. */
     *lock_lev = 0;
 
     RUBY_DTRACE_GC_HOOK(ENTER, event);
@@ -7997,7 +8066,7 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
         rb_gc_vm_barrier();
         break;
       default:
-        if (objspace == rlgc_main_objspace) {
+        if (gc_local_gc_holds_vm_lock(objspace)) {
             *lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
         }
         break;
@@ -8057,7 +8126,7 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
         RB_GC_VM_UNLOCK(*lock_lev);
         break;
       default:
-        if (objspace == rlgc_main_objspace) {
+        if (gc_local_gc_holds_vm_lock(objspace)) {
             RB_GC_VM_UNLOCK_NO_BARRIER(*lock_lev);
         }
         break;
