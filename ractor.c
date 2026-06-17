@@ -1982,6 +1982,19 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
         return 0;
     }
 
+    /* Dedup BEFORE enter_func: a shared or cyclic node visited again must
+     * reuse its recorded replacement without re-running enter_func. The copy
+     * path's enter_func makes a shallow copy whose children still point at the
+     * source; on a revisit that copy is immediately discarded by the dedup,
+     * but until it is swept it is a live object holding cross-objspace edges,
+     * which violates RLGCv2's per-objspace containment invariant (caught by
+     * GC.verify_internal_consistency) -- besides being wasted work and, for the
+     * move path, a double enter_func on the same node. */
+    if (UNLIKELY(st_lookup(obj_traverse_replace_rec(data), (st_data_t)obj, &replacement))) {
+        data->replacement = (VALUE)replacement;
+        return 0;
+    }
+
     switch (data->enter_func(obj, data)) {
       case traverse_cont: break;
       case traverse_skip: return 0; // skip children
@@ -1989,16 +2002,9 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
     }
 
     replacement = (st_data_t)data->replacement;
-
-    if (UNLIKELY(st_lookup(obj_traverse_replace_rec(data), (st_data_t)obj, &replacement))) {
-        data->replacement = (VALUE)replacement;
-        return 0;
-    }
-    else {
-        st_insert(obj_traverse_replace_rec(data), (st_data_t)obj, replacement);
-        if (!RB_SPECIAL_CONST_P((VALUE)replacement)) {
-            rb_ary_push(data->rec_keepalive, (VALUE)replacement);
-        }
+    st_insert(obj_traverse_replace_rec(data), (st_data_t)obj, replacement);
+    if (!RB_SPECIAL_CONST_P((VALUE)replacement)) {
+        rb_ary_push(data->rec_keepalive, (VALUE)replacement);
     }
 
     if (!data->move) {
