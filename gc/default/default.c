@@ -1696,6 +1696,7 @@ RVALUE_UNCOLLECTIBLE(rb_objspace_t *objspace, VALUE obj)
 static int rgengc_remember(rb_objspace_t *objspace, VALUE obj);
 static void rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap);
 static void rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap);
+static bool verify_pointer_in_any_heap_p(const void *ptr); /* RLGCv2: cross-objspace membership */
 
 static int
 check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int terminate)
@@ -1709,21 +1710,31 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
             err++;
         }
         else if (!is_pointer_to_heap(objspace, (void *)obj)) {
-            struct heap_page *empty_page = objspace->empty_pages;
-            while (empty_page) {
-                if ((uintptr_t)empty_page->body <= (uintptr_t)obj &&
-                        (uintptr_t)obj < (uintptr_t)empty_page->body + HEAP_PAGE_SIZE) {
-                    GC_ASSERT(heap_page_in_global_empty_pages_pool(objspace, empty_page));
-                    fprintf(stderr, "check_rvalue_consistency: %p is in an empty page (%p).\n",
-                            (void *)obj, (void *)empty_page);
-                    err++;
-                    goto skip;
+            /* RLGCv2: obj may be a legitimate cross-objspace reference -- a
+             * shareable, or an in-flight shref payload, living in ANOTHER
+             * objspace (is_pointer_to_heap only searches the passed objspace's
+             * pages). Only when it is in no objspace's heap at all is it really
+             * not a Ruby object. A valid foreign object's mark/age/remembered
+             * bits are its owner's, and reading them here would race the
+             * owner's confined GC, so do not descend into the per-object
+             * checks for it. */
+            if (!verify_pointer_in_any_heap_p((void *)obj)) {
+                struct heap_page *empty_page = objspace->empty_pages;
+                while (empty_page) {
+                    if ((uintptr_t)empty_page->body <= (uintptr_t)obj &&
+                            (uintptr_t)obj < (uintptr_t)empty_page->body + HEAP_PAGE_SIZE) {
+                        GC_ASSERT(heap_page_in_global_empty_pages_pool(objspace, empty_page));
+                        fprintf(stderr, "check_rvalue_consistency: %p is in an empty page (%p).\n",
+                                (void *)obj, (void *)empty_page);
+                        err++;
+                        goto skip;
+                    }
                 }
+                fprintf(stderr, "check_rvalue_consistency: %p is not a Ruby object.\n", (void *)obj);
+                err++;
+              skip:
+                ;
             }
-            fprintf(stderr, "check_rvalue_consistency: %p is not a Ruby object.\n", (void *)obj);
-            err++;
-          skip:
-            ;
         }
         else {
             const int wb_unprotected_bit = RVALUE_WB_UNPROTECTED_BITMAP(obj) != 0;
