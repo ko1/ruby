@@ -358,3 +358,38 @@ RLGC and the move courier are fully exonerated. The fiber annotation is an
 upstream-valuable contribution (makes TSan usable for any multi-Ractor testing).
 Reproduction artifacts: /tmp/claude/wt-up (clean upstream 26f09eb6a),
 /tmp/claude/build-up-tsan, /tmp/claude/generic_ractor.rb, stage1.sh, stage2.sh.
+
+### RLGC BUG-FINDING 2026-06-17 (TSan now stable)
+
+With the coroutine fiber annotation + IC ignorelist + handoff suppression in
+place, TSan finally runs the RLGC oracles without crashing in libtsan, so it can
+report RLGC's own races. Findings:
+
+1. REAL RLGC BUG (fixed -- commit "lock the recv_queue against senders ..."):
+   ractor_queue_mark vs ractor_queue_enq. ractor_sync_mark walked a Ractor's
+   recv_queue in the r==cr case (own concurrent local GC) without the sync lock,
+   while foreign senders append to it under that lock. Marker could follow a
+   half-linked ccan node -> miss/UAF an in-flight basket. Fixed by taking
+   RACTOR_LOCK around the recv_queue+ports walk in the r==cr non-global-GC case
+   (deadlock-free: holding a ractor lock disables malloc-GC, so the marker never
+   already holds it).
+
+2. NOT RLGC -- TSan tooling: v2_incremental_vs_multi_objspace "hangs" under TSan
+   because libtsan's deadlock detector caps simultaneously-held locks at 64
+   (sanitizer_deadlock_detector.h:67 CHECK n_all_locks_ < 64) and RLGCv2 holds
+   more (per-objspace/per-Ractor locks). Run TSan with detect_deadlocks=0:
+   then it completes clean (INC_VS_MULTI_OK, 0 unsuppressed races).
+
+3. NOT RLGC -- my own fiber annotation gap (fixed, folded into the coroutine
+   commit): coroutine_destroy must not __tsan_destroy_fiber a borrowed
+   __tsan_get_current_fiber() handle (the OS thread's implicit fiber, used by
+   Ruby Fibers' root context via coroutine_initialize_main). Destroying it aborts
+   libtsan (FiberDestroy->ProcWire CHECK). Added tsan_fiber_owned: only destroy
+   handles we created.
+
+STANDING TSAN RECIPE for the RLGC oracles (multi-Ractor):
+  TSAN_OPTIONS="suppressions=RLGC_DOC/tsan_suppressions.txt history_size=7 \
+                report_signal_unsafe=0 detect_deadlocks=0"
+  build with cflags ... -fsanitize-ignorelist=RLGC_DOC/tsan_ignorelist.txt
+  (plus the coroutine fiber annotation, now in the base "coroutine: annotate
+  fiber context switches for ThreadSanitizer" commit).
