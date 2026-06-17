@@ -5949,15 +5949,25 @@ check_children_i(const VALUE child, void *ptr)
 
     if (GET_HEAP_OBJSPACE(child) != data->objspace) {
         /* RLGCv2 containment (design_v2.md section 1.4): the only legal
-         * cross-objspace edges start at a shareable. An unshareable
-         * parent holding a foreign unshareable child is invisible to
-         * both owners' confined GCs -- the v1 crash family.
+         * cross-objspace edges start at a shareable, OR are recorded in
+         * the child's shref bit (an in-flight send/move payload kept alive
+         * across its owner's confined GCs -- the same record root_scope_check_i
+         * honours). An unshareable parent holding an *un*recorded foreign
+         * unshareable child is invisible to both owners' confined GCs -- the
+         * v1 crash family.
          * Documented exception: the box's top_self (every thread's
          * th->top_self points at it; it is VM-permanent, rooted by the
-         * box for the process lifetime). */
+         * box for the process lifetime).
+         * Skipped during a global GC: it clears every shref bit (step 5) and
+         * keeps in-flight payloads alive by re-pinning instead, so the shref
+         * exemption cannot fire; and the unified exact STW mark makes the
+         * confined-containment invariant moot anyway (no confined GC can free
+         * the child out from under the edge). */
         if (!data->parent_shareable &&
             child != rb_vm_top_self() &&
-            !MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child)) {
+            !MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child) &&
+            !MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(child), child) &&
+            !rb_gc_impl_during_global_gc_p(data->objspace)) {
             fprintf(stderr, "check_children_i: containment violation: "
                     "unshareable %s (objspace %p) -> foreign unshareable %s (objspace %p)\n",
                     rb_obj_info(data->parent), (void *)data->objspace,
@@ -6262,8 +6272,14 @@ gc_verify_internal_consistency_(rb_objspace_t *objspace)
     }
 
     /* RLGCv2: check the calling Ractor's root scoping (the walk roots
-     * the CURRENT objspace, so only when that is the one under test) */
-    if (!rb_gc_single_objspace_p() && objspace == rb_gc_get_objspace()) {
+     * the CURRENT objspace, so only when that is the one under test).
+     * Skip it during a global GC: there rb_gc_mark_roots walks with
+     * global_gc=true, which deliberately spans every Ractor's roots and the
+     * main-only VM-global containers (gc.c rb_gc_mark_roots) -- the unified
+     * exact mark legitimately reaches foreign objects, so the confined-scope
+     * invariant this check enforces simply does not apply. */
+    if (!rb_gc_single_objspace_p() && objspace == rb_gc_get_objspace() &&
+        !rb_gc_impl_during_global_gc_p(objspace)) {
         rb_objspace_reachable_objects_from_root(root_scope_check_i, &data);
     }
 
