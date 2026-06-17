@@ -448,3 +448,31 @@ entering co_start and locking the sched lock. This is a distinct, narrower windo
 (local-GC free vs co_start lock-acquire) not covered by the dying_th signal;
 needs separate handling (e.g. the local-GC free of a never-started Ractor must
 also wait out / order against its nt's co_start). Left open and documented.
+
+### RLGC BUG #3 fixed + verify-as-oracle findings (2026-06-17)
+
+Interleaving GC.verify_internal_consistency on every Ractor#send receive (and
+across compaction / shareable / lifecycle stress) is a strong oracle for
+concurrent RLGC heap corruption. Findings:
+
+REAL, FIXED (commit "dedup before enter_func in obj_traverse_replace_i"):
+  Copy-path containment violation. obj_traverse_replace_i ran enter_func (the
+  shallow copy) BEFORE the dedup st_lookup, so revisiting a shared/cyclic node
+  allocated a throwaway copy whose children still point at the source -- a live
+  cross-objspace-edged object until swept (containment violation). Minimal repro:
+  send([a, a]). Fix: dedup first. Verified: make_shareable DAG/cycle + test_ractor
+  green.
+
+BENIGN (verify stricter than the design's liveness):
+  cc_table generational WB miss "WB miss (O->Y) VM/cc_table -> T_IMEMO" (and
+  T_CLASS/T_ICLASS -> cc/cme), under concurrent multi-Ractor dispatch + send. The
+  cc/cme are kept alive by the born-shareable pin (per the inline-cache
+  suppressions), not the remember set, so the missing O->Y entry causes no UAF:
+  no-verify + RUBY_GC_STRESS=1 (forces minor GCs) = 6/6 clean, and a full mark
+  before verify reconciles it (5/5). verify_internal_consistency's generational
+  WB check does not model the pin. Pre-existing.
+
+METHOD NOTE: don't blanket GC.start(full) before verify -- it reconciles BOTH the
+benign cc-WB miss AND real transient corruption (the copy garbage above cleared
+under a full GC too). Verify without a preceding full GC, then triage: real
+containment/T_NONE corruption is fixable; cc-WB misses are the benign pin family.
