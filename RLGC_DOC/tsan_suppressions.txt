@@ -140,3 +140,42 @@ race:rlgc_objspace_absorb
 # a wrong thread)". Benign: the lock ownership is handed over intentionally.
 mutex:thread_sched_unlock_
 mutex:thread_sched_lock_
+
+# The dying_th handoff field (rb_thread_sched.dying_th) is read+cleared under the
+# sched lock in thread_sched_unlock_ and set under it in co_start; all accesses
+# are sched-lock-protected, so they are really mutually excluded. But that lock
+# is handed off across the terminal coroutine transfer, which defeats TSan's
+# happens-before tracking for it (same family as thread_sched_set_running etc.),
+# so concurrent thread_sched_unlock_ runs look like a data race on dying_th.
+# Benign: it carries "which dying thread to mark finished" across the handoff so
+# finished is published only after the lock's final release (fixes the M1b
+# teardown UAF); the field itself is never read outside the lock.
+race:thread_sched_unlock_
+
+# M:N scheduler sched-lock-handoff false positives. The per-Ractor sched lock
+# (rb_thread_sched.lock_) is handed off across coroutine switches (held in
+# co_start, released by the resuming context), which defeats TSan's
+# happens-before tracking for it. All of these touch sched-lock-protected
+# scheduler state and ARE mutually excluded by that lock; TSan only flags them
+# because of the handoff. Confirmed on stock upstream master + TSan (no RLGC):
+# a generic multi-Ractor send/receive workload reproduces them, so they are an
+# upstream M:N-scheduler x TSan interaction, not an RLGCv2 race.
+race:thread_sched_set_running
+race:thread_sched_to_ready_common
+race:thread_sched_wakeup_running_thread
+race:thread_sched_wait_running_turn
+race:rb_ractor_sched_wakeup
+race:rb_ractor_sched_wait
+
+# Thread teardown vs its GC free, after the dying_th fix. The dying thread writes
+# th->nt under the sched lock (native_thread_assign in co_start) and saves SP into
+# th->sched.context during the terminal coroutine transfer; the dying_th handoff
+# (see thread_sched_unlock_) now publishes th->sched.finished only AFTER that
+# transfer's lock is released, so the zombie ledger frees the thread strictly
+# after every teardown write -- there is no concurrent access. TSan still reports
+# it because the lock is handed off across the coroutine switch, so it sees no
+# happens-before edge from the dying native thread to the freeing thread (same
+# coroutine-handoff blind spot as the sched-handoff family above). Benign given
+# the dying_th ordering.
+race:rb_threadptr_sched_free
+race:native_thread_assign
