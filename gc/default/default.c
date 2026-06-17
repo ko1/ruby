@@ -8418,6 +8418,15 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         gc_sweep_rest(objspace);
         during_gc = FALSE;
         heap_alloc_state_clear(objspace);
+        /* gc_sweep_finish keeps swept pages "pooled" for a would-be
+         * incremental mark (will_be_incremental_marking). src will never run
+         * one -- it is about to be absorbed and dst's next collection is
+         * forced full -- so release them to src's free list now. This mirrors
+         * the global-GC settle (rlgc_global_gc step 3) and restores the
+         * pooled_pages == NULL invariant the page merge below relies on. */
+        for (int h = 0; h < HEAP_COUNT; h++) {
+            heap_move_pooled_pages_to_free_pages(&heaps[h]);
+        }
     }
 
     /* per size pool: hand the pages over.
