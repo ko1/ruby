@@ -713,8 +713,22 @@ ractor_sync_mark(rb_ractor_t *r)
          * VALUEs it carries so a concurrent global GC keeps them */
         ractor_move_courier_mark(r->sync.in_flight_courier);
         if (r->sync.ports) {
+            /* The recv_queue (and the ports table) are written by foreign
+             * SENDERS that hold r's sync lock (ractor_queue_enq under
+             * RACTOR_LOCK). When this is our own concurrent local GC
+             * (r == cr, and not a stop-the-world global GC) a sender on
+             * another thread can mutate the queue while we walk it -- a real
+             * data race (ractor_queue_mark vs ractor_queue_enq). Take the lock
+             * to exclude senders. This cannot self-deadlock: holding any
+             * ractor lock disables malloc-triggered GC (malloc_gc_disabled,
+             * gc.c), so a GC marker never itself already holds r's lock. Under
+             * a global GC every sender is stopped, and a terminated Ractor has
+             * none, so neither of those cases needs the lock. */
+            bool lock_against_senders = (r == cr) && !rb_gc_during_global_gc_p();
+            if (lock_against_senders) RACTOR_LOCK(r);
             ractor_queue_mark(r->sync.recv_queue);
             st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
+            if (lock_against_senders) RACTOR_UNLOCK(r);
         }
         /* monitors are not walked -- see the comment above
          * ractor_monitor's data structures */
