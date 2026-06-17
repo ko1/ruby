@@ -393,3 +393,58 @@ STANDING TSAN RECIPE for the RLGC oracles (multi-Ractor):
   build with cflags ... -fsanitize-ignorelist=RLGC_DOC/tsan_ignorelist.txt
   (plus the coroutine fiber annotation, now in the base "coroutine: annotate
   fiber context switches for ThreadSanitizer" commit).
+
+### RLGC BUG #2 (open, characterised): orphan-merge teardown UAF (M1b-specific)
+
+v2_orphan_merge_pjob, found by the now-stable TSan. Two races, one root cause:
+  - main: ractor_free (gc.c rb_data_free) frees the ractor incl. its sched lock
+    M2 (r->threads.sched.lock_); also rb_threadptr_sched_free / thread_free.
+  - nt (T2/T3): co_start native_thread_assign(NULL,th) / nt_start
+    thread_sched_unlock_ -- the dying thread's final teardown, which UNLOCKS the
+    handed-off sched lock M2 AFTER co_start set th->sched.finished = true.
+The zombie ledger (rb_thread_sched_mark_zombies) keeps the thread (and via
+th->ractor, the ractor) marked until sched.finished; once it flips, the thread
++ ractor become collectable. But sched.finished is set in co_start BEFORE the
+terminal coroutine_transfer0 that HANDS OFF M2 (still locked) to nt_context, and
+the nt unlocks M2 only after. So between finished=true and the nt's unlock, a
+concurrent collector frees M2 -> unlock-after-free.
+
+UPSTREAM SPLIT: stock master + TSan + unjoined-ractor churn = 0/15 hits.
+Upstream GC is STW, so the dying ractor's nt is stopped at a safepoint during
+the GC that frees it -- no concurrent free. M1b (barrier-free local GC) removed
+that barrier, so main's concurrent GC races the nt teardown. The teardown code
+(co_start, the handoff, sched.finished) is upstream-unmodified; M1b is what
+exposes the premature signal. => fix on the RLGC side: the signal that gates the
+concurrent free must reflect the nt's LAST release of the ractor's resources,
+not be set before the handed-off unlock.
+
+### RLGC BUG #2 fix (2026-06-17): teardown UAF -- dominant case fixed (dying_th)
+
+Fixed via commit "publish a terminating thread's 'finished' after its nt's last
+sched-lock release": co_start records the dying thread in sched->dying_th before
+the terminal handoff; thread_sched_unlock_ publishes th->sched.finished only
+after releasing the handed-off lock. The zombie ledger then frees the
+thread/Ractor strictly after every teardown write. No new lock (a free-path lock
+risks inverting with the scheduler's sched-lock->VM-lock order -> deadlock), so
+the fix is lock-free.
+
+Verified under TSan (orphan/churn/rehome/nosend x stress x tiny, dozens of runs):
+the dominant teardown races are gone -- ractor_free vs the nt's M2 unlock, and
+rb_threadptr_sched_free vs native_thread_assign are now correctly ordered (no
+concurrent access). crash=0, hang=0. Plain orphan_merge 6/6 (no zombie leak).
+
+Residual TSan reports are coroutine-handoff blind spots, now classified benign in
+tsan_suppressions.txt (the sched lock is handed off across the coroutine switch,
+so TSan sees no happens-before for it even though the accesses are really
+mutually excluded / correctly ordered): race:thread_sched_unlock_ (the dying_th
+field), the sched-handoff family (thread_sched_set_running etc., confirmed on
+stock upstream), and race:rb_threadptr_sched_free / race:native_thread_assign
+(ordered by dying_th, but the handoff hides the HB).
+
+REMAINING (rare, ~1/24): ractor_free vs co_start:478 thread_sched_lock, from the
+oracle's "never-started Ractor" section -- a Ractor whose creation failed is
+freed by a SINGLE-WORLD local GC (not the global barrier) while its thread is
+entering co_start and locking the sched lock. This is a distinct, narrower window
+(local-GC free vs co_start lock-acquire) not covered by the dying_th signal;
+needs separate handling (e.g. the local-GC free of a never-started Ractor must
+also wait out / order against its nt's co_start). Left open and documented.
