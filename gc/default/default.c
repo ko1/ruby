@@ -7560,8 +7560,17 @@ rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache)
     rb_objspace_t *objspace = objspace_ptr;
 
     GC_ASSERT(cache == NULL);
-    GC_ASSERT(objspace->live_ractor_cache_count > 0);
-    objspace->live_ractor_cache_count--;
+
+    /* RLGCv2: cache_alloc runs in the creator Ractor's objspace context
+     * (rb_gc_get_objspace() at Ractor.new) while cache_free runs in the
+     * terminating Ractor's own objspace -- different objspaces, so this
+     * per-objspace counter is ++'d on one and --'d on another and can
+     * underflow here (the mirror of the "drift high" noted in cache_alloc).
+     * It only feeds the capped r_mul heap-growth heuristic and is rethought
+     * with per-Ractor objspaces in M1, so clamp instead of asserting. */
+    if (objspace->live_ractor_cache_count > 0) {
+        objspace->live_ractor_cache_count--;
+    }
 }
 
 static void
