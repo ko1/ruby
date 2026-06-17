@@ -493,3 +493,28 @@ exception / ports / deep-DAG patterns under GC stress, the real RLGC bugs found
 were the three fixed this session (recv_queue race, teardown UAF, copy
 containment). Remaining reports are benign (cc-WB pin family, coroutine-handoff
 false positives) or the open rare never-started-Ractor teardown edge.
+
+### never-started edge resolved + upstream exception/longjmp TSan limit (2026-06-17)
+
+The "never-started Ractor" residual splits into two non-RLGC items, both closed:
+ 1. ractor_free vs co_start thread_sched_lock_ (the local-GC free of a
+    failed-creation Ractor vs its nt's sched-lock acquire) -- benign coroutine
+    handoff false positive (ASAN over GC-stress failed-creation churn = no UAF;
+    dying_th orders the free after teardown). Suppressed (race:thread_sched_lock_).
+ 2. The TSan SEGV on heavy failed-creation churn is NOT a teardown bug at all:
+    it is libtsan's shadow stack overflowing because Ruby exceptions longjmp past
+    __tsan_func_exit, leaking shadow-stack frames per raise. CONFIRMED on stock
+    upstream master + TSan: pure raise/rescue x200k (no Ractors, no GC) crashes in
+    __tsan_func_entry identically on upstream and rlgc-v2 (ec=139). An upstream
+    Ruby x TSan integration limit (Ruby's setjmp/longjmp not resetting TSan's
+    shadow stack); real fix is to route rb_longjmp through TSan's interceptor or
+    annotate it. Affects only exception-storm oracles under TSan; not RLGC.
+
+FINAL STATE: 3 real RLGC concurrency bugs found and fixed this session
+(recv_queue mark-vs-enqueue race, terminating-thread teardown UAF, copy-traversal
+containment). #18 "move SEGV" resolved as the upstream coroutine-not-annotated
+TSan crash (fixed by the fiber annotation). All other reports across TSan +
+verify + ASAN over move/copy/compact/shareable/fiber/lifecycle/finalizer/
+exception/ports/select/deep/types/callable/zombie patterns are benign (cc-WB pin
+family, coroutine-handoff false positives, lazy-static IDs) or upstream tooling
+limits (exception/longjmp shadow stack). ASAN: 0 memory errors.
