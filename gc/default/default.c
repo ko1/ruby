@@ -4364,7 +4364,14 @@ gc_mode_transition(rb_objspace_t *objspace, enum gc_mode mode)
 #if RGENGC_CHECK_MODE
     enum gc_mode prev_mode = gc_mode(objspace);
     switch (prev_mode) {
-      case gc_mode_none:     GC_ASSERT(mode == gc_mode_marking); break;
+      case gc_mode_none:
+        /* RLGCv2: the global GC marks every objspace as one unified heap
+         * (mark_roots on the driver), so an individual objspace's per-objspace
+         * mode stays `none` across that mark; its in-barrier sweep then
+         * legitimately transitions none -> sweeping. */
+        GC_ASSERT(mode == gc_mode_marking ||
+                  (objspace->during_global_gc && mode == gc_mode_sweeping));
+        break;
       case gc_mode_marking:  GC_ASSERT(mode == gc_mode_sweeping); break;
       case gc_mode_sweeping: GC_ASSERT(mode == gc_mode_none || mode == gc_mode_compacting); break;
       case gc_mode_compacting: GC_ASSERT(mode == gc_mode_none); break;
