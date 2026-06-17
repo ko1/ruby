@@ -476,3 +476,20 @@ METHOD NOTE: don't blanket GC.start(full) before verify -- it reconciles BOTH th
 benign cc-WB miss AND real transient corruption (the copy garbage above cleared
 under a full GC too). Verify without a preceding full GC, then triage: real
 containment/T_NONE corruption is fixable; cc-WB misses are the benign pin family.
+
+### ASAN sweep clean 2026-06-17
+
+Rebuilt ASAN on the current tree (all fixes) and swept move/copy/compact/
+lifecycle/shareable/fiber + the existing oracles x {stress, stress-tiny} x2,
+GC-stressed: 88 runs, ZERO AddressSanitizer errors (no heap-use-after-free,
+heap-buffer-overflow, or stack-use-after-return). The only aborts were the
+benign cc-WB verify family on the verify-on-receive oracles. The move courier's
+xmalloc buffers, the copy/move re-home, the recv_queue + teardown fixes are
+memory-clean under ASAN.
+
+CONVERGENCE: across TSan (stabilized) + GC.verify_internal_consistency + ASAN,
+over move / copy / compact / shareable / fiber / lifecycle / finalizer /
+exception / ports / deep-DAG patterns under GC stress, the real RLGC bugs found
+were the three fixed this session (recv_queue race, teardown UAF, copy
+containment). Remaining reports are benign (cc-WB pin family, coroutine-handoff
+false positives) or the open rare never-started-Ractor teardown edge.
