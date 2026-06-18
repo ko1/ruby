@@ -1040,6 +1040,21 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     return b;
 }
 
+/* RLGCv2: true while this Ractor is materializing an incoming copy
+ * (ractor_basket_value -> ractor_copy_native_try). During that window the
+ * half-built result legitimately holds edges into the sender-resident snapshot
+ * (pinned via sync.in_flight_materializing), so the confined-GC verifier must
+ * not flag those as containment violations -- the copy's own allocations can
+ * trigger that GC mid-traversal. */
+bool
+rb_gc_current_ractor_materializing_p(void)
+{
+    const rb_ractor_t *cr = rb_current_ractor_raw(false);
+    if (cr == NULL) return false;
+    const VALUE m = cr->sync.in_flight_materializing;
+    return !UNDEF_P(m) && m != Qfalse;
+}
+
 static VALUE
 ractor_basket_value(struct ractor_basket *b)
 {

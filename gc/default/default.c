@@ -5974,7 +5974,8 @@ check_children_i(const VALUE child, void *ptr)
             child != rb_vm_top_self() &&
             !MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child) &&
             !MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(child), child) &&
-            !rb_gc_impl_during_global_gc_p(data->objspace)) {
+            !rb_gc_impl_during_global_gc_p(data->objspace) &&
+            !rb_gc_current_ractor_materializing_p()) {
             fprintf(stderr, "check_children_i: containment violation: "
                     "unshareable %s (objspace %p) -> foreign unshareable %s (objspace %p)\n",
                     rb_obj_info(data->parent), (void *)data->objspace,
@@ -6057,6 +6058,10 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
     if (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(obj), obj)) return;
     if (MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj)) return;
     if (obj == rb_vm_top_self()) return;  /* VM-permanent (see check_children_i) */
+    /* the sender-resident snapshot a receive is materializing is rooted via
+     * sync.in_flight_materializing -- a legitimate foreign-unshareable root for
+     * the duration of the copy (see check_children_i). */
+    if (rb_gc_current_ractor_materializing_p()) return;
 
     fprintf(stderr, "root_scope_check_i: root category \"%s\" names a foreign "
             "unshareable without a shref record: %s (owner %p, self %p)\n",
