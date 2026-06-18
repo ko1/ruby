@@ -210,6 +210,14 @@ struct fiber_pool {
 
     // The amount to allocate for the vm_stack.
     size_t vm_stack_size;
+
+    // RLGCv2: the (shared) pool is VM-global but its mutators run without the
+    // GVL -- acquire on a Ractor's thread, release from that Ractor's
+    // barrier-free confined GC sweep. A confined GC must not take the VM lock
+    // (it would join a pending global barrier mid-collection), so this
+    // dedicated leaf mutex -- never held while acquiring the VM lock -- gives
+    // the vacancy-list / counters mutual exclusion instead.
+    rb_nativethread_lock_t lock;
 };
 
 // Continuation contexts used by JITs
@@ -652,6 +660,7 @@ fiber_pool_initialize(struct fiber_pool * fiber_pool, size_t size, size_t minimu
     fiber_pool->free_stacks = 1;
     fiber_pool->used = 0;
     fiber_pool->vm_stack_size = vm_stack_size;
+    rb_native_mutex_initialize(&fiber_pool->lock);
 
     if (fiber_pool->minimum_count > 0) {
         if (RB_UNLIKELY(!fiber_pool_expand(fiber_pool, fiber_pool->minimum_count))) {
@@ -751,7 +760,13 @@ fiber_pool_stack_acquire_expand(struct fiber_pool *fiber_pool)
     else {
         if (DEBUG_ACQUIRE) fprintf(stderr, "fiber_pool_stack_acquire: expand failed (%s), collecting garbage\n", strerror(errno));
 
+        /* RLGCv2: the caller (fiber_pool_stack_acquire) holds fiber_pool->lock;
+         * this GC may free dead fibers, whose release re-takes that same leaf
+         * lock. Drop it across the collection to avoid self-deadlock, then
+         * re-take it before touching the pool again. */
+        rb_native_mutex_unlock(&fiber_pool->lock);
         rb_gc();
+        rb_native_mutex_lock(&fiber_pool->lock);
 
         // After running GC, the vacancy list may have some stacks:
         vacancy = fiber_pool_vacancy_pop(fiber_pool);
@@ -781,6 +796,12 @@ fiber_pool_stack_acquire(struct fiber_pool * fiber_pool)
 
     unsigned int lev;
     RB_VM_LOCK_ENTER_LEV(&lev);
+    /* RLGCv2: the leaf lock serialises against release from a confined GC
+     * sweep on another Ractor (which cannot take the VM lock). acquire takes
+     * it under the VM lock; fiber_pool_stack_acquire_expand drops it around
+     * its rb_gc() so a GC-driven release on this same thread does not
+     * self-deadlock. */
+    rb_native_mutex_lock(&fiber_pool->lock);
     {
         // Fast path: try to acquire a stack from the vacancy list:
         vacancy = fiber_pool_vacancy_pop(fiber_pool);
@@ -793,6 +814,7 @@ fiber_pool_stack_acquire(struct fiber_pool * fiber_pool)
 
             // If expansion failed, raise an error:
             if (RB_UNLIKELY(!vacancy)) {
+                rb_native_mutex_unlock(&fiber_pool->lock);
                 RB_VM_LOCK_LEAVE_LEV(&lev);
                 rb_raise(rb_eFiberError, "can't allocate fiber stack: %s", strerror(errno));
             }
@@ -814,6 +836,7 @@ fiber_pool_stack_acquire(struct fiber_pool * fiber_pool)
 
         fiber_pool_stack_reset(&vacancy->stack);
     }
+    rb_native_mutex_unlock(&fiber_pool->lock);
     RB_VM_LOCK_LEAVE_LEV(&lev);
 
     return vacancy->stack;
@@ -889,6 +912,13 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
 
     if (DEBUG) fprintf(stderr, "fiber_pool_stack_release: %p used=%"PRIuSIZE"\n", stack->base, stack->pool->used);
 
+    /* RLGCv2: serialize against a concurrent acquire on another Ractor and
+     * against other releases. Reached here either from a confined GC sweep
+     * (no VM lock) or from fiber finish (under the VM lock); the pool's leaf
+     * lock is correct in both and never deadlocks with the VM lock (it is
+     * only ever taken under the VM lock or with no lock, never the reverse). */
+    rb_native_mutex_lock(&pool->lock);
+
     // Copy the stack details into the vacancy area:
     vacancy->stack = *stack;
     // After this point, be careful about updating/using state in stack, since it's copied to the vacancy area.
@@ -919,6 +949,8 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
         fiber_pool_stack_free(&vacancy->stack);
     }
 #endif
+
+    rb_native_mutex_unlock(&pool->lock);
 }
 
 static inline void
@@ -1034,11 +1066,12 @@ fiber_stack_release(rb_fiber_t * fiber)
 static void
 fiber_stack_release_locked(rb_fiber_t *fiber)
 {
-    if (!ruby_vm_during_cleanup) {
-        // We can't try to acquire the VM lock here because MMTK calls free in its own native thread which has no ec.
-        // This assertion will fail on MMTK but we currently don't have CI for debug releases of MMTK, so we can assert for now.
-        ASSERT_vm_locking_with_barrier();
-    }
+    /* RLGCv2: this runs from the GC free path (cont_free). Under per-Ractor
+     * objspaces that is a Ractor's barrier-free confined GC sweep -- there is
+     * no VM lock or barrier, and the collection must not take the VM lock (it
+     * would join a pending global barrier mid-sweep). The stack return to the
+     * VM-global fiber pool is instead serialised by the pool's own leaf lock
+     * (fiber_pool_stack_release), so no VM-locking assertion holds here. */
     fiber_stack_release(fiber);
 }
 
