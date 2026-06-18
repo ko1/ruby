@@ -8436,6 +8436,30 @@ rlgc_global_gc(rb_objspace_t *driver)
         os->flags.immediate_sweep = prev_immediate;
     }
 
+    /* RLGCv2: the global GC runs its own unified mark+sweep and never calls
+     * gc_marks_finish -- which is where a local GC sets up the next cycle's
+     * heap-growth budget (allocatable_bytes). An objspace whose heap is still
+     * full after the global sweep -- e.g. a Ractor part-way through
+     * materializing a large incoming copy, whose live graph the global GC
+     * cannot reclaim -- would be left with no free pages, no empty pages to
+     * resurrect, and allocatable_bytes == 0, so its very next allocation hits
+     * newobj_refill's "cannot create a new page after major GC". Give every
+     * still-stuck objspace a growth budget here, mirroring gc_marks_finish. */
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        rb_objspace_t *objspace = rlgc_global.list[i];
+        if (objspace->heap_pages.allocatable_bytes != 0 || objspace->empty_pages_count != 0) {
+            continue;
+        }
+        bool stuck = false;
+        for (int h = 0; h < HEAP_COUNT; h++) {
+            if (heaps[h].free_pages == NULL) { stuck = true; break; }
+        }
+        if (stuck) {
+            heap_allocatable_bytes_expand(objspace, NULL, 0,
+                    objspace_available_slots(objspace), heaps[0].slot_size);
+        }
+    }
+
     /* recount the surviving shareables (the sweep already folded dead
      * ones out of shareable_bits) and reset each trigger limit */
     for (size_t i = 0; i < rlgc_global.count; i++) {
