@@ -825,6 +825,15 @@ static struct {
     size_t count, capa;
 } rlgc_global;
 
+/* RLGCv2: true while rlgc_objspace_absorb is merging a dead Ractor's objspace
+ * into another. The absorb settles dst with gc_rest -- which under CHECK_MODE
+ * runs the consistency verifier -- while the VM-global root tables still name
+ * the not-yet-merged src graph and objects are mid-migration, so the
+ * cross-objspace root/containment checks see legitimately transient
+ * non-heap/foreign edges. They are suppressed for this window; the next
+ * ordinary GC verifies the merged result. */
+static bool rlgc_during_absorb = false;
+
 static void rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
 /* The MAIN objspace, for gc_enter's locking policy. A stable pointer on
@@ -5927,6 +5936,9 @@ check_children_i(const VALUE child, void *ptr)
      * unmapped) identify the culprit field across soak rounds without
      * aborting them. */
     if (!verify_pointer_in_any_heap_p((void *)child)) {
+        /* mid-absorb the graph is in flux; transient non-heap edges are
+         * expected and re-checked after the merge */
+        if (rlgc_during_absorb) return;
         VALUE w[2] = {0, 0};
         bool readable = false;
 #ifndef _WIN32
@@ -5939,9 +5951,16 @@ check_children_i(const VALUE child, void *ptr)
         }
 #endif
         /* if the parent is a Thread wrapper, identify the field by raw
-         * pointer equality (no dereference of the stale target) */
+         * pointer equality (no dereference of the stale target). Use a direct
+         * class-pointer comparison rather than rb_obj_is_kind_of: the parent
+         * can be any object reached with a stale field -- a T_IMEMO call-cache
+         * entry (no class header) or a T_DATA whose klass is itself stale
+         * during an objspace absorb -- and walking its ancestry would assert.
+         * A direct compare just fails to match for those (it only needs to
+         * name the field of a genuine Thread wrapper). */
         const char *field = "?";
-        if (rb_obj_is_kind_of(data->parent, rb_cThread)) {
+        if (RB_TYPE_P(data->parent, T_DATA) &&
+            RBASIC_CLASS(data->parent) == rb_cThread) {
             const rb_thread_t *pth = rb_thread_ptr(data->parent);
             if (child == (VALUE)pth->ractor) field = "th->ractor";
             else if (child == (VALUE)pth->root_fiber) field = "th->root_fiber";
@@ -5975,7 +5994,8 @@ check_children_i(const VALUE child, void *ptr)
             !MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child) &&
             !MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(child), child) &&
             !rb_gc_impl_during_global_gc_p(data->objspace) &&
-            !rb_gc_current_ractor_materializing_p()) {
+            !rb_gc_current_ractor_materializing_p() &&
+            !rlgc_during_absorb) {
             fprintf(stderr, "check_children_i: containment violation: "
                     "unshareable %s (objspace %p) -> foreign unshareable %s (objspace %p)\n",
                     rb_obj_info(data->parent), (void *)data->objspace,
@@ -6040,6 +6060,9 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
     struct verify_internal_consistency_struct *data = ptr;
 
     if (RB_SPECIAL_CONST_P(obj)) return;
+    /* mid-absorb the VM-global root tables still name the not-yet-merged src
+     * graph (transient non-heap/foreign roots); checked again after the merge */
+    if (rlgc_during_absorb) return;
     if (strcmp(category, "machine_context") == 0 ||
         strcmp(category, "vm_registered_objects") == 0 ||
         strcmp(category, "end_proc") == 0 ||
@@ -8531,6 +8554,11 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
 {
     GC_ASSERT(dst != src);
 
+    /* suppress the cross-objspace verifier checks while the graph is in
+     * flux (see rlgc_during_absorb) */
+    const bool prev_absorb = rlgc_during_absorb;
+    rlgc_during_absorb = true;
+
     /* settle dst first: appending pages while its lazy sweep cursor is
      * walking the heap lists would sweep the merged pages against src's
      * stale mark bits and free live objects. gc_rest also finishes an
@@ -8700,6 +8728,8 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     rb_native_mutex_destroy(&src->malloc_counters.lock);
 #endif
     free(src);
+
+    rlgc_during_absorb = prev_absorb;
 }
 
 void
