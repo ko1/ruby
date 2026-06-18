@@ -7380,7 +7380,16 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
 
   retry:
     if (!is_incremental_marking(objspace)) {
-        if (!RVALUE_OLD_P(objspace, a) || RVALUE_OLD_P(objspace, b)) {
+        /* RLGCv2: the generational barrier only concerns THIS objspace's
+         * remembered set. A foreign child b is a live leaf here -- this
+         * objspace's minor GC never traverses it, so remembering a to rescan
+         * it is pointless. It is also unsafe: b's old bit is owned by b's
+         * objspace (or a global GC) and can flip concurrently between this
+         * check and gc_writebarrier_generational's own RVALUE_OLD_P(b)
+         * assertion (a same-objspace b cannot -- the owner thread runs both
+         * the store and its GC). Skip foreign b. */
+        if (!RVALUE_OLD_P(objspace, a) || RVALUE_OLD_P(objspace, b) ||
+                GET_HEAP_OBJSPACE(b) != objspace) {
             // do nothing
         }
         else {
