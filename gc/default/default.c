@@ -5859,18 +5859,25 @@ check_generation_i(const VALUE child, void *ptr)
      * machinery, not by this objspace's remembered set. */
     if (GET_HEAP_OBJSPACE(child) != data->objspace) return;
 
-    /* RLGCv2: in the multi-objspace world the end-of-mark pinned walk
-     * re-marks every shareable -- and every shref'd child of one -- on
-     * every local cycle, so a shareable parent keeps its young children
-     * alive without a remembered-set entry; the generational O->Y
-     * invariant simply does not bind for it. (In the single-objspace
-     * world the pinned walk does not run, so the ordinary check stays.
-     * Confirmed harmless: the identical churn without the verifier never
-     * freed such a child.) This surfaced only when the verifier ran on a
-     * WORKER's objspace, where born-shareable cc/cme entries age
-     * locally; main's per-test verify never reached it. */
-    if (!rb_gc_single_objspace_p() &&
-        MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(parent), parent)) {
+    /* RLGCv2: once multi-Ractor mode is active the shareable world is
+     * managed by the pin/shref machinery, not the per-objspace remembered
+     * set -- the end-of-mark pinned walk re-marks every shareable (and every
+     * shref'd child of one) on every local cycle, and a global GC rebuilds
+     * generation state from scratch. So the generational O->Y invariant does
+     * not bind whenever EITHER endpoint is shareable: a shareable parent keeps
+     * its young children alive, and a shareable child is itself re-marked and
+     * cannot be freed by a minor GC. This is the common false positive of an
+     * old constcache / cc_table / interned string referencing a young
+     * (post-global-GC) core class. Gate on rb_multi_ractor_p() (permanent once
+     * multi-Ractor mode is entered) rather than the instantaneous
+     * single-objspace count, so the momentary ractor.cnt==1 windows of a
+     * multi-Ractor program are covered too. A never-multi-Ractor program keeps
+     * the ordinary strict check. (Residual risk -- a non-VM-rooted shareable
+     * only reachable via an old unremembered parent freed in a single-objspace
+     * window -- is caught by ASAN; born-shareables are VM-rooted in practice.) */
+    if (rb_multi_ractor_p() &&
+        (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(parent), parent) ||
+         MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child))) {
         return;
     }
 
