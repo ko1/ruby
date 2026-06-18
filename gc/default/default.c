@@ -834,6 +834,16 @@ static struct {
  * ordinary GC verifies the merged result. */
 static bool rlgc_during_absorb = false;
 
+/* RLGCv2: true only while a verify runs with the world stopped -- the
+ * standalone GC.verify path (which takes the VM lock + barrier) or the global
+ * GC (driver holds the barrier). The cross-objspace verifier checks scan EVERY
+ * objspace's pages (verify_pointer_in_any_heap_p), which is sound only then; a
+ * confined mid-collection verify runs while other Ractors allocate lock-free
+ * and mutate their own page structures, so those scans race (SEGV). When false,
+ * the cross-objspace checks are skipped -- the confined verify still checks its
+ * own objspace's local invariants. */
+static bool rlgc_verify_world_stopped = false;
+
 static void rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
 /* The MAIN objspace, for gc_enter's locking policy. A stable pointer on
@@ -5928,6 +5938,14 @@ check_children_i(const VALUE child, void *ptr)
         return;
     }
 
+    /* The remaining cross-objspace checks scan every objspace's pages
+     * (verify_pointer_in_any_heap_p). That is sound only with the world
+     * stopped; in a confined mid-collection verify other Ractors allocate
+     * lock-free and mutate their page structures concurrently, so the scan
+     * would race (SEGV). Skip it then -- the foreign edge is re-verified by the
+     * next world-stopped (global GC / standalone) verify. */
+    if (!rlgc_verify_world_stopped) return;
+
     /* A non-heap child can only reach this callback through a plain
      * rb_gc_mark of a stale field -- so far seen only on dmarks of
      * live-but-unreachable wrappers whose sibling struct was freed
@@ -6060,6 +6078,10 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
     struct verify_internal_consistency_struct *data = ptr;
 
     if (RB_SPECIAL_CONST_P(obj)) return;
+    /* this check scans every objspace (verify_pointer_in_any_heap_p) -- sound
+     * only with the world stopped; a confined mid-collection verify races other
+     * Ractors' lock-free allocations. */
+    if (!rlgc_verify_world_stopped) return;
     /* mid-absorb the VM-global root tables still name the not-yet-merged src
      * graph (transient non-heap/foreign roots); checked again after the merge */
     if (rlgc_during_absorb) return;
@@ -6437,14 +6459,22 @@ gc_verify_internal_consistency(void *objspace_ptr)
      * mutation), and the global driver -- which sets during_gc on every
      * objspace it collects -- already holds the lock and the barrier. */
     if (during_gc) {
+        /* world is stopped only when the global-GC driver runs this (it holds
+         * the barrier); a confined worker GC does not stop other Ractors. */
+        const bool prev_ws = rlgc_verify_world_stopped;
+        rlgc_verify_world_stopped = rb_gc_impl_during_global_gc_p(objspace);
         gc_verify_internal_consistency_body(objspace);
+        rlgc_verify_world_stopped = prev_ws;
         return;
     }
 
     unsigned int lev = RB_GC_VM_LOCK();
     {
         rb_gc_vm_barrier(); // stop other ractors
+        const bool prev_ws = rlgc_verify_world_stopped;
+        rlgc_verify_world_stopped = true;   // barrier held: all-objspace scans are sound
         gc_verify_internal_consistency_body(objspace);
+        rlgc_verify_world_stopped = prev_ws;
     }
     RB_GC_VM_UNLOCK(lev);
 }
