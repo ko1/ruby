@@ -129,8 +129,15 @@ update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_
     rb_execution_context_t *ec = rb_current_execution_context(false);
     unsigned int lev;
 
-    // Can't enter VM lock during freeing of ractor hook list on MMTK, where ec == NULL.
-    if (ec) {
+    // Take the VM lock only when there is a current Ractor to take it as.
+    // ec == NULL on MMTK during ractor hook-list free. And under the RLGCv2
+    // global-GC sweep a dead Ractor's hook list is freed (ractor_free) with ec
+    // resolved through the GC's vm_context but GET_RACTOR() == NULL -- here
+    // vm_lock_enter would dereference a NULL Ractor (and barrier-join with it),
+    // and the global GC already holds the barrier, so the lock is both unsafe
+    // and unnecessary.
+    const bool vm_locked_here = ec && GET_RACTOR() != NULL;
+    if (vm_locked_here) {
         RB_VM_LOCK_ENTER_LEV(&lev);
         rb_vm_barrier();
     }
@@ -185,7 +192,7 @@ update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_
         rb_zjit_tracing_invalidate_all();
     }
 
-    if (ec) {
+    if (vm_locked_here) {
         RB_VM_LOCK_LEAVE_LEV(&lev);
     }
 }
