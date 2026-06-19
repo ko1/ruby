@@ -1113,6 +1113,14 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
         thval = rb_thread_alloc(rb_cThread);
         if (gc_was_disabled == Qfalse) rb_gc_enable();
         cr->objspace = parent_objspace;
+        /* The child's objspace now holds its Thread/Fiber wrappers but the child
+         * is not yet in vm->ractor.set. Keep it enumerable (a global GC that
+         * runs between here and vm_insert_ractor -- e.g. another Ractor's
+         * GC.compact -- would otherwise miss it and loop in the mark). Cleared
+         * under the VM lock in vm_insert_ractor when the child joins the set.
+         * Set inside this VM-locked block so the hand-off from "visible via the
+         * swap" to "visible here" is atomic against any whole-VM walk. */
+        cr->creating_child_objspace = r->objspace;
     }
 
     return thread_create_core(thval, &params);
