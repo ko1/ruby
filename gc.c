@@ -3778,6 +3778,13 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
         if (r->objspace) {
             func(r->objspace, data);
         }
+        /* RLGCv2: a child being created is not yet in the set, but its objspace
+         * already holds its Thread/Fiber wrappers -- enumerate it through the
+         * creator so a global GC (e.g. a concurrent GC.compact) does not skip it
+         * and loop forever marking into an un-cleared objspace. */
+        if (r->creating_child_objspace) {
+            func(r->creating_child_objspace, data);
+        }
     }
     for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
         func(vm->gc.zombie_objspaces[i].objspace, data);

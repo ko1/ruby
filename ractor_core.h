@@ -146,6 +146,15 @@ struct rb_ractor_struct {
      * objspace (NULL here) until M1 gives each Ractor its own. */
     void *objspace;
 
+    /* RLGCv2: while this Ractor is creating a child, the child's objspace is
+     * already populated (its Thread/Fiber wrappers are born there) but the
+     * child is not yet in vm->ractor.set, so a whole-VM walk would miss it. The
+     * creator parks the child's objspace here for the window between the wrapper
+     * allocation and vm_insert_ractor, so the global GC enumerates it. Per
+     * Ractor (concurrent creators each have their own), cleared under the VM
+     * lock when the child joins the set. */
+    void *creating_child_objspace;
+
     /* RLGCv2 (design_v2.md section 1.3): the mark redirect installed by
      * this Ractor's object-traversal API call, if any. Per Ractor so
      * that a foreign Ractor's concurrent real GC never sees it; the

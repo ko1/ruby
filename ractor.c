@@ -527,6 +527,14 @@ vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
         {
             vm_insert_ractor0(vm, r, false);
             vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
+            /* RLGCv2: the child is now in the set and enumerated on its own;
+             * stop covering it through the creator (else it would be enumerated
+             * twice). Cleared here, under the same VM lock that added it, so no
+             * whole-VM walk ever sees both. */
+            rb_ractor_t *cur = rb_current_ractor_raw(false);
+            if (cur && cur->creating_child_objspace == r->objspace) {
+                cur->creating_child_objspace = NULL;
+            }
         }
         RB_VM_UNLOCK();
     }
