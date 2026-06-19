@@ -1722,7 +1722,14 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
 {
     int err = 0;
 
-    int lev = RB_GC_VM_LOCK_NO_BARRIER();
+    /* During a global GC the barrier already stopped every Ractor, so the
+     * cross-objspace scans below are safe without the VM lock. Taking it here
+     * would also dereference a NULL current Ractor when the objspace being
+     * swept is a zombie (a terminated Ractor's objspace, which has no owner) --
+     * rb_vm_lock_enter_nb passes GET_RACTOR() == NULL. */
+    const bool world_stopped = objspace->during_global_gc;
+    unsigned int lev = 0;
+    if (!world_stopped) lev = RB_GC_VM_LOCK_NO_BARRIER();
     {
         if (SPECIAL_CONST_P(obj)) {
             fprintf(stderr, "check_rvalue_consistency: %p is a special const.\n", (void *)obj);
@@ -1822,7 +1829,7 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
             }
         }
     }
-    RB_GC_VM_UNLOCK_NO_BARRIER(lev);
+    if (!world_stopped) RB_GC_VM_UNLOCK_NO_BARRIER(lev);
 
     if (err > 0 && terminate) {
         rb_bug("check_rvalue_consistency_force: there is %d errors.", err);
