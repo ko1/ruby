@@ -1101,7 +1101,17 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
     RB_VM_LOCKING() {
         void *const parent_objspace = cr->objspace;
         cr->objspace = r->objspace;
+        /* The wrapper allocation below must not re-entrantly run a GC here:
+         * while cr->objspace names the child, the creator's own objspace is
+         * named by no r->objspace and a whole-VM walk (a global GC the creator
+         * triggers from this very allocation) would skip it -- a missed
+         * objspace leaves stale mark bits = UAF. The VM lock already keeps
+         * every OTHER Ractor's walk out of this window; suppress the creator's
+         * own re-entrant GC too. It is a single wrapper object, so the heap
+         * just grows by a slot instead of collecting. */
+        VALUE gc_was_disabled = rb_gc_disable_no_rest();
         thval = rb_thread_alloc(rb_cThread);
+        if (gc_was_disabled == Qfalse) rb_gc_enable();
         cr->objspace = parent_objspace;
     }
 
