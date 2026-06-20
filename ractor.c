@@ -549,6 +549,19 @@ vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
             cancel_single_ractor_mode();
             vm_insert_ractor0(vm, r, true);
             vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
+            /* RLGCv2: the child is now in the set, so stop covering it through
+             * the creator -- exactly as the multi-Ractor branch above does.
+             * The single->multi transition path used to skip this: the creator
+             * kept creating_child_objspace == r->objspace, so a later global GC
+             * enumerated the child's objspace twice (once via the set, once via
+             * the creator) and swept it twice. The second sweep -- after
+             * gc_setup_mark_bits reset the page's mark bits -- frees the child's
+             * still-live main Thread/root Fiber, nulling its ec->thread_ptr and
+             * crashing the child's startup (GET_RACTOR()==NULL). */
+            rb_ractor_t *cur = rb_current_ractor_raw(false);
+            if (cur && cur->creating_child_objspace == r->objspace) {
+                cur->creating_child_objspace = NULL;
+            }
         }
     }
 }
