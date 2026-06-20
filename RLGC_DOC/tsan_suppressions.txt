@@ -22,6 +22,15 @@ deadlock:rb_ractor_sched_barrier_start
 # Shape tree lock-free readers (upstream lock-free design).
 race:shape_get_next
 
+# rb_intern("literal") lazy static-ID cache (rbimpl_intern_const in
+# include/ruby/internal/symbol.h:301-303): `while(!*ptr) *ptr =
+# rb_intern_const(str)`. Deliberately racy idempotent lazy init -- every
+# racer writes the SAME ID and the loop re-checks, so the report is benign
+# by design. Pre-existing upstream: any cfunc using rb_intern("lit") called
+# from two parallel Ractors hits it. RLGCv2 merely exposes one more instance
+# by making GC.compact concurrent across objspaces (gc_compact_stats).
+race:rbimpl_intern_const
+
 # The timer thread peeks ubf_list_head emptiness without ubf_list_lock
 # (ubf_threads_empty <- timer_thread_set_timeout); a stale read only
 # defers the unblock sweep by one timer tick. Upstream pattern in
