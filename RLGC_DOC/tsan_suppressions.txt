@@ -241,3 +241,11 @@ race:rb_class_set_initialized
 race:rb_ractor_sched_barrier_start
 race:ec_switch
 race:fiber_restore_thread
+
+# UPSTREAM (string.c, not RLGCv2), benign: concurrent String#length on a SHARED
+# frozen string whose coderange is still ENC_CODERANGE_UNKNOWN. str_strlen scans
+# and caches the coderange (a flag write) the first time; multiple Ractors do it
+# concurrently and compute the SAME value -- idempotent lazy cache, same family
+# as rb_intern / rb_class_set_initialized. Generic string code, GC not involved.
+race:str_strlen
+race:single_byte_optimizable
