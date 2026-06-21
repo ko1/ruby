@@ -1744,7 +1744,18 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
              * bits are its owner's, and reading them here would race the
              * owner's confined GC, so do not descend into the per-object
              * checks for it. */
-            if (!verify_pointer_in_any_heap_p((void *)obj)) {
+            if (!world_stopped) {
+                /* A confined verify (e.g. a write barrier's RVALUE_OLD_P check
+                 * on a class's subclass-list update) holds only the no-barrier
+                 * VM lock, NOT the barrier: other Ractors are running and
+                 * realloc their own heap_pages.sorted via confined allocation.
+                 * verify_pointer_in_any_heap_p bsearches every objspace's sorted
+                 * pages, so it would race that realloc and SEGV in bsearch. We
+                 * cannot soundly confirm a foreign pointer without the barrier,
+                 * so accept it here; the global GC's verify (world stopped) still
+                 * performs the full cross-objspace existence check. */
+            }
+            else if (!verify_pointer_in_any_heap_p((void *)obj)) {
                 struct heap_page *empty_page = objspace->empty_pages;
                 while (empty_page) {
                     if ((uintptr_t)empty_page->body <= (uintptr_t)obj &&
