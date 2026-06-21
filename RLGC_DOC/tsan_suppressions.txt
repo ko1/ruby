@@ -216,3 +216,13 @@ race:native_thread_assign
 # failed-creation churn) shows NO use-after-free -- the dying_th ordering keeps
 # the free after the nt's teardown; this is the same benign handoff blind spot.
 race:thread_sched_lock_
+
+# UPSTREAM (not RLGCv2), benign: concurrent Module#include of a SHAREABLE module
+# from multiple Ractors. ensure_includable -> rb_class_set_initialized does
+# FL_SET_RAW(module, RCLASS_IS_INITIALIZED) -- an idempotent re-set of an
+# already-set flag on an already-initialized (frozen, shareable) module -- while
+# another Ractor reads the module's classext flags (RCLASS_PRIME_CLASSEXT_*).
+# Generic class.c machinery (git blame: upstream "Use flag for
+# RCLASS_IS_INITIALIZED"), no RLGC involvement; the GC is not in the picture.
+# Observed via p_module_include; NOT in the continuous arms. Upstream's call.
+race:rb_class_set_initialized
