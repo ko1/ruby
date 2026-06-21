@@ -226,3 +226,18 @@ race:thread_sched_lock_
 # RCLASS_IS_INITIALIZED"), no RLGC involvement; the GC is not in the picture.
 # Observed via p_module_include; NOT in the continuous arms. Upstream's call.
 race:rb_class_set_initialized
+
+# UPSTREAM MN-scheduler / coroutine layer (not RLGCv2), CHECK+ASAN clean:
+# - rb_ractor_sched_barrier_start reads ractor scheduler state during barrier
+#   ESTABLISHMENT (before STW completes), while other Ractors still run; the
+#   barrier protocol synchronizes the actual stop via safepoints. (Already have
+#   the deadlock: variant; this is the data-race read.)
+# - ec_switch (cont.c) writes th->ec during a fiber context switch. The coroutine
+#   switch is TSan-fiber-annotated (coroutine/*/Context.h, __tsan_switch_to_fiber);
+#   the residual report is the barrier-window read of thread/ec state. The GC's
+#   real mark of th->ec happens under the completed barrier (world stopped).
+# Observed via p_fiber_enum (Enumerator-backed fibers + GC.start); the GC is only
+# the caller of the upstream barrier, not the source. Upstream's call.
+race:rb_ractor_sched_barrier_start
+race:ec_switch
+race:fiber_restore_thread
