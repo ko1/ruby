@@ -249,3 +249,15 @@ race:fiber_restore_thread
 # as rb_intern / rb_class_set_initialized. Generic string code, GC not involved.
 race:str_strlen
 race:single_byte_optimizable
+
+# UPSTREAM class/metaclass/namespace internals (class.c, not RLGCv2), benign:
+# concurrent class creation across Ractors (rb_class_initialize -> rb_make_metaclass
+# -> make_metaclass) races on FLAG bits of shared classes/metaclasses (e.g. the
+# Object metaclass chain): class_associate_super does FL_SET_RAW while another
+# Ractor's make_metaclass does FL_TEST on the same flags word. Independent/
+# idempotent bits; CHECK+ASAN clean. git blame = upstream ("Don't add singleton
+# classes to subclasses list", "namespace on read"); GC not involved. Same family
+# as rb_class_set_initialized. "Concurrent class/module creation across Ractors"
+# is an upstream classext/namespace TSan area, not an RLGC GC surface.
+race:make_metaclass
+race:class_associate_super
