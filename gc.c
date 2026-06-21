@@ -5061,7 +5061,21 @@ rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE,
 
     *mfdp = &mfd;
     rb_gc_save_machine_context();
+    /* RLGCv2: hold the VM lock across the root walk so the VM lock is always
+     * acquired BEFORE registered_globals_lock. rb_gc_mark_roots ->
+     * rb_vm_mark_registered_global_objects takes registered_globals_lock, and
+     * the mark callback installed above records reachability via rb_hash_aset,
+     * whose write barrier re-enters the VM lock (check_rvalue_consistency_force
+     * under RGENGC_CHECK_MODE). Without this, this walk acquires reg -> VM,
+     * while the per-object verify scan and the global GC's own root mark acquire
+     * VM -> reg; two such walks on different Ractors (e.g. a confined-GC verify
+     * and ObjectSpace.reachable_objects_from_root) then deadlock on
+     * VM lock <-> registered_globals_lock. The no-barrier lock keeps the inner
+     * re-entry cheap and serializes concurrent walks. Never reached during a GC
+     * (asserted above), so GET_RACTOR() is the live current Ractor, never NULL. */
+    unsigned int lev = rb_gc_vm_lock_no_barrier(__FILE__, __LINE__);
     rb_gc_mark_roots(rb_gc_get_objspace(), &data.category);
+    rb_gc_vm_unlock_no_barrier(lev, __FILE__, __LINE__);
     *mfdp = prev_mfd;
 }
 
