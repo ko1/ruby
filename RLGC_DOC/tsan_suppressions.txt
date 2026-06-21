@@ -31,6 +31,25 @@ race:shape_get_next
 # by making GC.compact concurrent across objspaces (gc_compact_stats).
 race:rbimpl_intern_const
 
+# Open-coded lazy static-ID cache, same benign idempotent pattern as
+# rbimpl_intern_const: extract_raise_options (eval.c) does
+#   static ID keywords[1] = {0}; if (!keywords[0]) CONST_ID(keywords[0],"cause");
+# Two Ractors raising concurrently both init the static to the SAME id. Benign.
+race:extract_raise_options
+
+# objspace->flags.during_gc read on the GC-accounted malloc path
+# (malloc_during_gc_p, inlined into rb_gc_impl_calloc / objspace_malloc_gc_stress)
+# vs the global GC setting during_gc=TRUE on each foreign objspace
+# (rlgc_global_gc step 3). Benign: malloc_during_gc_p is
+#   during_gc && !dont_gc_val() && !rb_gc_multi_ractor_p() && ruby_thread_has_gvl_p()
+# and the racing reader is the GVL-less timer thread (native_thread_alloc) in
+# multi-Ractor mode, so BOTH !rb_gc_multi_ractor_p() and ruby_thread_has_gvl_p()
+# force the result to false regardless of the during_gc bit -- the raced read is
+# never used. (Possible non-race cleanup for upstream: test ruby_thread_has_gvl_p
+# before during_gc so the GVL-less path never reads it.)
+race:malloc_during_gc_p
+race:objspace_malloc_gc_stress
+
 # The timer thread peeks ubf_list_head emptiness without ubf_list_lock
 # (ubf_threads_empty <- timer_thread_set_timeout); a stale read only
 # defers the unblock sweep by one timer tick. Upstream pattern in
