@@ -206,6 +206,17 @@ race:rb_ractor_sched_wait
 # coroutine-handoff blind spot as the sched-handoff family above). Benign given
 # the dying_th ordering.
 race:rb_threadptr_sched_free
+
+# Same coroutine-handoff blind spot, anchored on co_start itself: the dying thread's
+# terminal coroutine epilogue (co_start, thread_pthread_mn.c -- native_thread_assign,
+# rb_ractor_set_current_ec(th->ractor, NULL) at :487) reads th / th->nt / th->ractor,
+# while the freeing thread's GC does a sized ruby_xfree of a thread-owned buffer
+# (free <- rb_gc_impl_free <- ruby_xfree_sized). The sched lock that orders these is
+# handed off across the terminal coroutine transfer, so TSan sees no happens-before
+# edge and reports free-vs-co_start-read. Benign: the dying_th ordering frees the
+# thread strictly after the epilogue's last write (M1b). git blame co_start = upstream
+# baseline d2a0e98c7; CHECK 0/16 + ASAN 0/56 on v2_first_child_double_sweep; ~1/1500.
+race:co_start
 race:native_thread_assign
 
 # The Ractor sched lock is ACQUIRED across the handoff too (co_start ->
