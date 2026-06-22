@@ -261,3 +261,14 @@ race:single_byte_optimizable
 # is an upstream classext/namespace TSan area, not an RLGC GC surface.
 race:make_metaclass
 race:class_associate_super
+
+# UPSTREAM MN thread-scheduler (thread_pthread*.c, not RLGCv2): the timer thread
+# (timer_thread_deq_wakeup/check_timeout managing sleep timeouts) writes a sched
+# field under one mutex while a sleeping thread (thread_sched_wait_events <-
+# native_sleep) reads it under another. git blame = upstream "Fix thread
+# scheduler issue with thread_sched_wait_events"; no RLGC markers; CHECK+ASAN
+# clean; GC not involved (observed via f_sleep_gc whose sleep engages the timer).
+# Same MN-scheduler family as rb_ractor_sched_barrier_start / ec_switch.
+race:timer_thread_deq_wakeup
+race:timer_thread_check_timeout
+race:thread_sched_wait_events
