@@ -395,6 +395,17 @@ race:gc_counter_load_acquire
 race:gc_counter_load_relaxed
 race:gc_counter_store_release
 
+# Same malloc-accounting-heuristic family: objspace_malloc_increase_body
+# (default.c:9957) reads the GC-trigger counter `malloc_increase` of a per-Ractor
+# objspace while the creating thread is still calloc'ing that objspace struct
+# (rb_gc_impl_objspace_alloc -> calloc1(sizeof(rb_objspace_t)), default.c:11362). The
+# objspace is fully zeroed by calloc before it is published to its Ractor, and
+# malloc_increase only drives WHEN a GC fires, so a stale/racy read is benign; TSan
+# just lacks a happens-before edge from the Ractor-creation handshake to the reader.
+# git blame both lines = upstream baseline d2a0e98c7, 0 RLGC markers; CHECK 0/20 +
+# ASAN 0/20 on h_io_pipe_gc; ~1/2000.
+race:objspace_malloc_increase_body
+
 # UPSTREAM YJIT global stats counters (compile.c, not RLGCv2): rb_iseq_translate_
 # threaded_code does a plain `rb_yjit_live_iseq_count++` / `rb_yjit_iseq_alloc_count++`
 # (compile.c:996-997) on process-global counters while finalizing a compiled iseq.
