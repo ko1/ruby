@@ -379,3 +379,32 @@ race:thread_sched_to_waiting_common
 # corruption. git blame = upstream (Matt Valentine-House, cb3b126eee / ec114e5701).
 # Extremely rare (1 in 200+ runs); CHECK+ASAN clean.
 race:gc_counter_load_acquire
+
+# UPSTREAM object-id counter (gc.c, not RLGCv2): id2ref_tbl_mark reads
+# LAST_OBJECT_ID() (the monotonic global object_id_counter, gc.c:2153) to decide
+# whether enough ids were generated that keys went T_BIGNUM, while another thread
+# bumps it via RUBY_ATOMIC_SIZE_FETCH_ADD in generate_next_object_id. A stale read
+# of a monotonic counter at the BIGNUM threshold (~2^62 ids) is harmless. git blame
+# = upstream (Jean Boussier b5575a80bc); 0 RLGC markers; CHECK+ASAN clean.
+race:id2ref_tbl_mark
+
+# RLGCv2 benign: rb_gc_impl_handle_weak_references_alive_p (gc/default/default.c:6471)
+# reads obj's mark bit (RVALUE_MARKED -> page->mark_bits) to judge a weak ref's
+# target, while another thread reinitializes a recycled heap page via
+# heap_page_allocate (default.c:2493). The page struct memory is valid (being
+# re-initialized, not freed), so the read yields a valid bool: a dead target on a
+# recycled page reads not-marked -> correctly judged not-alive, and the global GC's
+# unified mark is authoritative anyway (per the containment comment at :6468). git
+# blame = RLGCv2 (Koichi d3df7bcdc0) but CHECK 0/12 + ASAN 0/36 -- no corruption.
+race:rb_gc_impl_handle_weak_references_alive_p
+
+# KNOWN BENIGN UPSTREAM, deliberately NOT suppressed (no narrow token): the lock-free
+# `...` forwarding call-cache has a write-write variant where two threads running the
+# same iseq both publish cd->cc via RB_OBJ_WRITE(GET_ISEQ(), &cd->cc, ...) at
+# insns.def:888 (both stacks symbolize to rb_obj_write + vm_exec_core). Same benign
+# cd->cc speculative cache as race:vm_caller_setup_fwd_args above (last-writer-wins,
+# both values valid; git blame insns.def:888 = upstream d2a0e98c7; CHECK+ASAN clean).
+# A `race:rb_obj_write` or `race:insns.def` suppression would be far too broad (the
+# generational write barrier / the entire bytecode interpreter) and could mask real
+# WB races, so it is left unsuppressed and recognized on sight in triage. The campaign
+# scripts filter this exact signature (insns.def:888) so it does not crowd the logs.
