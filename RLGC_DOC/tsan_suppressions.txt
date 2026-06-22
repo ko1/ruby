@@ -280,3 +280,15 @@ race:thread_sched_wait_events
 # Same MN-scheduler family as rb_ractor_sched_barrier_start / timer_thread_* / ec_switch.
 race:ruby_thread_set_native
 race:nt_start
+
+# UPSTREAM lock-free concurrent set (concurrent_set.c, not RLGCv2): the fstring /
+# symbol / id tables are a lock-free open-addressing set. concurrent_set_try_resize
+# publishes the new table via an atomic RELEASE store (concurrent_set.c:211) under
+# RB_VM_LOCKING(), while rb_concurrent_set_find_or_insert reads the table lock-free
+# (acquire). TSan flags the resize-publish vs lock-free-reader pair. git blame line
+# 211 = upstream 45c016866 "Use explicit memory orders in concurrent_set"; 0 RLGC
+# markers in the file (RLGC's only touch, b7d184d3f, was GC-liveness of the container,
+# not its access protocol). Observed via i_hash_rehash_compact; CHECK+ASAN clean.
+# Same upstream lock-free-by-design family as shape_get_next.
+race:concurrent_set_try_resize_without_locking
+race:concurrent_set_try_resize
