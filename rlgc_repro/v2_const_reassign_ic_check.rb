@@ -14,10 +14,12 @@
 # legal (variable.c:3995 only forbids non-shareable values), so this is a legal but
 # inherently racy operation whose IC invalidation isn't synchronized across Ractors.
 #
-# Likely UPSTREAM (constant-cache invalidation vs concurrent cross-Ractor reassign),
-# NOT RLGC -- but the pre-RLGC base (26f09eb6a) cores on this workload for an
-# unrelated reason, so a stock-master CHECK build is needed to confirm attribution.
-# Control: read-only shared constants do NOT trip it (reassignment is the trigger).
+# CONFIRMED UPSTREAM (constant-cache invalidation vs concurrent cross-Ractor reassign),
+# NOT RLGC: a from-scratch CHECK build of the true merge-base 26f09eb6a
+# (RGENGC_CHECK_MODE=2, no RLGC) asserts rb_vm_opt_getconstant_path 12/12 on this
+# exact workload -- more reliably than RLGC (6/10). The IC + global-constant-serial
+# invalidation is upstream; RLGC does not touch it. Control: read-only shared
+# constants do NOT trip it (reassignment is the trigger).
 rs = (1..6).map do
   Ractor.new do
     300.times { |i| K_RLGC_PROBE = Object.new.freeze; _ = K_RLGC_PROBE }
