@@ -49,6 +49,12 @@ race:extract_raise_options
 # before during_gc so the GVL-less path never reads it.)
 race:malloc_during_gc_p
 race:objspace_malloc_gc_stress
+# Same during_gc-flag-on-malloc-path race, but with malloc_during_gc_p inlined into
+# check_malloc_not_in_gc (default.c:10092, the read), reached via rb_gc_impl_malloc.
+# TSan symbolizes the top frame as the caller, so the lines above didn't match it.
+# Observed via h_io_pipe_gc (~1/6000); git blame = upstream baseline d2a0e98c7;
+# 0 RLGC markers; CHECK+ASAN clean. Same benign reasoning as above.
+race:check_malloc_not_in_gc
 
 # The timer thread peeks ubf_list_head emptiness without ubf_list_lock
 # (ubf_threads_empty <- timer_thread_set_timeout); a stale read only
