@@ -292,3 +292,52 @@ race:nt_start
 # Same upstream lock-free-by-design family as shape_get_next.
 race:concurrent_set_try_resize_without_locking
 race:concurrent_set_try_resize
+
+# UPSTREAM dynamic-symbol lazy-id pinning (symbol.c, not RLGCv2): a Ractor-shared
+# dynamic symbol gets its ID assigned lazily on first rb_sym2id. The writer pins it
+# under GLOBAL_SYMBOLS_LOCKING (symbol.c:993 `RSYMBOL(sym)->id = id |= num`), while
+# another Ractor reads SYMBOL_PINNED_P / RSYMBOL(name)->id lock-free on the fast path
+# (symbol.c:1177-1178, via rb_check_id). A reader that sees not-yet-pinned falls to the
+# slow path under the same lock, so the result is always correct. git blame both lines
+# = upstream (d2a0e98c7 / Peter Zhu 6c24904a69); 0 RLGC markers in symbol.c; not GC
+# code. Observed via i_genivar_gc (concurrent ivar set across Ractors); CHECK+ASAN clean.
+race:rb_sym2id
+race:rb_check_id
+
+# RLGCv2 benign-by-design: a confined (foreign) GC marks another Ractor's
+# single-VALUE slots -- r_stdin/r_stdout/r_stderr/verbose/debug -- in
+# ractor_mark_unshareable_parts (ractor.c:246), while that Ractor's own main
+# thread initializes the same fields during startup (thread.c:680
+# `r->r_stdin = rb_io_prep_stdin()` under RB_VM_LOCK). These are single aligned
+# 8-byte words: a torn read is impossible, and BOTH possible values are safe to
+# pass to rb_gc_mark -- the calloc'd initial 0 (Qfalse, an immediate, skipped)
+# or a fully-published IO object (foreign to the marking objspace, skipped by
+# containment). The design (design_v2.md, ractor.c:243-245) explicitly accepts
+# this lock-free single-word read. CHECK 0/20 + ASAN 0/20 on f_mega_mix /
+# compact_race / p_absorb_compact_race; only TSan flags the bare read/write pair.
+race:ractor_mark_unshareable_parts
+
+# UPSTREAM lock-free inline call-cache for `...` argument forwarding (vm_args.c /
+# insns.def, not RLGCv2): the same iseq run by two threads shares one call-data.
+# vm_caller_setup_fwd_args reads `cd->cc` lock-free (vm_args.c:1225) to build a
+# forwarding call, while another thread publishes a refreshed cc with a write
+# barrier (insns.def:888 `RB_OBJ_WRITE(GET_ISEQ(), &cd->cc, ...)`). A stale read
+# just re-searches the method -- the cc is a speculative cache. git blame both
+# lines = upstream baseline d2a0e98c7; 0 RLGC markers. Observed via struct_data /
+# compact_send; CHECK 0/5 + ASAN 0/5. Same lock-free-cc family as the IC notes above.
+race:vm_caller_setup_fwd_args
+
+# UPSTREAM benign static-local lazy init (gc/default/default.c, not RLGCv2):
+# gc_verify_compaction_references lazily fills a `static ID keywords[3]` cache
+# (default.c:11111) on first call. RLGC made GC.verify_compaction_references run
+# concurrently across Ractors, so two callers race to init the static -- but both
+# write the SAME interned IDs (idempotent). Debug-only method. git blame = upstream
+# baseline d2a0e98c7; CHECK 0/5 + ASAN 0/5. Same family as the static-id init notes.
+race:gc_verify_compaction_references
+
+# UPSTREAM concurrent Module#include (class.c, not RLGCv2): two Ractors including
+# into shareable modules race in do_include_modules_at (class.c:1742) on the
+# origin/super-chain machinery. git blame = upstream baseline d2a0e98c7; 0 RLGC
+# markers; GC not involved. Observed via p_module_include; CHECK 0/5 + ASAN 0/5.
+# Same upstream class.c family as the rb_class_set_initialized note above.
+race:do_include_modules_at
