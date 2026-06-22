@@ -394,6 +394,17 @@ race:gc_counter_store_release
 # the GVL these counters assumed.
 race:rb_iseq_translate_threaded_code
 
+# UPSTREAM Regexp not Ractor-safe (re.c, not RLGCv2): rb_reg_onig_match bumps the
+# shared Regexp's in-use guard `RREGEXP(re)->usecnt++ / usecnt--` (re.c:1816/1819)
+# non-atomically around the Onigmo match. Two Ractors matching the SAME frozen Regexp
+# literal concurrently race on usecnt. usecnt guards against recompiling the shared
+# regex in place while a match is in flight, so a torn count is benign UNLESS the
+# recompile path is taken (encoding mismatch) -- a genuine UPSTREAM Ractor-safety gap
+# (worth reporting upstream, like the dtoa one), not RLGCv2's doing. git blame =
+# upstream baseline d2a0e98c7; 0 RLGC markers; not GC code; CHECK+ASAN clean (the
+# repro uses one encoding, so no in-place recompile).
+race:rb_reg_onig_match
+
 # UPSTREAM object-id counter (gc.c, not RLGCv2): id2ref_tbl_mark reads
 # LAST_OBJECT_ID() (the monotonic global object_id_counter, gc.c:2153) to decide
 # whether enough ids were generated that keys went T_BIGNUM, while another thread
