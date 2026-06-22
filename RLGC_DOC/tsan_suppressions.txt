@@ -384,6 +384,16 @@ race:gc_counter_load_acquire
 race:gc_counter_load_relaxed
 race:gc_counter_store_release
 
+# UPSTREAM YJIT global stats counters (compile.c, not RLGCv2): rb_iseq_translate_
+# threaded_code does a plain `rb_yjit_live_iseq_count++` / `rb_yjit_iseq_alloc_count++`
+# (compile.c:996-997) on process-global counters while finalizing a compiled iseq.
+# Two Ractors compiling iseqs concurrently (e.g. via eval) race on these stats; a
+# lost increment only skews a YJIT bookkeeping count. git blame = upstream baseline
+# d2a0e98c7; 0 RLGC markers; not GC code; CHECK+ASAN clean. Same non-atomic-global-
+# counter family as gc_counter / object_id_counter; broken only because Ractors drop
+# the GVL these counters assumed.
+race:rb_iseq_translate_threaded_code
+
 # UPSTREAM object-id counter (gc.c, not RLGCv2): id2ref_tbl_mark reads
 # LAST_OBJECT_ID() (the monotonic global object_id_counter, gc.c:2153) to decide
 # whether enough ids were generated that keys went T_BIGNUM, while another thread
