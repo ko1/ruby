@@ -272,3 +272,11 @@ race:class_associate_super
 race:timer_thread_deq_wakeup
 race:timer_thread_check_timeout
 race:thread_sched_wait_events
+
+# UPSTREAM MN native-thread setup (thread_pthread.c, not RLGCv2): ruby_thread_set_native
+# (sets the per-NT current-thread TLS) vs nt_start (a starting native thread) racing
+# during native-thread create/start. Observed via h_io_pipe_gc (IO.pipe spawns
+# threads). git blame = upstream, no RLGC markers, GC not involved, CHECK+ASAN clean.
+# Same MN-scheduler family as rb_ractor_sched_barrier_start / timer_thread_* / ec_switch.
+race:ruby_thread_set_native
+race:nt_start
