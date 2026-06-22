@@ -377,8 +377,12 @@ race:thread_sched_to_waiting_common
 # another GC publishes them via gc_counter_store_release. These are atomic
 # acquire/release stats counters; a stale read only nudges the next-GC heuristic, no
 # corruption. git blame = upstream (Matt Valentine-House, cb3b126eee / ec114e5701).
-# Extremely rare (1 in 200+ runs); CHECK+ASAN clean.
+# Extremely rare (1 in 200+ runs); CHECK+ASAN clean. The same counters are also read
+# via gc_counter_load_relaxed (gc_malloc_counters_increase, default.c:1230) and
+# published via gc_counter_store_release -- all the same benign stats-counter family.
 race:gc_counter_load_acquire
+race:gc_counter_load_relaxed
+race:gc_counter_store_release
 
 # UPSTREAM object-id counter (gc.c, not RLGCv2): id2ref_tbl_mark reads
 # LAST_OBJECT_ID() (the monotonic global object_id_counter, gc.c:2153) to decide
