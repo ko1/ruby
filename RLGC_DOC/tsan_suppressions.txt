@@ -341,3 +341,41 @@ race:gc_verify_compaction_references
 # markers; GC not involved. Observed via p_module_include; CHECK 0/5 + ASAN 0/5.
 # Same upstream class.c family as the rb_class_set_initialized note above.
 race:do_include_modules_at
+
+# UPSTREAM non-ractor-safe dtoa (missing/dtoa.c, vendored, not RLGCv2): pow5mult
+# walks a process-wide `static Bigint *p5s` powers-of-5 cache while building a
+# float<->string conversion. Ruby defines ACQUIRE_DTOA_LOCK/FREE_DTOA_LOCK as
+# no-ops ("unused right now", dtoa.c:507-508), relying on the GVL -- which Ractors
+# break by running float conversion in parallel. Observed via l_marshal_deep_send
+# (Marshal of Floats across Ractors, w_float/ruby_dtoa + r_object_for/ruby_strtod).
+# git blame = upstream (Nobuyoshi Nakada); 0 RLGC markers; not GC code; CHECK+ASAN
+# clean. This is a genuine UPSTREAM Ractor thread-safety gap in vendored dtoa, not
+# RLGCv2's doing -- worth reporting upstream, but out of scope here.
+race:pow5mult
+
+# UPSTREAM MN-scheduler lock-free handoff hints (thread_pthread.c / ractor_core.h,
+# not RLGCv2): the scheduler tracks two per-Ractor fast-path hints that one native
+# thread publishes under sched->lock_ (M0) while another reads them lock-free during
+# a context switch -- the authoritative state stays under the lock, a stale hint just
+# costs an extra check.
+#   * running_ec: rb_ractor_set_current_ec_ (ractor_core.h:306) writes it; another
+#     thread's rb_ractor_thread_switch (ractor_core.h:272) reads it via
+#     blocking_region_end.
+#   * runnable_hot_th: thread_sched_to_waiting_common (thread_pthread.c:1079) writes
+#     it; thread_sched_to_running (thread_pthread.c:1004) reads it.
+# running_ec git blame = upstream baseline d2a0e98c7; runnable_hot_th = upstream
+# (Jacob Lacouture). 0 RLGC markers near either. Observed via h_io_pipe_gc; CHECK+ASAN
+# clean. Same MN-scheduler family as ec_switch / fiber_restore_thread / thread_sched_*.
+race:rb_ractor_set_current_ec_
+race:rb_ractor_thread_switch
+race:thread_sched_to_running
+race:thread_sched_to_waiting_common
+
+# UPSTREAM malloc-accounting counters with explicit memory orders (gc/default/
+# default.c, not RLGCv2): gc_malloc_counters_increase reads malloc_at_last_gc /
+# free_at_last_gc via gc_counter_load_acquire (rbimpl_atomic_u64_load_acquire) while
+# another GC publishes them via gc_counter_store_release. These are atomic
+# acquire/release stats counters; a stale read only nudges the next-GC heuristic, no
+# corruption. git blame = upstream (Matt Valentine-House, cb3b126eee / ec114e5701).
+# Extremely rare (1 in 200+ runs); CHECK+ASAN clean.
+race:gc_counter_load_acquire
