@@ -19,6 +19,21 @@ race:rb_ec_vm_lock_rec
 # barrier protocol.
 deadlock:rb_ractor_sched_barrier_start
 
+# UPSTREAM MN-scheduler lock-order-inversion (potential deadlock), not RLGCv2: the
+# per-Ractor sched lock (thread_sched_lock_, thread_pthread.c) is held across a
+# coroutine switch by design and acquired in rb_threadptr_interrupt /
+# rb_threadptr_join_list_wakeup when waking a Thread#join waiter. Because the lock is
+# handed off across the coroutine transfer, TSan attributes it to whatever code runs
+# next (e.g. an rb_ensure body, even the require/raise_loaderror path), so it sees a
+# spurious cycle "sched-lock => other-lock => sched-lock". Same coroutine-handoff
+# blind spot as the mutex:thread_sched_* family above, just reported as a lock-order
+# cycle. git blame = upstream (thread_sched_lock_ = ef2bb61018 Koichi's upstream MN
+# scheduler; interrupt/ensure = baseline d2a0e98c7); 0 RLGC markers; not an actual
+# deadlock through the GVL/handoff protocol. Surfaced via l_coderange_share (TSan
+# exitcode 66) where a failed error_highlight require raised inside the wakeup path.
+deadlock:thread_sched_lock_
+deadlock:rb_threadptr_interrupt
+
 # Shape tree lock-free readers (upstream lock-free design).
 race:shape_get_next
 
