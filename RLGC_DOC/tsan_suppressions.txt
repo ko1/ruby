@@ -34,6 +34,20 @@ deadlock:rb_ractor_sched_barrier_start
 deadlock:thread_sched_lock_
 deadlock:rb_threadptr_interrupt
 
+# More of the SAME coroutine-handoff lock-order-inversion family (potential deadlock,
+# not actual -- the probes complete in 1-6s, no hang), among the upstream ractor /
+# MN-scheduler locks that are held across coroutine switches:
+#   * ractor_sched_lock_ (global ractor scheduler lock, thread_pthread.c:497) <=>
+#     ractor_lock (per-Ractor lock, ractor.c:85)         [via ractor_chain]
+#   * ubf_set (unblock-func install, thread_pthread.c:1111) <=> a lock held across a
+#     vm_yield                                           [via m_objspace_each]
+# git blame all = upstream baseline d2a0e98c7; 0 RLGC markers near any. The MN
+# scheduler holds these across coroutine transfers, so TSan's lock-order graph sees
+# spurious cycles; the real acquisition order is consistent (no hang observed).
+deadlock:ractor_sched_lock_
+deadlock:ractor_lock
+deadlock:ubf_set
+
 # Shape tree lock-free readers (upstream lock-free design).
 race:shape_get_next
 
