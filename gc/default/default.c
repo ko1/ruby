@@ -4848,7 +4848,15 @@ rb_gc_impl_location(void *objspace_ptr, VALUE value)
 {
     VALUE destination;
 
-    GC_ASSERT(is_pointer_to_heap(objspace_ptr, (void *)value));
+    /* RLGCv2: a reference into ANOTHER objspace's heap does not move during
+     * THIS objspace's compaction -- only the owning objspace relocates it (and
+     * fixes its own incoming references). Leave such a foreign reference
+     * unchanged rather than asserting it belongs to this objspace. (In a
+     * single-objspace VM every valid reference is local, so this is a no-op
+     * there.) */
+    if (!is_pointer_to_heap(objspace_ptr, (void *)value)) {
+        return value;
+    }
 
     asan_unpoisoning_object(value) {
         if (BUILTIN_TYPE(value) == T_MOVED) {
