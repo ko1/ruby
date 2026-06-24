@@ -1343,6 +1343,10 @@ rb_obj_set_shareable_no_assert(VALUE obj)
             // no recursive mark
             FL_SET_RAW(fields, FL_SHAREABLE);
             rb_gc_obj_became_shareable(fields);
+            // ...but field values not reached by the make_shareable traversal
+            // (e.g. hidden internal ivars) may stay unshareable; record their
+            // shrefs so the shareable fields imemo keeps a valid edge record.
+            rb_imemo_fields_record_shrefs(fields);
         }
     }
 }
