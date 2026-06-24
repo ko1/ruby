@@ -1752,6 +1752,29 @@ imemo_fields_complex_from_obj_i(ID key, VALUE val, st_data_t arg)
     return ST_CONTINUE;
 }
 
+static int
+imemo_fields_shref_i(ID key, VALUE val, st_data_t arg)
+{
+    VALUE fields_obj = (VALUE)arg;
+    /* RLGCv2: fields_obj just became shareable (rb_obj_set_shareable_no_assert)
+     * while this field value stayed unshareable -- some field values (e.g. a
+     * hidden [path,line] location ivar) are not reached by the make_shareable
+     * traversal and so are never deep-shared. Record the shref the write
+     * barrier would have, so the shareable -> unshareable edge is tracked. */
+    if (!SPECIAL_CONST_P(val) && !RB_OBJ_SHAREABLE_P(val)) {
+        rb_gc_writebarrier(fields_obj, val);
+    }
+    return ST_CONTINUE;
+}
+
+/* Record shrefs for any still-unshareable values held by a fields imemo that
+ * has just been promoted to shareable. */
+void
+rb_imemo_fields_record_shrefs(VALUE fields_obj)
+{
+    rb_field_foreach(fields_obj, imemo_fields_shref_i, (st_data_t)fields_obj, false);
+}
+
 static VALUE
 imemo_fields_complex_from_obj(VALUE owner, VALUE source, shape_id_t shape_id, bool ivar_only, int extra_capa)
 {

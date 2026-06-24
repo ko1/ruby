@@ -57,6 +57,7 @@ attr_index_t rb_obj_field_set(VALUE obj, shape_id_t target_shape_id, ID field_na
 VALUE rb_ivar_get_at(VALUE obj, attr_index_t index, ID id);
 VALUE rb_ivar_get_at_no_ractor_check(VALUE obj, attr_index_t index);
 void rb_generic_fields_lock_atfork(void);
+void rb_imemo_fields_record_shrefs(VALUE fields_obj);
 
 RUBY_SYMBOL_EXPORT_BEGIN
 /* variable.c (export) */
