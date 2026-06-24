@@ -2077,6 +2077,17 @@ rb_objspace_garbage_object_p(VALUE obj)
     return !SPECIAL_CONST_P(obj) && rb_gc_impl_garbage_object_p(rb_gc_get_objspace(), obj);
 }
 
+/* RLGCv2: whether obj is a live object in the current objspace's heap. Used as
+ * a defensive guard before marking a possibly-stale back-pointer (e.g. a
+ * winding-down zombie thread's self / Ractor). Upstream removed its own
+ * rb_gc_pointer_to_heap_p (renamed the impl to live_object_p); RLGC keeps this
+ * thin public wrapper for the containment-aware teardown marking paths. */
+bool
+rb_gc_pointer_to_heap_p(VALUE obj)
+{
+    return !SPECIAL_CONST_P(obj) && rb_gc_impl_live_object_p(rb_gc_get_objspace(), (void *)obj);
+}
+
 #define OBJ_ID_INCREMENT (RUBY_IMMEDIATE_MASK + 1)
 #define LAST_OBJECT_ID() (object_id_counter * OBJ_ID_INCREMENT)
 
@@ -2911,16 +2922,6 @@ static VALUE
 gc_location_internal(void *objspace, VALUE value)
 {
     if (SPECIAL_CONST_P(value)) {
-        return value;
-    }
-
-    /* RLGCv2: a reference into ANOTHER objspace's heap does not move during
-     * THIS objspace's compaction -- only the owning objspace relocates it (and
-     * fixes its own incoming references). Leave such a foreign reference
-     * unchanged rather than asserting it belongs to this objspace. (In a
-     * single-objspace VM every valid reference is local, so this is a no-op
-     * there.) */
-    if (!rb_gc_impl_pointer_to_heap_p(objspace, (void *)value)) {
         return value;
     }
 
