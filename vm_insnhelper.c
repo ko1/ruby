@@ -612,7 +612,14 @@ lep_svar_in_env_p(const rb_execution_context_t *ec, const VALUE *lep)
     if (!lep) return false;
     if (ec == NULL) return true;
     if (ec->root_lep == lep) return false;
-    if (VM_ENV_ESCAPED_P(lep) &&
+    /* lep may be the stale on-stack ep of a frame whose env has since
+     * escaped: vm_make_env_each() leaves the imemo_env VALUE in lep[0] as a
+     * GC-mark anchor, so the flags slot is no longer a FIXNUM and reading
+     * VM_ENV_ESCAPED_P(lep) would assert. Such a frame cannot be a live
+     * shareable proc's env (those keep a valid env header), so fall back to
+     * the in-env svar slot -- the same lep[ME_CREF] read upstream does. */
+    if (FIXNUM_P(lep[VM_ENV_DATA_INDEX_FLAGS]) &&
+            VM_ENV_ESCAPED_P(lep) &&
             RB_FL_TEST_RAW(VM_ENV_ENVVAL(lep), RUBY_FL_SHAREABLE)) {
         return false;
     }
