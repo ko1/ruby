@@ -1331,9 +1331,15 @@ fiber_free(void *ptr)
      * the thread wrapper can outlive this one (their sweep order is
      * arbitrary), and its dmark must not walk a freed ec -- the
      * consistency verifier visits such wrappers even when no real mark
-     * ever would. (thread_free clears our thread_ptr in the reverse
-     * order, so this dereference is safe.) */
-    {
+     * ever would. thread_free clears the ROOT fiber's thread_ptr before
+     * the thread is freed, so this dereference is safe for it.
+     *
+     * Only the root fiber needs (and may safely do) this: a non-root
+     * fiber's thread_ptr is NOT cleared by thread_free and can dangle
+     * (its thread wrapper freed in an earlier sweep step), while the
+     * thread's ec never points into a non-root fiber. Gate on first_proc
+     * -- root fibers have none -- so we never dereference a freed thread. */
+    if (fiber->first_proc == 0) {
         rb_thread_t *th = fiber->cont.saved_ec.thread_ptr;
         if (th && th->ec == &fiber->cont.saved_ec) {
             th->ec = NULL;
@@ -1355,12 +1361,15 @@ fiber_memsize(const void *ptr)
     const rb_fiber_t *fiber = ptr;
     size_t size = sizeof(*fiber);
     const rb_execution_context_t *saved_ec = &fiber->cont.saved_ec;
-    const rb_thread_t *th = rb_ec_thread_ptr(saved_ec);
 
     /*
      * vm.c::thread_memsize already counts th->ec->local_storage
+     * (the root fiber's). RLGCv2: test first_proc rather than
+     * fiber != th->root_fiber -- a non-root fiber's thread_ptr may
+     * dangle, and only non-root fibers (first_proc != 0) own storage
+     * not already accounted by the thread.
      */
-    if (saved_ec->local_storage && fiber != th->root_fiber) {
+    if (saved_ec->local_storage && fiber->first_proc != 0) {
         size += rb_id_table_memsize(saved_ec->local_storage);
         size += rb_obj_memsize_of(saved_ec->storage);
     }
