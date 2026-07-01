@@ -166,7 +166,7 @@ struct rb_ractor_struct {
     /* RLGCv2: この Ractor で登録された VM グローバル root を per-Ractor に持つ
      * （旧 vm->global_object_list / vm->mark_object_ary を Ractor-local 化）。
      * これにより local GC は自 Ractor の登録だけを walk し、VM グローバルな
-     * 共有リストと registered_globals_lock（の register 用途）が hot path から消える。
+     * 共有リスト（と、その走査を守っていた共有ロック）が hot path から消える。
      * mark は rb_ractor_mark_local_roots（local=current Ractor / global=全 Ractor）。
      *   registered_addrs = rb_gc_register_address（VALUE* の「場所」。*addr を mark_maybe）
      *   registered_marks  = rb_gc_register_mark_object / rb_vm_register_global_object
