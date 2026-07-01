@@ -3409,11 +3409,9 @@ rb_vm_mark(void *ptr)
             rb_gc_mark(rb_ractor_self(r));
         }
 
-        /* global_object_list (rb_gc_register_address) is marked by
-         * rb_vm_mark_registered_global_objects() from every objspace's root
-         * scan, not here: its entries can live in any objspace.  Registered
-         * mark objects (rb_gc_register_mark_object) are per-Ractor and marked
-         * from ractor_mark (and the main Ractor's list, above). */
+        /* RLGCv2: 旧 global_object_list / mark_object_ary（登録済み VM グローバル
+         * root）は Ractor-local になり、各 Ractor の rb_ractor_mark_local_roots で
+         * mark される。ここでは何もしない。 */
 
         rb_gc_mark_movable(vm->self);
 
@@ -3528,8 +3526,6 @@ ruby_vm_destruct(rb_vm_t *vm)
         st_free_embedded_table(&vm->ci_table);
         RB_ALTSTACK_FREE(vm->main_altstack);
 
-        SIZED_FREE_N(vm->global_object_list, vm->global_object_list_capa);
-
         if (objspace) {
             if (rb_free_at_exit) {
                 rb_objspace_free_objects(objspace);
@@ -3613,7 +3609,6 @@ vm_memsize(const void *ptr)
         vm_memsize_builtin_function_table(vm->builtin_function_table) +
         (rb_id_table_memsize(&vm->negative_cme_table) - sizeof(struct rb_id_table)) +
         (rb_st_memsize(&vm->overloaded_cme_table) - sizeof(struct st_table)) +
-        (vm->global_object_list_capa * sizeof(*vm->global_object_list)) +
         vm_memsize_constant_cache()
     );
 
@@ -4816,89 +4811,6 @@ ruby_init_stack(void *addr)
 #endif
 
 
-#ifndef MARK_OBJECT_ARY_BUCKET_SIZE
-#define MARK_OBJECT_ARY_BUCKET_SIZE 1024
-#endif
-
-struct pin_array_list {
-    VALUE next;
-    long len;
-    VALUE *array;
-};
-
-static void
-pin_array_list_mark(void *data)
-{
-    struct pin_array_list *array = (struct pin_array_list *)data;
-    rb_gc_mark_movable(array->next);
-
-    rb_gc_mark_vm_stack_values(array->len, array->array);
-}
-
-static void
-pin_array_list_free(void *data)
-{
-    struct pin_array_list *array = (struct pin_array_list *)data;
-    xfree(array->array);
-}
-
-static size_t
-pin_array_list_memsize(const void *data)
-{
-    return sizeof(struct pin_array_list) + (MARK_OBJECT_ARY_BUCKET_SIZE * sizeof(VALUE));
-}
-
-static void
-pin_array_list_update_references(void *data)
-{
-    struct pin_array_list *array = (struct pin_array_list *)data;
-    array->next = rb_gc_location(array->next);
-}
-
-static const rb_data_type_t pin_array_list_type = {
-    .wrap_struct_name = "VM/pin_array_list",
-    .function = {
-        .dmark = pin_array_list_mark,
-        .dfree = pin_array_list_free,
-        .dsize = pin_array_list_memsize,
-        .dcompact = pin_array_list_update_references,
-    },
-    .flags = RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_EMBEDDABLE,
-};
-
-static VALUE
-pin_array_list_new(VALUE next)
-{
-    struct pin_array_list *array_list;
-    VALUE obj = TypedData_Make_Struct(0, struct pin_array_list, &pin_array_list_type, array_list);
-    RB_OBJ_WRITE(obj, &array_list->next, next);
-    array_list->array = ALLOC_N(VALUE, MARK_OBJECT_ARY_BUCKET_SIZE);
-    return obj;
-}
-
-static VALUE
-pin_array_list_append(VALUE obj, VALUE item)
-{
-    struct pin_array_list *array_list;
-    TypedData_Get_Struct(obj, struct pin_array_list, &pin_array_list_type, array_list);
-
-    /* Allocate a full bucket's successor BEFORE taking
-     * registered_globals_lock: the allocation can run this thread's
-     * local GC, whose root walk takes the same mutex. The chunk chain
-     * and len are then published under the mutex, excluding the
-     * lock-free walkers (rb_vm_mark_registered_global_objects). */
-    if (array_list->len >= MARK_OBJECT_ARY_BUCKET_SIZE) {
-        obj = pin_array_list_new(obj);
-        TypedData_Get_Struct(obj, struct pin_array_list, &pin_array_list_type, array_list);
-    }
-
-    rb_gc_registered_globals_lock();
-    RB_OBJ_WRITE(obj, &array_list->array[array_list->len], item);
-    array_list->len++;
-    rb_gc_registered_globals_unlock();
-    return obj;
-}
-
 void
 rb_vm_register_global_object(VALUE obj)
 {
@@ -4918,58 +4830,8 @@ rb_vm_register_global_object(VALUE obj)
       default:
         break;
     }
-    RB_VM_LOCKING() {
-        rb_ractor_t *cr = GET_RACTOR();
-        if (!cr->mark_object_ary) cr->mark_object_ary = pin_array_list_new(Qnil);
-        VALUE list = cr->mark_object_ary;
-        VALUE head = pin_array_list_append(list, obj);
-        if (head != list) {
-            cr->mark_object_ary = head;
-        }
-        RB_GC_GUARD(obj);
-    }
-}
-
-/* Hand src's registered mark objects to dst (used when a Ractor terminates:
- * these are process-lifetime pins, so the main Ractor keeps them alive). */
-void
-rb_vm_ractor_migrate_mark_objects(rb_ractor_t *dst, rb_ractor_t *src)
-{
-    ASSERT_vm_locking();
-    VALUE list = src->mark_object_ary;
-    while (!NIL_P(list) && list) {
-        struct pin_array_list *array_list;
-        TypedData_Get_Struct(list, struct pin_array_list, &pin_array_list_type, array_list);
-        for (long i = 0; i < array_list->len; i++) {
-            if (!dst->mark_object_ary) dst->mark_object_ary = pin_array_list_new(Qnil);
-            VALUE head = pin_array_list_append(dst->mark_object_ary, array_list->array[i]);
-            if (head != dst->mark_object_ary) dst->mark_object_ary = head;
-        }
-        list = array_list->next;
-    }
-    src->mark_object_ary = 0;
-}
-
-/* Mark the VM-global address registrations (rb_gc_register_address).  The list
- * can hold objects from any objspace (whoever registers allocates), so every
- * objspace's root scan walks it structurally: mark_maybe keeps exactly its own
- * residents alive.  (rb_gc_register_mark_object is per-Ractor; see
- * rb_ractor_t.mark_object_ary and ractor_mark.) */
-void
-rb_vm_mark_registered_global_objects(rb_vm_t *vm)
-{
-    /* Walked by every objspace's lock-free root pass (design_v2.md
-     * §2.1 step 3.e); the mutex excludes the registration writers.
-     * Marking never allocates through the GC (mark-stack chunks come
-     * from the GC's own cache/malloc with GC re-entry blocked), so
-     * holding the mutex across the walk cannot self-deadlock. */
-    rb_gc_registered_globals_lock();
-
-    for (size_t index = 0; index < vm->global_object_list_size; index++) {
-        rb_gc_mark_maybe(*vm->global_object_list[index]);
-    }
-
-    rb_gc_registered_globals_unlock();
+    rb_ractor_register_mark_object(GET_RACTOR(), obj);
+    RB_GC_GUARD(obj);
 }
 
 VALUE rb_cc_refinement_set_create(void);
@@ -4979,8 +4841,8 @@ Init_vm_objects(void)
 {
     rb_vm_t *vm = GET_VM();
 
-    /* mark object arrays are per-Ractor (rb_ractor_t.mark_object_ary),
-     * lazily created on first rb_gc_register_mark_object */
+    /* RLGCv2: registered global object の格納は Ractor-local になった
+     * （旧 vm->mark_object_ary / vm->global_object_list）ので、ここでの初期化は不要。 */
     st_init_existing_table_with_size(&vm->ci_table, &vm_ci_hashtype, 0);
     vm->cc_refinement_set = rb_cc_refinement_set_create();
 }

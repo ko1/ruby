@@ -332,16 +332,107 @@ ractor_mark(void *ptr)
     }
 }
 
-/* RLGCv2 (design_v2.md §2.1): mark the GC roots of Ractor r that are
- * reachable from its C structure.  A confined GC cannot rely on the heap
- * Ractor/Thread wrapper objects (they may live in another objspace), so the
- * current Ractor's belongings are rooted directly from here. */
+/* RLGCv2: Ractor-local 化した VM グローバル root（旧 vm->global_object_list /
+ * vm->mark_object_ary）の登録・解除・移管。migration は GC sweep（ractor_free）
+ * からも呼ばれるので raw malloc/realloc/free のみを使う（accounting allocator は
+ * sweep 中禁止だし、raw malloc は登録中の GC 再入も避ける）。 */
+void
+rb_ractor_register_address(rb_ractor_t *r, VALUE *addr)
+{
+    if (r->registered_addrs_cnt == r->registered_addrs_capa) {
+        size_t nc = r->registered_addrs_capa ? r->registered_addrs_capa * 2 : 64;
+        VALUE **p = realloc(r->registered_addrs, nc * sizeof(VALUE *));
+        if (!p) rb_bug("rb_ractor_register_address: out of memory");
+        r->registered_addrs = p;
+        r->registered_addrs_capa = nc;
+    }
+    r->registered_addrs[r->registered_addrs_cnt++] = addr;
+}
+
+void
+rb_ractor_unregister_address(rb_ractor_t *r, VALUE *addr)
+{
+    for (size_t i = 0; i < r->registered_addrs_cnt; i++) {
+        if (r->registered_addrs[i] == addr) {
+            MEMMOVE(&r->registered_addrs[i], &r->registered_addrs[i + 1], VALUE *,
+                    r->registered_addrs_cnt - i - 1);
+            r->registered_addrs_cnt--;
+            return;
+        }
+    }
+    /* 見つからなければ no-op（吸収済み Ractor で登録され移管された等） */
+}
+
+void
+rb_ractor_register_mark_object(rb_ractor_t *r, VALUE obj)
+{
+    if (r->registered_marks_cnt == r->registered_marks_capa) {
+        size_t nc = r->registered_marks_capa ? r->registered_marks_capa * 2 : 64;
+        VALUE *p = realloc(r->registered_marks, nc * sizeof(VALUE));
+        if (!p) rb_bug("rb_ractor_register_mark_object: out of memory");
+        r->registered_marks = p;
+        r->registered_marks_capa = nc;
+    }
+    r->registered_marks[r->registered_marks_cnt++] = obj;
+}
+
+/* src の登録済み VM グローバル root を dst へ移管して src を空にする。
+ * Ractor 吸収（Ractor#value join）や終了（ractor_free, sweep 中）から呼ばれるので
+ * raw realloc/free のみ使う。 */
+void
+rb_ractor_absorb_registered_globals(rb_ractor_t *dst, rb_ractor_t *src)
+{
+    if (dst == src) return;
+    if (src->registered_addrs_cnt) {
+        size_t need = dst->registered_addrs_cnt + src->registered_addrs_cnt;
+        if (need > dst->registered_addrs_capa) {
+            VALUE **p = realloc(dst->registered_addrs, need * sizeof(VALUE *));
+            if (!p) rb_bug("rb_ractor_absorb_registered_globals: out of memory");
+            dst->registered_addrs = p;
+            dst->registered_addrs_capa = need;
+        }
+        MEMCPY(&dst->registered_addrs[dst->registered_addrs_cnt], src->registered_addrs,
+               VALUE *, src->registered_addrs_cnt);
+        dst->registered_addrs_cnt = need;
+    }
+    if (src->registered_marks_cnt) {
+        size_t need = dst->registered_marks_cnt + src->registered_marks_cnt;
+        if (need > dst->registered_marks_capa) {
+            VALUE *p = realloc(dst->registered_marks, need * sizeof(VALUE));
+            if (!p) rb_bug("rb_ractor_absorb_registered_globals: out of memory");
+            dst->registered_marks = p;
+            dst->registered_marks_capa = need;
+        }
+        MEMCPY(&dst->registered_marks[dst->registered_marks_cnt], src->registered_marks,
+               VALUE, src->registered_marks_cnt);
+        dst->registered_marks_cnt = need;
+    }
+    free(src->registered_addrs); src->registered_addrs = NULL;
+    src->registered_addrs_cnt = src->registered_addrs_capa = 0;
+    free(src->registered_marks); src->registered_marks = NULL;
+    src->registered_marks_cnt = src->registered_marks_capa = 0;
+}
+
+/* RLGCv2 (design_v2.md §2.1): Ractor r の C 構造体から到達可能な GC root を
+ * mark する。confined GC は heap 上の Ractor/Thread wrapper object に頼れない
+ * （それらは別の objspace に存在する場合がある）ため、現在の Ractor の所有物は
+ * ここから直接 root にされる。 */
 void
 rb_ractor_mark_local_roots(rb_ractor_t *r)
 {
     rb_gc_mark(r->loc);
     rb_gc_mark(r->name);
     ractor_mark_unshareable_parts(r);
+
+    /* RLGCv2: この Ractor で登録された VM グローバル root（旧 vm->global_object_list /
+     * vm->mark_object_ary を Ractor-local 化）。local GC は自 Ractor のみ、global GC は
+     * rb_gc_mark_roots のループで全 Ractor 分を処理する（containment 解除下なので
+     * foreign shareable も辿れる）。registered_addrs は *addr を mark_maybe（未初期化・
+     * 非オブジェクト値に耐える）、registered_marks は pin する（不滅オブジェクト）。 */
+    for (size_t i = 0; i < r->registered_addrs_cnt; i++) {
+        rb_gc_mark_maybe(*r->registered_addrs[i]);
+    }
+    rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
 }
 
 static int
@@ -363,6 +454,14 @@ ractor_free(void *ptr)
 {
     rb_ractor_t *r = (rb_ractor_t *)ptr;
     RUBY_DEBUG_LOG("free r:%d", rb_ractor_id(r));
+
+    /* RLGCv2: この Ractor は join されずに死ぬ（orphan path）。登録済みの VM
+     * グローバル root（不滅オブジェクト等）を main Ractor へ移管しておかないと
+     * この struct と共に失われる。migration は raw alloc のみで sweep 中でも安全。 */
+    if (!r->main_ractor) {
+        rb_ractor_absorb_registered_globals(GET_VM()->ractor.main_ractor, r);
+    }
+
     free_targeted_hooks(&r->pub.targeted_hooks);
     rb_native_mutex_destroy(&r->sync.lock);
 #ifdef RUBY_THREAD_WIN32_H
@@ -398,6 +497,15 @@ ractor_free(void *ptr)
     }
 
     ractor_sync_free(r);
+
+    /* RLGCv2: Ractor-local な registered globals バッファを解放。非 main は上で
+     * absorb 済みで NULL だが、main は shutdown 時に非 NULL のことがある。
+     * free(NULL) は安全。 */
+    free(r->registered_addrs); r->registered_addrs = NULL;
+    r->registered_addrs_cnt = r->registered_addrs_capa = 0;
+    free(r->registered_marks); r->registered_marks = NULL;
+    r->registered_marks_cnt = r->registered_marks_capa = 0;
+
     if (!r->main_ractor) {
         SIZED_FREE(r);
     }
