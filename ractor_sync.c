@@ -940,15 +940,19 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
         }
         rb_gc_objspace_absorb_into_current(&r->objspace);
 
-        /* The inherited objects are now ours, but the only path to them
-         * is the dead Ractor's C struct, traversed only by whoever owns
-         * the Ractor OBJECT -- usually a different Ractor, whose mark
-         * foreign-skips our objects. Pin them with the shref bit (we own
-         * their pages now, so plain stores): our local GC then roots
-         * them, and the next global GC re-derives the same bits from the
-         * shareable-Ractor-object -> unshareable edges for as long as
-         * the Ractor object itself survives, which is exactly their
-         * lifetime. */
+        /* RLGCv2: join した Ractor r の登録済み VM グローバル root を joiner へ
+         * 移管し、joiner の local GC がその不滅オブジェクトを生かし続けるようにする。 */
+        rb_ractor_absorb_registered_globals(GET_RACTOR(), r);
+
+        /* inherit したオブジェクトは今や我々のものだが、それらへの唯一の
+         * 経路は死んだ Ractor の C struct であり、Ractor オブジェクトを
+         * 所有する者（通常は別の Ractor で、その mark は我々のオブジェクトを
+         * foreign-skip する）だけがそれを traverse する。それらを shref
+         * ビットで pin する（今や我々がそのページを所有するので通常のストア）。
+         * すると我々の local GC がそれらを root し、次の global GC は Ractor
+         * オブジェクト自体が生存する間ずっと、shareable-Ractor-object ->
+         * unshareable のエッジから同一のビットを再導出する。それはまさに
+         * それらの生存期間に等しい。 */
         rb_ractor_pin_inherited_parts(r);
 
         ractor_reset_belonging(r->sync.legacy);

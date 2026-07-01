@@ -162,12 +162,36 @@ struct rb_ractor_struct {
      * Ractor's own real GC (triggered by a callback's allocation)
      * cannot be hijacked either. */
     struct gc_mark_func_data_struct *mark_func_data;
+
+    /* RLGCv2: この Ractor で登録された VM グローバル root を per-Ractor に持つ
+     * （旧 vm->global_object_list / vm->mark_object_ary を Ractor-local 化）。
+     * これにより local GC は自 Ractor の登録だけを walk し、VM グローバルな
+     * 共有リストと registered_globals_lock（の register 用途）が hot path から消える。
+     * mark は rb_ractor_mark_local_roots（local=current Ractor / global=全 Ractor）。
+     *   registered_addrs = rb_gc_register_address（VALUE* の「場所」。*addr を mark_maybe）
+     *   registered_marks  = rb_gc_register_mark_object / rb_vm_register_global_object
+     *                       （不滅の pinned オブジェクト。mark_vm_stack_values で pin）
+     * Ractor 吸収/終了時に継承先へ移管される（rb_ractor_absorb_registered_globals）。 */
+    VALUE **registered_addrs;
+    size_t registered_addrs_cnt;
+    size_t registered_addrs_capa;
+    VALUE *registered_marks;
+    size_t registered_marks_cnt;
+    size_t registered_marks_capa;
 }; // rb_ractor_t is defined in vm_core.h
 
 /* RLGCv2: mark Ractor r's GC roots from its C structure (gc.c root scan). */
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
 void rb_ractor_pin_inherited_parts(rb_ractor_t *r);
+
+/* RLGCv2: Ractor-local 化した VM グローバル root（旧 vm->global_object_list /
+ * vm->mark_object_ary）の登録・解除・移管。migration は GC sweep（ractor_free）
+ * からも呼ばれるので raw malloc/realloc/free のみを使う。 */
+void rb_ractor_register_address(rb_ractor_t *r, VALUE *addr);
+void rb_ractor_unregister_address(rb_ractor_t *r, VALUE *addr);
+void rb_ractor_register_mark_object(rb_ractor_t *r, VALUE obj);
+void rb_ractor_absorb_registered_globals(rb_ractor_t *dst, rb_ractor_t *src);
 
 enum ractor_wakeup_status {
     wakeup_none,
