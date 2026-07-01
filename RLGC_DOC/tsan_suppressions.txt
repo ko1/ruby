@@ -203,6 +203,14 @@ race:rlgc_objspace_absorb
 # a wrong thread)". Benign: the lock ownership is handed over intentionally.
 mutex:thread_sched_unlock_
 mutex:thread_sched_lock_
+# Same sched-lock-across-coroutine-handoff, but with thread_sched_unlock_ INLINED
+# into the resumed coroutine entry (co_start = ruby_coroutine_start,
+# thread_pthread_mn.c:456): the unlock frame then symbolizes to co_start, so the
+# thread_sched_unlock_ suppression above misses it. The unlocked mutex lives in the
+# rb_ractor_t (per-Ractor sched lock); the lock is handed over the coroutine transfer
+# by design. Same benign "wrong thread" report. (caught 2026-06-29 via WeakMap probe)
+mutex:co_start
+mutex:ruby_coroutine_start
 
 # The dying_th handoff field (rb_thread_sched.dying_th) is read+cleared under the
 # sched lock in thread_sched_unlock_ and set under it in co_start; all accesses
