@@ -560,35 +560,6 @@ rb_gc_guarded_ptr_val(volatile VALUE *ptr, VALUE val)
 static const char *obj_type_name(VALUE obj);
 static st_table *id2ref_tbl;
 
-/* RLGCv2 (design_v2.md §2.4): VM-shared structures that the lock-free
- * local GC path reads or writes get their own native mutexes -- the GC
- * must never block on the VM lock (a thread waiting for it joins a
- * pending barrier, and joining mid-mark/mid-sweep would expose a
- * half-collected heap to the global GC).
- *
- * Deadlock discipline for these mutexes: a critical section must not
- * start a GC on this thread (its mark or sweep takes the same mutex).
- * Sections that cannot allocate satisfy this trivially; the ones that
- * may (a growing st_insert, a list realloc) either disable GC for the
- * section or move the allocation outside it. Nothing blocks while
- * holding one of these mutexes, so cross-thread waiters are bounded. */
-static rb_nativethread_lock_t id2ref_tbl_lock;
-
-void
-rb_gc_init_global_locks(void)
-{
-    rb_native_mutex_initialize(&id2ref_tbl_lock);
-}
-
-/* The forking thread cannot hold these (fork happens at a safepoint,
- * never inside GC or the table writers), but another thread might:
- * give the child fresh mutexes. */
-void
-rb_gc_atfork_global_locks(void)
-{
-    rb_native_mutex_initialize(&id2ref_tbl_lock);
-}
-
 #include "gc/default/default.c"
 
 #if USE_MODULAR_GC && !defined(HAVE_DLOPEN)
@@ -2126,25 +2097,24 @@ generate_next_object_id(void)
 #endif
 }
 
-/* Insert under id2ref_tbl_lock. st_insert may malloc, and a malloc can
- * start this thread's own local GC, whose sweep takes the same mutex
- * (obj_free_object_id) -- a self-deadlock. So GC is disabled for the
- * locked section; other threads' local GCs just block on the mutex for
- * its (bounded, non-blocking) duration. */
+/* RLGCv2: id2ref_tbl は main Ractor に封じ込める（insert は main のみ、lookup/build も
+ * main のみ、delete は main の local GC か global GC(STW) のみ）。よって main の Ractor
+ * GVL + GC safepoint + global GC の STW で相互排他され、ロックは不要。st_insert が
+ * malloc→GC を誘発すると sweep が同じ表を触り得るので、その間だけ GC を無効化する。 */
 static void
 id2ref_tbl_insert(st_data_t key, st_data_t value)
 {
     bool gc_disabled = RTEST(rb_gc_disable_no_rest());
-    rb_native_mutex_lock(&id2ref_tbl_lock);
     st_insert(id2ref_tbl, key, value);
-    rb_native_mutex_unlock(&id2ref_tbl_lock);
     if (!gc_disabled) rb_gc_enable();
 }
 
 void
 rb_gc_obj_id_moved(VALUE obj)
 {
-    if (UNLIKELY(id2ref_tbl)) {
+    /* compaction は single-objspace（= main）でのみ走るが、id2ref_tbl は main 限定
+     * なので念のため main のみ更新する。 */
+    if (UNLIKELY(id2ref_tbl) && rb_ractor_main_p()) {
         id2ref_tbl_insert((st_data_t)rb_obj_id(obj), (st_data_t)obj);
     }
 }
@@ -2194,9 +2164,7 @@ id2ref_tbl_memsize(const void *data)
 static void
 id2ref_tbl_free(void *data)
 {
-    rb_native_mutex_lock(&id2ref_tbl_lock);
     id2ref_tbl = NULL; // clear global ref
-    rb_native_mutex_unlock(&id2ref_tbl_lock);
     st_table *table = (st_table *)data;
     st_free_table(table);
 }
@@ -2224,7 +2192,7 @@ class_object_id(VALUE klass)
         if (existing_id) {
             id = existing_id;
         }
-        else if (RB_UNLIKELY(id2ref_tbl)) {
+        else if (RB_UNLIKELY(id2ref_tbl) && rb_ractor_main_p()) {
             id2ref_tbl_insert(id, klass);
         }
         RB_GC_VM_UNLOCK(lock_lev);
@@ -2270,10 +2238,8 @@ object_id0(VALUE obj)
 
     RUBY_ASSERT(rb_obj_shape_has_id(obj));
 
-    if (RB_UNLIKELY(id2ref_tbl)) {
-        RB_VM_LOCKING() {
-            id2ref_tbl_insert((st_data_t)id, (st_data_t)obj);
-        }
+    if (RB_UNLIKELY(id2ref_tbl) && rb_ractor_main_p()) {
+        id2ref_tbl_insert((st_data_t)id, (st_data_t)obj);
     }
     return id;
 }
@@ -2341,6 +2307,13 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
+    /* RLGCv2: id2ref_tbl は main Ractor に封じ込める。build/lookup も main のみに限る
+     * （非 main からの _id2ref は表を触らせない）。これで表を触るのは main の mutator/
+     * local GC と global GC(STW) だけになり、ロック無しで安全。 */
+    if (!rb_ractor_main_p()) {
+        rb_raise(rb_eRangeError, "ObjectSpace._id2ref is only available on the main ractor");
+    }
+
     unsigned int lev = RB_GC_VM_LOCK();
 
     if (!id2ref_tbl) {
@@ -2355,8 +2328,8 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
         // build_id2ref_i will most certainly malloc, which could trigger GC and sweep
         // objects we just added to the table.
         // By calling rb_gc_disable() we also save having to handle potentially garbage objects.
-        // The barrier above also means no lock-free sweep is in flight, so the
-        // bulk inserts may bypass id2ref_tbl_lock.
+        // RLGCv2: build は main のみ + 上の barrier で他 Ractor は停止しているので、
+        // 一括挿入は安全（表を触るのは main のみ）。
         bool gc_disabled = RTEST(rb_gc_disable());
         {
             id2ref_tbl = tmp_id2ref_tbl;
@@ -2373,15 +2346,10 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
         if (!gc_disabled) rb_gc_enable();
     }
 
-    /* The lookup must exclude concurrent sweep-side deletes
-     * (obj_free_object_id runs on lock-free local GCs). A non-shareable
-     * foreign object cannot be returned (the caller rejects it), and
-     * shareables never die in a local sweep, so the freshness check may
-     * run outside the mutex. */
+    /* lookup: main のみが表を触る（insert=main、delete=main local GC/global GC）ので
+     * VM lock 下・main の GVL で並行変更は無く、ロック不要。 */
     VALUE obj;
-    rb_native_mutex_lock(&id2ref_tbl_lock);
     bool found = st_lookup(id2ref_tbl, object_id, &obj);
-    rb_native_mutex_unlock(&id2ref_tbl_lock);
     found = found && !rb_gc_impl_garbage_object_p(objspace, obj);
 
     RB_GC_VM_UNLOCK(lev);
@@ -2429,20 +2397,17 @@ obj_free_object_id(VALUE obj)
         if (RB_UNLIKELY(obj_id)) {
             RUBY_ASSERT(FIXNUM_P(obj_id) || RB_TYPE_P(obj_id, T_BIGNUM));
 
-            /* Runs on the lock-free sweep of any Ractor's local GC: the
-             * mutex (never the VM lock -- a GC must not join a barrier
-             * mid-sweep) excludes concurrent inserts and lookups.
-             * st_delete does not allocate. Re-check the table under the
-             * mutex: it is dropped at shutdown. */
-            rb_native_mutex_lock(&id2ref_tbl_lock);
-            st_table *tbl = id2ref_tbl;
-            if (tbl) st_delete(tbl, (st_data_t *)&obj_id, NULL);
-            rb_native_mutex_unlock(&id2ref_tbl_lock);
-            /* RLGCv2: 表に無い id は許容する（rb_bug しない）。global な単一 id2ref
-             * テーブルは呼び出し元 Ractor の objspace からのみ遅延構築される一方、
-             * object_id はどの Ractor からも付与されるため、「構築より前に別 objspace で
-             * id を持ったオブジェクト」は表に居ない。その解放時に st_delete が失敗しても
-             * 正当（upstream が T_IMEMO/fields に与えていた許容を全型へ一般化）。 */
+            /* RLGCv2: id2ref_tbl は main-objspace オブジェクトしか持たない（insert が
+             * main 限定）。よって表を触るのは main の local GC か global GC(STW) のときだけ
+             * でよく、worker の lock-free sweep は表に一切触らない（自分のオブジェクトは
+             * 表に居ない）→ ロック不要。main local GC は no-barrier VM lock を、global GC は
+             * STW を持つので、insert/lookup とも相互排他される。
+             * 表に無い id は許容する（rb_bug しない。main が build する前に id を持った
+             * main オブジェクトは表に居ないため）。 */
+            if (rb_gc_during_global_gc_p() || rb_ractor_main_p()) {
+                st_table *tbl = id2ref_tbl;
+                if (tbl) st_delete(tbl, (st_data_t *)&obj_id, NULL);
+            }
         }
     }
 }
