@@ -4762,9 +4762,8 @@ Init_BareVM(void)
     vm_init2(vm);
 
     ruby_current_vm_ptr = vm;
-    rb_gc_init_global_locks();
-    /* RLGCv2: the boot objspace belongs to the main Ractor, so the main
-     * Ractor must exist before rb_objspace_alloc assigns it. */
+    /* RLGCv2: boot objspace は main Ractor に属するので、rb_objspace_alloc が
+     * それを割り当てる前に main Ractor が存在していなければならない。 */
     vm->ractor.main_ractor = rb_ractor_main_alloc();
     rb_objspace_alloc();
     vm->ractor.main_ractor->newobj_cache = rb_gc_ractor_cache_alloc(vm->ractor.main_ractor);
@@ -4840,9 +4839,6 @@ void
 Init_vm_objects(void)
 {
     rb_vm_t *vm = GET_VM();
-
-    /* RLGCv2: registered global object の格納は Ractor-local になった
-     * （旧 vm->mark_object_ary / vm->global_object_list）ので、ここでの初期化は不要。 */
     st_init_existing_table_with_size(&vm->ci_table, &vm_ci_hashtype, 0);
     vm->cc_refinement_set = rb_cc_refinement_set_create();
 }
