@@ -60,13 +60,6 @@ static struct end_proc_data *end_procs, *ephemeral_end_procs;
 void
 rb_set_end_proc(void (*func)(VALUE), VALUE data)
 {
-    /* RLGCv2: the end_procs lists are VM-global C roots holding objects
-     * from any Ractor's objspace, so every objspace's lock-free root
-     * pass walks them (rb_mark_end_proc, design_v2.md section 2.1 step
-     * 3.e); publication synchronizes with those walks on the
-     * registered-globals mutex. The allocation stays OUTSIDE the mutex:
-     * it can run this thread's own local GC, whose root walk takes the
-     * same mutex. */
     struct end_proc_data *link = ALLOC(struct end_proc_data);
     struct end_proc_data **list;
     rb_thread_t *th = GET_THREAD();
@@ -77,24 +70,17 @@ rb_set_end_proc(void (*func)(VALUE), VALUE data)
     else {
         list = &end_procs;
     }
+    link->next = *list;
     link->func = func;
     link->data = data;
-    rb_gc_registered_globals_lock();
-    link->next = *list;
     *list = link;
-    rb_gc_registered_globals_unlock();
 }
 
 void
 rb_mark_end_proc(void)
 {
-    /* Runs on EVERY objspace's root pass (a worker's at_exit proc lives
-     * in the worker's objspace and nothing else roots it; foreign
-     * entries are skipped by the mark's containment guard). The mutex
-     * excludes concurrent registration and the at-exit pops. */
     struct end_proc_data *link;
 
-    rb_gc_registered_globals_lock();
     link = end_procs;
     while (link) {
         rb_gc_mark(link->data);
@@ -105,7 +91,6 @@ rb_mark_end_proc(void)
         rb_gc_mark(link->data);
         link = link->next;
     }
-    rb_gc_registered_globals_unlock();
 }
 
 static void
@@ -115,19 +100,9 @@ exec_end_procs_chain(struct end_proc_data *volatile *procs, VALUE *errp)
     struct end_proc_data *link;
     VALUE errinfo = *errp;
 
-    for (;;) {
-        /* pop under the registered-globals mutex (END procs run while
-         * other Ractors' GCs may still walk the list); the proc body
-         * runs outside it */
-        rb_gc_registered_globals_lock();
-        link = *procs;
-        if (link) {
-            *procs = link->next;
-            endproc = *link;
-        }
-        rb_gc_registered_globals_unlock();
-        if (!link) break;
-
+    while ((link = *procs) != 0) {
+        *procs = link->next;
+        endproc = *link;
         SIZED_FREE(link);
         (*endproc.func) (endproc.data);
         *errp = errinfo;
