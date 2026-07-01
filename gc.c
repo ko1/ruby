@@ -2339,12 +2339,6 @@ build_id2ref_i(VALUE obj, void *data)
     }
 }
 
-static void
-build_id2ref_objspace_i(void *objspace, void *data)
-{
-    rb_gc_impl_each_object(objspace, build_id2ref_i, data);
-}
-
 static VALUE
 object_id_to_ref(void *objspace_ptr, VALUE object_id)
 {
@@ -2371,10 +2365,13 @@ object_id_to_ref(void *objspace_ptr, VALUE object_id)
             id2ref_tbl = tmp_id2ref_tbl;
             id2ref_value = tmp_id2ref_value;
 
-            /* RLGCv2: every objspace's objects can carry an object_id,
-             * and obj_free_object_id rb_bugs on a seen-but-missing id,
-             * so the build must cover them all (zombies included). */
-            rb_gc_vm_each_objspace(build_id2ref_objspace_i, (void *)id2ref_tbl);
+            /* RLGCv2: id2ref テーブルは呼び出し元 Ractor の objspace からのみ構築する
+             * （＝ origin/master と同じ単一 objspace 走査）。以前は全 objspace
+             * （zombie / creating_child 含む）を rb_gc_vm_each_objspace で走査していたが、
+             * freed / 構築途中の objspace を踏む UAF の元だったため単一 objspace へ戻した。
+             * id 管理自体は global な単一テーブルのまま。obj_free_object_id は表に無い id を
+             * 許容する（下記参照）。 */
+            rb_gc_impl_each_object(objspace, build_id2ref_i, (void *)id2ref_tbl);
         }
         if (!gc_disabled) rb_gc_enable();
     }
@@ -2442,15 +2439,13 @@ obj_free_object_id(VALUE obj)
              * mutex: it is dropped at shutdown. */
             rb_native_mutex_lock(&id2ref_tbl_lock);
             st_table *tbl = id2ref_tbl;
-            bool deleted = tbl ? st_delete(tbl, (st_data_t *)&obj_id, NULL) : true;
+            if (tbl) st_delete(tbl, (st_data_t *)&obj_id, NULL);
             rb_native_mutex_unlock(&id2ref_tbl_lock);
-            if (!deleted) {
-                // The the object is a T_IMEMO/fields, then it's possible the actual object
-                // has been garbage collected already.
-                if (!RB_TYPE_P(obj, T_IMEMO)) {
-                    rb_bug("Object ID seen, but not in _id2ref table: object_id=%llu object=%s", NUM2ULL(obj_id), rb_obj_info(obj));
-                }
-            }
+            /* RLGCv2: 表に無い id は許容する（rb_bug しない）。global な単一 id2ref
+             * テーブルは呼び出し元 Ractor の objspace からのみ遅延構築される一方、
+             * object_id はどの Ractor からも付与されるため、「構築より前に別 objspace で
+             * id を持ったオブジェクト」は表に居ない。その解放時に st_delete が失敗しても
+             * 正当（upstream が T_IMEMO/fields に与えていた許容を全型へ一般化）。 */
         }
     }
 }
