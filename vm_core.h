@@ -773,9 +773,8 @@ typedef struct rb_vm_struct {
     unsigned int thread_ignore_deadlock: 1;
 
     /* object management */
-    VALUE **global_object_list;
-    size_t global_object_list_size;
-    size_t global_object_list_capa;
+    /* RLGCv2: 旧 mark_object_ary / global_object_list（登録済み VM グローバル root）は
+     * Ractor-local になった（rb_ractor_struct::registered_marks / registered_addrs）。 */
     const VALUE special_exceptions[ruby_special_error_count];
 
     /* Ruby Box */

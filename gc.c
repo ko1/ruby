@@ -3114,11 +3114,9 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
         rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
     }
 
-    /* The VM-global object registrations can hold entries from any
-     * objspace (whoever registers allocates them), so every objspace
-     * walks them; marking skips foreign entries (design_v2.md §2.4). */
-    MARK_CHECKPOINT("vm_registered_objects");
-    rb_vm_mark_registered_global_objects(vm);
+    /* RLGCv2: VM-global だった登録済みオブジェクト（rb_gc_register_address /
+     * rb_vm_register_global_object）は今や Ractor-local になり、各 Ractor の
+     * rb_ractor_mark_local_roots から mark される。ここでは何もしない。 */
 
     /* Same shape: a worker's at_exit/END proc sits in the VM-global
      * end_procs C list but lives in the worker's objspace, where only
@@ -3619,76 +3617,15 @@ rb_gc_register_mark_object(VALUE obj)
 void
 rb_gc_register_address(VALUE *addr)
 {
-    rb_vm_t *vm = GET_VM();
-
-    VALUE obj = *addr;
-
-    RB_VM_LOCKING() {
-        /* Every objspace's root walk reads this list without the VM lock
-         * (registered_globals_lock instead, design_v2.md §2.1 step 3.e).
-         * Growth is two-phase so the locked section never allocates (an
-         * allocation can run this thread's local GC, whose root walk
-         * takes the same mutex): build the bigger array outside, swap it
-         * in under the mutex, free the old one outside. The VM lock
-         * serializes the writers themselves. */
-        VALUE **old_list = NULL;
-        size_t old_capa = 0;
-        if (vm->global_object_list_size == vm->global_object_list_capa) {
-            size_t new_capa = vm->global_object_list_capa ? vm->global_object_list_capa * 2 : 64;
-            VALUE **new_list = ALLOC_N(VALUE *, new_capa);
-            MEMCPY(new_list, vm->global_object_list, VALUE *, vm->global_object_list_size);
-
-            rb_native_mutex_lock(&registered_globals_lock);
-            old_list = vm->global_object_list;
-            old_capa = vm->global_object_list_capa;
-            vm->global_object_list = new_list;
-            vm->global_object_list_capa = new_capa;
-            vm->global_object_list[vm->global_object_list_size++] = addr;
-            rb_native_mutex_unlock(&registered_globals_lock);
-        }
-        else {
-            rb_native_mutex_lock(&registered_globals_lock);
-            vm->global_object_list[vm->global_object_list_size++] = addr;
-            rb_native_mutex_unlock(&registered_globals_lock);
-        }
-        if (old_list) {
-            SIZED_FREE_N(old_list, old_capa);
-        }
-    }
-
-    /*
-     * Because some C extensions have assignment-then-register bugs,
-     * we guard `obj` here so that it would not get swept defensively.
-     */
-    RB_GC_GUARD(obj);
-    if (0 && !SPECIAL_CONST_P(obj)) {
-        rb_warn("Object is assigned to registering address already: %"PRIsVALUE,
-                rb_obj_class(obj));
-        rb_print_backtrace(stderr);
-    }
+    rb_ractor_register_address(GET_RACTOR(), addr);
+    /* 一部 C 拡張は代入前に登録するバグを持つため、ここで obj を GC から守る */
+    RB_GC_GUARD(*addr);
 }
 
 void
 rb_gc_unregister_address(VALUE *addr)
 {
-    rb_vm_t *vm = GET_VM();
-    RB_VM_LOCKING() {
-        rb_native_mutex_lock(&registered_globals_lock);
-        size_t index;
-        for (index = 0; index < vm->global_object_list_size; index++) {
-            if (addr == vm->global_object_list[index]) {
-                MEMMOVE(
-                    &vm->global_object_list[index],
-                    &vm->global_object_list[index + 1],
-                    VALUE *,
-                    vm->global_object_list_size - index - 1
-                );
-                vm->global_object_list_size--;
-                break;
-            }
-        }
-        rb_native_mutex_unlock(&registered_globals_lock);
-    }
+    rb_ractor_unregister_address(GET_RACTOR(), addr);
 }
 
 /* for the walkers and writers that live outside this file (vm.c) */
@@ -5057,18 +4994,19 @@ rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE,
 
     *mfdp = &mfd;
     rb_gc_save_machine_context();
-    /* RLGCv2: hold the VM lock across the root walk so the VM lock is always
-     * acquired BEFORE registered_globals_lock. rb_gc_mark_roots ->
-     * rb_vm_mark_registered_global_objects takes registered_globals_lock, and
-     * the mark callback installed above records reachability via rb_hash_aset,
-     * whose write barrier re-enters the VM lock (check_rvalue_consistency_force
-     * under RGENGC_CHECK_MODE). Without this, this walk acquires reg -> VM,
-     * while the per-object verify scan and the global GC's own root mark acquire
-     * VM -> reg; two such walks on different Ractors (e.g. a confined-GC verify
-     * and ObjectSpace.reachable_objects_from_root) then deadlock on
-     * VM lock <-> registered_globals_lock. The no-barrier lock keeps the inner
-     * re-entry cheap and serializes concurrent walks. Never reached during a GC
-     * (asserted above), so GET_RACTOR() is the live current Ractor, never NULL. */
+    /* RLGCv2: root walk の間ずっと VM lock を保持し、VM lock が常に
+     * registered_globals_lock より先に取得されるようにする。rb_gc_mark_roots は
+     * end_procs 等の walk で registered_globals_lock を取り、
+     * 上で設定した mark コールバックは rb_hash_aset を介して到達可能性を記録するが、
+     * その write barrier は VM lock に再入する（RGENGC_CHECK_MODE 下の
+     * check_rvalue_consistency_force）。これが無いと、この walk は reg -> VM の
+     * 順で取得する一方、オブジェクトごとの verify 走査や global GC 自身の root mark は
+     * VM -> reg の順で取得する。そして異なる Ractor 上のこのような walk が 2 つ
+     * （例えば confined-GC の verify と ObjectSpace.reachable_objects_from_root）
+     * あると、VM lock <-> registered_globals_lock でデッドロックする。no-barrier な
+     * ロックは内側の再入を安価に保ち、並行する walk を直列化する。GC 中には決して
+     * 到達しない（上でアサート済み）ので、GET_RACTOR() は生きた current Ractor で
+     * あり、決して NULL ではない。 */
     unsigned int lev = rb_gc_vm_lock_no_barrier(__FILE__, __LINE__);
     rb_gc_mark_roots(rb_gc_get_objspace(), &data.category);
     rb_gc_vm_unlock_no_barrier(lev, __FILE__, __LINE__);
