@@ -573,13 +573,11 @@ static st_table *id2ref_tbl;
  * section or move the allocation outside it. Nothing blocks while
  * holding one of these mutexes, so cross-thread waiters are bounded. */
 static rb_nativethread_lock_t id2ref_tbl_lock;
-static rb_nativethread_lock_t registered_globals_lock;
 
 void
 rb_gc_init_global_locks(void)
 {
     rb_native_mutex_initialize(&id2ref_tbl_lock);
-    rb_native_mutex_initialize(&registered_globals_lock);
 }
 
 /* The forking thread cannot hold these (fork happens at a safepoint,
@@ -589,7 +587,6 @@ void
 rb_gc_atfork_global_locks(void)
 {
     rb_native_mutex_initialize(&id2ref_tbl_lock);
-    rb_native_mutex_initialize(&registered_globals_lock);
 }
 
 #include "gc/default/default.c"
@@ -3922,19 +3919,6 @@ rb_gc_unregister_address(VALUE *addr)
     rb_ractor_unregister_address(GET_RACTOR(), addr);
 }
 
-/* for the walkers and writers that live outside this file (vm.c) */
-void
-rb_gc_registered_globals_lock(void)
-{
-    rb_native_mutex_lock(&registered_globals_lock);
-}
-
-void
-rb_gc_registered_globals_unlock(void)
-{
-    rb_native_mutex_unlock(&registered_globals_lock);
-}
-
 void
 rb_global_variable(VALUE *var)
 {
@@ -5324,22 +5308,7 @@ rb_objspace_reachable_objects_from_root(void (func)(const char *category, VALUE,
 
     cr->mark_func_data = &mfd;
     rb_gc_save_machine_context();
-    /* RLGCv2: root walk の間ずっと VM lock を保持し、VM lock が常に
-     * registered_globals_lock より先に取得されるようにする。rb_gc_mark_roots は
-     * end_procs 等の walk で registered_globals_lock を取り、
-     * 上で設定した mark コールバックは rb_hash_aset を介して到達可能性を記録するが、
-     * その write barrier は VM lock に再入する（RGENGC_CHECK_MODE 下の
-     * check_rvalue_consistency_force）。これが無いと、この walk は reg -> VM の
-     * 順で取得する一方、オブジェクトごとの verify 走査や global GC 自身の root mark は
-     * VM -> reg の順で取得する。そして異なる Ractor 上のこのような walk が 2 つ
-     * （例えば confined-GC の verify と ObjectSpace.reachable_objects_from_root）
-     * あると、VM lock <-> registered_globals_lock でデッドロックする。no-barrier な
-     * ロックは内側の再入を安価に保ち、並行する walk を直列化する。GC 中には決して
-     * 到達しない（上でアサート済み）ので、GET_RACTOR() は生きた current Ractor で
-     * あり、決して NULL ではない。 */
-    unsigned int lev = rb_gc_vm_lock_no_barrier(__FILE__, __LINE__);
     rb_gc_mark_roots(rb_gc_get_objspace(), &data.category);
-    rb_gc_vm_unlock_no_barrier(lev, __FILE__, __LINE__);
     cr->mark_func_data = prev_mfd;
 }
 
