@@ -57,5 +57,8 @@ end
 
 results = workers.map(&:value)
 diers.each(&:value)
-raise "worker died early" if results.any? { |r| r < 1000 }
+# 生存判定は #value に委ねる: 本当に死んだ worker は Ractor::RemoteError を raise し、
+# その場合 M1B_MIX_OK トークンが出ないので oracle が fail と判定する。反復回数ベースの
+# 閾値は GC.stress(1 反復ごとに full GC)+ TSan(~10x)+並行負荷下の固定 30s 窓で
+# worker が生きていても <10 反復になり偽陽性を出したため廃止。
 puts "M1B_MIX_OK iters=#{results.sum + mk}"
