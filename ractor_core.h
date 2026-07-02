@@ -178,6 +178,36 @@ struct rb_ractor_struct {
     VALUE *registered_marks;
     size_t registered_marks_cnt;
     size_t registered_marks_capa;
+
+    /* RLGCv2: この Ractor が所有する unshareable オブジェクトの generic fields
+     * （旧 VM-global な generic_fields_tbl_ + generic_fields_lock を per-Ractor 化）。
+     * generic_fields は VM の ivar 格納機能であって GC の機能ではないので、GC-impl の
+     * objspace ではなく Ractor に持つ。owner のみが触る（containment）ため無ロック。
+     * shareable オブジェクトの分は今も variable.c の global 表 + narrow lock に残る。
+     * weak-KEY: key=host obj が死ねば entry は消え、値 fields_obj は live key の strong
+     * child。confined GC は per-object の rb_mark_generic_ivar でこの表を引く。global GC
+     * は per-object を止め、mark 後に全 Ractor の本表を舐めて drain する（variable.c の
+     * rb_gc_vm_generic_fields_* を参照）。lazy に生成する（NULL = まだ空）。
+     *
+     * この表は owner 専有＝完全無ロック。unshareable オブジェクトは containment により
+     * owner=GET_RACTOR() だけが触る。唯一の例外だった Ractor#send の native copy による
+     * cross-Ractor read は、送信時に「host→fields_obj の対応表」をメッセージに同梱し
+     * （gen_fields_capture / basket->p.gen_fields）、受信側 materialize がそれを引く
+     * （gen_fields_materialize）ことで排除した。write は st resize 中の自 Ractor confined
+     * GC 再入を避けるため GC 無効化下で行うが、ロックは要らない。 */
+    struct st_table *generic_fields_tbl;
+    /* RLGCv2: Ractor#send の native copy 中の generic-ivar 対応表。
+     *   gen_fields_capturing:  送信側の snapshot 作成中だけ true。generic-ivar host が
+     *                          出たとき初めて gen_fields_capture を遅延確保する合図
+     *                          （generic ivar 無しのメッセージでは表を確保しない）。
+     *   gen_fields_capture:    上の間、copy(snapshot node) が generic-ivar host なら
+     *                          その fields_obj をここに記録する（copy_enter）。
+     *   gen_fields_materialize: 受信側 materialize 中、rb_obj_fields_generic_uncached が
+     *                          自表に無い snapshot host の fields_obj をここから引く。
+     * これで受信側が sender の per-Ractor 表を跨がない。 */
+    bool gen_fields_capturing;
+    struct st_table *gen_fields_capture;
+    struct st_table *gen_fields_materialize;
 }; // rb_ractor_t is defined in vm_core.h
 
 /* RLGCv2: mark Ractor r's GC roots from its C structure (gc.c root scan). */
@@ -199,6 +229,13 @@ void rb_ractor_register_address(rb_ractor_t *r, VALUE *addr);
 void rb_ractor_unregister_address(rb_ractor_t *r, VALUE *addr);
 void rb_ractor_register_mark_object(rb_ractor_t *r, VALUE obj);
 void rb_ractor_absorb_registered_globals(rb_ractor_t *dst, rb_ractor_t *src);
+
+/* RLGCv2: src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする
+ * （Ractor#value join / orphan free）。実装は variable.c（表のセマンティクスを持つ）。
+ * st は raw malloc なので sweep 中の呼び出しも安全。 */
+void rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src);
+/* RLGCv2: この Ractor の per-Ractor generic_fields 表を解放（ractor_free）。 */
+void rb_ractor_free_generic_fields(rb_ractor_t *r);
 
 enum ractor_wakeup_status {
     wakeup_none,

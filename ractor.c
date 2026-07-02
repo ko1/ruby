@@ -468,6 +468,11 @@ ractor_free(void *ptr)
      * この struct と共に失われる。migration は raw alloc のみで sweep 中でも安全。 */
     if (!r->main_ractor) {
         rb_ractor_absorb_registered_globals(GET_VM()->ractor.main_ractor, r);
+        /* RLGCv2: この Ractor の per-Ractor generic_fields 表も main へ移送する。
+         * この struct と共に失われると、objspace が後で main に merge された後に
+         * host obj の obj_free が entry を見つけられず rb_bug になる。st は raw malloc
+         * なので sweep 中でも安全（registered globals と同型の移送）。 */
+        rb_ractor_absorb_generic_fields(GET_VM()->ractor.main_ractor, r);
     }
 
     free_targeted_hooks(&r->pub.targeted_hooks);
@@ -513,6 +518,10 @@ ractor_free(void *ptr)
     r->registered_addrs_cnt = r->registered_addrs_capa = 0;
     free(r->registered_marks); r->registered_marks = NULL;
     r->registered_marks_cnt = r->registered_marks_capa = 0;
+
+    /* RLGCv2: per-Ractor generic_fields 表を解放。非 main は上で main へ移送済みで
+     * NULL だが、main は shutdown 時に非 NULL のことがある。NULL は no-op。 */
+    rb_ractor_free_generic_fields(r);
 
     if (!r->main_ractor) {
         SIZED_FREE(r);
@@ -802,6 +811,9 @@ static void
 ractor_init(rb_ractor_t *r, VALUE name, VALUE loc)
 {
     ractor_sync_init(r);
+    r->gen_fields_capturing = false;
+    r->gen_fields_capture = NULL;
+    r->gen_fields_materialize = NULL;
     st_init_existing_numtable_with_size(&r->pub.targeted_hooks, 0);
     r->pub.hooks.type = hook_list_type_ractor_local;
 
@@ -1454,6 +1466,15 @@ rb_obj_set_shareable_no_assert(VALUE obj)
     rb_gc_obj_became_shareable(obj);
 
     if (rb_obj_gen_fields_p(obj)) {
+        /* RLGCv2: obj の generic_fields が per-Ractor 表バック（T_STRUCT の RSTRUCT_GEN_FIELDS
+         * や T_STRING 等）なら、entry を owner の per-Ractor 表から shared な global 表へ
+         * 移送する（T_DATA は fields_obj を inline に持つので表移送は不要）。obj は今
+         * shareable なので、下の rb_obj_fields_no_ractor_check は global 表を引く。
+         * FL_SHAREABLE の設定〜ここまでに GC safepoint は無く、移送自体も GC 無効化下で
+         * 行うので atomic である。 */
+        if (rb_obj_using_gen_fields_table_p(obj)) {
+            rb_mv_generic_ivar_to_shared(obj);
+        }
         VALUE fields = rb_obj_fields_no_ractor_check(obj);
         if (imemo_type_p(fields, imemo_fields)) {
             // no recursive mark
@@ -2438,6 +2459,14 @@ move_alloc_node(struct rb_ractor_move_courier *c)
 static void
 move_neutralize_source(VALUE obj)
 {
+    /* RLGCv2: source が非 T_OBJECT ホスト（String/Array/… with ivars）なら、その
+     * generic_fields entry を削除しておく。下で shape を 0（root）に潰すと obj はもう
+     * gen-fields ホストではなくなり、その fields_obj は到達不能になって回収される。
+     * entry を消さないと、host が生きたまま値だけ freed の stale entry が残り、global GC
+     * の weak pass（全表を舐める）がその freed 値を mark して UAF になる（旧 per-object
+     * mark は非ホストを触らなかったので露呈しなかった）。owner=GET_RACTOR() の write。 */
+    rb_free_generic_ivar(obj);
+
     VALUE flags = T_OBJECT | FL_FREEZE | (RBASIC(obj)->flags & FL_PROMOTED);
     RBASIC_SET_CLASS_RAW(obj, rb_cRactorMovedObject);
 #if RBASIC_SHAPE_ID_FIELD
@@ -2932,6 +2961,21 @@ copy_enter(VALUE obj, struct obj_traverse_replace_data *data)
         VALUE copy = ractor_native_shallow_copy(obj);
         if (UNDEF_P(copy)) return traverse_stop; /* not natively copyable */
         data->replacement = copy;
+        /* RLGCv2: 送信側の snapshot 作成中（gen_fields_capturing）、copy(snapshot node) が
+         * generic-ivar host なら、その fields_obj を対応表に記録する。こうしておくと受信側
+         * materialize が sender の per-Ractor 表を跨いで読まずに済む（rb_obj_fields_generic_uncached
+         * が gen_fields_materialize から引く）。owner=送信側 なので rb_obj_fields_no_ractor_check
+         * は local read。表は host が出て初めて遅延確保する（make_shareable の copy や受信側の
+         * copy では capturing=false なので記録しない）。 */
+        rb_ractor_t *cr = GET_RACTOR();
+        if (cr->gen_fields_capturing &&
+            BUILTIN_TYPE(copy) != T_OBJECT && rb_obj_gen_fields_p(copy)) {
+            if (cr->gen_fields_capture == NULL) {
+                cr->gen_fields_capture = st_init_numtable();
+            }
+            st_insert(cr->gen_fields_capture, (st_data_t)copy,
+                      (st_data_t)rb_obj_fields_no_ractor_check(copy));
+        }
         return traverse_cont;
     }
 }

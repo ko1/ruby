@@ -8441,9 +8441,67 @@ rlgc_clear_shref_bits(rb_objspace_t *objspace)
     }
 }
 
-/* RLGCv2 global GC (design_v2.md §2.2): stop every Ractor, then clear,
- * mark and sweep every objspace as one heap. The only collector that may
- * free shareables and judge cross-objspace reachability exactly. */
+/* RLGCv2 global GC (design_v2.md §2.2): すべての Ractor を停止させ、その後
+ * 全 objspace を 1 つの heap として clear、mark、sweep する。shareable を free
+ * でき、cross-objspace な到達可能性を正確に判定できる唯一の collector である。 */
+/* RLGCv2: global GC の generic_fields weak pass。
+ * per-Ractor 表（unshareable）と global 表（shareable）に分かれた generic_fields を、
+ * unified な mark fixpoint の後・sweep の前に処理する。confined GC は per-object の
+ * rb_mark_generic_ivar で表を引くが、global GC の driver は GET_RACTOR()≠owner なので
+ * per-object 引きが壊れる（finding-B）。そこで global GC では per-object mark を止め
+ * （rb_mark_generic_ivar は during_global_gc で即 return する）、ここで全表を舐める。
+ * weak-KEY: live(marked) な key の val（fields_obj = strong child）だけを mark し、
+ * dead な key の entry は drain する。val の mark が新たな key を live 化しうるので
+ * fixpoint まで繰り返す。 */
+struct rlgc_genfields_mark_arg {
+    rb_objspace_t *objspace;
+    bool progress;
+};
+
+static int
+rlgc_genfields_mark_i(VALUE key, VALUE val, void *arg)
+{
+    struct rlgc_genfields_mark_arg *a = (struct rlgc_genfields_mark_arg *)arg;
+    if (!RB_SPECIAL_CONST_P(val) &&
+        RVALUE_MARKED_BITMAP(key) && !RVALUE_MARKED_BITMAP(val)) {
+        /* host(key) を parent にして val(fields_obj) を mark する。これにより old(key)→
+         * young(val) の世代間エッジが remembered set に正しく記録される。parent を張らない
+         * （Qundef のままにする）と、val は mark されて今回は生き延びるが WB が記録されず、
+         * 次の minor GC が old key を走査せず young val を取りこぼす（CHECK verifier の
+         * "WB miss (O->Y)"）。confined GC 経路は rb_gc_mark_children(key) が既に parent=key を
+         * 張っているのでこの問題は無い。 */
+        gc_mark_set_parent(a->objspace, key);
+        gc_mark(a->objspace, val);
+        a->progress = true;
+    }
+    return ST_CONTINUE;
+}
+
+static bool
+rlgc_genfields_dead_p(VALUE key)
+{
+    return RVALUE_MARKED_BITMAP(key) == 0;
+}
+
+static void
+rlgc_global_mark_generic_fields(rb_objspace_t *driver)
+{
+    struct rlgc_genfields_mark_arg arg = { driver, false };
+    do {
+        arg.progress = false;
+        /* 各エントリの mark で parent=key を張る（rlgc_genfields_mark_i）。世代間 WB を
+         * 正しく記録するため。foreach 後は gc_mark_stacked_objects_all が自分で per-obj の
+         * parent を張るので、その前に parent を invalid に戻しておく（poison 契約）。 */
+        rb_gc_vm_generic_fields_mark_foreach(rlgc_genfields_mark_i, &arg);
+        gc_mark_set_parent_invalid(driver);
+        if (arg.progress) {
+            gc_mark_stacked_objects_all(driver);
+        }
+    } while (arg.progress);
+
+    rb_gc_vm_generic_fields_drain_dead(rlgc_genfields_dead_p);
+}
+
 static void
 rlgc_global_gc(rb_objspace_t *driver)
 {
@@ -8509,6 +8567,12 @@ rlgc_global_gc(rb_objspace_t *driver)
      * the in-flight payloads), then one unified, exact mark */
     mark_roots(driver, NULL);
     gc_mark_stacked_objects_all(driver);
+
+    /* RLGCv2: mark fixpoint の後、generic_fields の weak pass を走らせる。
+     * live key の val（fields_obj）を mark（＋その先を drain）し、dead key の entry を
+     * drain する。per-object の rb_mark_generic_ivar は global GC 中は no-op なので、
+     * ここが唯一の generic_fields の mark 経路である。 */
+    rlgc_global_mark_generic_fields(driver);
 
     /* step 8 */
     gc_update_weak_references(driver);

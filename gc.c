@@ -4327,6 +4327,10 @@ struct global_vm_table_foreach_data {
     vm_table_update_callback_func update_callback;
     void *data;
     bool weak_only;
+    /* RLGCv2: generic_fields は shared な global 表 + 各 Ractor の per-Ractor 表に
+     * 分かれるため、compaction の参照更新は表ごとに走る。移動した key の再挿入先が
+     * その entry の属する表になるよう、現在走査中の表をここに持つ。 */
+    struct st_table *gen_fields_current_tbl;
 };
 
 static int
@@ -4432,7 +4436,10 @@ vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
     if (key != new_key || value != new_value) {
         DURING_GC_COULD_MALLOC_REGION_START();
         {
-            st_insert(rb_generic_fields_tbl_get(), (st_data_t)new_key, new_value);
+            /* RLGCv2: entry が属する表（global 用 shared か、いずれかの per-Ractor か）に
+             * 再挿入する。single-objspace でのみ compaction が走るので、per-Ractor は
+             * 実質 main の 1 本だけである。 */
+            st_insert(iter_data->gen_fields_current_tbl, (st_data_t)new_key, new_value);
         }
         DURING_GC_COULD_MALLOC_REGION_END();
     }
@@ -4471,6 +4478,16 @@ rb_gc_vm_weak_table_essential_p(enum rb_gc_vm_weak_tables table)
       default:
         return false;
     }
+}
+
+/* generic_fields 表を 1 本ずつ compaction 用の gen_fields foreach で走査する。
+ * 移動した key の再挿入先が正しくなるよう現在の表を foreach_data に記録する。 */
+static void
+vm_weak_table_gen_fields_tbl_cb(struct st_table *tbl, void *arg)
+{
+    struct global_vm_table_foreach_data *foreach_data = (struct global_vm_table_foreach_data *)arg;
+    foreach_data->gen_fields_current_tbl = tbl;
+    st_foreach(tbl, vm_weak_table_gen_fields_foreach, (st_data_t)foreach_data);
 }
 
 void
@@ -4516,14 +4533,10 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
         break;
       }
       case RB_GC_VM_GENERIC_FIELDS_TABLE: {
-        st_table *generic_fields_tbl = rb_generic_fields_tbl_get();
-        if (generic_fields_tbl) {
-            st_foreach(
-                generic_fields_tbl,
-                vm_weak_table_gen_fields_foreach,
-                (st_data_t)&foreach_data
-            );
-        }
+        /* RLGCv2: shared な global 表 + 全 Ractor の per-Ractor 表を舐める
+         * （compaction は single-objspace でのみ走るので per-Ractor は実質 main の 1 本）。
+         * 各 entry の再挿入先が正しい表になるよう、表ポインタを foreach_data に渡す。 */
+        rb_generic_fields_tables_foreach(vm_weak_table_gen_fields_tbl_cb, (void *)&foreach_data);
         break;
       }
       case RB_GC_VM_FROZEN_STRINGS_TABLE: {
