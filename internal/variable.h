@@ -59,6 +59,19 @@ VALUE rb_ivar_get_at_no_ractor_check(VALUE obj, attr_index_t index);
 void rb_generic_fields_lock_atfork(void);
 void rb_imemo_fields_record_shrefs(VALUE fields_obj);
 
+/* RLGCv2 generic_fields weak pass（gc-impl の global GC から呼ぶ）。
+ * mark_foreach: 全 generic_fields 表（shareable 用 global + 全 Ractor の per-Ractor）の
+ *   各 (key,val) について cb(key,val,arg) を呼ぶ。cb は live key の val を mark する。
+ * drain_dead: 同じ表を舐め、is_dead(key) が真の entry を削除し key を root shape に戻す
+ *   （obj_free の rb_free_generic_ivar を no-op 化する）。 */
+void rb_gc_vm_generic_fields_mark_foreach(int (*cb)(VALUE key, VALUE val, void *arg), void *arg);
+void rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key));
+/* 全 generic_fields 表（global + 全 Ractor per-Ractor）について cb(tbl,arg) を呼ぶ。
+ * compaction の参照更新（gc.c）から使う。 */
+void rb_generic_fields_tables_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg);
+/* obj の generic_fields entry を owner の per-Ractor 表から shared global 表へ移送。 */
+void rb_mv_generic_ivar_to_shared(VALUE obj);
+
 RUBY_SYMBOL_EXPORT_BEGIN
 /* variable.c (export) */
 void rb_mark_generic_ivar(VALUE obj);
