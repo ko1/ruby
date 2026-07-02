@@ -821,9 +821,17 @@ typedef struct rb_vm_struct {
         struct rb_objspace_zombie {
             void *objspace;
             void **owner_slot;
-            /* heap pages the zombie held when last measured (at retire;
-             * refreshed by each global cycle under the barrier). The
-             * aggregate below stays in exact entry-by-entry sync. */
+            /* RLGCv2: この zombie の所有 Ractor（終了して vm->ractor.set から外れたが
+             * まだ merge されていない）。global GC はこの objspace を毎回 sweep するが、
+             * owner は set に居ないので root walk がここを見て owner の registered roots
+             * （registered_addrs/registered_marks）も mark しないと、継承前に registered
+             * オブジェクトが sweep され dangling pin になる（freeze-hash 系 UAF）。
+             * orphan（Ractor object が global GC で回収済み）は NULL: その registered
+             * globals は ractor_free が main へ移管済みなので main の root walk で覆われる。 */
+            struct rb_ractor_struct *owner;
+            /* zombie が最後に測定された時点（retire 時。各 global cycle で
+             * barrier 下に更新される）で保持していた heap page 数。下の合計値は
+             * エントリ単位で正確に同期し続ける。 */
             size_t pages;
         } *zombie_objspaces;
         size_t zombie_objspaces_count;

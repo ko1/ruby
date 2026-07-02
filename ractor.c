@@ -417,6 +417,22 @@ rb_ractor_absorb_registered_globals(rb_ractor_t *dst, rb_ractor_t *src)
  * mark する。confined GC は heap 上の Ractor/Thread wrapper object に頼れない
  * （それらは別の objspace に存在する場合がある）ため、現在の Ractor の所有物は
  * ここから直接 root にされる。 */
+/* RLGCv2: この Ractor で登録された VM グローバル root（旧 vm->global_object_list /
+ * vm->mark_object_ary を Ractor-local 化）だけを mark する。これらは object グラフ
+ * （ractor_mark）ではなく root なので、Ractor object 到達可能でも root walk で別途
+ * mark が要る。local GC は自 Ractor のみ、global GC は rb_gc_mark_roots のループで
+ * 全 Ractor ＋ zombie 分を処理する（containment 解除下なので foreign shareable も
+ * 辿れる）。registered_addrs は *addr を mark_maybe（未初期化・非オブジェクト値に
+ * 耐える）、registered_marks は pin する（不滅オブジェクト）。 */
+void
+rb_ractor_mark_registered_globals(rb_ractor_t *r)
+{
+    for (size_t i = 0; i < r->registered_addrs_cnt; i++) {
+        rb_gc_mark_maybe(*r->registered_addrs[i]);
+    }
+    rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
+}
+
 void
 rb_ractor_mark_local_roots(rb_ractor_t *r)
 {
@@ -424,15 +440,7 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
     rb_gc_mark(r->name);
     ractor_mark_unshareable_parts(r);
 
-    /* RLGCv2: この Ractor で登録された VM グローバル root（旧 vm->global_object_list /
-     * vm->mark_object_ary を Ractor-local 化）。local GC は自 Ractor のみ、global GC は
-     * rb_gc_mark_roots のループで全 Ractor 分を処理する（containment 解除下なので
-     * foreign shareable も辿れる）。registered_addrs は *addr を mark_maybe（未初期化・
-     * 非オブジェクト値に耐える）、registered_marks は pin する（不滅オブジェクト）。 */
-    for (size_t i = 0; i < r->registered_addrs_cnt; i++) {
-        rb_gc_mark_maybe(*r->registered_addrs[i]);
-    }
-    rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
+    rb_ractor_mark_registered_globals(r);
 }
 
 static int

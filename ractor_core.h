@@ -182,6 +182,13 @@ struct rb_ractor_struct {
 
 /* RLGCv2: mark Ractor r's GC roots from its C structure (gc.c root scan). */
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
+/* rb_ractor_mark_local_roots のうち「登録済み VM グローバル root（registered_addrs /
+ * registered_marks）」だけを mark する。これらは object グラフ（ractor_mark）ではなく
+ * root なので、Ractor object が到達可能でも root walk で別途 mark が要る。zombie
+ * （set から外れたが未 merge。objspace は global GC が sweep する）に対しては、
+ * loc/name/threads 等の object-graph 部分は ractor_mark 側（join 待ちなら Ractor
+ * object 到達可能、orphan なら回収されるべき）に委ね、ここだけを補う。 */
+void rb_ractor_mark_registered_globals(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
 void rb_ractor_pin_inherited_parts(rb_ractor_t *r);
 
