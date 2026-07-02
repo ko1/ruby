@@ -3875,6 +3875,15 @@ thread_free(void *ptr)
     rb_thread_t *th = ptr;
     RUBY_FREE_ENTER("thread");
 
+    /* Detach from the root fiber before this struct is freed: if the fiber
+     * wrapper outlives us, its fiber_free/memsize must not follow
+     * saved_ec.thread_ptr to a freed thread (paired with the detach fiber_free
+     * does in the opposite sweep order). */
+    if (th->ec && th->ec->fiber_ptr &&
+        th->ec == rb_fiberptr_get_ec(th->ec->fiber_ptr)) {
+        rb_fiberptr_detach_thread(th->ec->fiber_ptr);
+    }
+
     rb_threadptr_sched_free(th);
 
     if (th->locking_mutex != Qfalse) {

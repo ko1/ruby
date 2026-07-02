@@ -1293,6 +1293,19 @@ fiber_free(void *ptr)
 
     if (DEBUG) fprintf(stderr, "fiber_free: %p[%p]\n", (void *)fiber, fiber->stack.base);
 
+    /* A thread's root fiber holds the thread's ec inside this struct. The thread
+     * wrapper may be freed before us (sweep order is arbitrary), so detach now.
+     * Gate on first_proc (root fibers have none) and only touch th while its ec
+     * still points here, so we never dereference a freed thread. Paired with the
+     * detach thread_free does in the opposite order. */
+    if (fiber->first_proc == 0) {
+        rb_thread_t *th = fiber->cont.saved_ec.thread_ptr;
+        if (th && th->ec == &fiber->cont.saved_ec) {
+            th->ec = NULL;
+            if (th->root_fiber == fiber) th->root_fiber = NULL;
+        }
+    }
+
     if (fiber->cont.saved_ec.local_storage) {
         rb_id_table_free(fiber->cont.saved_ec.local_storage);
     }
@@ -1307,12 +1320,14 @@ fiber_memsize(const void *ptr)
     const rb_fiber_t *fiber = ptr;
     size_t size = sizeof(*fiber);
     const rb_execution_context_t *saved_ec = &fiber->cont.saved_ec;
-    const rb_thread_t *th = rb_ec_thread_ptr(saved_ec);
 
     /*
-     * vm.c::thread_memsize already counts th->ec->local_storage
+     * vm.c::thread_memsize already counts the root fiber's local_storage.
+     * Test first_proc rather than fiber != th->root_fiber: a non-root fiber's
+     * thread_ptr may dangle, and only a non-root fiber (first_proc != 0) owns
+     * storage not already counted by the thread.
      */
-    if (saved_ec->local_storage && fiber != th->root_fiber) {
+    if (saved_ec->local_storage && fiber->first_proc != 0) {
         size += rb_id_table_memsize(saved_ec->local_storage);
         size += rb_obj_memsize_of(saved_ec->storage);
     }
@@ -1513,6 +1528,13 @@ struct rb_execution_context_struct *
 rb_fiberptr_get_ec(struct rb_fiber_struct *fiber)
 {
     return &fiber->cont.saved_ec;
+}
+
+void
+rb_fiberptr_detach_thread(struct rb_fiber_struct *fiber)
+{
+    /* The owning thread struct is about to be freed (see thread_free). */
+    fiber->cont.saved_ec.thread_ptr = NULL;
 }
 
 static void
