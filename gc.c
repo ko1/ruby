@@ -3094,6 +3094,27 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
             rb_ractor_mark_local_roots(r);
             rb_ractor_repin_in_flight(r);
         }
+        /* RLGCv2: 終了して vm->ractor.set から外れたが、まだ継承（Ractor#value /
+         * orphan merge）されていない zombie の owner Ractor の「registered globals だけ」
+         * を mark する。これらの objspace は上の enumerate 対象として global GC が sweep
+         * するので、ここで registered roots（registered_addrs/registered_marks）を mark
+         * しないと、set に居ないぶん未 mark のまま sweep され、後で継承した joiner の
+         * registered リストに dangling ポインタが残る（freeze-hash UAF）。
+         *
+         * ここで rb_ractor_mark_local_roots（full）を呼んではならない: それは
+         * ractor_mark_unshareable_parts 経由で zombie の thread/EC も mark するため、
+         * 未 join のまま参照を手放した orphan Ractor object が到達可能になり、回収→
+         * disown→merge が起きず objspace が永久に merge されなくなる（v2_orphan_merge_pjob
+         * 回帰）。loc/name/threads 等の object-graph 部分は ractor_mark 側に委ねる:
+         * join 待ちなら Ractor object 到達可能で ractor_mark が覆い、orphan なら回収され
+         * るべき。orphan（Ractor object 回収済み, owner==NULL）は registered globals も
+         * ractor_free が main へ移管済みなので、そもそもここでは skip される。 */
+        for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
+            rb_ractor_t *zr = vm->gc.zombie_objspaces[i].owner;
+            if (zr) {
+                rb_ractor_mark_registered_globals(zr);
+            }
+        }
     }
     else {
         rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
@@ -3722,7 +3743,7 @@ static void rlgc_orphan_merge_job(void *unused);
  * global GC's sweep, where the accounted allocators are forbidden. The
  * ledger is VM-lifetime metadata, a few dozen entries at most. */
 static void
-zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot)
+zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot, struct rb_ractor_struct *owner)
 {
     if (vm->gc.zombie_objspaces_count == vm->gc.zombie_objspaces_capa) {
         size_t new_capa = vm->gc.zombie_objspaces_capa ? vm->gc.zombie_objspaces_capa * 2 : 16;
@@ -3736,6 +3757,7 @@ zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot)
     vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count++] = (struct rb_objspace_zombie){
         .objspace = objspace,
         .owner_slot = owner_slot,
+        .owner = owner,
         .pages = pages,
     };
     vm->gc.zombie_total_pages += pages;
@@ -3761,7 +3783,13 @@ rb_gc_objspace_retire(void **objspace_slot)
                 rb_bug("Could not preregister postponed job for GC");
             }
         }
-        zombie_objspaces_push(vm, *objspace_slot, objspace_slot);
+        /* owner_slot は常に retire される Ractor の &r->objspace（vm_remove_ractor /
+         * ractor 終了パスから）。owner を記録しておき、global GC が set から外れた
+         * この zombie の registered roots も mark できるようにする。orphan 化
+         * （Ractor object 回収）で owner は下の rb_gc_objspace_disown が NULL にする。 */
+        struct rb_ractor_struct *owner =
+            (struct rb_ractor_struct *)((char *)objspace_slot - offsetof(rb_ractor_t, objspace));
+        zombie_objspaces_push(vm, *objspace_slot, objspace_slot, owner);
     }
 }
 
@@ -3790,12 +3818,16 @@ rb_gc_objspace_disown(void *objspace)
     for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
         if (vm->gc.zombie_objspaces[i].objspace == objspace) {
             vm->gc.zombie_objspaces[i].owner_slot = NULL;
+            /* Ractor object が回収されるので owner も落とす（root walk はこの
+             * zombie を skip する）。registered globals は ractor_free が既に main へ
+             * 移管済みで、main の root walk が覆う。 */
+            vm->gc.zombie_objspaces[i].owner = NULL;
             found = true;
             break;
         }
     }
     if (!found) {
-        zombie_objspaces_push(vm, objspace, NULL);
+        zombie_objspaces_push(vm, objspace, NULL, NULL);
     }
 
     /* the trigger is wait-free (atomic bit + interrupt flag), safe in
@@ -3885,21 +3917,23 @@ rb_gc_single_objspace_p(void)
     return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0;
 }
 
-/* RLGCv2 (design_v2.md section 2.3): inherit a dead Ractor's objspace
- * into the calling Ractor's one. Takes the owning slot so that clearing
- * it and freeing the objspace happen under one VM-lock critical section
- * (the dying thread's teardown reads the slot under the same lock). */
-/* design_v2.md section 2.3: the merge reallocates dst bookkeeping (the
- * sorted page array, the finalizer table), and an allocation-triggered
- * GC of dst would run over the half-spliced heap lists. No GC may
- * start while the merge runs; preserve a user GC.disable. */
+/* RLGCv2 (design_v2.md section 2.3): 死んだ Ractor の objspace を呼び出し側の
+ * Ractor のものへ継承する。所有スロットを受け取ることで、そのクリアと objspace の
+ * 解放が 1 つの VM-lock クリティカルセクションの下で起きるようにする
+ * （死につつあるスレッドの teardown は同じロックの下でそのスロットを読む）。 */
+/* マージ本体（rlgc_objspace_absorb）は Ruby オブジェクトを alloc しない: ページは
+ * 引き渡し、ソート済みページ配列は rb_darray_*_without_gc（GC 非誘発の変種）、
+ * finalizer は st 移送。よってマージ中に GC がトリガされることはなく、呼び出し側が
+ * VM lock を保持しているので他 Ractor の global GC も排除される。したがって明示的な
+ * gc-disable は不要（かつては realloc が GC を誘発しうるとして disable していたが、
+ * _without_gc 変種の採用で不要になった）。
+ * 不変条件: (1) 呼び出し側は VM lock 下、(2) マージ本体は alloc-free のまま。
+ * これを崩すと継承オブジェクトが pin される前に sweep される GC 窓が再発する。 */
 static void
-objspace_absorb_with_gc_disabled(void *dst, void *src)
+objspace_absorb_merge(void *dst, void *src)
 {
-    bool was_enabled = rb_gc_impl_gc_enabled_p(dst);
-    if (was_enabled) rb_gc_impl_gc_disable(dst, false);
+    ASSERT_vm_locking();
     rb_gc_impl_objspace_absorb(dst, src);
-    if (was_enabled) rb_gc_impl_gc_enable(dst);
 }
 
 void
@@ -3910,7 +3944,7 @@ rb_gc_objspace_absorb_into_current(void **objspace_slot)
         if (objspace != NULL) {
             *objspace_slot = NULL;
             rb_gc_vm_forget_zombie(objspace);
-            objspace_absorb_with_gc_disabled(rb_gc_get_objspace(), objspace);
+            objspace_absorb_merge(rb_gc_get_objspace(), objspace);
         }
     }
 }
@@ -3931,7 +3965,7 @@ objspace_absorb_disowned_zombies(void)
                 void *zombie = vm->gc.zombie_objspaces[i].objspace;
                 vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count - 1];
                 vm->gc.zombie_objspaces_count--;
-                objspace_absorb_with_gc_disabled(rb_gc_get_objspace(), zombie);
+                objspace_absorb_merge(rb_gc_get_objspace(), zombie);
             }
             else {
                 i++;
