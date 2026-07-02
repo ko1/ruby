@@ -96,6 +96,11 @@ MODULAR_GC_FN void rb_gc_vm_forget_zombie(void *objspace);
 MODULAR_GC_FN size_t rb_gc_obj_optimal_size(VALUE obj);
 MODULAR_GC_FN void rb_gc_mark_children(void *objspace, VALUE obj);
 MODULAR_GC_FN void rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback, vm_table_update_callback_func update_callback, void *data, bool weak_only, enum rb_gc_vm_weak_tables table);
+/* RLGCv2: generic_fields の global GC 用 weak pass（variable.c 実装、gc-impl から呼ぶ）。
+ * MODULAR_GC_FN は付けない: 実体は VM 側の variable.c にあり、gc-impl の TU から呼ぶので
+ * 非モジュラービルドでも外部リンケージが要る（rb_gc_single_objspace_p と同じ扱い）。 */
+void rb_gc_vm_generic_fields_mark_foreach(int (*cb)(VALUE key, VALUE val, void *arg), void *arg);
+void rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key));
 MODULAR_GC_FN void rb_gc_update_object_references(void *objspace, VALUE obj);
 MODULAR_GC_FN void rb_gc_update_vm_references(void *objspace);
 MODULAR_GC_FN void rb_gc_event_hook(VALUE obj, rb_event_flag_t event);
