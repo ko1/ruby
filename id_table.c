@@ -390,11 +390,9 @@ rb_managed_id_table_dup(VALUE old_table)
 {
     struct rb_id_table *new_tbl;
     VALUE obj = TypedData_Make_Struct(0, struct rb_id_table, RTYPEDDATA_TYPE(old_table), new_tbl);
-    /* Same as rb_managed_id_table_create: a managed table can hang off a
-     * VM-global structure -- the shape tree's edge tables grow through
-     * this dup on whatever Ractor inserts the transition -- where only
-     * the global mark reaches it. Without the shareable pin the owner's
-     * local GC frees it while installed. */
+    /* A managed id table hangs off VM-global state (e.g. a shape tree's edge
+     * table grows via this dup) and is reachable from every Ractor, so mark it
+     * shareable. */
     RB_OBJ_SET_SHAREABLE(obj);
     struct rb_id_table *old_tbl = managed_id_table_ptr(old_table);
     rb_id_table_init(new_tbl, old_tbl->num + 1);

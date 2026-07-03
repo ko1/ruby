@@ -1677,12 +1677,11 @@ module Test
 
           leakchecker.check("#{inst.class}\##{inst.__name__}")
 
-          # RLGCv2: verify the GC invariants (shareable/shref/containment)
-          # after tests when requested. An integer >= 2 samples every Nth
-          # test (a prime, combined with the randomized test order, varies
-          # the sampled set per run); other non-empty values verify every
-          # test (full verification is O(heap) per test -- only viable for
-          # small runs).
+          # Optionally verify GC internal consistency after each test. An
+          # integer >= 2 samples once every N tests (use a prime so a
+          # randomized test order samples a different set each run); any other
+          # non-empty value verifies every test (O(heap) per test, so only
+          # practical for small runs).
           if (interval = ENV["RUBY_TEST_GC_VERIFY"])
             n = interval.to_i
             @__gc_verify_tick = (@__gc_verify_tick || 0) + 1
