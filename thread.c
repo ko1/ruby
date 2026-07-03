@@ -884,9 +884,9 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
                  "can't start a new thread (frozen ThreadGroup)");
     }
 
-    /* RLGCv2 (design_v2.md §1.5): a new Ractor does not inherit fiber
-     * storage -- the entries may be unshareable objects owned by the
-     * creating Ractor, which the new Ractor must never reference. */
+    /* A new Ractor must not inherit the creating thread's fiber storage: its
+     * entries may be objects owned by the creating Ractor. Only threads created
+     * within the same Ractor inherit it. */
     if (params->type != thread_invoke_type_ractor_proc) {
         rb_fiber_inherit_storage(ec, th->ec->fiber_ptr);
     }
