@@ -103,10 +103,8 @@ rb_concurrent_set_new(const struct rb_concurrent_set_funcs *funcs, int capacity)
     set->funcs = funcs;
     set->entries = ZALLOC_N(struct concurrent_set_entry, capacity);
     set->capacity = capacity;
-    /* The set object is reached from all Ractors (e.g. through a C global
-     * such as the fstring table), and a resize allocates the new generation
-     * in the resizing Ractor's objspace where no local root reaches it.
-     * Mark it shareable so the owning objspace's local GC pins it. */
+    /* The set is reachable from every Ractor (e.g. via C globals such as the
+     * frozen-string and symbol tables), so mark it shareable. */
     RB_OBJ_SET_SHAREABLE(obj);
     return obj;
 }

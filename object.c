@@ -446,10 +446,9 @@ rb_immutable_obj_clone(int argc, VALUE *argv, VALUE obj)
 VALUE
 rb_get_freeze_opt(int argc, VALUE *argv)
 {
-    /* idFreeze is a predefined id (== :freeze), set up at boot before any
-     * Ruby code runs. Using it directly avoids the lazy `if (!keyword_ids[0])
-     * CONST_ID(...)` on a process-wide static, whose unsynchronized init
-     * raced (benignly, same value) across parallel Ractors under RLGCv2. */
+    /* idFreeze (== :freeze) is preinterned before any Ruby code runs, so use it
+     * directly instead of lazily initializing a shared static, which races when
+     * Ractors run this concurrently. */
     const ID keyword_ids[1] = { idFreeze };
     VALUE opt;
     VALUE kwfreeze = Qnil;
@@ -472,17 +471,12 @@ immutable_obj_clone(VALUE obj, VALUE kwfreeze)
     return obj;
 }
 
-/* The `{freeze: true/false}` keyword hashes passed to #initialize_clone,
- * lazily built and pinned on the VM-global object list (design_v2.md §2.4).
- *
- * Under RLGCv2 multiple Ractors run #clone in parallel without a shared
- * GVL, so the old lazy init raced: thread A published an empty hash to the
- * shared static, thread B re-read the static and froze it, then A's
- * rb_hash_aset hit a now-frozen hash (FrozenError: can't modify frozen Hash
- * {freeze: true}). We instead build a fully populated, frozen, *pinned* hash
- * in a local and publish it with one atomic CAS: every value a Ractor can
- * observe in the static is already complete and rooted, and a concurrent
- * builder that loses the CAS just drops its hash as garbage. */
+/* Cache of the `{freeze: true/false}` keyword hash passed to #initialize_clone.
+ * Ractors may reach this concurrently, so build a fully populated, frozen and
+ * pinned hash locally and publish it with a single atomic CAS: any value another
+ * thread can observe in the static is already complete, and a builder that loses
+ * the CAS just discards its hash. (The old lazy init published an empty hash that
+ * a second thread could read and freeze before the first finished filling it.) */
 static VALUE freeze_true_hash, freeze_false_hash;
 
 static VALUE
@@ -493,12 +487,9 @@ clone_freeze_kwarg_hash(VALUE *cache, VALUE freeze_value)
         h = rb_hash_new();
         rb_hash_aset(h, ID2SYM(idFreeze), freeze_value);
         rb_obj_freeze(h);
-        /* Pin before publishing: once the CAS makes h reachable from
-         * another Ractor (a foreign reference no confined GC would mark),
-         * only the global pin keeps it alive. */
-        rb_vm_register_global_object(h);
+        rb_vm_register_global_object(h); /* pin before publishing */
         VALUE prev = RUBY_ATOMIC_VALUE_CAS(*cache, 0, h);
-        if (prev) h = prev; /* lost the race; our h is now garbage */
+        if (prev) h = prev; /* lost the race; our h becomes garbage */
     }
     return h;
 }
