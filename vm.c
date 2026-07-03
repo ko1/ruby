@@ -3957,15 +3957,6 @@ thread_free(void *ptr)
     rb_thread_t *th = ptr;
     RUBY_FREE_ENTER("thread");
 
-    /* RLGCv2: detach from the root fiber before this struct dies; if
-     * the fiber wrapper outlives us, its fiber_free must not chase a
-     * freed thread through saved_ec.thread_ptr (the mirror of the
-     * detach fiber_free performs in the reverse sweep order). */
-    if (th->ec && th->ec->fiber_ptr &&
-        th->ec == rb_fiberptr_get_ec(th->ec->fiber_ptr)) {
-        rb_fiberptr_detach_thread(th->ec->fiber_ptr);
-    }
-
     rb_threadptr_sched_free(th);
     // destroyed here rather than during teardown: nothing can interrupt a
     // thread that is unreachable and off its Ractor's living set
