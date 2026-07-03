@@ -1326,27 +1326,6 @@ fiber_free(void *ptr)
 
     if (DEBUG) fprintf(stderr, "fiber_free: %p[%p]\n", (void *)fiber, fiber->stack.base);
 
-    /* RLGCv2: if this is a thread's root fiber, the thread's ec points
-     * INTO this struct (&fiber->cont.saved_ec). Detach before freeing:
-     * the thread wrapper can outlive this one (their sweep order is
-     * arbitrary), and its dmark must not walk a freed ec -- the
-     * consistency verifier visits such wrappers even when no real mark
-     * ever would. thread_free clears the ROOT fiber's thread_ptr before
-     * the thread is freed, so this dereference is safe for it.
-     *
-     * Only the root fiber needs (and may safely do) this: a non-root
-     * fiber's thread_ptr is NOT cleared by thread_free and can dangle
-     * (its thread wrapper freed in an earlier sweep step), while the
-     * thread's ec never points into a non-root fiber. Gate on first_proc
-     * -- root fibers have none -- so we never dereference a freed thread. */
-    if (fiber->first_proc == 0) {
-        rb_thread_t *th = fiber->cont.saved_ec.thread_ptr;
-        if (th && th->ec == &fiber->cont.saved_ec) {
-            th->ec = NULL;
-            if (th->root_fiber == fiber) th->root_fiber = NULL;
-        }
-    }
-
     if (fiber->cont.saved_ec.local_storage) {
         rb_id_table_free(fiber->cont.saved_ec.local_storage);
     }
@@ -1363,11 +1342,10 @@ fiber_memsize(const void *ptr)
     const rb_execution_context_t *saved_ec = &fiber->cont.saved_ec;
 
     /*
-     * vm.c::thread_memsize already counts th->ec->local_storage
-     * (the root fiber's). RLGCv2: test first_proc rather than
-     * fiber != th->root_fiber -- a non-root fiber's thread_ptr may
-     * dangle, and only non-root fibers (first_proc != 0) own storage
-     * not already accounted by the thread.
+     * vm.c::thread_memsize already counts th->ec->local_storage (the root
+     * fiber's). Test first_proc rather than fiber != th->root_fiber: only a
+     * non-root fiber (first_proc != 0) owns storage not already counted by
+     * the thread, and this avoids dereferencing thread_ptr entirely.
      */
     if (saved_ec->local_storage && fiber->first_proc != 0) {
         size += rb_id_table_memsize(saved_ec->local_storage);
@@ -1564,13 +1542,6 @@ cont_init_jit_cont(rb_context_t *cont)
     VM_ASSERT(cont->jit_cont == NULL);
     // We always allocate this since YJIT may be enabled later
     cont->jit_cont = jit_cont_new(&(cont->saved_ec));
-}
-
-void
-rb_fiberptr_detach_thread(struct rb_fiber_struct *fiber)
-{
-    /* the owning thread struct is being freed (see thread_free) */
-    fiber->cont.saved_ec.thread_ptr = NULL;
 }
 
 struct rb_execution_context_struct *
