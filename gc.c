@@ -1839,7 +1839,11 @@ os_obj_of(VALUE of)
 
     oes.num = 0;
     oes.of = of;
-    rb_objspace_each_objects(os_obj_of_i, &oes);
+    /* Current Ractor only. os_obj_of_i yields each object to a user block;
+     * doing that across the cross-Ractor walk runs user code (with its own
+     * safepoints) while this walk holds the VM lock + barrier, which lets
+     * another thread's Ractor work take the lock and unbalances it. */
+    rb_objspace_each_objects_local(os_obj_of_i, &oes);
     return SIZET2NUM(oes.num);
 }
 
