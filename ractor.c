@@ -2399,7 +2399,15 @@ struct move_node {
         struct { VALUE klass; } obj;
         struct { long len; uint32_t *elems; VALUE klass; } strct; /* owns elems */
         struct { uint32_t regexp_id, str_id; int num_regs; void *regs; VALUE klass; } match; /* owns regs */
-        struct { struct rb_io *fptr; VALUE klass; } io;  /* fptr carried across */
+        struct {
+            struct rb_io *fptr;  /* carried across by pointer (owns the fd) */
+            VALUE klass;
+            /* the fptr's sender-resident VALUE members travel as ordinary
+             * child nodes; the capture severs them from the fptr (see the
+             * T_FILE arm) and the rebuild writes the receiver-side shells
+             * back with RB_OBJ_WRITE */
+            uint32_t pathv_id, ecopts_id, wc_pre_ecopts_id, wc_asciicompat_id, timeout_id;
+        } io;
     } u;
 };
 
@@ -2656,15 +2664,47 @@ move_capture(struct move_build *b, VALUE obj)
       }
 
       case T_FILE:
+      {
         /* RLGCv2 (design_v2.md §4.5): carry the whole fptr (and its fd)
          * across by pointer; the source becomes a shell that never closes
-         * it.  v1 transfers the fptr as-is, like the original move did: its
-         * VALUE members (pathv etc.) ride along, which is sound for simple
-         * IOs (pipes/files with no in-flight cross-objspace state). */
+         * it. The fptr's VALUE members are sender-objspace objects: once
+         * the source is husked nothing on the sender roots them, so the
+         * sender's next local GC (or an in-flight global GC) would
+         * collect them under the receiver (File always has a pathv --
+         * io.path/inspect would read freed memory). Capture them as
+         * ordinary child nodes and SEVER them from the fptr: the ridden
+         * fptr is marked by nobody in flight, and on the receiver the
+         * shell's T_FILE mark runs before the fill pass rewrites these
+         * slots, so a stale pointer left here would get marked. The
+         * rebuild writes the receiver-side shells back; write_lock and
+         * wakeup_mutex are lazily (re)created by io.c on demand, and a
+         * tied/mid-close IO is rejected in move_preflight. */
+        struct rb_io *fptr = RFILE(obj)->fptr;
+        VM_ASSERT(!RTEST(fptr->tied_io_for_writing) && !RTEST(fptr->wakeup_mutex));
+        uint32_t pathv_id   = move_capture(b, fptr->pathv);
+        uint32_t ecopts_id  = move_capture(b, fptr->encs.ecopts);
+        uint32_t wc_pre_id  = move_capture(b, fptr->writeconv_pre_ecopts);
+        uint32_t wc_ac_id   = move_capture(b, fptr->writeconv_asciicompat);
+        uint32_t timeout_id = move_capture(b, fptr->timeout);
+        fptr->self = Qnil;   /* points at the husk otherwise; rebuilt on attach */
+        fptr->pathv = Qnil;
+        fptr->encs.ecopts = Qnil;
+        fptr->writeconv_pre_ecopts = Qnil;
+        fptr->writeconv_asciicompat = Qnil;
+        fptr->timeout = Qnil;
+        fptr->write_lock = Qnil;
+        fptr->wakeup_mutex = Qnil;
+        fptr->tied_io_for_writing = 0;  /* io.c tests this by C truthiness: 0, not Qnil */
         b->c->nodes[id].kind = MOVE_K_IO;
-        b->c->nodes[id].u.io.fptr = RFILE(obj)->fptr;
+        b->c->nodes[id].u.io.fptr = fptr;
         b->c->nodes[id].u.io.klass = RBASIC_CLASS(obj);
+        b->c->nodes[id].u.io.pathv_id = pathv_id;
+        b->c->nodes[id].u.io.ecopts_id = ecopts_id;
+        b->c->nodes[id].u.io.wc_pre_ecopts_id = wc_pre_id;
+        b->c->nodes[id].u.io.wc_asciicompat_id = wc_ac_id;
+        b->c->nodes[id].u.io.timeout_id = timeout_id;
         break;
+      }
 
       default:
         rb_raise(rb_eRactorError, "can not move a %"PRIsVALUE" object",
@@ -2726,11 +2766,27 @@ move_preflight(VALUE obj, st_table *seen)
             move_preflight(RSTRUCT_GET(obj, (int)i), seen);
         }
         break;
-      case T_FILE:
-        if (RFILE(obj)->fptr == NULL) {
+      case T_FILE: {
+        struct rb_io *fptr = RFILE(obj)->fptr;
+        if (fptr == NULL) {
             rb_raise(rb_eRactorError, "can not move an uninitialized IO");
         }
+        if (RTEST(fptr->tied_io_for_writing)) {
+            /* a popen("r+")-style pair: moving one half would leave the
+             * tied writer dangling on the sender */
+            rb_raise(rb_eRactorError, "can not move an IO tied to a writer IO");
+        }
+        if (RTEST(fptr->wakeup_mutex)) {
+            /* close in progress: threads are blocked on this IO */
+            rb_raise(rb_eRactorError, "can not move an IO that is being closed");
+        }
+        move_preflight(fptr->pathv, seen);
+        move_preflight(fptr->encs.ecopts, seen);
+        move_preflight(fptr->writeconv_pre_ecopts, seen);
+        move_preflight(fptr->writeconv_asciicompat, seen);
+        move_preflight(fptr->timeout, seen);
         break;
+      }
       default:
         rb_raise(rb_eRactorError, "can not move a %"PRIsVALUE" object",
                  rb_class_name(rb_obj_class(obj)));
@@ -2855,6 +2911,18 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
                                RARRAY_AREF(shells, n->u.match.str_id),
                                n->u.match.num_regs, n->u.match.regs);
             break;
+          case MOVE_K_IO: {
+            /* write the rebuilt VALUE members back into the ridden fptr
+             * (severed at capture); write_lock / wakeup_mutex stay nil,
+             * io.c re-creates them lazily on demand */
+            struct rb_io *fptr = RFILE(shell)->fptr;
+            RB_OBJ_WRITE(shell, &fptr->pathv, RARRAY_AREF(shells, n->u.io.pathv_id));
+            RB_OBJ_WRITE(shell, &fptr->encs.ecopts, RARRAY_AREF(shells, n->u.io.ecopts_id));
+            RB_OBJ_WRITE(shell, &fptr->writeconv_pre_ecopts, RARRAY_AREF(shells, n->u.io.wc_pre_ecopts_id));
+            RB_OBJ_WRITE(shell, &fptr->writeconv_asciicompat, RARRAY_AREF(shells, n->u.io.wc_asciicompat_id));
+            RB_OBJ_WRITE(shell, &fptr->timeout, RARRAY_AREF(shells, n->u.io.timeout_id));
+            break;
+          }
           default:
             break;
         }
