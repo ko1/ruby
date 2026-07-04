@@ -635,6 +635,7 @@ typedef struct gc_function_map {
     void (*pin_in_flight_message)(void *objspace_ptr, VALUE obj);
     // Heap walking
     void (*each_objects)(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
+    void (*each_objects_shareable)(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
     void (*each_object)(void *objspace_ptr, void (*func)(VALUE obj, void *data), void *data);
     // Finalizers
     void (*make_zombie)(void *objspace_ptr, VALUE obj, void (*dfree)(void *), void *data);
@@ -819,6 +820,7 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(pin_in_flight_message);
     // Heap walking
     load_modular_gc_func(each_objects);
+    load_modular_gc_func(each_objects_shareable);
     load_modular_gc_func(each_object);
     // Finalizers
     load_modular_gc_func(make_zombie);
@@ -912,6 +914,7 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_pin_in_flight_message rb_gc_functions.pin_in_flight_message
 // Heap walking
 # define rb_gc_impl_each_objects rb_gc_functions.each_objects
+# define rb_gc_impl_each_objects_shareable rb_gc_functions.each_objects_shareable
 # define rb_gc_impl_each_object rb_gc_functions.each_object
 // Finalizers
 # define rb_gc_impl_make_zombie rb_gc_functions.make_zombie
@@ -3697,6 +3700,33 @@ rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *
 {
     RB_VM_LOCKING() {
         rb_vm_barrier();
+
+        void *self = rb_gc_get_objspace();
+        rb_gc_impl_each_objects(self, callback, data);
+
+        /* RLGCv2: also reach the shareable objects owned by other live
+         * Ractors (their iseqs, callcaches, ...). The barrier keeps every
+         * live objspace stable; being-created and zombie objspaces are
+         * intentionally skipped -- their heaps are not in a walkable state
+         * and they hold nothing a caller of this API needs to see. */
+        rb_vm_t *vm = GET_VM();
+        rb_ractor_t *r;
+        ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+            if (r->objspace && r->objspace != self) {
+                rb_gc_impl_each_objects_shareable(r->objspace, callback, data);
+            }
+        }
+    }
+}
+
+/* Like rb_objspace_each_objects, but only the current Ractor's objspace --
+ * for callers that must stay within their own heap (e.g. ObjectSpace.dump_all,
+ * which would otherwise leak other Ractors' objects across the isolation). */
+void
+rb_objspace_each_objects_local(int (*callback)(void *, void *, size_t, void *), void *data)
+{
+    RB_VM_LOCKING() {
+        rb_vm_barrier();
         rb_gc_impl_each_objects(rb_gc_get_objspace(), callback, data);
     }
 }
@@ -4021,27 +4051,6 @@ rb_gc_objspace_absorb_all_zombies(void)
             rb_bug("rb_gc_objspace_absorb_all_zombies: zombie list did not shrink");
         }
     }
-}
-
-struct each_objects_all_data {
-    int (*callback)(void *, void *, size_t, void *);
-    void *data;
-};
-
-static void
-each_objects_all_i(void *objspace, void *ptr)
-{
-    struct each_objects_all_data *d = ptr;
-    rb_gc_impl_each_objects(objspace, d->callback, d->data);
-}
-
-/* Walk the objects of every objspace (living and zombie). The caller
- * must hold the VM lock and have issued a barrier. */
-void
-rb_objspace_each_objects_all(int (*callback)(void *, void *, size_t, void *), void *data)
-{
-    struct each_objects_all_data d = { .callback = callback, .data = data };
-    rb_gc_vm_each_objspace(each_objects_all_i, &d);
 }
 
 static void
