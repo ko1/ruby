@@ -349,7 +349,7 @@ rb_ractor_register_address(rb_ractor_t *r, VALUE *addr)
     r->registered_addrs[r->registered_addrs_cnt++] = addr;
 }
 
-void
+bool
 rb_ractor_unregister_address(rb_ractor_t *r, VALUE *addr)
 {
     for (size_t i = 0; i < r->registered_addrs_cnt; i++) {
@@ -357,10 +357,12 @@ rb_ractor_unregister_address(rb_ractor_t *r, VALUE *addr)
             MEMMOVE(&r->registered_addrs[i], &r->registered_addrs[i + 1], VALUE *,
                     r->registered_addrs_cnt - i - 1);
             r->registered_addrs_cnt--;
-            return;
+            return true;
         }
     }
-    /* 見つからなければ no-op（吸収済み Ractor で登録され移管された等） */
+    /* 見つからない: 呼び出し側（rb_gc_unregister_address）が cross-Ractor 登録の
+     * 観測 scan を行う。二重 unregister（upstream が黙認する形）はそのまま no-op。 */
+    return false;
 }
 
 void
