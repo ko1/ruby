@@ -1468,6 +1468,34 @@ rb_obj_set_shareable_no_assert(VALUE obj)
     FL_SET_RAW(obj, FL_SHAREABLE);
     rb_gc_obj_became_shareable(obj);
 
+    if (BUILTIN_TYPE(obj) == T_FILE && RFILE(obj)->fptr) {
+        /* RLGCv2: the fptr's VALUE members (gc.c's T_FILE mark set) are not
+         * reached by the make_shareable traversal -- they sit in a C struct,
+         * were stored without the write barrier (File.open predates this
+         * promotion), and some can never become shareable (write_lock is a
+         * Mutex). Without a record the now-shareable IO holds naked edges to
+         * owner-confined objects: a local GC never traverses a shareable
+         * (mark-only), so once the owner collects them (or dies and its
+         * objspace is absorbed) the live IO's T_FILE mark walks freed memory
+         * ([BUG] try to mark T_NONE). Record the shrefs the write barrier
+         * would have -- the same discipline as rb_imemo_fields_record_shrefs
+         * below; every global full mark recomputes them from then on
+         * (gc_mark's during_global_gc shref pass). */
+        const struct rb_io *const fptr = RFILE(obj)->fptr;
+        const VALUE members[] = {
+            fptr->self, fptr->pathv, fptr->tied_io_for_writing,
+            fptr->writeconv_asciicompat, fptr->writeconv_pre_ecopts,
+            fptr->encs.ecopts, fptr->write_lock, fptr->timeout,
+            fptr->wakeup_mutex,
+        };
+        for (size_t i = 0; i < numberof(members); i++) {
+            const VALUE v = members[i];
+            if (v && !RB_SPECIAL_CONST_P(v) && !RB_OBJ_SHAREABLE_P(v)) {
+                rb_gc_writebarrier(obj, v);
+            }
+        }
+    }
+
     if (rb_obj_gen_fields_p(obj)) {
         /* RLGCv2: obj の generic_fields が per-Ractor 表バック（T_STRUCT の RSTRUCT_GEN_FIELDS
          * や T_STRING 等）なら、entry を owner の per-Ractor 表から shared な global 表へ
