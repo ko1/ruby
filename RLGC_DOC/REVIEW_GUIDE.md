@@ -1,12 +1,19 @@
 # RLGC コードレビュー副読本 (REVIEW_GUIDE.md)
 
+> **注意(2026-07-04)**: 本書は初期の RLGC 実装スナップショット(`de5545202` からの 43 コミット)を
+> コードに即して解説した副読本で、**その時点の diff に固定**されている。以降 RLGCv2 は大きく進み、
+> 一部の記述(特に cross-Ractor 列挙 `rb_objspace_each_objects_all`・shareable の mark-only 化・
+> imemo の born-shareable 確定など)は**現行と異なる**。
+> **最新の仕様は `design_v2.md` 冒頭「現在の到達点(最新仕様サマリ)」、進捗は `STATUS_v2.md` を正**とする。
+> 本書は「初期実装をコード単位で追う」用途の歴史的資料として残す。
+
 Ractor-Local GC (RLGC) の実装 diff を**コードに即して**読むための副読本。
 `git diff de5545202 HEAD`(= master..ractor-local-gc)と**並べて**読むことを想定しています。
 箇条書き中心の `RACTOR_LOCAL_GC_DESIGN.md`(設計の経緯)に対し、本書は**変更された実コードを引用し、
 何を・なぜ・どう設計に合うか・レビュー時の注意点**を関心ごとに解説します。
-現状の到達点・残課題のサマリは `RLGC_STATUS.md` を参照。
+現状の到達点・残課題のサマリは `STATUS_v2.md`(最新)/ `design_v2.md`「現在の到達点」を参照。
 
-ベースコミット `de5545202`(master, RLGC 無し)から **43 コミット**。
+ベースコミット `de5545202`(master, RLGC 無し)から **43 コミット**(当時)。
 
 ## diff 一覧(コード、master..HEAD)
 
