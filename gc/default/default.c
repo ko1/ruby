@@ -8602,6 +8602,15 @@ rlgc_global_gc(rb_objspace_t *driver)
         /* the unified mark is exact and never pins; the per-objspace
          * sweeps below must not re-check against a stale local cycle */
         objspace->rlgc.last_cycle_pinned = 0;
+        /* stalled_shareables is written only by a LOCAL cycle's
+         * pinned-roots pass (gc_marks_finish). Once it trips trigger 2,
+         * gc_start short-circuits every entry into the global cycle and
+         * the local pass that could lower it never runs again --
+         * survivors shrink the limit, the stale count keeps beating it,
+         * and the objspace is stuck running STW global GCs forever. This
+         * global cycle reclaims/pins the stalled shareables, so the count
+         * restarts from zero. */
+        objspace->rlgc.stalled_shareables = 0;
         objspace->rgengc.uncollectible_wb_unprotected_objects = 0;
         objspace->rgengc.old_objects = 0;
         objspace->rgengc.last_major_gc = objspace->profile.count;
