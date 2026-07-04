@@ -3946,14 +3946,15 @@ rb_gc_single_objspace_p(void)
  * Ractor のものへ継承する。所有スロットを受け取ることで、そのクリアと objspace の
  * 解放が 1 つの VM-lock クリティカルセクションの下で起きるようにする
  * （死につつあるスレッドの teardown は同じロックの下でそのスロットを読む）。 */
-/* マージ本体（rlgc_objspace_absorb）は Ruby オブジェクトを alloc しない: ページは
- * 引き渡し、ソート済みページ配列は rb_darray_*_without_gc（GC 非誘発の変種）、
- * finalizer は st 移送。よってマージ中に GC がトリガされることはなく、呼び出し側が
- * VM lock を保持しているので他 Ractor の global GC も排除される。したがって明示的な
- * gc-disable は不要（かつては realloc が GC を誘発しうるとして disable していたが、
- * _without_gc 変種の採用で不要になった）。
- * 不変条件: (1) 呼び出し側は VM lock 下、(2) マージ本体は alloc-free のまま。
- * これを崩すと継承オブジェクトが pin される前に sweep される GC 窓が再発する。 */
+/* マージ本体（rlgc_objspace_absorb）のページ引き渡しとソート済みページ配列
+ * （rb_darray_*_without_gc）は GC 非誘発だが、finalizer の st 移送は例外:
+ * st_insert の resize は ruby_xmalloc（st.c の #define）経由で malloc 会計を
+ * 跨ぎ、継承側の GC を誘発し得る。その瞬間 src の detach 済み finalizer 表は
+ * C ローカルからしか届かず未マークで、未移送の finalizer proc が sweep される。
+ * よってマージ本体は設計（design_v2.md §2.3）どおり継承側 objspace の GC を
+ * disable した窓の中で走る（rlgc_objspace_absorb 内、settle 後〜末尾）。
+ * 他 Ractor の global GC は呼び出し側の VM lock が排除する。
+ * 不変条件: (1) 呼び出し側は VM lock 下、(2) マージ本体は gc-disable 窓内。 */
 static void
 objspace_absorb_merge(void *dst, void *src)
 {
