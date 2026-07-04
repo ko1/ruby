@@ -1,4 +1,8 @@
-# Ractor-local GC 設計ドキュメント
+# Ractor-local GC 設計ドキュメント【v1・凍結】
+
+> **これは v1(ブランチ `ractor-local-gc`)の設計記録で凍結**。現行 RLGCv2 の設計正典は
+> `design_v2.md`(最新仕様サマリは同書「現在の到達点」)。本書は v1 の設計経緯・タクソノミの
+> 歴史的資料として残す。
 
 CRuby の GC を **Ractor ごとに独立した objspace** へ分割し、各 Ractor が自分のヒープを
 **Stop-The-World なしで並行に** mark/sweep する実験実装。`gc/default/default.c` のみ対象
