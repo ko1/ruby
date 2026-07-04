@@ -117,7 +117,7 @@ each_object_with_flags(each_obj_with_flags cb, void *ctx)
     struct obj_itr data;
     data.cb = cb;
     data.data = ctx;
-    rb_objspace_each_objects(heap_iter, &data);
+    rb_objspace_each_objects_local(heap_iter, &data);
 }
 
 /*
