@@ -2539,22 +2539,30 @@ move_capture(struct move_build *b, VALUE obj)
 
     switch (BUILTIN_TYPE(obj)) {
       case T_STRING: {
-        /* Make the source own a private buffer (un-shares a shared string and
+        /* Make the source own a private buffer (un-shares a sharer and
          * copies a static STR_NOFREE one); frozen strings are fine -- this
          * changes buffer ownership, not content. After this the string is
-         * either embedded or owns an exclusive malloc'd heap buffer. */
+         * embedded, owns an exclusive malloc'd heap buffer, or is a
+         * shared ROOT (make_independent is a no-op for a root: its buffer
+         * is exactly what its live CoW children read). */
         rb_str_make_independent(obj);
         long len = RSTRING_LEN(obj);
         int encidx = ENCODING_GET(obj);
         char *ptr;
-        if (!STR_EMBED_P(obj)) {
+        if (!STR_EMBED_P(obj) && rb_str_reembeddable_p(obj)) {
             /* owns an exclusive heap buffer: carry it across by pointer
              * (zero-copy); the source becomes a shell that never frees it. */
             ptr = RSTRING(obj)->as.heap.ptr;
         }
         else {
-            /* embedded: copy the bytes into a courier-owned buffer (the slot
-             * is released the normal way when the husk is swept). */
+            /* embedded, or still a shared root: copy the bytes into a
+             * courier-owned buffer. Stealing a root's buffer would dangle
+             * every child still pointing into it (str.dup CoW) once the
+             * receiver materializes and the courier frees it -- leave the
+             * buffer with the children instead, exactly like the
+             * ARY_SHARED_ROOT_P exclusion in the T_ARRAY branch below.
+             * (An embedded slot is released the normal way when the husk
+             * is swept.) */
             ptr = ALLOC_N(char, len + 1);
             if (len) memcpy(ptr, RSTRING_PTR(obj), len);
             ptr[len] = '\0';
