@@ -4000,8 +4000,12 @@ objspace_absorb_disowned_zombies(void)
         while (i < vm->gc.zombie_objspaces_count) {
             if (vm->gc.zombie_objspaces[i].owner_slot == NULL) {
                 void *zombie = vm->gc.zombie_objspaces[i].objspace;
-                vm->gc.zombie_objspaces[i] = vm->gc.zombie_objspaces[vm->gc.zombie_objspaces_count - 1];
-                vm->gc.zombie_objspaces_count--;
+                /* delist via forget: it also subtracts the entry's page
+                 * count from zombie_total_pages. A hand-rolled swap-remove
+                 * left the pages counted, and the phantom total kept
+                 * trigger 3 firing extra STW global cycles until the next
+                 * cycle's barrier re-measure zeroed it. */
+                rb_gc_vm_forget_zombie(zombie);
                 objspace_absorb_merge(rb_gc_get_objspace(), zombie);
             }
             else {
