@@ -1,4 +1,7 @@
-# Ractor-Local GC (RLGC) — 現状サマリ
+# Ractor-Local GC (RLGC v1) — 現状サマリ【凍結】
+
+> **これは v1(ブランチ `ractor-local-gc`)の凍結記録**。現行は RLGCv2(ブランチ `rlgc-v2`)で、
+> **最新の仕様は `design_v2.md`「現在の到達点」、進捗は `STATUS_v2.md`**。本書は v1 の歴史的資料。
 
 ブランチ `ractor-local-gc`。クラッシュ駆動のバグ修正 + adversarial サーフェシングの到達点。
 詳細な経緯は `RACTOR_LOCAL_GC_DESIGN.md`(§6.x)、再現コードは `rlgc_repro/`。

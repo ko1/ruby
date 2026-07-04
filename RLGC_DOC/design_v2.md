@@ -64,17 +64,20 @@ single writer から「割り当ても GC もロック不要」が出る。
 13. **WB-unprotected な shareable は unshareable を参照しない**、を不変条件とする。
     これにより shareable → unshareable の store の親は常に WB-protected で、この store は
     必ず write barrier を通る(shref の完全性が既存の世代別 WB と同じ規律に帰着する、
-    §2.1)。「WB-unprotected がそもそも shareable になれるか」自体は要調査 — なれたと
-    しても、この不変条件が成り立つ限り shref は壊れない。実装では make_shareable /
+    §2.1)。この不変条件が成り立つ限り shref は壊れない。実装では make_shareable /
     FROZEN_SHAREABLE 系の既存検査(参照先がすべて shareable であること)に加え、
-    shareable への wb_unprotect を assert で禁じて担保する。
+    shareable への wb_unprotect を assert で禁じて担保する。(より強い不変条件として、
+    現行実装では `FL_SHAREABLE ⟺ shareable_bits` を 1:1 に保ち、shareable が参照するのは
+    shareable か shref 付き unshareable のみ、を CHECK モード verifier で検査する
+    — §現在の到達点 4a/4b。)
 14. **local major と global GC の起動要件は独立**。major は毎回 global へ昇格しない。
     local major は自分の旧世代(unshareable)の増加で、global GC は **shareable の世界の
     増加・滞留**(と終了済み Ractor の堆積)で起動する(§2.2)。
 15. ページに **shareable_bits** を追加し、「local GC が解放してはならないオブジェクト」
     (shareable + 共有され得る VM 内部 imemo)をビットマップ化する。confined GC は
-    これを索引に shareable を **root としてマークして**生かす(§2.1 — sweep で除外する
-    方式は、生かしたオブジェクトの世代が進まず世代不変条件と衝突するため不採用)。
+    これを索引に shareable を **root として mark bit を立てて**生かす(traverse は
+    しない = mark-only。§2.1 — sweep で除外する方式は、生かしたオブジェクトの世代が
+    進まず世代不変条件と衝突するため不採用)。
     ページ上の RLGC 追加ビットはオブジェクトあたり shref と合わせて 2 bit(§1.4)。
 16. ユーザ定義 T_DATA の `dmark` / `dfree` は、upstream で導入予定の
     [Feature #22067](https://bugs.ruby-lang.org/issues/22067) の宣言機構に従う:
@@ -83,13 +86,68 @@ single writer から「割り当ても GC もロック不要」が出る。
 17. **shareable から参照されるものは、例外を除いて shareable にする**。cc / cme /
     callinfo / iseq などメソッド・キャッシュ系の VM 内部オブジェクトは born-shareable に
     し、shareable_bits は FL_SHAREABLE と 1:1 に保つ。shareable → unshareable を許す
-    例外は明示的なリストで管理する(§2.1)。
+    例外は明示的なリストで管理する(§2.1)。【達成済み】ment / callcache / callinfo /
+    constcache / iseq(および cref / cvar_entry)は `SHAREABLE_IMEMO_NEW`(is_shareable=true)
+    で生成され、誕生時から完全な FL_SHAREABLE + shareable_bits を持つ(pin のみで
+    FL_SHAREABLE を立てない中間状態は無い)。
 18. **postponed job を特定の Ractor(まずは main)宛てに配送できる機構**を、GC とは
     独立の汎用 VM 機構として新設する。トリガ側は宛先 Ractor の triggered マスクに
     ビットを立てて宛先 EC に POSTPONED_JOB 割込みフラグを立てるだけ(ubf では
     起こさない — ブロック中なら次に自然な safepoint へ戻ったときに実行される)。
     flush は従来の「自分宛て(トリガしたスレッド)」のジョブに加えて自 Ractor 宛ての
     マスクを drain する。最初の利用者は orphan objspace の main 併合(§2.3)。
+
+---
+
+## 現在の到達点(最新仕様サマリ)
+
+この節は「最新の確定仕様がどこにあるか」を一目で掴むためのアンカーである。確定済みの
+事項についてはこの節を正とする(機序・理由の詳細は各節)。当初の設計メモには「予定 /
+これから決める」という段階的な書き方が残っている箇所があるが、以下はすべて**実装済み**で
+ある。
+
+- **local GC はロックもバリアも取らない(達成済み。旧 M1a→M1b 完了)**。例外は 2 つだけ:
+  (a) main objspace の local GC は VM グローバル root を歩くため no-barrier の VM lock を
+  取る(worker は止めない)、(b) global GC は lock + barrier を取る。
+- **local GC は shareable の生存を traverse に依存しない(mark-only 設計)**。shareable_bits
+  でのみ生かされる(local root から届かない)shareable は、pinned-roots パス
+  (`rlgc_pinned_roots_mark`)が(old と同じく)mark bit を立てて sweep から守り、
+  **traverse はしない**。その unshareable な子は、子自身の **shref ビット**が別途 root として
+  mark + traverse して生かす(foreign な子は所有者の責務)。old な shareable は
+  uncollectible→mark_bits のコピーで事前マーク済みなので pinned-roots パスは短絡する。
+  shref が立ったオブジェクトは root として **辿る**。
+- **shareable グラフの 2 不変条件**:
+  1. `FL_SHAREABLE ⟺ shareable_bits`。誕生時(newobj)・昇格時
+     (`RB_OBJ_SET_SHAREABLE` / `rb_obj_set_shareable_no_assert`)に同時に立て、move が保存し、
+     解放時に同時に消す。**「pin されているが FL_SHAREABLE でない」状態はもう無い**。
+  2. shareable が参照するのは **shareable、または shref ビットを持つ unshareable** に限る。
+     cross-objspace 辺は CHECK モードの verifier が検査し、規律面は WB が担う
+     (shareable→unshareable の store は必ず write barrier を通って shref を立てる)。
+- **imemo は born-shareable(決定 17、達成済み)**。ment / callcache / callinfo / constcache /
+  iseq は `SHAREABLE_IMEMO_NEW`(is_shareable=true)で生成され、誕生時から FL_SHAREABLE +
+  shareable_bits を持つ(pinned-without-flag ではなく完全な FL_SHAREABLE)。それらが持つ
+  unshareable な子(bmethod の proc、constcache の ice->value、iseq の once/coverage スロット、
+  attr.location など)は WB(RB_OBJ_WRITE / RB_OBJ_WRITTEN)経由で記録される shref が守る。
+- **列挙モデル(§2.4、達成済み)**: `rb_objspace_each_objects` 自身が callee 側で VM barrier を
+  取り、「自分の objspace の全オブジェクト + 他の生きている Ractor の **shareable だけ**
+  (`shareable_bits` を索引に 1 スロットずつ)」を歩く。being-created / zombie の objspace は
+  歩かない(列挙 SEGV を閉じる)。自分の objspace だけ見たい caller は
+  `rb_objspace_each_objects_local`(`ObjectSpace.dump_all` ・objspace 拡張・JIT の iseq 走査・
+  method coverage)。`ObjectSpace.each_object` は cross-Ractor で他 Ractor の shareable も
+  yield する。旧 `rb_objspace_each_objects_all` は撤去済み。
+- **compaction は objspace が複数ある間は不可**(`GC.compact` / `GC.auto_compact=` /
+  `GC.verify_compaction_references` の 3 経路すべてを非移動 full GC に degrade)。Ractor が
+  1 個のときのみ従来どおり許可(§2.5)。
+- **既知の設計逸脱が 1 つ**: shareable(isolated-proc)env の特殊変数($~ / $_)。設計意図は
+  per-EC(`ec->root_svar`)で、escaped な shareable env については per-EC 化が実装済み
+  (`lep_svar_in_env_p` → `ec->root_svar`)。しかし shareable env スロットへ直接書く残存経路
+  (`vm_env_write_slowpath` の FL_SHAREABLE 枝)は WB で shref を立てて **GC 安全にしている
+  だけ**であり、共有された isolated Proc が cross-Ractor で svar($~)を共有・競合し得る
+  **意味的ギャップは未修正**(§2.1)。
+
+上流へ抽出済みの非 RLGC 固有の前提(origin/master にマージ済み): `rb_objspace_each_objects`
+の中へ VM barrier を移動、iseq の遅延ロードローダオブジェクトの `RB_OBJ_WRITE` 化、
+per-Ractor 宛ての postponed job(`rb_postponed_job_trigger_for_ractor`)。
 
 ---
 
@@ -202,7 +260,7 @@ typedef struct rb_global_objspace {
   フラグと同時に立てる。書き手は常に所有 Ractor のスレッド(封じ込めにより、どちらの
   操作も所有 Ractor 上でしか起きない)なので atomic は不要。bit を消すのは global sweep
   (`shareable_bits &= mark_bits`)と slot の解放時だけ。confined GC はこのビットマップを
-  索引に shareable を root としてマークする(§2.1)。
+  索引に shareable を root として **mark bit を立てる(traverse しない mark-only)**(§2.1)。
 - 複数スレッドが書き得るビットマップ(remembered set / shref_bits)への set は atomic CAS、
   ページ単位のフラグはビットフィールドでなく byte にする。非 atomic の `bits[i] |= mask`
   は並行する set を片方消し、関係ないオブジェクトの bit を落とす(young な子が解放される)。
@@ -243,9 +301,17 @@ VM スタックとマシンスタック(保守的)、Ractor ローカル変数�
 
 **mark**: 自分の objspace の中だけを辿る。他の objspace のオブジェクトに行き当たったら
 「生きている葉」として扱い、**辿らずに止まる**。相手の生死は相手の所有者(あるいは
-global GC)が決める。自分の objspace に居る shareable は普通に辿る — その子(自分の
-unshareable)を生かすのは自分の責務だから。ユーザ定義 T_DATA の `dmark` は決定 16 に
-従う(宣言済みの型のみ local で mark し、未宣言の型は global GC に委ねる)。
+global GC)が決める。**shareable の unshareable な子の生存を、local GC は「shareable を
+辿ること」に依存しない** — それを保証するのは子自身に立った **shref ビット**である
+(shref は root として別途 mark + traverse される、後述)。理由: ある shareable s は
+自分の local root からは到達できず、shareable_bits でのみ生かされる(他 objspace から
+参照されているだけ)ことがあり、その s は下記の pinned-roots パスで **mark bit を
+立てるだけ・traverse しない**扱いになるからである(§2.1 手順 3.f、`rlgc_pinned_roots_mark`)。
+逆に、local root から通常辺で到達した同 objspace の shareable は普通に traverse され得る
+(それは安全だが冗長で、子の生存はどのみち shref が独立に担保している)。この設計により
+「shareable の mark 関数が他 objspace に散る foreign な子へ踏み込む」事故も、shareable の
+可変スロットを他 Ractor と競合して読むことも避けられる。ユーザ定義 T_DATA の `dmark` は
+決定 16 に従う(宣言済みの型のみ local で mark し、未宣言の型は global GC に委ねる)。
 
 **shref と shref_bits**: shareable から参照されている unshareable を **shref**
 (**sh**areable-**ref**erenced)と呼ぶ — shareable の世界から、ある Ractor の私有グラフへ
@@ -287,6 +353,14 @@ shareable は unshareable を参照しない)なので、「WB を通らない s
   Ractor 間で混ざる)。そこで lep が shareable env のフレームは特殊変数を **per-EC
   (`ec->root_svar`)に置く** — 割当て分類は「root で守る(EC = Ractor の C 構造)」。
   cref は従来どおり env slot に残る。
+  **【既知の設計逸脱・未修正】** この per-EC 化は escaped な shareable env については
+  実装済み(`lep_svar_in_env_p` → `ec->root_svar`。vm_insnhelper.c)。しかし shareable env
+  スロットへ直接 svar を書き込む残存経路(`vm_env_write_slowpath` の FL_SHAREABLE 枝)が
+  あり、そこは svar 値が unshareable なら **write barrier で shref を立てて GC 安全に
+  しているだけ**(WB_REQUIRED も維持して以後の store も必ずバリアを通す)。つまり
+  「延命は正しいが意味は正しくない」状態で、共有された isolated Proc が cross-Ractor で
+  同じ svar スロット($~)を競合・共有し得る **意味的なギャップは残っている**。正しくは
+  全経路を per-EC に寄せるべきで、これは将来修正する既知バグ。
 - 他にもあり得る(候補: iseq が持つ実行時の可変スロット — once キャッシュ、coverage 等)。
   実装時に「shareable の mark 関数が辿る先」を監査し、見つけたものはこのリストに追加して
   「shareable にする / shref で守る(WB で書かれる物)/ root で守る(所有者の構造から
@@ -305,14 +379,15 @@ shref は常に「unshareable を指す」を保つ)。なお u→u の機械的
   判定できないから。shareable の回収は global GC だけが行う。
   (クラスはもともと shareable。メソッドエントリ・コールキャッシュ等の VM 内部
   オブジェクトも born-shareable にする(決定 17)ので、同じ扱いに自然に含まれる。)
-  実現方法は「**mark フェーズで shareable_bits を索引に root としてマークする**」
-  (shref と同じ walk)。sweep 側でビット演算により除外する方式は採らない —
+  実現方法は「**mark フェーズで shareable_bits を索引に mark bit を立てる(root 扱い)**」
+  (shref と同じ walk。ただし shareable は mark + 老化だけで **traverse はしない** —
+  §2.1 mark 参照)。sweep 側でビット演算により除外する方式は採らない —
   生かしたオブジェクトがマークされないと age が進まず、「old の親 → 永遠に young の子」
   という remember されない O→Y エッジが生じて世代不変条件
-  (GC.verify_internal_consistency)と衝突する。mark で生かせば普通に老化・昇格し、
-  その子も traversal で自然に生きる。滞留計数(§2.2)は「この root 化で**新たに**
-  マークされた数」(= 自分の root からは届かなかった shareable の数)として同じ walk で
-  得られる。
+  (GC.verify_internal_consistency)と衝突する。mark で生かせば shareable 自身は普通に
+  老化・昇格する(その unshareable な子は traversal ではなく子の shref ビットが生かす)。
+  滞留計数(§2.2)は「この root 化で**新たに**マークされた数」(= 自分の root からは
+  届かなかった shareable の数)として同じ walk で得られる。
   例外として、Ractor が 1 個しか居なければ local GC = 全体 GC なのでこの root 化ごと
   スキップし、shareable も普通に死ぬ。引き継ぎ(§2.3)で objspace は main 1 個に戻り
   得るので、この最適化は復帰可能にしておく。
@@ -372,9 +447,16 @@ mark/sweep 途中の合流は半回収ヒープを global GC に晒す。GC 経�
       アドレス登録で、スロットには後から**別の objspace の値**が代入され得るため、
       表の所有 objspace を決められない。走査コストは O(全登録数) × objspace 数だが、
       登録物は定数規模(チューニングは M5)。
-   f. ★shareable と shref を root 化: `has_shareable_objects` / `has_shref_objects` の
-      立った自分のページを走査し、shareable_bits | shref_bits の立ったオブジェクトを
-      root として mark する(bit の在処は自分のページなので走査は自己完結)。
+   f. ★shareable と shref を root 化(`rlgc_pinned_roots_mark`):
+      `has_shareable_objects` / `has_shref_objects` の立った自分のページを走査し、
+      `(shareable_bits | shref_bits) & ~mark_bits` の立ったオブジェクトだけを処理する
+      (bit の在処は自分のページなので走査は自己完結)。すでにマーク済み — traversal で
+      到達済み、または old で事前マーク済み(minor では uncollectible→mark_bits コピー、
+      major の前 cycle で昇格したもの)— は短絡する。
+      - **shref**(unshareable): `gc_mark` で mark **かつ traverse**(remembered な
+        old→young ターゲットと同じ。これを辿らないと、参照元の shareable を辿らない
+        本設計では到達不能に見えてしまう)。
+      - **shareable**: mark bit を立てて `gc_aging`(**老化のみ、traverse しない**)。
       このとき「新たにマークされた shareable の数」を数えておく — 滞留推定(§2.2)。
    g. minor のみ: remembered set(master と同じ。remembered ページの旧世代の子を再走査し、
       wb-unprotected な uncollectible も再走査する)。
@@ -382,7 +464,10 @@ mark/sweep 途中の合流は半回収ヒープを global GC に晒す。GC 経�
    - 子 c を辿る前に★ `GET_HEAP_PAGE(c)->objspace` を見る。自分でなければ**何もしない**
      (bit も立てず、子も辿らない)。これが封じ込めの実行点。
    - 自分のものなら master と同じ: mark bit を立て、age を進めて昇格を判定し、子を積む。
-     自分の shareable も普通に辿る。weak 参照は後処理用に積む。
+     local root からこの通常辺で到達した同 objspace の shareable は普通に辿られる(安全)。
+     ただし設計は shareable の traversal に依存せず、local root から届かない shareable は
+     手順 3.f の pinned-roots パスで mark-only(辿らない)になる — shareable の unshareable な
+     子の生存を保証するのは常に shref である(§2.1 mark)。weak 参照は後処理用に積む。
    - bitmap の書き込み規律★: mark / marking / uncollectible 系を触るのは自スレッドだけ
      (plain store 可)。remembered / shref は他 Ractor の WB が並行に書くので atomic。
 5. mark の終了処理: weak 参照のうち対象が**自分の** unmarked のものをクリアする。
@@ -615,16 +700,37 @@ local GC はロックを取らずに走るため、「local GC のコードパ�
 
 実装では「local GC から触る VM 共有構造」を列挙し、必ずこの 3 分類のどれかに割り当てる。
 
-補足: **VM 全体のヒープ走査**が要る操作のために `rb_objspace_each_objects_all`
-(VM lock + barrier 必須、`vm->ractor.set` の全 objspace を順に走査)を用意した。
-TracePoint の iseq 計装(`rb_iseq_trace_set_all`)・attr/bf コールキャッシュの一掃・
-coverage 削除はこれを使う(per-objspace 走査のままだと「worker で TracePoint を
-enable しても main の iseq が計装されない」)。なお Ruby レベルの
-`ObjectSpace.each_object` は現状 per-objspace 走査のまま(multi-Ractor 時は従来どおり
-shareable のみ yield)で、「全 objspace の shareable を見せる」master 互換にするかは
-M2 で決める。注意: `cr->objspace` はこの走査の入力なので、一時的に差し替える処理
-(Ractor 生成時の子 objspace への割り当て)は必ず VM lock 下で行い、barrier を張った
-walker から差し替え中の状態が見えないようにする。
+補足: **cross-Ractor のヒープ走査**。iseq/callcache 等は born-shareable(決定 17)なので、
+ある Ractor の iseq を触る操作(TracePoint 計装 `rb_iseq_trace_set_all`・attr/bf コール
+キャッシュ一掃・coverage 削除)は「自分の objspace の全オブジェクト + **他の生きている
+Ractor の shareable**」を歩く必要がある(per-objspace のままだと worker で TracePoint を
+enable しても main の iseq が計装されない)。これを `rb_objspace_each_objects` 自身が担う:
+
+- **barrier は callee 側**が取る(`rb_objspace_each_objects` の中で `rb_vm_barrier`)。
+  ヒープ walk は「ページ集合が動かないこと」を要求し、他 Ractor の STW GC が walk 途中に
+   page を free / move すると壊れるため。これは master でも正しい硬化なので上流に取り込んだ
+  (`gc: take the VM barrier inside rb_objspace_each_objects`)。呼び出し側は自前の
+  `RB_VM_LOCKING+rb_vm_barrier` を持たない(上流の iseq sweep 群と逐語一致)。
+- **自分の objspace は全オブジェクト**を、**他の生きている Ractor の objspace は
+  shareable オブジェクトだけ**を渡す(`shareable_bits` を索引に 1 スロットずつ callback。
+  ページ丸ごとの range では他 Ractor の unshareable まで callback に渡ってしまい、
+  それを inspect する caller(例: `ObjectSpace.each_object` の `rb_ractor_shareable_p` →
+  per-Ractor な generic fields 参照)が別 Ractor の構造を誤って引く)。
+- **being-created / zombie の objspace は歩かない**(生成途中・撤収途中で heap が
+  walkable でない — 従来の全 objspace 走査(`rb_gc_vm_each_objspace` 経由)がここを
+  踏んで発生していた列挙 SEGV を、生きている Ractor だけに絞ることで閉じる)。
+- caller が「自分の objspace だけを見たい」場合は **`rb_objspace_each_objects_local`**
+  を使う(barrier は取るが cross-Ractor 走査はしない)。`ObjectSpace.dump_all` /
+  objspace 拡張 / JIT の iseq 走査 / method coverage はこれ(他 Ractor のオブジェクトを
+  自 Ractor の構造で触らないため)。`ObjectSpace.each_object` は
+  `rb_objspace_each_objects`(cross-Ractor)を使い、他 Ractor の shareable も yield する
+  (master 互換。上の 1 スロット単位走査により foreign には FL_SHAREABLE だけが渡るので
+  `rb_ractor_shareable_p` は flag で短絡し安全)。
+
+旧 `rb_objspace_each_objects_all`(全 objspace を無差別に走査)は撤去した。注意:
+`cr->objspace` はこの走査の入力なので、一時的に差し替える処理(Ractor 生成時の子
+objspace への割り当て)は必ず VM lock 下で行い、barrier を張った walker から差し替え中の
+状態が見えないようにする。
 
 ### 2.5 compaction
 
@@ -821,26 +927,35 @@ onig 非依存の blob に取り出して再構築する。
 最後尾近くまで遅らせるのが要点(理由は M1b の項)。並列性能が出るのは M1b 以降で、
 それまでの各段は「master と同等性能・正しさは段ごとに full green」を保って進める。
 
+**現状(2026-07)**: M0〜M1b はすべて実装済み(下記各段の【達成済み】参照)。本 branch は
+mark-only shareable + shref rooting + born-shareable imemo + cross-Ractor 列挙まで含む
+「§現在の到達点」の仕様で動作しており、残るのは M5(堅牢化・チューニング)と、既知逸脱
+(svar-in-shareable-env、§2.1)の是正である。以下は各段の意図と、実装で得た知見の記録。
+
 - **M0 土台**: rb_global_objspace(ページプール)新設、`vm->gc.objspace` を
   `vm->gc.global_objspace` に差し替え、main objspace を main Ractor 持ちに、newobj cache を
   剥がしてヒープ直割り当てに(単一 Ractor なら自明に single writer)。master と性能比較。
+  【達成済み】
 - **M1a per-Ractor objspace と local GC(STW 段階)**: Ractor 生成で objspace 生成、
   封じ込め mark、shareable / shref の root 化 pin(§2.1 手順 3.f)、shref_bits と
   write barrier。**この段階では gc_enter が従来どおり VM lock + barrier を取る** —
   「自分のヒープしか刈らないが、刈る間は全 Ractor が停止する」。§2.1 冒頭の
-  「ロックもバリアも取らない」はまだ実現せず、M1b で達成する。並行性バグが存在しない
+  「ロックもバリアも取らない」はこの段階ではまだ実現せず、M1b で達成した。並行性バグが存在しない
   世界で、封じ込め・pin・root 集合の正しさだけを固めるための分割。
-  (global GC がまだ無いので shareable は滞留する。M2 で解消。)
+  (global GC がまだ無いので shareable は滞留する。M2 で解消。)【達成済み。以後 M1b で
+  この VM lock + barrier は撤去された(§2.1 手順の M1a/M1b 注記)。】
 - **M3 message send**: 受信側実体化(コア型の C 深コピー + Marshal 経路)、送信中 pin
   (global GC またぎ含む)、**受信側 write barrier の徹底**(§4.2 世代の整合)、
   T_DATA passthrough の廃止、value の successor 規則(§4.3。併合本体は M4)。
   M2 より先に行う: 実体化と pin の形が決まらないと、global GC が in-flight メッセージを
-  どう扱うか(pin の付け直し先)を確定できないため。
+  どう扱うか(pin の付け直し先)を確定できないため。【達成済み。move は §4.5 の
+  off-heap courier に置き換わった。】
 - **M2 global GC**: バリア、root 表(local と共有)、全 objspace の一括 mark/sweep、
-  shref_bits の再計算、global の起動条件(shareable 増加・滞留・zombie Ractor)。
+  shref_bits の再計算、global の起動条件(shareable 増加・滞留・zombie Ractor)。【達成済み】
 - **M4 終了と引き継ぎ**: join 時のその場併合、未 join の global GC 内 main 併合、
   終了済み Ractor の一覧延命、finalizer / zombie の引き継ぎ実行、単一 Ractor 復帰時の
-  shareable 回収、fork / shutdown の接続。
+  shareable 回収、fork / shutdown の接続。【達成済み(zombie 帳簿 = §2.3、main 併合は
+  決定 18 の per-Ractor postponed job 経由)】
 - **M1b local GC の並行化(バリア外し)**: gc_enter / gc_exit から VM lock と barrier を
   外し、§2.1 本文どおり「local GC はロックもバリアも取らない」を実現する。
   **並列性能はここで出る**(それまでは GC が STW なので、GC を踏む負荷では master と
@@ -868,7 +983,7 @@ onig 非依存の blob に取り出して再構築する。
   性能は 8 Ractor 割り当て負荷で実効 ~7.7 コア(M1a 比 4 倍超)。
   なお M0 時点で master と同等性能(割り当て経路に退行なし)は確認済み。性能の伸び代は
   M1b 完了後にまとめて測り直す。
-- **M5 堅牢化・調整**: 既知のクラッシュ再現スクリプト群(`rlgc_repro/`)と多 Ractor
+- **M5 堅牢化・調整(現在ここ・進行中)**: 既知のクラッシュ再現スクリプト群(`rlgc_repro/`)と多 Ractor
   ストレスシナリオをテストオラクルに常用する。btest / test-all に加え、**ASAN / TSan を
   CI に常設**する(並行 GC のバグは再現が確率的で、サニタイザでないと根本原因まで
   辿れない — 特に M1b の検証は TSan が主武器)。GC_STRESS はタイミングを変えて
