@@ -125,14 +125,16 @@ single writer から「割り当ても GC もロック不要」が出る。
   - GC の内側では VM lock を取らない(待機者が保留中バリアに合流し半回収ヒープを晒す)。
     GC 経路が触る VM 共有構造は専用 native mutex(id2ref / registered globals /
     generic fields)かページプールのロックで守る。
-  - (実装都合・production 無関係: `RGENGC_CHECK_MODE >= 2` では `gc_local_gc_holds_vm_lock` が
-    非 main の local GC にも no-barrier VM lock を全 GC 区間取らせる。目的は「全区間 VM lock を
-    保持して global GC の start をブロックし、CHECK verify を割り込ませない」こと。
-    `check_rvalue_consistency_force` 内で lock が本質的に要るのは `verify_pointer_in_any_heap_p`
-    (cross-objspace bsearch)だけで、それは world_stopped 限定。だが 1730 の lock 撤去＋
-    gc_enter CHECK lock 撤去を試すと verify がまだ割り込まれて壊れた(`inconsistent old slot`
-    /`gc_mode_transition`)＝**非 main local GC の CHECK≥2 経路に 1730 以外の safepoint が残る**。
-    未特定・CHECK 専用なので現状維持。)
+  - (実装都合・production 無関係だが必要: `RGENGC_CHECK_MODE >= 2` では
+    `gc_local_gc_holds_vm_lock` が非 main の local GC にも no-barrier VM lock を全 GC 区間
+    取らせる。理由 = `gc_verify_internal_consistency_body` が checks の assert を通すため
+    verify 中 **`during_gc` を一時 FALSE** にする。この窓で global GC が割り込むと R1 の
+    half-marked heap を sweep して壊す(`inconsistent old slot`/`gc_mode_transition`)。
+    no-barrier VM lock を全区間保持すると、(a) global GC が VM lock を取れず **start できない**、
+    (b) no-barrier なので R1 は gc_enter(safepoint)で **barrier に合流しない**(barrier lock だと
+    合流 or デッドロック)。よってこの lock は**削除不可**。`check_rvalue_consistency_force` の
+    自前 lock は gc_enter lock 下で再入 no-op・cross-objspace scan は world_stopped 限定なので
+    vestigial(撤去可・利得なし)。)
 - **local GC は shareable の生存を traverse に依存しない(mark-only 設計)**。shareable_bits
   でのみ生かされる(local root から届かない)shareable は、pinned-roots パス
   (`rlgc_pinned_roots_mark`)が(old と同じく)mark bit を立てて sweep から守り、
