@@ -112,20 +112,25 @@ single writer から「割り当ても GC もロック不要」が出る。
 これから決める」という段階的な書き方が残っている箇所があるが、以下はすべて**実装済み**で
 ある。
 
-- **ロック模型(達成済み。旧 M1a→M1b 完了)**。判定は `gc_local_gc_holds_vm_lock` =
-  `objspace == rlgc_main_objspace || RGENGC_CHECK_MODE >= 2`:
-  - **非 main Ractor の local GC、かつ通常ビルド(`RGENGC_CHECK_MODE` off)**: ロックもバリアも
-    取らない(封じ込めで single-writer、cross-objspace の bitmap 書き込みは atomic)。
-  - **main objspace の local GC**: 常に no-barrier の VM lock を取る(barrier は張らず他 Ractor は
+- **ロック模型(達成済み。旧 M1a→M1b 完了)** — 通常ビルド(production):
+  - **非 main Ractor の local GC**: ロックもバリアも取らない(封じ込めで single-writer、
+    cross-objspace の bitmap 書き込みは atomic)。
+  - **main objspace の local GC**: no-barrier の VM lock を取る(barrier は張らず他 Ractor は
     止めない)。main は VM グローバル root(boot オブジェクト)を持ち、その local GC が
     `rb_vm_mark` でそれを歩くが、root は他 Ractor が VM lock 下で変異させるため。
-  - **`RGENGC_CHECK_MODE >= 2` ビルド**: 上に加え、非 main Ractor の local GC も no-barrier
-    VM lock を取る(mid-GC の verify が全 objspace を舐めるため)。
+    (この main の特別扱いは排除の検討対象 — root を shareable-pin 化して global GC へ
+    寄せれば落とせる見込み。)
   - **global GC**: VM lock + barrier(STW)。local GC ではなく別 mode。barrier が in-flight の
     local GC を待つ(GC は safepoint を持たず gc_exit まで合流しない)。
   - GC の内側では VM lock を取らない(待機者が保留中バリアに合流し半回収ヒープを晒す)。
     GC 経路が触る VM 共有構造は専用 native mutex(id2ref / registered globals /
     generic fields)かページプールのロックで守る。
+  - (実装都合・production 無関係: `RGENGC_CHECK_MODE >= 2` では `gc_local_gc_holds_vm_lock` が
+    非 main の local GC にも no-barrier VM lock を取らせるが、**mark 自体は lock 不要**。CHECK の
+    cross-objspace 走査を行う verify(`check_rvalue_consistency_force`)は**自前で no-barrier lock
+    を取る**(default.c:1730、VM lock は再入なので二重取得は無害)。よって gc_enter が全 GC 区間
+    保持しているのは over-locking で、`RGENGC_CHECK_MODE >= 2` 分岐は削除候補
+    (verify の自己ロックに委ねる)。)
 - **local GC は shareable の生存を traverse に依存しない(mark-only 設計)**。shareable_bits
   でのみ生かされる(local root から届かない)shareable は、pinned-roots パス
   (`rlgc_pinned_roots_mark`)が(old と同じく)mark bit を立てて sweep から守り、
