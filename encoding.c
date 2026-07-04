@@ -18,7 +18,6 @@
 #include "internal/enc.h"
 #include "internal/encoding.h"
 #include "internal/error.h"
-#include "internal/gc.h"
 #include "internal/inits.h"
 #include "internal/load.h"
 #include "internal/object.h"
