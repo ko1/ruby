@@ -8768,6 +8768,19 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         }
     }
 
+    /* From here on the merge must not run dst's GC (design_v2.md §2.3):
+     * the finalizer st_insert below can resize dst's table, st.c's malloc
+     * is ruby_xmalloc, and that resize crosses the malloc-accounting
+     * threshold -- a GC here would run while src's detached finalizer
+     * entries are reachable only from this C frame (no mark), sweeping
+     * the not-yet-transferred finalizer procs into dangling VALUEs. The
+     * page/darray moves are alloc-free (_without_gc variants), so the
+     * disable costs nothing there and makes the whole splice atomic
+     * against dst's own collector. (Both settles above must stay OUTSIDE
+     * the window -- they intentionally run collection work.) */
+    const bool dst_gc_was_enabled = rb_gc_impl_gc_enabled_p(dst);
+    if (dst_gc_was_enabled) rb_gc_impl_gc_disable(dst, false);
+
     /* per size pool: hand the pages over.
      * ("heaps" is a macro over a local objspace, so take the arrays via
      * scoped locals.) */
@@ -8909,6 +8922,8 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     rb_native_mutex_destroy(&src->malloc_counters.lock);
 #endif
     free(src);
+
+    if (dst_gc_was_enabled) rb_gc_impl_gc_enable(dst);
 
     rlgc_during_absorb = prev_absorb;
 }
