@@ -705,8 +705,8 @@ ractor_sync_mark(rb_ractor_t *r)
     rb_gc_mark(r->sync.default_port_value);
 
     /* RLGCv2 M1b: the queues, the port table, the monitor list AND the
-     * in_flight_materializing slot are mutated by the owner under its sync
-     * lock (or, for in_flight_materializing, written by the owner during a
+     * materialize-frame chain are mutated by the owner under its sync
+     * lock (or, for the frame chain, written by the owner during a
      * receive), so a lock-free foreign mark (main's local GC traversing this
      * Ractor object) reads them torn -- and by containment everything in
      * them is foreign to that marker anyway (payload snapshots stay alive
@@ -716,13 +716,17 @@ ractor_sync_mark(rb_ractor_t *r)
      * or under the global GC's barrier. */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p()) {
-        /* snapshot/manager being materialized by a receive (basket already
-         * popped); off the queue, rooted only here for the global GC's
-         * re-pin. A foreign marker must not read this slot. */
-        rb_gc_mark(r->sync.in_flight_materializing);
-        /* the move courier being materialized is off-heap; mark the shareable
-         * VALUEs it carries so a concurrent global GC keeps them */
-        ractor_move_courier_mark(r->sync.in_flight_courier);
+        /* snapshots/couriers being materialized by receives (baskets
+         * already popped); off the queue, rooted only here for the global
+         * GC's re-pin. A chain: nested receives from user load hooks each
+         * push a frame. A foreign marker must not read it. */
+        for (const struct rlgc_materialize_frame *f = r->sync.materialize_frames;
+             f != NULL; f = f->prev) {
+            rb_gc_mark(f->snapshot);
+            /* the move courier is off-heap; mark the shareable VALUEs it
+             * carries so a concurrent global GC keeps them */
+            ractor_move_courier_mark(f->courier);
+        }
         if (r->sync.ports) {
             /* The recv_queue (and the ports table) are written by foreign
              * SENDERS that hold r's sync lock (ractor_queue_enq under
@@ -777,9 +781,11 @@ rb_ractor_repin_in_flight(rb_ractor_t *r)
         ractor_queue_repin_in_flight(r->sync.recv_queue);
         st_foreach(r->sync.ports, ractor_repin_ports_i, 0);
     }
-    if (r->sync.in_flight_materializing &&
-        !RB_SPECIAL_CONST_P(r->sync.in_flight_materializing)) {
-        rb_gc_pin_in_flight_message(r->sync.in_flight_materializing);
+    for (const struct rlgc_materialize_frame *f = r->sync.materialize_frames;
+         f != NULL; f = f->prev) {
+        if (f->snapshot && !RB_SPECIAL_CONST_P(f->snapshot)) {
+            rb_gc_pin_in_flight_message(f->snapshot);
+        }
     }
 }
 
@@ -842,6 +848,9 @@ ractor_sync_init(rb_ractor_t *r)
 
     // legacy
     r->sync.legacy = Qundef;
+
+    // RLGCv2: no receive is rebuilding a payload yet
+    r->sync.materialize_frames = NULL;
 
 #ifndef RUBY_THREAD_PTHREAD_H
     rb_native_cond_initialize(&r->sync.wakeup_cond);
@@ -1028,8 +1037,24 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
             rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
             VM_ASSERT(!cr->gen_fields_capturing && cr->gen_fields_capture == NULL);
             cr->gen_fields_capturing = true;
-            VALUE snapshot = ractor_copy_native_try(obj);
+            VALUE snapshot = Qundef;
+            /* the native copy can raise (allocation, async interrupt);
+             * a stuck capturing flag would fail the next send's assert
+             * and leak a stale capture map into its basket */
+            enum ruby_tag_type state;
+            EC_PUSH_TAG(ec);
+            if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+                snapshot = ractor_copy_native_try(obj);
+            }
+            EC_POP_TAG();
             cr->gen_fields_capturing = false;
+            if (state != TAG_NONE) {
+                if (cr->gen_fields_capture) {
+                    st_free_table(cr->gen_fields_capture);
+                    cr->gen_fields_capture = NULL;
+                }
+                EC_JUMP_TAG(ec, state);
+            }
             if (UNDEF_P(snapshot)) {
                 if (cr->gen_fields_capture) {
                     st_free_table(cr->gen_fields_capture);
@@ -1093,8 +1118,13 @@ rb_gc_current_ractor_materializing_p(void)
 {
     const rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (cr == NULL) return false;
-    const VALUE m = cr->sync.in_flight_materializing;
-    return !UNDEF_P(m) && m != Qfalse;
+    /* true only for a COPY materialize (snapshot != Qfalse): move shells
+     * reference other shells in this objspace, never the sender's graph */
+    for (const struct rlgc_materialize_frame *f = cr->sync.materialize_frames;
+         f != NULL; f = f->prev) {
+        if (f->snapshot != Qfalse) return true;
+    }
+    return false;
 }
 
 static VALUE
@@ -1113,27 +1143,45 @@ ractor_basket_value(struct ractor_basket *b)
          * (in-flight shref) in the sender's objspace and becomes garbage
          * there once this copy is made. Marshal.load allocates through
          * the ordinary newobj/write-barrier paths of this Ractor.
-         * The basket is already off the queue, so the materializing slot
+         * The basket is already off the queue, so the materialize frame
          * is what keeps the snapshot rooted (and re-pinnable by a global
-         * GC) for the duration of the copy. */
-        rb_ractor_t *cr = rb_ec_ractor_ptr(rb_current_ec_noinline());
-        VM_ASSERT(UNDEF_P(cr->sync.in_flight_materializing) || cr->sync.in_flight_materializing == Qfalse);
-        cr->sync.in_flight_materializing = b->p.v;
-        VALUE result;
-        if (b->p.marshaled) {
-            result = rb_marshal_load(b->p.v);
+         * GC) for the duration of the copy.
+         *
+         * The rebuild can raise -- marshal_load/_load hooks and autoload
+         * are user code, and async interrupts (Timeout, Thread#raise)
+         * can land anywhere in it -- and those same hooks can run a
+         * nested Ractor.receive. Push a machine-stack frame (nesting)
+         * and pop it under TAG protection (unwind), so the chain never
+         * leaks a dead materialization or drops an outer one. */
+        rb_execution_context_t *ec = rb_current_ec_noinline();
+        rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
+        struct rlgc_materialize_frame frame = {
+            .snapshot = b->p.v, .courier = NULL, .prev = cr->sync.materialize_frames,
+        };
+        cr->sync.materialize_frames = &frame;
+        struct st_table *prev_gf = cr->gen_fields_materialize;
+        VALUE result = Qundef;
+        enum ruby_tag_type state;
+        EC_PUSH_TAG(ec);
+        if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+            if (b->p.marshaled) {
+                result = rb_marshal_load(b->p.v);
+            }
+            else {
+                /* RLGCv2: materialize 中、snapshot host の generic-ivar を読むとき（native copy
+                 * の rb_copy_generic_ivar）、sender の per-Ractor 表を跨がずこの対応表から
+                 * fields_obj を引く（rb_obj_fields_generic_uncached が gen_fields_materialize
+                 * を参照）。 */
+                cr->gen_fields_materialize = b->p.gen_fields;
+                result = ractor_copy_native_try(b->p.v);
+                if (UNDEF_P(result)) rb_bug("ractor_basket_value: native snapshot not natively copyable");
+            }
         }
-        else {
-            /* RLGCv2: materialize 中、snapshot host の generic-ivar を読むとき（native copy の
-             * rb_copy_generic_ivar）、sender の per-Ractor 表を跨がずこの対応表から fields_obj
-             * を引く（rb_obj_fields_generic_uncached が gen_fields_materialize を参照）。 */
-            cr->gen_fields_materialize = b->p.gen_fields;
-            result = ractor_copy_native_try(b->p.v);
-            cr->gen_fields_materialize = NULL;
-            if (UNDEF_P(result)) rb_bug("ractor_basket_value: native snapshot not natively copyable");
-        }
-        cr->sync.in_flight_materializing = Qfalse;
-        /* keep the result stack-rooted past the in_flight slot being cleared */
+        EC_POP_TAG();
+        cr->gen_fields_materialize = prev_gf;
+        cr->sync.materialize_frames = frame.prev;
+        if (state != TAG_NONE) EC_JUMP_TAG(ec, state);
+        /* keep the result stack-rooted past the frame being popped */
         ractor_reset_belonging(result);
         b->p.v = result;
         RB_GC_GUARD(result);
@@ -1146,20 +1194,35 @@ ractor_basket_value(struct ractor_basket *b)
          * move's snapshot semantics hold. The courier is xmalloc'd, not a GC
          * object, so the sender's concurrent confined GC never marked, swept,
          * moved or raced it -- no keep-alive trick, no STW. The only VALUEs it
-         * carries are shareables/immediates; in_flight_courier roots them for
-         * a global GC while we rebuild. */
-        rb_ractor_t *cr = rb_ec_ractor_ptr(rb_current_ec_noinline());
-        VM_ASSERT(cr->sync.in_flight_courier == NULL);
+         * carries are shareables/immediates; the materialize frame roots them
+         * for a global GC while we rebuild.
+         *
+         * The rebuild can raise here too (rb_hash_aset on moved keys with a
+         * custom #hash runs user code; async interrupts): same frame + TAG
+         * discipline. On a raise the courier stays owned by the basket
+         * (b->p.move_courier != NULL), so basket teardown frees it. */
+        rb_execution_context_t *ec = rb_current_ec_noinline();
+        rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         struct rb_ractor_move_courier *courier = b->p.move_courier;
-        cr->sync.in_flight_courier = courier;
+        struct rlgc_materialize_frame frame = {
+            .snapshot = Qfalse, .courier = courier, .prev = cr->sync.materialize_frames,
+        };
+        cr->sync.materialize_frames = &frame;
         /* Keep the materialized graph on the machine stack (result) across the
-         * whole post-materialize sequence. Once in_flight_courier is cleared it
+         * whole post-materialize sequence. Once the frame is popped it
          * is the ONLY root for the graph until it reaches the caller's stack;
          * ractor_move_courier_free walks a big free-loop here, a wide enough
          * window for a concurrent global GC (main's GC.start(full)) to collect
          * the graph if it lived only in the malloc'd basket's p.v. */
-        VALUE result = ractor_move_courier_materialize(courier);
-        cr->sync.in_flight_courier = NULL;
+        VALUE result = Qundef;
+        enum ruby_tag_type state;
+        EC_PUSH_TAG(ec);
+        if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+            result = ractor_move_courier_materialize(courier);
+        }
+        EC_POP_TAG();
+        cr->sync.materialize_frames = frame.prev;
+        if (state != TAG_NONE) EC_JUMP_TAG(ec, state);
         ractor_move_courier_free(courier);
         b->p.move_courier = NULL;
         ractor_reset_belonging(result);

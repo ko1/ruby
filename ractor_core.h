@@ -15,6 +15,7 @@
 /* RLGCv2 (design_v2.md §4.5): an in-flight move payload, serialized off-heap
  * (defined in ractor.c). */
 struct rb_ractor_move_courier;
+struct rlgc_materialize_frame;
 
 struct rb_ractor_sync {
     // ractor lock
@@ -47,18 +48,29 @@ struct rb_ractor_sync {
     VALUE legacy;
     bool legacy_exc;
 
-    /* RLGCv2 (design_v2.md §4.2): the snapshot currently being
-     * materialized by this Ractor's receive. The basket has already been
-     * popped from the queue, so this slot is what lets the root scan and
-     * the global GC's in-flight re-pin keep the sender-resident snapshot
-     * alive while the copy is running. */
-    VALUE in_flight_materializing;
+    /* RLGCv2 (design_v2.md §4.2/§4.5): chain of in-flight
+     * materializations, newest first -- one frame per receive currently
+     * rebuilding its payload on this Ractor. The basket is already off
+     * the queue, so these frames are what let the root scan and the
+     * global GC's in-flight re-pin keep the sender-resident snapshot
+     * (copy) alive and the courier's shareable VALUEs (move) marked
+     * while the rebuild runs. A CHAIN, not a single slot, because the
+     * rebuild can run user code (marshal_load/_load hooks, autoload,
+     * custom #hash of moved keys) that may do a nested Ractor.receive --
+     * a single slot would lose the outer snapshot's root and re-pin.
+     * Frames live on the receiving thread's machine stack (no
+     * allocation) and are pushed/popped under TAG protection in
+     * ractor_basket_value, so any raise out of the rebuild (user hook,
+     * async interrupt like Timeout) restores the chain -- a dead Ractor
+     * never keeps naming a sender-collected snapshot. */
+    struct rlgc_materialize_frame *materialize_frames;
+};
 
-    /* RLGCv2 (design_v2.md §4.5): the move courier currently being
-     * materialized by this Ractor's receive. The courier is xmalloc'd (not a
-     * GC object), so this slot exists only to mark the shareable VALUEs it
-     * carries while the rebuild is running. */
-    struct rb_ractor_move_courier *in_flight_courier;
+/* one in-flight payload rebuild (lives on the receiver's machine stack) */
+struct rlgc_materialize_frame {
+    VALUE snapshot;                          /* copy: sender-resident snapshot; Qfalse for move */
+    struct rb_ractor_move_courier *courier;  /* move: off-heap courier; NULL for copy */
+    struct rlgc_materialize_frame *prev;
 };
 
 // created
