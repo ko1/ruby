@@ -226,7 +226,7 @@ void rb_ractor_pin_inherited_parts(rb_ractor_t *r);
  * vm->mark_object_ary）の登録・解除・移管。migration は GC sweep（ractor_free）
  * からも呼ばれるので raw malloc/realloc/free のみを使う。 */
 void rb_ractor_register_address(rb_ractor_t *r, VALUE *addr);
-void rb_ractor_unregister_address(rb_ractor_t *r, VALUE *addr);
+bool rb_ractor_unregister_address(rb_ractor_t *r, VALUE *addr);
 void rb_ractor_register_mark_object(rb_ractor_t *r, VALUE obj);
 void rb_ractor_absorb_registered_globals(rb_ractor_t *dst, rb_ractor_t *src);
 
