@@ -3250,6 +3250,11 @@ struct each_obj_data {
     rb_objspace_t *objspace;
     bool reenable_incremental;
 
+    /* RLGCv2: visit only pages that hold shareable objects. Used to walk a
+     * foreign Ractor's objspace for the shareables it owns without touching
+     * the rest of its (isolated) heap. */
+    bool shareable_only;
+
     each_obj_callback *each_obj_callback;
     each_page_callback *each_page_callback;
     void *data;
@@ -3325,13 +3330,43 @@ objspace_each_objects_try(VALUE arg)
             uintptr_t pstart = (uintptr_t)page->start;
             uintptr_t pend = pstart + (page->total_slots * heap->slot_size);
 
-            if (data->each_obj_callback &&
-                (*data->each_obj_callback)((void *)pstart, (void *)pend, heap->slot_size, data->data)) {
-                break;
+            if (data->shareable_only) {
+                /* RLGCv2: hand the callback each shareable object on its own
+                 * (a one-slot range) rather than the whole page. A walk of a
+                 * foreign Ractor's objspace must never expose that Ractor's
+                 * unshareable objects -- the caller runs with its own Ractor's
+                 * structures and cannot safely inspect them. */
+                if (page->has_shareable_objects) {
+                    int planes = CEILDIV(page->total_slots, BITS_BITLENGTH);
+                    uintptr_t base = pstart;
+                    bool stop = false;
+                    for (int j = 0; j < planes && !stop; j++) {
+                        bits_t bits = page->shareable_bits[j];
+                        uintptr_t slot = base;
+                        while (bits) {
+                            if ((bits & 1) && data->each_obj_callback &&
+                                (*data->each_obj_callback)((void *)slot, (void *)(slot + heap->slot_size),
+                                                           heap->slot_size, data->data)) {
+                                stop = true;
+                                break;
+                            }
+                            slot += heap->slot_size;
+                            bits >>= 1;
+                        }
+                        base += BITS_BITLENGTH * heap->slot_size;
+                    }
+                    if (stop) break;
+                }
             }
-            if (data->each_page_callback &&
-                (*data->each_page_callback)(page, data->data)) {
-                break;
+            else {
+                if (data->each_obj_callback &&
+                    (*data->each_obj_callback)((void *)pstart, (void *)pend, heap->slot_size, data->data)) {
+                    break;
+                }
+                if (data->each_page_callback &&
+                    (*data->each_page_callback)(page, data->data)) {
+                    break;
+                }
             }
 
             page = ccan_list_next(&heap->pages, page, page_node);
@@ -3377,6 +3412,22 @@ void
 rb_gc_impl_each_objects(void *objspace_ptr, each_obj_callback *callback, void *data)
 {
     objspace_each_objects(objspace_ptr, callback, data, TRUE);
+}
+
+/* RLGCv2: like rb_gc_impl_each_objects, but only visits pages that hold
+ * shareable objects. Used to reach a foreign Ractor's shareables without
+ * walking the rest of its heap. */
+void
+rb_gc_impl_each_objects_shareable(void *objspace_ptr, each_obj_callback *callback, void *data)
+{
+    struct each_obj_data each_obj_data = {
+        .objspace = objspace_ptr,
+        .shareable_only = true,
+        .each_obj_callback = callback,
+        .each_page_callback = NULL,
+        .data = data,
+    };
+    objspace_each_exec(TRUE, &each_obj_data);
 }
 
 #if GC_CAN_COMPILE_COMPACTION
