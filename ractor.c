@@ -19,6 +19,7 @@
 #include "internal/struct.h"
 #include "internal/re.h"
 #include "internal/variable.h"
+#include "eval_intern.h"
 #include "ruby/encoding.h"
 #include "internal/io.h"
 #include "internal/ractor.h"
@@ -2702,11 +2703,90 @@ move_capture(struct move_build *b, VALUE obj)
     return id;
 }
 
+static void move_preflight(VALUE obj, st_table *seen);
+
+static int
+move_preflight_ivar_i(ID name, VALUE val, st_data_t arg)
+{
+    move_preflight(val, (st_table *)arg);
+    return ST_CONTINUE;
+}
+
+static int
+move_preflight_hash_i(st_data_t key, st_data_t val, st_data_t arg)
+{
+    move_preflight((VALUE)key, (st_table *)arg);
+    move_preflight((VALUE)val, (st_table *)arg);
+    return ST_CONTINUE;
+}
+
+/* Pre-flight walk, mirroring move_capture's decision tree WITHOUT mutating
+ * anything. move_capture husks each original (and steals buffers) as it
+ * goes, so a mid-capture raise on an unmovable child used to leave the
+ * already-captured part of the graph husked, its data marooned in a leaked
+ * courier -- unrecoverable, where the pre-move graph was still intact.
+ * Raise all "can not move" errors here, before the first mutation; after
+ * this pass the capture itself can only fail on allocation failure. */
+static void
+move_preflight(VALUE obj, st_table *seen)
+{
+    if (RB_SPECIAL_CONST_P(obj) || rb_ractor_shareable_p(obj)) return;
+    if (st_lookup(seen, (st_data_t)obj, NULL)) return;   /* cycle */
+    st_insert(seen, (st_data_t)obj, 0);
+
+    switch (BUILTIN_TYPE(obj)) {
+      case T_STRING:
+      case T_OBJECT:
+        break;                       /* children = ivars only (below) */
+      case T_MATCH:
+        break;                       /* children = Regexp (shareable) + String */
+      case T_ARRAY:
+        for (long i = 0; i < RARRAY_LEN(obj); i++) {
+            move_preflight(RARRAY_AREF(obj, i), seen);
+        }
+        break;
+      case T_HASH:
+        rb_hash_stlike_foreach(obj, move_preflight_hash_i, (st_data_t)seen);
+        move_preflight(RHASH_IFNONE(obj), seen);
+        break;
+      case T_STRUCT:
+        for (long i = 0; i < RSTRUCT_LEN(obj); i++) {
+            move_preflight(RSTRUCT_GET(obj, (int)i), seen);
+        }
+        break;
+      case T_FILE:
+        if (RFILE(obj)->fptr == NULL) {
+            rb_raise(rb_eRactorError, "can not move an uninitialized IO");
+        }
+        break;
+      default:
+        rb_raise(rb_eRactorError, "can not move a %"PRIsVALUE" object",
+                 rb_class_name(rb_obj_class(obj)));
+    }
+
+    rb_ivar_foreach(obj, move_preflight_ivar_i, (st_data_t)seen);
+}
+
 /* Build a move courier from obj, turning every captured original into a
  * RactorMovedObject (move semantics).  Returns the xmalloc'd courier. */
 struct rb_ractor_move_courier *
 ractor_move_courier_build(VALUE obj)
 {
+    /* two-phase (preflight, then commit): all move-eligibility errors
+     * raise from the read-only walk while the graph is still intact */
+    {
+        st_table *pf_seen = st_init_numtable();
+        enum ruby_tag_type state;
+        rb_execution_context_t *ec = GET_EC();
+        EC_PUSH_TAG(ec);
+        if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+            move_preflight(obj, pf_seen);
+        }
+        EC_POP_TAG();
+        st_free_table(pf_seen);
+        if (state != TAG_NONE) EC_JUMP_TAG(ec, state);
+    }
+
     struct rb_ractor_move_courier *c = ZALLOC(struct rb_ractor_move_courier);
     struct move_build b = { c, st_init_numtable() };
     c->root = move_capture(&b, obj);
