@@ -2473,27 +2473,47 @@ rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key))
     rb_generic_fields_tables_foreach(gf_drain_table_cb, &ctx);
 }
 
-/* RLGCv2: obj が shareable 化するとき、その generic_fields entry を owner の per-Ractor
- * 表から shared な global 表へ移送する。owner スレッド上で delete/insert の間に GC
- * （＝アロケーション safepoint）を挟まなければ atomic である。 */
+/* RLGCv2: promote obj to shareable, moving its generic_fields entry from the
+ * owner's per-Ractor table to the shared global table. The field lookup picks
+ * the table by RB_OBJ_SHAREABLE_P(obj), so the order matters against a foreign
+ * reader (e.g. a worker polling a constant that names obj): if FL_SHAREABLE
+ * became visible before the entry reached the global table, that reader would
+ * consult the global table, miss, and rb_bug "missing entry in
+ * generic_fields_tbl" (review A-5).
+ *
+ * Order: insert into the global table AND flip FL_SHAREABLE while holding
+ * generic_fields_lock, then drop the owner-exclusive per-Ractor entry. Every
+ * global-table read takes the same lock, so a reader that observes the flag
+ * blocks until this insert is committed and always finds the entry; a reader
+ * that has not yet seen the flag still finds it in the per-Ractor table (the
+ * delete is after the flag is published, and that table is owner-exclusive).
+ * The flag flip is the caller's FL_SHAREABLE set for this path, so callers
+ * must NOT set it themselves before calling this. */
 void
 rb_mv_generic_ivar_to_shared(VALUE obj)
 {
     rb_ractor_t *cr = GET_RACTOR();
     struct st_table *src = cr->generic_fields_tbl;
-    if (src == NULL) return;
 
     st_data_t key = (st_data_t)obj, val = 0;
-    /* delete と insert（malloc しうる）の間に自 Ractor の confined GC が入ると、entry が
-     * どちらの表にも無い瞬間に mark が走って fields_obj を取りこぼす。GC を無効化する。
-     * per-Ractor 表の delete は owner 専有で無ロック、shared 表への insert のみ global mutex。 */
+    /* an st_insert may allocate (resize); keep this thread's own confined GC
+     * out -- its mark/sweep take generic_fields_lock (self-deadlock) and could
+     * observe the entry mid-move. */
     bool gc_disabled = RTEST(rb_gc_disable_no_rest());
-    int moved = st_delete(src, &key, &val);
-    if (moved) {
-        rb_native_mutex_lock(&generic_fields_lock);
-        st_insert(generic_fields_tbl_, (st_data_t)obj, (st_data_t)val);
-        rb_native_mutex_unlock(&generic_fields_lock);
+    bool has_entry = (src != NULL) && st_lookup(src, key, &val);
+
+    rb_native_mutex_lock(&generic_fields_lock);
+    if (has_entry) {
+        st_insert(generic_fields_tbl_, key, val);
     }
+    FL_SET_RAW(obj, FL_SHAREABLE);
+    rb_gc_obj_became_shareable(obj);
+    rb_native_mutex_unlock(&generic_fields_lock);
+
+    if (has_entry) {
+        st_delete(src, &key, NULL);  /* owner-exclusive per-Ractor table */
+    }
+
     if (!gc_disabled) rb_gc_enable();
 }
 
