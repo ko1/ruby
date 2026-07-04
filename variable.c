@@ -2511,7 +2511,11 @@ gf_absorb_i(st_data_t key, st_data_t val, st_data_t data)
 
 /* RLGCv2: src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする。
  * Ractor#value join（joiner が受け継ぐ）や orphan free（main へ移送）から呼ばれる。
- * st は raw malloc を使うので sweep 中でも安全。dst が空なら表ごと引き渡す（O(1)）。 */
+ * dst が空なら表ごと引き渡す（O(1)）。要素移送する場合、st_insert が dst 表を resize
+ * すると st.c の malloc(=ruby_xmalloc)が malloc 会計を跨いで dst の GC を誘発し得る
+ * (A-7 と同型)。その GC が半移送の表を触る／src の未移送値を回収するのを防ぐため、
+ * 移送ループは dst の GC を disable した窓の中で行う（GENERIC_FIELDS_PLAN.md 準拠、
+ * 他の全 insert サイトと同じ規律）。 */
 void
 rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src)
 {
@@ -2524,10 +2528,12 @@ rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src)
         return;
     }
 
+    VALUE gc_was_disabled = rb_gc_disable_no_rest();
     struct gf_absorb_ctx ctx = { dst->generic_fields_tbl };
     st_foreach(src->generic_fields_tbl, gf_absorb_i, (st_data_t)&ctx);
     st_free_table(src->generic_fields_tbl);
     src->generic_fields_tbl = NULL;
+    if (gc_was_disabled == Qfalse) rb_gc_enable();
 }
 
 void
