@@ -1465,8 +1465,18 @@ rb_ractor_targeted_hooks(rb_ractor_t *cr)
 static void
 rb_obj_set_shareable_no_assert(VALUE obj)
 {
-    FL_SET_RAW(obj, FL_SHAREABLE);
-    rb_gc_obj_became_shareable(obj);
+    /* Flip FL_SHAREABLE. For an object whose generic fields live in the
+     * per-Ractor table, the flag flip is interleaved with the table move to
+     * the shared table under generic_fields_lock (review A-5), so a foreign
+     * reader that observes the flag never misses the entry -- do NOT set the
+     * flag here in that case. Every other object flips it directly. */
+    if (rb_obj_gen_fields_p(obj) && rb_obj_using_gen_fields_table_p(obj)) {
+        rb_mv_generic_ivar_to_shared(obj); /* sets FL_SHAREABLE + pin, in order */
+    }
+    else {
+        FL_SET_RAW(obj, FL_SHAREABLE);
+        rb_gc_obj_became_shareable(obj);
+    }
 
     if (BUILTIN_TYPE(obj) == T_FILE && RFILE(obj)->fptr) {
         /* RLGCv2: the fptr's VALUE members (gc.c's T_FILE mark set) are not
@@ -1497,15 +1507,10 @@ rb_obj_set_shareable_no_assert(VALUE obj)
     }
 
     if (rb_obj_gen_fields_p(obj)) {
-        /* RLGCv2: obj の generic_fields が per-Ractor 表バック（T_STRUCT の RSTRUCT_GEN_FIELDS
-         * や T_STRING 等）なら、entry を owner の per-Ractor 表から shared な global 表へ
-         * 移送する（T_DATA は fields_obj を inline に持つので表移送は不要）。obj は今
-         * shareable なので、下の rb_obj_fields_no_ractor_check は global 表を引く。
-         * FL_SHAREABLE の設定〜ここまでに GC safepoint は無く、移送自体も GC 無効化下で
-         * 行うので atomic である。 */
-        if (rb_obj_using_gen_fields_table_p(obj)) {
-            rb_mv_generic_ivar_to_shared(obj);
-        }
+        /* obj は既に shareable（table-backed なら上で表移送込みで昇格済み、それ以外は
+         * fields_obj を inline に持つ）なので、rb_obj_fields_no_ractor_check は正しい表
+         * （shareable → global）を引く。ここでは fields imemo 自身を shareable 化し、
+         * traversal で届かない隠しフィールド値の shref を記録する。 */
         VALUE fields = rb_obj_fields_no_ractor_check(obj);
         if (imemo_type_p(fields, imemo_fields)) {
             // no recursive mark
