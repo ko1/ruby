@@ -7489,15 +7489,19 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
   retry:
     if (!is_incremental_marking(objspace)) {
         /* RLGCv2: the generational barrier only concerns THIS objspace's
-         * remembered set. A foreign child b is a live leaf here -- this
-         * objspace's minor GC never traverses it, so remembering a to rescan
-         * it is pointless. It is also unsafe: b's old bit is owned by b's
-         * objspace (or a global GC) and can flip concurrently between this
-         * check and gc_writebarrier_generational's own RVALUE_OLD_P(b)
-         * assertion (a same-objspace b cannot -- the owner thread runs both
-         * the store and its GC). Skip foreign b. */
-        if (!RVALUE_OLD_P(objspace, a) || RVALUE_OLD_P(objspace, b) ||
-                GET_HEAP_OBJSPACE(b) != objspace) {
+         * remembered set, so it applies only to a same-objspace old->young
+         * edge. A foreign parent a or child b is a live leaf here -- this
+         * objspace's minor GC never traverses it, so remembering it is
+         * pointless -- and reading its old bit is unsafe: that bit is owned
+         * by the other objspace (or a global GC) and can flip concurrently
+         * with this check and gc_writebarrier_generational's own RVALUE_OLD_P
+         * assertions (a same-objspace object cannot -- its owner thread runs
+         * both the store and its GC). A foreign a is necessarily shareable,
+         * and the shref recorded above already keeps b alive; a is re-marked
+         * by every local mark regardless of any remembered bit. Test locality
+         * FIRST so a foreign object's old bit is never read (C-1). */
+        if (GET_HEAP_OBJSPACE(a) != objspace || GET_HEAP_OBJSPACE(b) != objspace ||
+                !RVALUE_OLD_P(objspace, a) || RVALUE_OLD_P(objspace, b)) {
             // do nothing
         }
         else {
