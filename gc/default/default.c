@@ -7030,6 +7030,17 @@ rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
      * (no) parent instead of the poisoned one left by the previous GC. */
     gc_mark_set_parent_raw(objspace, Qundef, false);
 
+    /* A local GC never frees or traverses a shareable (containment); its
+     * unshareable children are kept alive by their shref bits instead. So:
+     *
+     *   - shareable: just set the mark bit (like an old object) so the sweep
+     *     keeps it, but do NOT traverse it.
+     *   - shref (unshareable referenced by a shareable): mark AND traverse,
+     *     like a remembered old->young target -- without this the referencing
+     *     shareable is not walked, so the target would look unreachable.
+     *
+     * This must run at mark start (not at the previous sweep) because an
+     * object can become shareable between GCs. */
     ccan_list_for_each(&heap->pages, page, page_node) {
         if (!(page->has_shareable_objects | page->has_shref_objects)) continue;
 
@@ -7039,7 +7050,11 @@ rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
         int bitmap_plane_count = CEILDIV(total_slots, BITS_BITLENGTH);
 
         for (int j = 0; j < bitmap_plane_count; j++) {
-            bits_t bitset = page->shareable_bits[j] | page->shref_bits[j];
+            bits_t sr_bits = page->shref_bits[j];
+            /* Only pins the normal mark left unmarked need work here; skip
+             * the already-marked ones (reached by the traversal, or old and
+             * pre-marked) instead of visiting them to no-op in gc_mark_set. */
+            bits_t bitset = (page->shareable_bits[j] | sr_bits) & ~page->mark_bits[j];
             uintptr_t pp = p;
             while (bitset) {
                 if (bitset & 1) {
@@ -7054,13 +7069,19 @@ rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
                             break;
                           default:
                             gc_report(2, objspace, "rlgc_pinned_roots_mark: mark %s\n", rb_obj_info(obj));
-                            gc_mark(objspace, obj);
+                            if (sr_bits & 1) {
+                                gc_mark(objspace, obj);          /* shref: root + traverse */
+                            }
+                            else if (gc_mark_set(objspace, obj)) {
+                                gc_aging(objspace, obj);         /* shareable: mark, no traverse */
+                            }
                             break;
                         }
                     }
                 }
                 pp += slot_size;
                 bitset >>= 1;
+                sr_bits >>= 1;
             }
             p += BITS_BITLENGTH * slot_size;
         }
@@ -7325,7 +7346,7 @@ rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
         memset(&page->marking_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
         /* The plain memset can lose a concurrent write barrier's
          * remember, but only a SHAREABLE can be remembered from another
-         * Ractor's thread, and shareables are re-rooted by every local
+         * Ractor's thread, and shareables are re-marked by every local
          * mark (rlgc_pinned_roots_mark) regardless of their remembered
          * bit, while the major this clear precedes rescans everything
          * anyway. */
