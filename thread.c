@@ -1123,7 +1123,42 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
         cr->creating_child_objspace = r->objspace;
     }
 
-    return thread_create_core(thval, &params);
+    /* Creation can still fail between here and vm_insert_ractor (which
+     * clears the cover on success): rb_proc_isolate_bang raises an
+     * IsolationError on captured outer variables (a perfectly ordinary
+     * failure), rb_ractor_send_parameters can raise on copy. Without
+     * cleanup the cover outlives the stillborn child: once the dead
+     * child Ractor is collected, ractor_free disowns its objspace into
+     * the zombie ledger and every whole-VM walk enumerates it twice
+     * (ledger + cover) -- the same double-sweep shape b3b132728 fixed --
+     * and after the orphan merge frees the shell the cover dangles, so
+     * every later walk reads freed memory. On failure, atomically (under
+     * the VM lock, invisible to barrier-protected walks) hand the
+     * stillborn objspace over to the zombie ledger -- it still holds the
+     * child's Thread/Fiber wrappers, so it must stay enumerable -- and
+     * drop the cover; r->objspace = NULL keeps ractor_free from
+     * disowning it twice. */
+    enum ruby_tag_type state;
+    VALUE thret = Qundef;
+    rb_execution_context_t *ec = GET_EC();
+    EC_PUSH_TAG(ec);
+    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+        thret = thread_create_core(thval, &params);
+    }
+    EC_POP_TAG();
+    if (state != TAG_NONE) {
+        RB_VM_LOCKING() {
+            if (cr->creating_child_objspace == r->objspace) {
+                cr->creating_child_objspace = NULL;
+            }
+            if (r->objspace) {
+                rb_gc_objspace_disown(r->objspace);
+                r->objspace = NULL;
+            }
+        }
+        EC_JUMP_TAG(ec, state);
+    }
+    return thret;
 }
 
 
