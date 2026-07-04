@@ -112,9 +112,20 @@ single writer から「割り当ても GC もロック不要」が出る。
 これから決める」という段階的な書き方が残っている箇所があるが、以下はすべて**実装済み**で
 ある。
 
-- **local GC はロックもバリアも取らない(達成済み。旧 M1a→M1b 完了)**。例外は 2 つだけ:
-  (a) main objspace の local GC は VM グローバル root を歩くため no-barrier の VM lock を
-  取る(worker は止めない)、(b) global GC は lock + barrier を取る。
+- **ロック模型(達成済み。旧 M1a→M1b 完了)**。判定は `gc_local_gc_holds_vm_lock` =
+  `objspace == rlgc_main_objspace || RGENGC_CHECK_MODE >= 2`:
+  - **非 main Ractor の local GC、かつ通常ビルド(`RGENGC_CHECK_MODE` off)**: ロックもバリアも
+    取らない(封じ込めで single-writer、cross-objspace の bitmap 書き込みは atomic)。
+  - **main objspace の local GC**: 常に no-barrier の VM lock を取る(barrier は張らず他 Ractor は
+    止めない)。main は VM グローバル root(boot オブジェクト)を持ち、その local GC が
+    `rb_vm_mark` でそれを歩くが、root は他 Ractor が VM lock 下で変異させるため。
+  - **`RGENGC_CHECK_MODE >= 2` ビルド**: 上に加え、非 main Ractor の local GC も no-barrier
+    VM lock を取る(mid-GC の verify が全 objspace を舐めるため)。
+  - **global GC**: VM lock + barrier(STW)。local GC ではなく別 mode。barrier が in-flight の
+    local GC を待つ(GC は safepoint を持たず gc_exit まで合流しない)。
+  - GC の内側では VM lock を取らない(待機者が保留中バリアに合流し半回収ヒープを晒す)。
+    GC 経路が触る VM 共有構造は専用 native mutex(id2ref / registered globals /
+    generic fields)かページプールのロックで守る。
 - **local GC は shareable の生存を traverse に依存しない(mark-only 設計)**。shareable_bits
   でのみ生かされる(local root から届かない)shareable は、pinned-roots パス
   (`rlgc_pinned_roots_mark`)が(old と同じく)mark bit を立てて sweep から守り、
@@ -416,13 +427,15 @@ shref は常に「unshareable を指す」を保つ)。なお u→u の機械的
 minor / major とも自スレッドで実行し、ロックもバリアも取らない。master の GC との差分に
 ★を付ける。
 (実装は 2 段階を踏んだ: M1a では従来どおり VM lock + barrier の下で動かして封じ込めの
-正しさを固め、「ロックもバリアも取らない」は M1b で達成済み — §5 の順序と理由を参照。
-例外が 2 つだけ残る: main objspace の local GC は VM グローバル root を歩くため
-no-barrier の VM lock を取る(worker は止めない)。global GC は lock + barrier を取る。
-GC の内側では VM lock を決して取らない — 待機者は保留中バリアに合流するので、
-mark/sweep 途中の合流は半回収ヒープを global GC に晒す。GC 経路が触る VM 共有構造は
-専用の native mutex(id2ref・registered globals・generic fields)かページプールの
-ロックで守る。)
+正しさを固め、非 main Ractor の local GC が「ロックもバリアも取らない」のは M1b で達成済み
+— §5 の順序と理由を参照。ロック模型の全体は「現在の到達点」参照。通常ビルドで完全無ロック
+なのは非 main Ractor の local GC だけで、main objspace の local GC は VM グローバル root を
+歩くため常に no-barrier の VM lock を取る(他 Ractor は止めない)。global GC は local GC では
+なく別 mode で、VM lock + barrier を取る。`RGENGC_CHECK_MODE ≥ 2` では非 main Ractor の
+local GC も verify のため no-barrier VM lock を取る。GC の内側では VM lock を決して取らない —
+待機者は保留中バリアに合流するので、mark/sweep 途中の合流は半回収ヒープを global GC に晒す。
+GC 経路が触る VM 共有構造は専用の native mutex(id2ref・registered globals・generic fields)か
+ページプールのロックで守る。)
 
 0. 前提: 自分の lazy sweep が残っていれば先に完走させる(master と同じ)。`during_gc` を
    立てて再入を防ぐ。incremental marking は objspace が複数ある間は使わない★
