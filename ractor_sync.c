@@ -727,6 +727,16 @@ ractor_sync_mark(rb_ractor_t *r)
              * carries so a concurrent global GC keeps them */
             ractor_move_courier_mark(f->courier);
         }
+
+        /* the return value (set at exit, read by Ractor#value) lives in this
+         * now-terminated Ractor's objspace; until value-time inheritance pins
+         * it (rb_ractor_pin_inherited_parts) its only sure root is here. Plain
+         * slot written by the owner, so mark under the same gate; Qundef (not
+         * terminated) is a no-op. Otherwise its liveness leans on the dead
+         * main thread's th->value/errinfo aliasing, which the exception
+         * teardown path can drop -> Ractor#value raising a freed object. */
+        rb_gc_mark(r->sync.legacy);
+
         if (r->sync.ports) {
             /* The recv_queue (and the ports table) are written by foreign
              * SENDERS that hold r's sync lock (ractor_queue_enq under
@@ -1180,6 +1190,14 @@ ractor_basket_value(struct ractor_basket *b)
         EC_POP_TAG();
         cr->gen_fields_materialize = prev_gf;
         cr->sync.materialize_frames = frame.prev;
+        /* rb_copy_generic_ivar populated this EC's gen_fields_cache with the
+         * SENDER's snapshot host + fields_obj (both sender-resident). The
+         * snapshot is garbage on the sender now; if the page pool later hands
+         * the receiver a new object at the snapshot host's freed address, a
+         * stale cache.obj == obj hit would deref the foreign freed fields_obj.
+         * Invalidate the cache (also on the raise path via the same reset). */
+        ec->gen_fields_cache.obj = Qundef;
+        ec->gen_fields_cache.fields_obj = Qundef;
         if (state != TAG_NONE) EC_JUMP_TAG(ec, state);
         /* keep the result stack-rooted past the frame being popped */
         ractor_reset_belonging(result);
