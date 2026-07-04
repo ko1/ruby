@@ -126,11 +126,13 @@ single writer から「割り当ても GC もロック不要」が出る。
     GC 経路が触る VM 共有構造は専用 native mutex(id2ref / registered globals /
     generic fields)かページプールのロックで守る。
   - (実装都合・production 無関係: `RGENGC_CHECK_MODE >= 2` では `gc_local_gc_holds_vm_lock` が
-    非 main の local GC にも no-barrier VM lock を取らせるが、**mark 自体は lock 不要**。CHECK の
-    cross-objspace 走査を行う verify(`check_rvalue_consistency_force`)は**自前で no-barrier lock
-    を取る**(default.c:1730、VM lock は再入なので二重取得は無害)。よって gc_enter が全 GC 区間
-    保持しているのは over-locking で、`RGENGC_CHECK_MODE >= 2` 分岐は削除候補
-    (verify の自己ロックに委ねる)。)
+    非 main の local GC にも no-barrier VM lock を全 GC 区間取らせる。目的は「全区間 VM lock を
+    保持して global GC の start をブロックし、CHECK verify を割り込ませない」こと。
+    `check_rvalue_consistency_force` 内で lock が本質的に要るのは `verify_pointer_in_any_heap_p`
+    (cross-objspace bsearch)だけで、それは world_stopped 限定。だが 1730 の lock 撤去＋
+    gc_enter CHECK lock 撤去を試すと verify がまだ割り込まれて壊れた(`inconsistent old slot`
+    /`gc_mode_transition`)＝**非 main local GC の CHECK≥2 経路に 1730 以外の safepoint が残る**。
+    未特定・CHECK 専用なので現状維持。)
 - **local GC は shareable の生存を traverse に依存しない(mark-only 設計)**。shareable_bits
   でのみ生かされる(local root から届かない)shareable は、pinned-roots パス
   (`rlgc_pinned_roots_mark`)が(old と同じく)mark bit を立てて sweep から守り、
