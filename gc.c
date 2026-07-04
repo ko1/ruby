@@ -3943,12 +3943,23 @@ rb_gc_finish_in_flight_gc(void)
 /* RLGCv2: true when only one objspace exists in the whole process (one
  * living Ractor and no zombie objspaces). Only then is a local GC the
  * whole world: the shareable pin and the other multi-objspace guards
- * can be skipped (design_v2.md section 2.3). */
+ * can be skipped (design_v2.md section 2.3).
+ *
+ * The first-child creation window counts as multi: between the wrapper
+ * allocation in rb_thread_create_ractor and vm_insert_ractor the child's
+ * objspace exists (covered by creating_child_objspace) while
+ * vm->ractor.cnt is still 1, and the creator does allocate in that
+ * window (rb_proc_isolate_bang, rb_ractor_send_parameters). Treating it
+ * as single would let a window-triggered GC skip the multi-objspace
+ * guards -- e.g. auto-compaction would move objects the child's
+ * wrappers reference. With cnt == 1 the only possible creator is main. */
 bool
 rb_gc_single_objspace_p(void)
 {
     rb_vm_t *vm = GET_VM();
-    return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0;
+    return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0 &&
+           (vm->ractor.main_ractor == NULL ||
+            vm->ractor.main_ractor->creating_child_objspace == NULL);
 }
 
 /* RLGCv2 (design_v2.md section 2.3): 死んだ Ractor の objspace を呼び出し側の
