@@ -3638,7 +3638,38 @@ rb_gc_register_address(VALUE *addr)
 void
 rb_gc_unregister_address(VALUE *addr)
 {
-    rb_ractor_unregister_address(GET_RACTOR(), addr);
+    if (rb_ractor_unregister_address(GET_RACTOR(), addr)) return;
+
+    /* RLGCv2: the registered-address lists are per-Ractor, so a C
+     * extension that registers on one Ractor and unregisters on another
+     * (Init on main, dfree on a worker's GC, ...) misses its own list.
+     * Leaving the foreign entry behind means the registering Ractor's
+     * root scan keeps reading *addr after the extension freed the slot
+     * (UAF read). No such caller is known -- core never does this -- so
+     * for now OBSERVE instead of silently repairing: scan the other
+     * Ractors under the VM lock (cold path) and rb_bug if the address is
+     * found, so a real-world hit tells us this contract needs deciding
+     * (search-and-remove vs "unregister where you registered").
+     * A full miss stays a silent no-op: upstream tolerates double
+     * unregister, and an entry may have been legitimately absorbed into
+     * main when its registering Ractor died (main unregistering it later
+     * finds it in main's own list above). */
+    if (rb_multi_ractor_p()) {
+        rb_ractor_t *self = GET_RACTOR();
+        RB_VM_LOCKING() {
+            rb_vm_t *vm = GET_VM();
+            rb_ractor_t *r;
+            ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+                if (r == self) continue;
+                for (size_t i = 0; i < r->registered_addrs_cnt; i++) {
+                    if (r->registered_addrs[i] == addr) {
+                        rb_bug("rb_gc_unregister_address: %p is registered by another Ractor (#%u)",
+                               (void *)addr, (unsigned int)rb_ractor_id(r));
+                    }
+                }
+            }
+        }
+    }
 }
 
 void
