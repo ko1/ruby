@@ -39,11 +39,17 @@ single writer から「割り当ても GC もロック不要」が出る。
 4. 空きページは global のページプールに返し、確保もそこから。Ractor は空きページを抱えない。
 5. 終了した Ractor の objspace は、join(`Ractor#value`)した Ractor が**その場で**併合して
    引き継ぐ。join されないまま Ractor オブジェクトが回収されたら main が引き継ぐ。
-6. 「unshareable はコピーでしか Ractor を渡れない」に例外を作らない。master に 1 つだけある
-   例外 —『コピー不可の T_DATA でも、参照先がすべて shareable なら、コピーせず**同じ
-   オブジェクトをそのまま**受信側のコピー結果に埋め込む』(ractor.c obj_traverse_replace_i の
-   T_DATA ケース。例外オブジェクトの backtrace が該当)— を廃止して送信エラーにする(§4.4)。
-   `Ractor#value` は「併合してから返す」ので例外にならない(§4.3)。
+6. 「unshareable はコピーでしか Ractor を渡れない」を守る。master に「同じオブジェクトを
+   そのまま埋め込む例外」は存在しない: master の copy は unshareable を必ず `#clone` で複製する
+   (`ractor_obj_clone`)。`obj_traverse_replace_i` の T_DATA ケースの
+   `obj_refer_only_shareables_p` は「参照先が全部 shareable なら copy を許可する条件」であって
+   (make_shareable 判定と同じ述語)、埋め込み例外ではない。すり抜けの実体は別で、`#clone` が
+   T_DATA(例外の backtrace)の内部の生ポインタ(locations 配列)を複製と共有する点にある:
+   master(単一ヒープ)では locations が全部 shareable なら無害だが、RLGC では objspace を跨ぐ
+   生ポインタになり containment を破る。RLGC は backtrace を専用 deep-copy(`rb_backtrace_dup`,
+   `ractor_native_shallow_copy` の T_DATA ケース)で複製して解消(§4.4)。`_dump` を持たない他の
+   T_DATA は Marshal fallback、それも無理なら送信エラー。`Ractor#value` は「併合してから返す」
+   ので例外にならない(§4.3)。
 7. GC.enable / disable / stress / config / measure_total_time / stat / count は
    呼んだ Ractor の objspace に対する操作・表示。
 8. fork は「自分以外の Ractor を殺してから」と同じ意味にする(子プロセスで他 Ractor の
@@ -859,11 +865,17 @@ raise する。
 
 ### 4.4 参照のすり抜けを許さない
 
-master の Ractor コピーには「move 不可で、直接参照が全部 shareable な T_DATA は、コピーせず
-同じポインタを埋め込む」という例外がある(ractor.c の obj_traverse_replace_i)。単一ヒープ
-なら無害な最適化だが、per-Ractor objspace では「受信側のコピー済みグラフの中に、送信側
-objspace の unshareable T_DATA への生ポインタが残る」ことを意味し、どの生存保証にも
-引っかからず UAF になる(例: 例外オブジェクトの backtrace がまさにこの形に該当する)。
+master の copy は unshareable を必ず `#clone` で複製する(`ractor_obj_clone`)。
+`obj_traverse_replace_i` の T_DATA ケースの `obj_refer_only_shareables_p` は
+「参照先が全部 shareable なら copy を許可する条件」(make_shareable と同じ述語)であって、
+「同じオブジェクトをそのまま埋め込む」例外ではない。
+
+すり抜けの実体はこれとは別で、`#clone` が T_DATA(例外の backtrace)の**内部の生データ
+(locations 配列などの `rb_backtrace_t*`)を複製ラッパと共有**する点にある。単一ヒープの master
+では、その内部が全部 shareable(`obj_refer_only_shareables_p` が保証)なら無害。だが per-Ractor
+objspace では「受信側のコピー済みグラフ(clone)の内部から、送信側 objspace の unshareable
+データへの生ポインタが残る」ことを意味し、どの生存保証にも引っかからず UAF になる
+(例外の backtrace が該当)。
 
 扱いは型ごとに 3 通り:
 
