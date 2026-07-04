@@ -239,7 +239,7 @@ void rb_objspace_each_objects(
     int (*callback)(void *start, void *end, size_t stride, void *data),
     void *data);
 
-void rb_objspace_each_objects_all(
+void rb_objspace_each_objects_local(
     int (*callback)(void *start, void *end, size_t stride, void *data),
     void *data);
 
