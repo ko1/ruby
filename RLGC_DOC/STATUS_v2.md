@@ -1,6 +1,13 @@
-# RLGCv2 現状サマリ(2026-06-12)
+# RLGCv2 現状サマリ(2026-07-04)
 
-設計の正典は `design_v2.md`。本書は「いまどこまで出来ていて、何が残っていて、どう検証するか」だけをまとめる。v1 の記録は `RACTOR_LOCAL_GC_DESIGN.md` / `RLGC_STATUS.md`(凍結)。
+設計の正典は `design_v2.md`(最新仕様サマリは同書冒頭「現在の到達点」)。本書は「いまどこまで出来ていて、何が残っていて、どう検証するか」だけをまとめる。v1 の記録は `RACTOR_LOCAL_GC_DESIGN.md` / `RLGC_STATUS.md`(凍結)。
+
+## 直近(2026-07-04)の変更
+
+- **local GC の shareable を mark-only 化(明示)**: `rlgc_pinned_roots_mark` は shareable に mark bit だけを立て(old objects と同じ)、**辿らない**。shref(shareable-referenced unshareable)のみ root として traverse する。old shareable は `uncollectible→mark_bits` の pre-mark で既 marked なので pinned-roots を短絡。設計(§2.1「shareable は解放せず mark で root 化・辿るのは子=shref」)を実装で徹底した。
+- **imemo の dead pin switch 撤去**: ment/callcache/callinfo/constcache/iseq は全て `SHAREABLE_IMEMO_NEW`(born FL_SHAREABLE、決定 17)なので、`rb_imemo_new` 内の「is_shareable=false 時に became_shareable する switch」は到達不能な dead code だった → 削除し `rb_imemo_new` は upstream と逐語一致。「pin だが FL_SHAREABLE 無し」という中間状態は存在しない(**FL_SHAREABLE ⟺ shareable_bits**)。
+- **cross-Ractor 列挙の再設計(§2.4 更新)**: `rb_objspace_each_objects_all` を撤去。`rb_objspace_each_objects` が callee で barrier を取り「自 objspace 全 + 他 live Ractor の shareable のみ(1 スロット単位)」を歩く。zombie/creating skip で列挙 SEGV を閉じた。current のみ版 `rb_objspace_each_objects_local` を新設(dump_all/objspace ext/JIT/method coverage)。`ObjectSpace.each_object` は cross-Ractor shareable を見せる(master 互換)。
+- **上流先出し(マージ済)**: `gc: take the VM barrier inside rb_objspace_each_objects` / `iseq: use RB_OBJ_WRITE for the lazy-load loader object` / Ractor 宛て postponed job — いずれも RLGC 非依存として origin/master に merge 済み(rebase で dedup)。
 
 ## 現在地
 
@@ -79,3 +86,14 @@
 2. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
 3. ASAN/TSan の CI 常設化(レシピ・suppression は完備)+ v1 オラクル 65 本の再掃引
 4. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
+
+## 既知の乖離(要修正)
+
+- **isolated proc の env の svar($~/$_)**: 設計(§2.1)どおり、**escaped な shareable env の
+  svar は per-EC(`ec->root_svar`)にルート済み**(`lep_svar_in_env_p`)。ただし
+  `vm_env_write_slowpath` の FL_SHAREABLE 分岐が**残余の env-slot write を WB で通して
+  GC-safe にしているだけ**の経路として残っており、そこを通ると shareable env 自身の svar
+  スロットへ書き得る。GC 的には安全だが、isolated Proc を複数 Ractor で共有した場合に
+  共有 env の svar を相互書き込みする**意味論の穴($~ の Ractor 間混じり)は残る**。
+  正しい修正は残余経路も per-EC 化(または当該変異の禁止)。列挙変更(§2.4)とは独立の
+  Ractor 正しさバグ。
