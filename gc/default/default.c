@@ -4736,10 +4736,6 @@ gc_sweep_finish(rb_objspace_t *objspace)
 
     gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_END_SWEEP);
     gc_mode_transition(objspace, gc_mode_none);
-
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
 }
 
 static int
@@ -6740,10 +6736,6 @@ gc_marks_finish(rb_objspace_t *objspace)
 
     gc_update_weak_references(objspace);
 
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
-
 #if RGENGC_CHECK_MODE >= 4
     during_gc = FALSE;
     gc_marks_check(objspace, gc_check_after_marks_i, "after_marks");
@@ -6968,9 +6960,6 @@ static void
 gc_sweep_compact(rb_objspace_t *objspace)
 {
     gc_compact_start(objspace);
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
 
     while (!gc_compact_all_compacted_p(objspace)) {
         for (int i = 0; i < HEAP_COUNT; i++) {
@@ -6996,10 +6985,6 @@ gc_sweep_compact(rb_objspace_t *objspace)
     }
 
     gc_compact_finish(objspace);
-
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
 }
 
 static void
@@ -7933,10 +7918,6 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     /* reason may be clobbered, later, so keep set immediate_sweep here */
     objspace->flags.immediate_sweep = !!(reason & GPR_FLAG_IMMEDIATE_SWEEP);
 
-#if RGENGC_CHECK_MODE >= 2
-    gc_verify_internal_consistency(objspace);
-#endif
-
     if (ruby_gc_stressful) {
         int flag = FIXNUM_P(ruby_gc_stress_mode) ? FIX2INT(ruby_gc_stress_mode) : 0;
 
@@ -8042,6 +8023,15 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     gc_prof_timer_stop(objspace);
 
     gc_exit(objspace, gc_enter_event_start, &lock_lev);
+
+    /* RLGCv2: verify as an independent step AFTER the GC (during_gc clear, a
+     * real safepoint). Verifying mid-collection would call
+     * rb_objspace_reachable_objects_from -- which is not GC-safe and takes the
+     * barrier VM lock -- joining another Ractor's global-GC barrier and letting
+     * it corrupt this half-collected heap. */
+#if RGENGC_CHECK_MODE >= 2
+    gc_verify_internal_consistency(objspace);
+#endif
     return TRUE;
 }
 
@@ -8051,8 +8041,6 @@ gc_rest(rb_objspace_t *objspace)
     if (is_incremental_marking(objspace) || is_lazy_sweeping(objspace)) {
         unsigned int lock_lev;
         gc_enter(objspace, gc_enter_event_rest, &lock_lev);
-
-        if (RGENGC_CHECK_MODE >= 2) gc_verify_internal_consistency(objspace);
 
         if (is_incremental_marking(objspace)) {
             gc_marking_enter(objspace);
@@ -8069,6 +8057,8 @@ gc_rest(rb_objspace_t *objspace)
         }
 
         gc_exit(objspace, gc_enter_event_rest, &lock_lev);
+
+        if (RGENGC_CHECK_MODE >= 2) gc_verify_internal_consistency(objspace); /* after GC, see gc_start */
     }
 }
 
@@ -8210,7 +8200,7 @@ gc_clock_end(struct timespec *ts)
 static inline bool
 gc_local_gc_holds_vm_lock(const rb_objspace_t *objspace)
 {
-    return objspace == rlgc_main_objspace || RGENGC_CHECK_MODE >= 2;
+    return objspace == rlgc_main_objspace;
 }
 
 static inline void
