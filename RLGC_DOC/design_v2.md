@@ -124,17 +124,18 @@ single writer から「割り当ても GC もロック不要」が出る。
     local GC を待つ(GC は safepoint を持たず gc_exit まで合流しない)。
   - GC の内側では VM lock を取らない(待機者が保留中バリアに合流し半回収ヒープを晒す)。
     GC 経路が触る VM 共有構造は専用 native mutex(id2ref / registered globals /
-    generic fields)かページプールのロックで守る。
-  - (実装都合・production 無関係だが必要: `RGENGC_CHECK_MODE >= 2` では
-    `gc_local_gc_holds_vm_lock` が非 main の local GC にも no-barrier VM lock を全 GC 区間
-    取らせる。理由 = `gc_verify_internal_consistency_body` が checks の assert を通すため
-    verify 中 **`during_gc` を一時 FALSE** にする。この窓で global GC が割り込むと R1 の
-    half-marked heap を sweep して壊す(`inconsistent old slot`/`gc_mode_transition`)。
-    no-barrier VM lock を全区間保持すると、(a) global GC が VM lock を取れず **start できない**、
-    (b) no-barrier なので R1 は gc_enter(safepoint)で **barrier に合流しない**(barrier lock だと
-    合流 or デッドロック)。よってこの lock は**削除不可**。`check_rvalue_consistency_force` の
-    自前 lock は gc_enter lock 下で再入 no-op・cross-objspace scan は world_stopped 限定なので
-    vestigial(撤去可・利得なし)。)
+    generic fields)かページプールのロックで守る。**この不変条件は CHECK ビルドも守る**:
+    `gc_local_gc_holds_vm_lock` は main objspace のみ(CHECK でも非 main は lock-free)。
+  - (2026-07-05 修正・05f28c86d: 以前は `RGENGC_CHECK_MODE >= 2` で全 objspace の local GC に
+    no-barrier VM lock を取らせていたが、これは **CHECK verify のバグをマスクしていただけ**だった。
+    真因 = `gc_verify_internal_consistency` を **GC の内側**(gc_marks_finish / gc_sweep_finish /
+    gc_sweep_compact / gc_start 先頭)で呼び、その verify が `rb_objspace_reachable_objects_from`
+    (=GC 中使用不可を自ら rb_bug する非GC用API・barrier VM lock を取る)を呼ぶため、非 main local GC
+    が **他 Ractor の global-GC barrier に mid-collection で合流** → global GC が half-collected heap を
+    破壊(`inconsistent old slot`/`gc_mode_transition none->sweeping dgg=0`)。**修正 = verify を GC の
+    外(gc_exit 後の独立ステップ、during_gc 自然 FALSE)に集約**。これで local GC は safepoint を持たず、
+    global GC の barrier が gc_exit まで待つ(設計どおり)。CHECK lock は不要になり撤去。詳細
+    [[rlgc-v2-global-vs-local-gc-race]]。)
 - **local GC は shareable の生存を traverse に依存しない(mark-only 設計)**。shareable_bits
   でのみ生かされる(local root から届かない)shareable は、pinned-roots パス
   (`rlgc_pinned_roots_mark`)が(old と同じく)mark bit を立てて sweep から守り、
