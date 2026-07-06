@@ -35,6 +35,8 @@
 #include "darray.h"
 #include "gc/gc.h"
 #include "gc/gc_impl.h"
+#include "yjit.h"
+#include "zjit.h"
 
 #ifdef BUILDING_MODULAR_GC
 /* hrtime.h transitively includes internal/time.h -> internal/bits.h, which are
@@ -594,6 +596,10 @@ typedef struct rb_objspace {
         unsigned int dont_incremental : 1;
         unsigned int during_gc : 1;
         unsigned int during_compacting : 1;
+        /* RLGCv2: set in gc_enter when this GC took the *barrier* VM lock
+         * (compaction), so gc_exit ends the barrier with a barrier unlock even
+         * after during_compacting was cleared by gc_compact_finish. */
+        unsigned int gc_lock_barrier : 1;
         unsigned int during_reference_updating : 1;
         unsigned int gc_stressful: 1;
         unsigned int during_minor_gc : 1;
@@ -8250,9 +8256,13 @@ gc_local_gc_holds_vm_lock(const rb_objspace_t *objspace)
      * gc_enter level. It takes the no-barrier VM lock only for the bounded
      * windows that touch VM-global weak tables (rb_vm_mark's shared tables in
      * the mark, rb_gc_obj_free_vm_weak_references in the sweep). Compaction is
-     * the exception: it updates those tables' references throughout, so it
-     * holds the lock for the whole GC. */
-    return objspace == rlgc_main_objspace && objspace->flags.during_compacting;
+     * handled separately in gc_enter (it takes the *barrier* lock); here we
+     * also keep the lock for the whole GC when a JIT is enabled, because the
+     * general mark reaches rb_yjit_iseq_mark / rb_zjit_iseq_mark for a shareable
+     * iseq's payload and that must be excluded from a concurrent JIT compilation
+     * on another Ractor (rb_iseq_mark_and_move asserts the VM lock there). */
+    return objspace == rlgc_main_objspace &&
+           (objspace->flags.during_compacting || rb_yjit_enabled_p || rb_zjit_enabled_p);
 }
 
 static inline void
@@ -8314,7 +8324,18 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
         *lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
         break;
       default:
-        if (gc_local_gc_holds_vm_lock(objspace)) {
+        objspace->flags.gc_lock_barrier = FALSE;
+        if (objspace->flags.during_compacting) {
+            /* RLGCv2: compaction relocates objects and rewrites JIT / global
+             * references across every Ractor, so it stops the world. Take the
+             * barrier VM lock; rb_gc_vm_barrier is a no-op with one Ractor and
+             * re-entrant, so any inner barrier request during the move folds
+             * into this one and gc_exit ends it. */
+            *lock_lev = RB_GC_VM_LOCK();
+            rb_gc_vm_barrier();
+            objspace->flags.gc_lock_barrier = TRUE;
+        }
+        else if (gc_local_gc_holds_vm_lock(objspace)) {
             *lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
         }
         break;
@@ -8378,7 +8399,13 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
         break;
       default:
         if (*lock_lev != 0) {
-            RB_GC_VM_UNLOCK_NO_BARRIER(*lock_lev);
+            if (objspace->flags.gc_lock_barrier) {
+                objspace->flags.gc_lock_barrier = FALSE;
+                RB_GC_VM_UNLOCK(*lock_lev);
+            }
+            else {
+                RB_GC_VM_UNLOCK_NO_BARRIER(*lock_lev);
+            }
         }
         break;
     }
