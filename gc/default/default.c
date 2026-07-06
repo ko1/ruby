@@ -8641,6 +8641,17 @@ rlgc_global_gc(rb_objspace_t *driver)
     rlgc_global.count = 0;
     rb_gc_vm_each_objspace(rlgc_global_objspaces_i, NULL);
 
+    /* Flag every objspace as under the global GC BEFORE settling their lazy
+     * sweeps in step 3: that settle frees leftover garbage on OTHER Ractors'
+     * objspaces from the driver's thread, and freeing a foreign object's weak
+     * references (rb_free_generic_ivar) must see "global GC in progress" so it
+     * defers the per-Ractor generic_fields delete to the weak-pass drain rather
+     * than mis-resolving it against the driver's own table (finding-B). */
+    rlgc_global.active = true;
+    for (size_t i = 0; i < rlgc_global.count; i++) {
+        rlgc_global.list[i]->during_global_gc = 1;
+    }
+
     /* step 3: settle every objspace's lazy sweep, so the meaning of the
      * mark bits is fixed before the clear below.
      * (during_gc is a macro over the local "objspace".)
@@ -8659,12 +8670,6 @@ rlgc_global_gc(rb_objspace_t *driver)
         rb_gc_initialize_vm_context(&objspace->vm_context);
         if (objspace != driver) during_gc = TRUE;
         gc_sweep_rest(objspace);
-    }
-
-    /* step 4: flag every objspace; predicates consult this */
-    rlgc_global.active = true;
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        rlgc_global.list[i]->during_global_gc = 1;
     }
 
     /* step 5: clear marks / remembered sets / generation counters / shref
