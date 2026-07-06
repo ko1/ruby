@@ -4211,10 +4211,9 @@ gc_sweep_register_free_slot(rb_objspace_t *objspace, struct heap_page *page, str
     rb_asan_unpoison_object(p, false);
     ((struct RBasic *)p)->flags = 0;
 
-    /* RLGCv2: a freed slot must not carry stale shareable/shref bits into
-     * its next life. */
-    CLEAR_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(p), (VALUE)p);
-    CLEAR_IN_BITMAP(GET_HEAP_SHREF_BITS(p), (VALUE)p);
+    /* RLGCv2: a freed slot must not carry stale shareable/shref bits into its
+     * next life. The clearing is done in bulk per bitmap word at the end of
+     * gc_sweep_page (`bits &= mark_bits`), not here per slot. */
 
     struct free_region *existing_region = ctx->free_region;
     if (existing_region) rb_asan_unpoison_object((VALUE)existing_region, false);
@@ -4269,9 +4268,13 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                 break;
 
               default:
+#if RGENGC_CHECK_MODE
                 /* RLGC_DEBUG: a confined GC must never free a pinned slot.
                  * (The global GC may: its unified mark is exact, and dead
-                 * shareables are precisely what it exists to collect.) */
+                 * shareables are precisely what it exists to collect.)
+                 * CHECK-only: this reads the shareable/shref bits, which are
+                 * still intact here because the bulk clear runs after the free
+                 * loop. In a release build the invariant is trusted. */
                 if (ctx->check_pinned_free &&
                     (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(vp), vp) ||
                      MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp))) {
@@ -4281,6 +4284,7 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
                            (int)!!MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(vp), vp),
                            (int)rb_gc_single_objspace_p());
                 }
+#endif
 #if RGENGC_CHECK_MODE
                 if (!is_full_marking(objspace)) {
                     if (RVALUE_OLD_P(objspace, vp)) rb_bug("page_sweep: %p - old while minor GC.", (void *)p);
@@ -4394,6 +4398,22 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
     }
 
     if (sweep_needs_vm_lock) RB_GC_VM_UNLOCK_NO_BARRIER(sweep_lock_lev);
+
+    /* RLGCv2: bulk-clear the shareable/shref bits of the freed slots. A freed
+     * (recycled) slot must not inherit stale bits, but a live shareable must
+     * keep its pin across GCs -- since freed slots are exactly the unmarked
+     * ones, `bits &= mark_bits` keeps live shareables and clears the freed
+     * slots, 64 slots per word instead of a CLEAR_IN_BITMAP per freed slot.
+     * Runs before the freelist is published, so a recycled slot is always
+     * clean. Skipped for pages that never held shareable/shref objects. */
+    if (sweep_page->has_shareable_objects || sweep_page->has_shref_objects) {
+        bits_t *shareable_bits = sweep_page->shareable_bits;
+        bits_t *shref_bits = sweep_page->shref_bits;
+        for (int i = 0; i < bitmap_plane_count; i++) {
+            shareable_bits[i] &= bits[i];
+            shref_bits[i] &= bits[i];
+        }
+    }
 
     asan_unlock_freelist(sweep_page);
     sweep_page->free_region = ctx->free_region;
