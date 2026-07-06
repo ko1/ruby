@@ -1728,8 +1728,18 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
      * swept is a zombie (a terminated Ractor's objspace, which has no owner) --
      * rb_vm_lock_enter_nb passes GET_RACTOR() == NULL. */
     const bool world_stopped = objspace->during_global_gc;
+    /* RLGCv2: the VM lock below guards the cross-objspace pointer scan for a
+     * confined verify invoked from a WRITE BARRIER, where other Ractors run and
+     * realloc their heaps. It must NOT be taken while a GC is in progress on
+     * this objspace: the pages are stable then (no concurrent realloc of this
+     * objspace), the cross-objspace scan is world-stopped-only anyway, and the
+     * Ractor may already hold its own ractor lock -- e.g. gc_mark reaching here
+     * while ractor_sync_mark marks the Ractor's ports -- so acquiring the VM
+     * lock here would be a ractor->VM lock-order inversion (rb_vm_lock_enter's
+     * deadlock guard). A global GC holds the barrier, so it needs no lock. */
+    const bool take_vm_lock = !world_stopped && !during_gc;
     unsigned int lev = 0;
-    if (!world_stopped) lev = RB_GC_VM_LOCK_NO_BARRIER();
+    if (take_vm_lock) lev = RB_GC_VM_LOCK_NO_BARRIER();
     {
         if (SPECIAL_CONST_P(obj)) {
             fprintf(stderr, "check_rvalue_consistency: %p is a special const.\n", (void *)obj);
@@ -1840,7 +1850,7 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
             }
         }
     }
-    if (!world_stopped) RB_GC_VM_UNLOCK_NO_BARRIER(lev);
+    if (take_vm_lock) RB_GC_VM_UNLOCK_NO_BARRIER(lev);
 
     if (err > 0 && terminate) {
         rb_bug("check_rvalue_consistency_force: there is %d errors.", err);
