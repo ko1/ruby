@@ -1474,6 +1474,17 @@ rb_free_generic_ivar(VALUE obj)
                  * 戻すので入口ガードで弾かれる）。absorb（join/orphan）は objspace merge の前に
                  * 表を移送済みなので、joiner が merge 中に src の dead host を掃くときも entry は
                  * joiner の表に居る。 */
+                if (rb_gc_during_global_gc_p()) {
+                    /* RLGCv2 finding-B: the global GC driver's GET_RACTOR() is
+                     * not this object's owner (e.g. the driver settling another
+                     * Ractor's leftover lazy sweep in rlgc_global_gc step 3), so
+                     * generic_fields_tbl_for() would pick the driver's table and
+                     * miss the entry, which lives in the owner's table. The
+                     * global GC's weak-pass drain removes every dead key's entry
+                     * across all tables, so leave the delete to it (mirrors
+                     * rb_mark_generic_ivar's during-global-gc skip). */
+                    break;
+                }
                 struct st_table *tbl = generic_fields_tbl_for(obj, false);
                 int deleted = 0;
                 if (tbl != NULL) {
