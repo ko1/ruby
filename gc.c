@@ -3145,11 +3145,22 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     rb_gc_mark_values(RUBY_NSIG, vm->trap_list.cmd);
 
     /* VM-global roots belong to the main Ractor's objspace (that is where
-     * boot-time objects live); a worker's confined GC does not scan them.
-     * The global GC scans everything. */
+     * boot-time objects live); a non-main Ractor's confined GC does not scan
+     * them. The global GC scans everything. */
     if (global_gc || objspace == vm->ractor.main_ractor->objspace) {
         MARK_CHECKPOINT("vm");
+        /* RLGCv2 (fine-grained lock prototype): rb_vm_mark walks VM-global weak
+         * tables (ractor.set / negative_cme / overloaded_cme / global_cc_cache /
+         * zombies) that other Ractors mutate under the VM lock. main's local GC
+         * is otherwise lock-free, so take the no-barrier VM lock just for this
+         * bounded window. During a global GC the barrier already protects those
+         * tables, so no extra lock is needed. (A compacting local GC holds the
+         * whole-GC lock, so this nests harmlessly.) */
+        const bool vm_mark_needs_lock = rb_multi_ractor_p() && !global_gc;
+        unsigned int vm_mark_lock_lev = 0;
+        if (vm_mark_needs_lock) vm_mark_lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
         rb_vm_mark(vm);
+        if (vm_mark_needs_lock) RB_GC_VM_UNLOCK_NO_BARRIER(vm_mark_lock_lev);
 
         MARK_CHECKPOINT("global_tbl");
         rb_gc_mark_global_tbl();
