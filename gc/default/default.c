@@ -4372,6 +4372,19 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
         }
     }
 
+    /* RLGCv2 (fine-grained lock prototype): main's local GC is lock-free, but
+     * freeing a shareable that is referenced from a VM-global weak table
+     * (rb_gc_obj_free_vm_weak_references: ci_table / fstring / symbol / cme
+     * tables) mutates that VM-global table, so take the no-barrier VM lock
+     * around the page's free loop. During a global GC the barrier already
+     * protects those tables (skip). A compacting local GC holds the whole-GC
+     * lock, so this nests harmlessly. Non-main Ractors' confined GC does not
+     * free VM-global-weak shareables, so they never take it. */
+    const bool sweep_needs_vm_lock =
+        objspace == rlgc_main_objspace && rb_multi_ractor_p() && !objspace->during_global_gc;
+    unsigned int sweep_lock_lev = 0;
+    if (sweep_needs_vm_lock) sweep_lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
+
     for (int i = 0; i < bitmap_plane_count; i++) {
         bitset = ~bits[i];
         if (bitset) {
@@ -4379,6 +4392,8 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
         }
         p += BITS_BITLENGTH * slot_size;
     }
+
+    if (sweep_needs_vm_lock) RB_GC_VM_UNLOCK_NO_BARRIER(sweep_lock_lev);
 
     asan_unlock_freelist(sweep_page);
     sweep_page->free_region = ctx->free_region;
@@ -7892,9 +7907,6 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     GC_ASSERT(!is_lazy_sweeping(objspace));
     GC_ASSERT(!is_incremental_marking(objspace));
 
-    unsigned int lock_lev;
-    gc_enter(objspace, gc_enter_event_start, &lock_lev);
-
     /* reason may be clobbered, later, so keep set immediate_sweep here */
     objspace->flags.immediate_sweep = !!(reason & GPR_FLAG_IMMEDIATE_SWEEP);
 
@@ -7957,6 +7969,10 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     }
 
     if (objspace->flags.immediate_sweep) reason |= GPR_FLAG_IMMEDIATE_SWEEP;
+
+    /* enter after during_compacting is decided (gc_local_gc_holds_vm_lock reads it) */
+    unsigned int lock_lev;
+    gc_enter(objspace, gc_enter_event_start, &lock_lev);
 
     gc_report(1, objspace, "gc_start(reason: %x) => %u, %d, %d\n",
               reason,
@@ -8180,7 +8196,13 @@ gc_clock_end(struct timespec *ts)
 static inline bool
 gc_local_gc_holds_vm_lock(const rb_objspace_t *objspace)
 {
-    return objspace == rlgc_main_objspace;
+    /* RLGCv2 (fine-grained lock prototype): main's local GC is lock-free at the
+     * gc_enter level. It takes the no-barrier VM lock only for the bounded
+     * windows that touch VM-global weak tables (rb_vm_mark's shared tables in
+     * the mark, rb_gc_obj_free_vm_weak_references in the sweep). Compaction is
+     * the exception: it updates those tables' references throughout, so it
+     * holds the lock for the whole GC. */
+    return objspace == rlgc_main_objspace && objspace->flags.during_compacting;
 }
 
 static inline void
@@ -8235,6 +8257,11 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
         *lock_lev = RB_GC_VM_LOCK();
         // stop other ractors
         rb_gc_vm_barrier();
+        break;
+      case gc_enter_event_finalizer:
+        /* shutdown finalizer reads VM-global tables (fstring/symbol) and frees
+         * non-thread-safe T_DATA, so it takes the no-barrier VM lock. */
+        *lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
         break;
       default:
         if (gc_local_gc_holds_vm_lock(objspace)) {
@@ -8296,8 +8323,11 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
       case gc_enter_event_global:
         RB_GC_VM_UNLOCK(*lock_lev);
         break;
+      case gc_enter_event_finalizer:
+        RB_GC_VM_UNLOCK_NO_BARRIER(*lock_lev);
+        break;
       default:
-        if (gc_local_gc_holds_vm_lock(objspace)) {
+        if (*lock_lev != 0) {
             RB_GC_VM_UNLOCK_NO_BARRIER(*lock_lev);
         }
         break;
@@ -8443,6 +8473,7 @@ rb_gc_impl_during_global_gc_p(void *objspace_ptr)
     rb_objspace_t *objspace = objspace_ptr;
     return objspace->during_global_gc != 0;
 }
+
 
 /* RLGCv2: is obj recorded as a shareable-referenced unshareable?
  * (Verifier use: the consistency checks accept a shareable -> unshareable
