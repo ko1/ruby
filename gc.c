@@ -636,6 +636,7 @@ typedef struct gc_function_map {
     // Heap walking
     void (*each_objects)(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
     void (*each_objects_shareable)(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
+    void (*each_objects_foreign)(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
     void (*each_object)(void *objspace_ptr, void (*func)(VALUE obj, void *data), void *data);
     // Finalizers
     void (*make_zombie)(void *objspace_ptr, VALUE obj, void (*dfree)(void *), void *data);
@@ -821,6 +822,7 @@ ruby_modular_gc_init(void)
     // Heap walking
     load_modular_gc_func(each_objects);
     load_modular_gc_func(each_objects_shareable);
+    load_modular_gc_func(each_objects_foreign);
     load_modular_gc_func(each_object);
     // Finalizers
     load_modular_gc_func(make_zombie);
@@ -915,6 +917,7 @@ ruby_modular_gc_init(void)
 // Heap walking
 # define rb_gc_impl_each_objects rb_gc_functions.each_objects
 # define rb_gc_impl_each_objects_shareable rb_gc_functions.each_objects_shareable
+# define rb_gc_impl_each_objects_foreign rb_gc_functions.each_objects_foreign
 # define rb_gc_impl_each_object rb_gc_functions.each_object
 // Finalizers
 # define rb_gc_impl_make_zombie rb_gc_functions.make_zombie
@@ -3824,6 +3827,35 @@ rb_objspace_each_objects_local(int (*callback)(void *, void *, size_t, void *), 
     RB_VM_LOCKING() {
         rb_vm_barrier();
         rb_gc_impl_each_objects(rb_gc_get_objspace(), callback, data);
+    }
+}
+
+/* Every object of every live Ractor's objspace -- foreign unshareables
+ * included. ONLY for callers whose callback is pure C and never yields
+ * (heap dumps, memory accounting: ObjectSpace.dump_all / memsize_of_all /
+ * count_*): the walk holds the VM lock + barrier, so every objspace is
+ * stable, and nothing but text/numbers leaves the walk -- no cross-Ractor
+ * object reference is created. Foreign objspaces are walked without
+ * settling their paused lazy sweeps (that is their owner's job -- running
+ * their obj_free here would use this Ractor's identity); the dead-but-
+ * unswept objects are skipped instead. Being-created / zombie objspaces
+ * are skipped like in rb_objspace_each_objects. */
+void
+rb_objspace_each_objects_all(int (*callback)(void *, void *, size_t, void *), void *data)
+{
+    RB_VM_LOCKING() {
+        rb_vm_barrier();
+
+        void *self = rb_gc_get_objspace();
+        rb_gc_impl_each_objects(self, callback, data);
+
+        rb_vm_t *vm = GET_VM();
+        rb_ractor_t *r;
+        ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+            if (r->objspace && r->objspace != self) {
+                rb_gc_impl_each_objects_foreign(r->objspace, callback, data);
+            }
+        }
     }
 }
 
