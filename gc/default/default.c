@@ -827,6 +827,12 @@ static rb_global_objspace_t *global_objspace = NULL;
  * snapshot, taken and used under the barrier. */
 static struct {
     bool active;
+    /* RLGCv2: true during the *move* half of a compacting global GC, so
+     * gc_sweep_compact relocates every objspace but defers gc_compact_finish
+     * (the reference-update half) until all objspaces have moved -- two-phase,
+     * so a cross-objspace reference is only rewritten once every forwarding
+     * pointer exists. */
+    bool compacting;
     struct rb_objspace **list;
     size_t count, capa;
 } rlgc_global;
@@ -4002,6 +4008,8 @@ gc_unprotect_pages(rb_objspace_t *objspace, rb_heap_t *heap)
 }
 
 static void gc_update_references(rb_objspace_t *objspace);
+static void gc_update_references_heap(rb_objspace_t *objspace);
+static void gc_update_references_global(rb_objspace_t *objspace);
 #if GC_CAN_COMPILE_COMPACTION
 static void invalidate_moved_page(rb_objspace_t *objspace, struct heap_page *page);
 #endif
@@ -4190,9 +4198,21 @@ gc_compact_finish(rb_objspace_t *objspace)
         gc_unprotect_pages(objspace, heap);
     }
 
-    uninstall_handlers();
+    if (!rlgc_global.compacting) uninstall_handlers();
 
-    gc_update_references(objspace);
+    if (rlgc_global.compacting) {
+        /* Compacting global GC: update only this objspace's heap references
+         * here. during_reference_updating is set on EVERY objspace by
+         * rlgc_global_gc for the whole pass, because the move-vs-mark decision
+         * (RB_GC_MARK_OR_TRAVERSE) reads it off rb_gc_get_objspace() -- the
+         * driver -- not this objspace. The VM-global half
+         * (gc_update_references_global) is not idempotent, so rlgc_global_gc
+         * runs it exactly once after every objspace's heap half. */
+        gc_update_references_heap(objspace);
+    }
+    else {
+        gc_update_references(objspace);
+    }
     objspace->profile.compact_count++;
 
     for (int i = 0; i < HEAP_COUNT; i++) {
@@ -4206,7 +4226,7 @@ gc_compact_finish(rb_objspace_t *objspace)
         gc_profile_record *record = gc_prof_record(objspace);
         record->moved_objects = objspace->rcompactor.total_moved - record->moved_objects;
     }
-    objspace->flags.during_compacting = FALSE;
+    if (!rlgc_global.compacting) objspace->flags.during_compacting = FALSE;
 }
 
 struct gc_sweep_context {
@@ -4941,18 +4961,23 @@ gc_sweep_step_for_malloc(rb_objspace_t *objspace)
     gc_exit(objspace, gc_enter_event_continue, &lock_lev);
 }
 
+static bool rlgc_global_pointer_to_heap_p(const void *ptr);
+
 VALUE
 rb_gc_impl_location(void *objspace_ptr, VALUE value)
 {
+    rb_objspace_t *objspace = objspace_ptr;
     VALUE destination;
 
-    /* RLGCv2: a reference into ANOTHER objspace's heap does not move during
-     * THIS objspace's compaction -- only the owning objspace relocates it (and
-     * fixes its own incoming references). Leave such a foreign reference
-     * unchanged rather than asserting it belongs to this objspace. (In a
-     * single-objspace VM every valid reference is local, so this is a no-op
-     * there.) */
-    if (!is_pointer_to_heap(objspace_ptr, (void *)value)) {
+    /* RLGCv2: a reference into ANOTHER objspace's heap does not move during a
+     * local (single-objspace) compaction -- only the owning objspace relocates
+     * it -- so leave such a foreign reference unchanged. But the compacting
+     * GLOBAL GC relocates EVERY objspace under the barrier, so a cross-objspace
+     * reference DOES move; follow its forwarding by testing every objspace's
+     * heap. (In a single-objspace VM every valid reference is local anyway.) */
+    if (RB_UNLIKELY(objspace->during_global_gc)
+            ? !rlgc_global_pointer_to_heap_p((void *)value)
+            : !is_pointer_to_heap(objspace_ptr, (void *)value)) {
         return value;
     }
 
@@ -5058,7 +5083,8 @@ gc_compact_start(rb_objspace_t *objspace)
     memset(objspace->rcompactor.moved_down_count_table, 0, T_MASK * sizeof(size_t));
 
     /* Set up read barrier for pages containing MOVED objects */
-    install_handlers();
+    /* the compacting global GC installs the read barrier once for all objspaces */
+    if (!rlgc_global.compacting) install_handlers();
 }
 
 static void gc_sweep_compact(rb_objspace_t *objspace);
@@ -6987,8 +7013,13 @@ gc_compact_all_compacted_p(rb_objspace_t *objspace)
     return true;
 }
 
+/* RLGCv2: the *move* half of compaction -- relocate this objspace's movable
+ * objects and leave T_MOVED forwarding pointers, but do NOT update references
+ * yet. The global GC calls this for every objspace before updating any of them
+ * (two-phase), so a cross-objspace reference to a moved object is only rewritten
+ * once every objspace's forwarding pointers exist. */
 static void
-gc_sweep_compact(rb_objspace_t *objspace)
+gc_compact_relocate(rb_objspace_t *objspace)
 {
     gc_compact_start(objspace);
 
@@ -7014,8 +7045,17 @@ gc_sweep_compact(rb_objspace_t *objspace)
             heap->compact_cursor = ccan_list_prev(&heap->pages, heap->compact_cursor, page_node);
         }
     }
+}
 
-    gc_compact_finish(objspace);
+static void
+gc_sweep_compact(rb_objspace_t *objspace)
+{
+    gc_compact_relocate(objspace);
+    /* The compacting global GC defers the finish (reference update) to its
+     * second phase, once every objspace has relocated. */
+    if (!rlgc_global.compacting) {
+        gc_compact_finish(objspace);
+    }
 }
 
 static void
@@ -7866,7 +7906,7 @@ gc_reset_malloc_info(rb_objspace_t *objspace, bool full_mark)
 #endif
 }
 
-static void rlgc_global_gc(rb_objspace_t *driver);
+static void rlgc_global_gc(rb_objspace_t *driver, bool compact);
 
 /* RLGCv2 (design_v2.md §2.2): does this collection have to be the global
  * one? A local GC cannot reclaim shareables or zombie objspaces, so once
@@ -7933,7 +7973,7 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
      * deciding only on explicit/malloc-triggered GCs would let an
      * allocation-driven workload sail past every threshold. */
     if (rlgc_global_wanted_p(objspace)) {
-        rlgc_global_gc(objspace);
+        rlgc_global_gc(objspace, false);
         return TRUE;
     }
 
@@ -8637,7 +8677,7 @@ rlgc_global_mark_generic_fields(rb_objspace_t *driver)
 }
 
 static void
-rlgc_global_gc(rb_objspace_t *driver)
+rlgc_global_gc(rb_objspace_t *driver, bool compact)
 {
     unsigned int lock_lev;
     gc_enter(driver, gc_enter_event_global, &lock_lev);
@@ -8711,6 +8751,30 @@ rlgc_global_gc(rb_objspace_t *driver)
     }
     driver->profile.major_gc_count++;
 
+    /* RLGCv2 Stage 2 (compacting global GC): enable compaction on every objspace
+     * before the mark, so the unified conservative root scan pins each Ractor's
+     * machine-stack referents (gc_pin only sets the pinned bit while
+     * during_compacting), and so step 9's per-objspace sweep relocates. The
+     * move half runs there; rlgc_global.compacting defers the reference-update
+     * half to phase 2 below (two-phase, cross-objspace safe). */
+    rlgc_global.compacting = compact;
+    if (compact) {
+        for (size_t i = 0; i < rlgc_global.count; i++) {
+            rb_objspace_t *objspace = rlgc_global.list[i];
+            objspace->flags.during_compacting = TRUE;
+            /* gc_marks_start resets each page's pinned_slots for a compacting
+             * local GC; the global GC skips gc_marks_start, so reset here. Step 5
+             * already cleared pinned_bits, and the coming conservative mark
+             * re-pins (gc_pin) the machine-stack referents. */
+            for (int h = 0; h < HEAP_COUNT; h++) {
+                struct heap_page *page = NULL;
+                ccan_list_for_each(&heaps[h].pages, page, page_node) {
+                    page->pinned_slots = 0;
+                }
+            }
+        }
+    }
+
     /* steps 6-7: every Ractor's roots (gc.c walks them all and re-pins
      * the in-flight payloads), then one unified, exact mark */
     mark_roots(driver, NULL);
@@ -8731,15 +8795,70 @@ rlgc_global_gc(rb_objspace_t *driver)
      * rb_ractor_finish_marking) */
     rb_ractor_finish_marking();
 
-    /* step 9: sweep every objspace inside the barrier, not lazily;
-     * dead shareables go here, empty pages return to the pool */
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        rb_objspace_t *os = rlgc_global.list[i];
-        unsigned int prev_immediate = os->flags.immediate_sweep;
-        os->flags.immediate_sweep = TRUE;
-        gc_sweep(os);
-        os->flags.immediate_sweep = prev_immediate;
+    /* step 9: sweep every objspace inside the barrier, not lazily; dead
+     * shareables go here, empty pages return to the pool. */
+    if (!compact) {
+        for (size_t i = 0; i < rlgc_global.count; i++) {
+            rb_objspace_t *os = rlgc_global.list[i];
+            unsigned int prev_immediate = os->flags.immediate_sweep;
+            os->flags.immediate_sweep = TRUE;
+            gc_sweep(os);
+            os->flags.immediate_sweep = prev_immediate;
+        }
     }
+    else {
+        /* RLGCv2 Stage 2: a compacting global GC is the single-objspace
+         * move -> update-references -> free sequence applied uniformly to every
+         * objspace under the barrier. It MUST run as three passes OVER ALL
+         * objspaces (not per-objspace), because (a) reference update must see
+         * every objspace's forwarding pointers -- a reference can point into
+         * another objspace's moved object -- and (b) freeing an objspace's
+         * move-from pages must wait until every objspace has updated, else
+         * another objspace's update would read a freed T_MOVED source. The read
+         * barrier is installed once for the whole pass. */
+        install_handlers();
+
+        /* pass 1 (move): relocate every objspace, leaving T_MOVED forwarding. */
+        for (size_t i = 0; i < rlgc_global.count; i++) {
+            rb_objspace_t *os = rlgc_global.list[i];
+            gc_sweeping_enter(os);
+            gc_sweep_start(os);        /* mode -> sweeping, sort heap for compaction */
+            gc_compact_relocate(os);   /* mode -> compacting, move */
+        }
+
+        /* pass 2 (update): now every forwarding pointer exists, update
+         * references in every objspace (cross-objspace references resolve).
+         * gc_compact_finish also unprotects pages and clears during_compacting. */
+        /* the move-vs-mark decision reads rb_gc_get_objspace()'s
+         * during_reference_updating; set it on every objspace for the pass. */
+        for (size_t i = 0; i < rlgc_global.count; i++) {
+            rlgc_global.list[i]->flags.during_reference_updating = TRUE;
+        }
+        rb_gc_before_updating_jit_code();
+        for (size_t i = 0; i < rlgc_global.count; i++) {
+            gc_compact_finish(rlgc_global.list[i]);
+        }
+        /* the VM-global / weak-table half of reference update runs exactly once
+         * (every objspace's heap half already ran in gc_compact_finish above). */
+        gc_update_references_global(driver);
+        rb_gc_after_updating_jit_code();
+        for (size_t i = 0; i < rlgc_global.count; i++) {
+            rlgc_global.list[i]->flags.during_reference_updating = FALSE;
+            rlgc_global.list[i]->flags.during_compacting = FALSE;
+        }
+        rlgc_global.compacting = false;
+        uninstall_handlers();
+
+        /* pass 3 (free): page-sweep every objspace -- free dead objects and the
+         * now-empty move-from pages. during_compacting is clear, so the sweep
+         * handles T_MOVED normally. */
+        for (size_t i = 0; i < rlgc_global.count; i++) {
+            rb_objspace_t *os = rlgc_global.list[i];
+            gc_sweep_rest(os);
+            gc_sweeping_exit(os);
+        }
+    }
+    rlgc_global.compacting = false;
 
     /* RLGCv2: the global GC runs its own unified mark+sweep and never calls
      * gc_marks_finish -- which is where a local GC sets up the next cycle's
@@ -9042,13 +9161,11 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
     int full_marking_p = gc_config_full_mark_val;
     gc_config_full_mark_set(TRUE);
 
-    /* RLGCv2: compaction moves objects -- incompatible with per-Ractor
-     * objspaces (cross-objspace references, the no-move shareable
-     * invariant). GC.compact / GC.verify_compaction_references degrade
-     * to a plain full GC while more than one objspace exists. */
-    if (compact) {
-        compact = rb_gc_single_objspace_p();
-    }
+    /* RLGCv2 Stage 2: compaction moves objects. With multiple objspaces the
+     * global GC's barrier stops every Ractor, so it can relocate and two-phase
+     * reference-update across all objspaces safely (rlgc_global_gc, invoked
+     * below with compact=true). Single-objspace compaction takes the normal
+     * local path (garbage_collect -> gc_start with during_compacting). */
 
     /* For now, compact implies full mark / sweep, so ignore other flags */
     if (compact) {
@@ -9065,8 +9182,8 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
     /* RLGCv2 (design_v2.md §2.2 trigger 4): an explicit full GC.start with
      * multiple objspaces runs the global GC -- the only collector that can
      * reclaim shareables and cross-objspace garbage. */
-    if (!rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK) && !compact) {
-        rlgc_global_gc(objspace);
+    if (!rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK)) {
+        rlgc_global_gc(objspace, compact);
         gc_finalize_deferred(objspace);
         gc_config_full_mark_set(full_marking_p);
         return;
@@ -9418,13 +9535,12 @@ gc_update_references_weak_table_replace_i(VALUE *obj, void *data)
     return ST_CONTINUE;
 }
 
+/* Per-objspace half of reference update: walk this objspace's heap objects and
+ * rewrite each moved reference (following T_MOVED forwarding, cross-objspace).
+ * The compacting global GC runs this for every objspace. */
 static void
-gc_update_references(rb_objspace_t *objspace)
+gc_update_references_heap(rb_objspace_t *objspace)
 {
-    objspace->flags.during_reference_updating = true;
-
-    rb_gc_before_updating_jit_code();
-
     struct heap_page *page = NULL;
 
     for (int i = 0; i < HEAP_COUNT; i++) {
@@ -9444,7 +9560,16 @@ gc_update_references(rb_objspace_t *objspace)
             }
         }
     }
+}
 
+/* VM-global half of reference update: the finalizer table, every Ractor's VM
+ * roots, and the weak tables. These are process-global, so the compacting
+ * global GC runs this exactly ONCE (after every objspace's heap half), not per
+ * objspace -- rb_gc_update_vm_references / the weak-table mark_and_move are not
+ * idempotent and would re-push already-updated objects otherwise. */
+static void
+gc_update_references_global(rb_objspace_t *objspace)
+{
     gc_update_table_refs(finalizer_table);
 
     rb_gc_update_vm_references((void *)objspace);
@@ -9458,6 +9583,17 @@ gc_update_references(rb_objspace_t *objspace)
             table
         );
     }
+}
+
+static void
+gc_update_references(rb_objspace_t *objspace)
+{
+    objspace->flags.during_reference_updating = true;
+
+    rb_gc_before_updating_jit_code();
+
+    gc_update_references_heap(objspace);
+    gc_update_references_global(objspace);
 
     rb_gc_after_updating_jit_code();
 
