@@ -7819,7 +7819,7 @@ heap_ready_to_gc(rb_objspace_t *objspace, rb_heap_t *heap)
 static int
 ready_to_gc(rb_objspace_t *objspace)
 {
-    if (dont_gc_val() || during_gc) {
+    if (rb_gc_gc_disabled_global_p() || dont_gc_val() || during_gc) {
         for (int i = 0; i < HEAP_COUNT; i++) {
             rb_heap_t *heap = &heaps[i];
             heap_ready_to_gc(objspace, heap);
@@ -8520,7 +8520,7 @@ int ruby_thread_has_gvl_p(void);
 static int
 garbage_collect_with_gvl(rb_objspace_t *objspace, unsigned int reason)
 {
-    if (dont_gc_val()) {
+    if (rb_gc_gc_disabled_global_p() || dont_gc_val()) {
         return TRUE;
     }
     else if (!ruby_native_thread_p()) {
@@ -10531,7 +10531,7 @@ objspace_malloc_increase_body(rb_objspace_t *objspace, void *mem, size_t new_siz
 
     if (type == MEMOP_TYPE_MALLOC && gc_allowed) {
       retry:
-        if (malloc_increase > malloc_limit && ruby_native_thread_p() && !dont_gc_val()) {
+        if (malloc_increase > malloc_limit && ruby_native_thread_p() && !dont_gc_val() && !rb_gc_gc_disabled_global_p()) {
             if (ruby_thread_has_gvl_p() && is_lazy_sweeping(objspace)) {
                 gc_sweep_step_for_malloc(objspace); /* sweeping frees may reduce malloc_increase */
                 goto retry;
