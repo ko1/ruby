@@ -244,6 +244,14 @@ objspace を中途半端な状態で渡す)or **VM グローバル GC スクラ�
 
 ### 3.10 メッセージの所有権: materialize-on-receive
 
+> **注(v2 で置換済み)**: 以下は v1 の機構で、receive 側が `ractor_copy`(=ユーザ `#clone`)を
+> **もう一度**走らせるため copy 意味論が 2 回発火する(`initialize_clone` の副作用が観測 2 回)。
+> **v2 はこれをやめ、send/receive とも native 構造コピー**(`ractor_native_shallow_copy` /
+> `ractor_copy_native_try`、ユーザ `#clone` を呼ばない。singleton 等は Marshal に fall through)
+> に置換した(design_v2.md 決定 11 / §4.4)。したがって v2 では native-copyable 型は
+> **ユーザコピーフック 0 回**、Marshal 経路は `marshal_dump`/`marshal_load` が各 1 回
+> (標準プロトコル)で、「2 回発火」は起きない。この §3.10 は v1 の歴史的記述として残す。
+
 **背景の問題**: Ractor 間で送ったコピー(`basket_type_copy`/`move`)は、送信側 S のコンテキストで `ractor_copy`
 (=`#clone`)が走るため **S の objspace に物理的に確保**される。受信(`ractor_basket_accept`)は
 `reset_belonging` で所有を受信側 R にするだけで再配置しない。結果「物理的には S・論理的所有は R」という
