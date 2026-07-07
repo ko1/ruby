@@ -6240,7 +6240,12 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
     if (strcmp(category, "machine_context") == 0 ||
         strcmp(category, "vm_registered_objects") == 0 ||
         strcmp(category, "end_proc") == 0 ||
-        strcmp(category, "trap_list") == 0) {
+        strcmp(category, "trap_list") == 0 ||
+        /* design §2.1 3.e: the VM-single registered-globals lists are walked
+         * conservatively by EVERY Ractor's root scan (a slot may hold another
+         * objspace's value); rb_gc_mark_maybe self-filters to own-objspace
+         * values, so foreign entries named here are by design, not a leak. */
+        strcmp(category, "registered_globals") == 0) {
         return;
     }
 
