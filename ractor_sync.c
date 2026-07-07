@@ -981,10 +981,6 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
 
         rb_gc_objspace_absorb_into_current(&r->objspace);
 
-        /* RLGCv2: join した Ractor r の登録済み VM グローバル root を joiner へ
-         * 移管し、joiner の local GC がその不滅オブジェクトを生かし続けるようにする。 */
-        rb_ractor_absorb_registered_globals(GET_RACTOR(), r);
-
         /* inherit したオブジェクトは今や我々のものだが、それらへの唯一の
          * 経路は死んだ Ractor の C struct であり、Ractor オブジェクトを
          * 所有する者（通常は別の Ractor で、その mark は我々のオブジェクトを

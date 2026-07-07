@@ -4779,6 +4779,7 @@ Init_BareVM(void)
     // setup ractor system
     rb_native_mutex_initialize(&vm->ractor.sync.lock);
     rb_native_cond_initialize(&vm->ractor.sync.terminate_cond);
+    rb_native_mutex_initialize(&vm->gc.registered_globals.lock);
 
     vm_opt_method_def_table = st_init_numtable();
     vm_opt_mid_table = st_init_numtable();
@@ -4820,7 +4821,19 @@ rb_vm_register_global_object(VALUE obj)
       default:
         break;
     }
-    rb_ractor_register_mark_object(GET_RACTOR(), obj);
+    /* RLGCv2 (design §2.1 3.e): the registered-globals lists are VM-single;
+     * every Ractor's GC walks them conservatively (see rb_gc_mark_roots). */
+    rb_vm_t *vm = GET_VM();
+    rb_native_mutex_lock(&vm->gc.registered_globals.lock);
+    if (vm->gc.registered_globals.marks_cnt == vm->gc.registered_globals.marks_capa) {
+        size_t nc = vm->gc.registered_globals.marks_capa ? vm->gc.registered_globals.marks_capa * 2 : 64;
+        VALUE *p = realloc(vm->gc.registered_globals.marks, nc * sizeof(VALUE));
+        if (!p) rb_bug("rb_vm_register_global_object: out of memory");
+        vm->gc.registered_globals.marks = p;
+        vm->gc.registered_globals.marks_capa = nc;
+    }
+    vm->gc.registered_globals.marks[vm->gc.registered_globals.marks_cnt++] = obj;
+    rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
     RB_GC_GUARD(obj);
 }
 
