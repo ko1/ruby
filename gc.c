@@ -3803,16 +3803,22 @@ rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *
         void *self = rb_gc_get_objspace();
         rb_gc_impl_each_objects(self, callback, data);
 
-        /* RLGCv2: also reach the shareable objects owned by other live
-         * Ractors (their iseqs, callcaches, ...). The barrier keeps every
-         * live objspace stable; being-created and zombie objspaces are
-         * intentionally skipped -- their heaps are not in a walkable state
-         * and they hold nothing a caller of this API needs to see. */
+        /* RLGCv2: upstream semantics -- every object in the process. The other
+         * live Ractors' objspaces are walked too (unshareables included; the
+         * being-created / zombie objspaces are skipped -- their heaps are not
+         * in a walkable state). Callers' callbacks must be pure C and never
+         * yield: the whole walk runs under the VM lock + barrier. Nothing but
+         * what the callback itself extracts leaves the walk, so no
+         * cross-Ractor object reference is created by the walk itself.
+         * A foreign objspace's paused lazy sweep is NOT settled here (running
+         * its obj_free/dfree on this thread would use the wrong Ractor
+         * identity); the dead-but-unswept objects are skipped in the walk
+         * instead (rb_gc_impl_each_objects_foreign). */
         rb_vm_t *vm = GET_VM();
         rb_ractor_t *r;
         ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
             if (r->objspace && r->objspace != self) {
-                rb_gc_impl_each_objects_shareable(r->objspace, callback, data);
+                rb_gc_impl_each_objects_foreign(r->objspace, callback, data);
             }
         }
     }
@@ -3830,34 +3836,6 @@ rb_objspace_each_objects_local(int (*callback)(void *, void *, size_t, void *), 
     }
 }
 
-/* Every object of every live Ractor's objspace -- foreign unshareables
- * included. ONLY for callers whose callback is pure C and never yields
- * (heap dumps, memory accounting: ObjectSpace.dump_all / memsize_of_all /
- * count_*): the walk holds the VM lock + barrier, so every objspace is
- * stable, and nothing but text/numbers leaves the walk -- no cross-Ractor
- * object reference is created. Foreign objspaces are walked without
- * settling their paused lazy sweeps (that is their owner's job -- running
- * their obj_free here would use this Ractor's identity); the dead-but-
- * unswept objects are skipped instead. Being-created / zombie objspaces
- * are skipped like in rb_objspace_each_objects. */
-void
-rb_objspace_each_objects_all(int (*callback)(void *, void *, size_t, void *), void *data)
-{
-    RB_VM_LOCKING() {
-        rb_vm_barrier();
-
-        void *self = rb_gc_get_objspace();
-        rb_gc_impl_each_objects(self, callback, data);
-
-        rb_vm_t *vm = GET_VM();
-        rb_ractor_t *r;
-        ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
-            if (r->objspace && r->objspace != self) {
-                rb_gc_impl_each_objects_foreign(r->objspace, callback, data);
-            }
-        }
-    }
-}
 
 /* Enumerate every objspace in the process: the living Ractors' ones and
  * the retired (zombie) ones of terminated, not yet inherited Ractors.

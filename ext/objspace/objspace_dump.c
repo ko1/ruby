@@ -881,7 +881,7 @@ dump_all_locked(void *args_p)
     /* dump all objects -- every Ractor's objspace (the caller holds the VM
      * lock + barrier and heap_i is pure C, so foreign heaps are safe to
      * read; only JSON text leaves this walk). */
-    rb_objspace_each_objects_all(heap_i, &dc);
+    rb_objspace_each_objects(heap_i, &dc);
 
     return dump_result(&dc);
 }
