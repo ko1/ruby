@@ -1109,9 +1109,9 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
          * every OTHER Ractor's walk out of this window; suppress the creator's
          * own re-entrant GC too. It is a single wrapper object, so the heap
          * just grows by a slot instead of collecting. */
-        VALUE gc_was_disabled = rb_gc_disable_no_rest();
+        VALUE gc_was_disabled = rb_gc_local_disable_no_rest();
         thval = rb_thread_alloc(rb_cThread);
-        if (gc_was_disabled == Qfalse) rb_gc_enable();
+        if (gc_was_disabled == Qfalse) rb_gc_local_enable();
         cr->objspace = parent_objspace;
         /* The child's objspace now holds its Thread/Fiber wrappers but the child
          * is not yet in vm->ractor.set. Keep it enumerable (a global GC that

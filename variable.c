@@ -1540,11 +1540,11 @@ rb_obj_set_fields(VALUE obj, VALUE fields_obj, ID field_name, VALUE original_fie
                  * （自己再入回避）。owner=GET_RACTOR() の write なので per-Ractor 表は無ロック
                  * （shareable のみ global mutex）。 */
                 struct st_table *tbl = generic_fields_tbl_for(obj, true);
-                bool gc_disabled = RTEST(rb_gc_disable_no_rest());
+                bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
                 generic_fields_write_lock(tbl);
                 st_insert(tbl, (st_data_t)obj, (st_data_t)fields_obj);
                 generic_fields_write_unlock(tbl);
-                if (!gc_disabled) rb_gc_enable();
+                if (!gc_disabled) rb_gc_local_enable();
                 RB_OBJ_WRITTEN(obj, original_fields_obj, fields_obj);
 
                 rb_execution_context_t *ec = GET_EC();
@@ -2379,14 +2379,14 @@ rb_replace_generic_ivar(VALUE clone, VALUE obj)
      * shareable 状態を前提とする（同じ表に属す）。insert は malloc しうるので
      * rb_obj_set_fields と同じ GC 無効化の作法に従う。 */
     struct st_table *tbl = generic_fields_tbl_for(obj, true);
-    bool gc_disabled = RTEST(rb_gc_disable_no_rest());
+    bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
     generic_fields_write_lock(tbl);
     int moved = st_delete(tbl, &obj_data, &fields_tbl);
     if (moved) {
         st_insert(tbl, (st_data_t)clone, fields_tbl);
     }
     generic_fields_write_unlock(tbl);
-    if (!gc_disabled) rb_gc_enable();
+    if (!gc_disabled) rb_gc_local_enable();
     if (moved) {
         RB_OBJ_WRITTEN(clone, Qundef, fields_tbl);
     }
@@ -2510,7 +2510,7 @@ rb_mv_generic_ivar_to_shared(VALUE obj)
     /* an st_insert may allocate (resize); keep this thread's own confined GC
      * out -- its mark/sweep take generic_fields_lock (self-deadlock) and could
      * observe the entry mid-move. */
-    bool gc_disabled = RTEST(rb_gc_disable_no_rest());
+    bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
     bool has_entry = (src != NULL) && st_lookup(src, key, &val);
 
     rb_native_mutex_lock(&generic_fields_lock);
@@ -2525,7 +2525,7 @@ rb_mv_generic_ivar_to_shared(VALUE obj)
         st_delete(src, &key, NULL);  /* owner-exclusive per-Ractor table */
     }
 
-    if (!gc_disabled) rb_gc_enable();
+    if (!gc_disabled) rb_gc_local_enable();
 }
 
 struct gf_absorb_ctx {
@@ -2559,12 +2559,12 @@ rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src)
         return;
     }
 
-    VALUE gc_was_disabled = rb_gc_disable_no_rest();
+    VALUE gc_was_disabled = rb_gc_local_disable_no_rest();
     struct gf_absorb_ctx ctx = { dst->generic_fields_tbl };
     st_foreach(src->generic_fields_tbl, gf_absorb_i, (st_data_t)&ctx);
     st_free_table(src->generic_fields_tbl);
     src->generic_fields_tbl = NULL;
-    if (gc_was_disabled == Qfalse) rb_gc_enable();
+    if (gc_was_disabled == Qfalse) rb_gc_local_enable();
 }
 
 void

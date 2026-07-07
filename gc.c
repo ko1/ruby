@@ -1040,11 +1040,11 @@ gc_newobj_hook(VALUE obj)
          * to trigger a GC right after an object has been allocated because
          * they perform initialization for the object and assume that the
          * GC does not trigger before then. */
-        bool gc_disabled = RTEST(rb_gc_disable_no_rest());
+        bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
         {
             rb_gc_event_hook(obj, RUBY_INTERNAL_EVENT_NEWOBJ);
         }
-        if (!gc_disabled) rb_gc_enable();
+        if (!gc_disabled) rb_gc_local_enable();
     }
     RB_GC_VM_UNLOCK_NO_BARRIER(lev);
 }
@@ -4982,38 +4982,39 @@ rb_gc_initial_stress_set(VALUE flag)
  * disabling, for internal critical sections that only need to suppress the
  * current Ractor's own re-entrant GC, is rb_objspace_gc_* (explicit objspace,
  * e.g. the verifier) and rb_gc_local_* (current objspace). */
-static bool ruby_gc_disabled_global = false;
+/* Atomic: any Ractor may toggle it, and every Ractor's ready_to_gc reads it. */
+static rb_atomic_t ruby_gc_disabled_global = 0;
 
 bool
 rb_gc_gc_disabled_global_p(void)
 {
-    return ruby_gc_disabled_global;
+    return RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0;
 }
 
 VALUE
 rb_gc_enable(void)
 {
-    bool was_disabled = ruby_gc_disabled_global;
-    ruby_gc_disabled_global = false;
+    bool was_disabled = RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0;
+    RUBY_ATOMIC_SET(ruby_gc_disabled_global, 0);
     return RBOOL(was_disabled);
 }
 
 VALUE
 rb_gc_disable_no_rest(void)
 {
-    bool was_disabled = ruby_gc_disabled_global;
-    ruby_gc_disabled_global = true;
+    bool was_disabled = RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0;
+    RUBY_ATOMIC_SET(ruby_gc_disabled_global, 1);
     return RBOOL(was_disabled);
 }
 
 VALUE
 rb_gc_disable(void)
 {
-    bool was_disabled = ruby_gc_disabled_global;
+    bool was_disabled = RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0;
     if (!was_disabled) {
         rb_gc_impl_gc_rest(rb_gc_get_objspace());
     }
-    ruby_gc_disabled_global = true;
+    RUBY_ATOMIC_SET(ruby_gc_disabled_global, 1);
     return RBOOL(was_disabled);
 }
 
