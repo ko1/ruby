@@ -1094,7 +1094,7 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
      * child heap is a no-op thanks to the containment guards.
      * The retargeting must be invisible to others: cr->objspace doubles as
      * "where this Ractor's objects live" for whole-VM walks
-     * (rb_objspace_each_objects_all), so swap under the VM lock -- a
+     * (rb_objspace_each_objects), so swap under the VM lock -- a
      * barrier-protected walker can then never observe the swapped state. */
     VALUE thval;
     rb_ractor_t *cr = GET_RACTOR();
