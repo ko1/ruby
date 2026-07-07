@@ -130,6 +130,7 @@ GC_IMPL_FN void rb_gc_impl_pin_in_flight_message(void *objspace_ptr, VALUE obj);
 // Heap walking
 GC_IMPL_FN void rb_gc_impl_each_objects(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
 GC_IMPL_FN void rb_gc_impl_each_objects_shareable(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
+GC_IMPL_FN void rb_gc_impl_each_objects_foreign(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
 GC_IMPL_FN bool rb_gc_impl_during_global_gc_p(void *objspace_ptr);
 GC_IMPL_FN bool rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN size_t rb_gc_impl_heap_page_count(void *objspace_ptr);
