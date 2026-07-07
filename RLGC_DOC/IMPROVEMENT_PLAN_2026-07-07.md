@@ -47,7 +47,10 @@
 | B-1,3,4,7,10,11,14,15 | 修正済み |
 | **B-6** | **本日修正(38c24f753)** — §4.1 |
 | **C-3** | **本日修正(同コミット)** — empty_page ループに free_next 前進を追加 |
-| B-2, B-5, B-8, B-9, B-12, B-13 | open(§3 で計画) |
+| **B-2** | **07-07 解決**(ko1 決定「全 Ractor が保守的に見る」= S-2 単一リスト復帰) |
+| **B-9** | **07-07 解決**(ko1 決定「自 Ractor のオブジェクトなら通す」= doc を所有権ベースに改訂) |
+| B-5 | ko1 判断: 当面無視 |
+| B-8, B-12, B-13 | open(§3 で計画) |
 | 改善 1〜9 | 一部済(9 の repro 群は fix batch で追加)、残は §3 |
 | doc 問題群 | 一部済(lock model, compaction, §3.1/3.2 追記等)。残あり |
 
@@ -82,15 +85,15 @@
 
 ### P3 — 設計判断が必要(ko1 判断待ち。実装はどれも小さい)
 
-9. **B-2: registered address の契約** — 選択肢は
-   (a) PATCH_REDUCTION S-2 案 = 単一リスト復帰(B-2 ごと解決、パッチも縮む/推奨)、
-   (b) 全リスト走査の復活、(c)「登録スロットへの store は登録 Ractor のみ」の契約明文化。
-   B-1 の観測罠(01e0aed1e)が実在数を報告するまでの繋ぎは現状で可。
-10. **B-9: 決定12 の文言** — 推奨: design_v2.md を実装(所有権ベース)に合わせて
-    「finalizer は所有 objspace からのみ。foreign は shareable 含め拒否」へ改訂
-    (own-shareable の finalizer は absorb 経由で正しく発火することを実測済み)。
+9. ~~B-2: registered address の契約~~ **解決(2026-07-07, ko1 決定=「全 Ractor が保守的に見る」)**:
+   S-2 を実装 — 登録リストを VM 単一(vm->gc.registered_globals + leaf lock)へ復帰し、
+   **全 Ractor の root walk が全登録を走査**(mark_maybe の own-objspace filter が選別)。
+   per-Ractor 分割・absorb 移送・zombie-owner 特例・B-1 観測罠を撤去(cross-Ractor
+   unregister は単一リストで自然に動作)。design §2.1 手順 3.e と実装が再び一致。
+10. ~~B-9: 決定12 の文言~~ **解決(2026-07-07, ko1 決定=「自 Ractor のオブジェクトなら通す」)**:
+    design_v2.md 決定12 を所有権ベース(実装 e11013b5f どおり)に改訂済み。
 11. **B-5: at_exit/END 非 main エラー化** — 仕様確定済(Matz 合意)・実装未着手。
-    実装自体は小さい。ユーザ可視の仕様変更なのでタイミングは ko1 判断。
+    **2026-07-07 ko1 判断: 当面無視**(実装しない)。
 12. **改善1: 会計系 pacing**(single→multi 遷移の shareable_objects 再計数、
     stalled_shareables の過大計上) — 性能チューニングとして一括で。
 13. **改善2: move の「ゼロコピー」方針** — steal をやめるか adopt を実装するか。
@@ -101,7 +104,8 @@
 
 ### P4 — doc 反映(レビュー §3 の残り)
 
-16. §2.1 3.e(registered globals)の per-Ractor 化反映は **B-2 の判断とセット**で。
+16. ~~§2.1 3.e の反映~~ **不要になった**: S-2 実装で per-Ractor 分割を撤去し、
+    実装が §2.1 3.e の記述(単一リスト・全走査)に復帰したため doc は正確に戻った。
 17. 決定16(T_DATA 宣言機構)に【未実装・現状は全 T_DATA が local GC 参加】を明記。
 18. id2ref の user-visible 非互換(非 main の `_id2ref` = RangeError)を決定として記録。
 19. STATUS_2026-06-28.md に superseded 注記(現況表は STATUS_v2 に一本化)。

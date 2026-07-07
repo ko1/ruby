@@ -64,9 +64,12 @@ single writer から「割り当ても GC もロック不要」が出る。
     フック仕様には従う)。どちらにも乗らない型は送信エラー。残りは後で考える(§4.2)。
 12. `define_finalizer` できるのは対象オブジェクトの所有 objspace(= 生成した objspace)
     だけ。他の Ractor から設定しようとしたらエラー。登録・テーブル・実行のすべてが所有
-    Ractor に閉じる(§2.1)。2026-06-12 確定: **shareable も一律拒否**
-    (Ractor::IsolationError; 非 frozen な shareable = Class/Module が実質対象。undefine も
-    対称)。**clone/dup は cross-objspace では finalizer を引き継がない**(Ruby の clone は
+    Ractor に閉じる(§2.1)。2026-07-07 確定(所有権ベース、実装 e11013b5f どおり):
+    **自 Ractor のオブジェクトなら shareable(非 frozen = Class/Module)でも許可**し、
+    foreign なら shareable 含め Ractor::IsolationError(undefine も対称)。own-shareable の
+    finalizer エントリは所有 objspace の表に住み、Ractor 終了時は継承(absorb)先へ
+    移送されて正しく発火する(実測済み)。(旧 2026-06-12 案の「shareable 一律拒否」は
+    所有権ベースに置き換え。)**clone/dup は cross-objspace では finalizer を引き継がない**(Ruby の clone は
     元々 finalizer を運ばない — 公開 C API rb_gc_copy_finalizer の cross-objspace 呼び出し
     だけが対象で、no-op にする)。
 13. **WB-unprotected な shareable は unshareable を参照しない**、を不変条件とする。
