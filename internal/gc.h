@@ -174,12 +174,15 @@ struct rb_gc_object_metadata_entry {
  * need to temporarily disable the GC to allow the malloc to happen.
  * Allocating memory during GC is a bad idea, so use this only when absolutely
  * necessary. */
+/* This suppresses only the current objspace's re-entrant GC (the malloc happens
+ * in this Ractor), so it uses the local disable -- the malloc-during-GC guard
+ * checks the per-objspace dont_gc flag, not the process-wide one. */
 #define DURING_GC_COULD_MALLOC_REGION_START() \
     assert(rb_during_gc()); \
-    VALUE _already_disabled = rb_gc_disable_no_rest()
+    VALUE _already_disabled = rb_gc_local_disable_no_rest()
 
 #define DURING_GC_COULD_MALLOC_REGION_END() \
-    if (_already_disabled == Qfalse) rb_gc_enable()
+    if (_already_disabled == Qfalse) rb_gc_local_enable()
 
 /* gc.c */
 RUBY_ATTR_MALLOC void *ruby_mimmalloc(size_t size);
@@ -246,6 +249,13 @@ void rb_objspace_each_objects_local(
 size_t rb_gc_obj_slot_size(VALUE obj);
 
 VALUE rb_gc_disable_no_rest(void);
+/* RLGCv2: per-objspace ("local") GC disable/enable for the current Ractor --
+ * suppresses only this objspace's own GC, unlike rb_gc_disable* which are now
+ * process-wide. Exported because the DURING_GC_COULD_MALLOC_REGION macro above
+ * expands to them in bundled extensions (ext/objspace, weakmap). */
+VALUE rb_gc_local_enable(void);
+VALUE rb_gc_local_disable(void);
+VALUE rb_gc_local_disable_no_rest(void);
 
 #define RB_GC_MAX_NAME_LEN 20
 
