@@ -41,7 +41,7 @@
 - worker の local GC: **無ロック**(封じ込め+atomic bitmap)
 - main の local GC: **no-barrier VM lock**(VM グローバル root walk の保護)
 - global GC: VM lock + barrier(`gc_enter_event_global`)
-- **GC の内側では VM lock を取らない**(待機=バリア合流=半回収ヒープ露出)。GC 経路が触る VM 共有構造は専用 native mutex: registered globals / id2ref / generic fields(+ページプール固有 lock)。クリティカルセクションは「確保しない・ブロックしない」規律(確保が要る挿入は GC 禁止区間か二相)
+- **GC の内側では barrier 参加型の VM lock を取らない**(pending barrier に mid-GC で合流=半回収ヒープ露出)。NO_BARRIER の VM lock は機能的には安全(barrier owner は join 待ちの間 mutex を手放す=thread_pthread.c rb_ractor_sched_barrier_start)だが、hot な GC 経路が取ると全 Ractor が global lock に再直列化するので、**頻度で使い分ける**: hot 経路(root walk 等)が触る VM 共有構造は専用 leaf mutex(registered globals / id2ref / shareable generic fields / ページプール)、**稀な free 経路(shared fiber pool の stack release 等)は NO_BARRIER VM lock で足りる**。leaf lock のクリティカルセクションは「確保しない・ブロックしない」規律(確保が要る挿入は GC 禁止区間か二相)
 
 ## global GC の起動条件(§2.2、全 3 種実装済み)
 
