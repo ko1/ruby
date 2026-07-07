@@ -1788,6 +1788,7 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
                         err++;
                         goto skip;
                     }
+                    empty_page = empty_page->free_next;
                 }
                 fprintf(stderr, "check_rvalue_consistency: %p is not a Ruby object.\n", (void *)obj);
                 err++;
@@ -3359,6 +3360,17 @@ objspace_each_objects_try(VALUE arg)
                  * unshareable objects -- the caller runs with its own Ractor's
                  * structures and cannot safely inspect them. */
                 if (page->has_shareable_objects) {
+                    /* This walk runs on a FOREIGN objspace (under the barrier)
+                     * and must not settle its owner's paused lazy sweep -- that
+                     * would run the owner's obj_free/dfree on this thread with
+                     * this Ractor's identity (wrong per-Ractor tables, foreign
+                     * T_DATA dfree). So instead of gc_rest, skip the objects a
+                     * pending sweep is about to free: on an unswept page, an
+                     * unmarked object is dead, its shareable bit merely not yet
+                     * bulk-cleared. Handing one to the callback would resurrect
+                     * it (e.g. give ObjectSpace.each_object a reference that the
+                     * owner's sweep frees right after the barrier lifts). */
+                    const bool page_unswept = is_lazy_sweeping(objspace) && page->flags.before_sweep;
                     int planes = CEILDIV(page->total_slots, BITS_BITLENGTH);
                     uintptr_t base = pstart;
                     bool stop = false;
@@ -3367,6 +3379,7 @@ objspace_each_objects_try(VALUE arg)
                         uintptr_t slot = base;
                         while (bits) {
                             if ((bits & 1) && data->each_obj_callback &&
+                                !(page_unswept && !RVALUE_MARKED(objspace, (VALUE)slot)) &&
                                 (*data->each_obj_callback)((void *)slot, (void *)(slot + heap->slot_size),
                                                            heap->slot_size, data->data)) {
                                 stop = true;
@@ -3449,7 +3462,16 @@ rb_gc_impl_each_objects_shareable(void *objspace_ptr, each_obj_callback *callbac
         .each_page_callback = NULL,
         .data = data,
     };
-    objspace_each_exec(TRUE, &each_obj_data);
+    /* NOT protected: objspace is another Ractor's (the caller holds the
+     * barrier). The protected path would gc_rest it -- running the OWNER's
+     * paused lazy sweep (obj_free / dfree) on the walking thread with the
+     * walker's Ractor identity: its per-Ractor tables (generic fields etc.)
+     * would be consulted for the owner's objects, and foreign T_DATA dfree
+     * would run in the wrong Ractor context. The owner is parked, so its page
+     * lists are stable; the walk itself skips dead-but-unswept objects (see
+     * the shareable_only branch of objspace_each_objects_try). The walker's
+     * own incremental GC state is untouched -- this is not its objspace. */
+    objspace_each_exec(FALSE, &each_obj_data);
 }
 
 #if GC_CAN_COMPILE_COMPACTION
