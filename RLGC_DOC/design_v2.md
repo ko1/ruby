@@ -168,9 +168,12 @@ single writer から「割り当ても GC もロック不要」が出る。
   safepoint(trace 有効時など)で別スレッドへ制御を渡し VM lock 所有を乱す。cross-Ractor
   each_object が要るなら「barrier 下で shareable を collect → lock 解放 → yield」の
   collect-then-yield が必要で、現状は未実装。よって each_object は current-Ractor のみ。)
-- **compaction は objspace が複数ある間は不可**(`GC.compact` / `GC.auto_compact=` /
-  `GC.verify_compaction_references` の 3 経路すべてを非移動 full GC に degrade)。Ractor が
-  1 個のときのみ従来どおり許可(§2.5)。
+- **compaction は複数 objspace でも動く(global GC の一部として実装済み、commit 0b23f634c)**:
+  `GC.compact` / `GC.auto_compact=` / `GC.verify_compaction_references` は、Ractor が 1 個の
+  ときは従来どおり local compaction、複数のときはバリアで全 Ractor を止めた global GC が
+  ①全 objspace 移動 → ②全 objspace 参照更新 → ③全 objspace sweep の 3 相で実行する
+  (§2.2 末尾)。所有権は変えない。かつては複数 objspace で非移動 full GC に degrade して
+  いたが、その制約は撤廃された。
 - **既知の設計逸脱が 1 つ**: shareable(isolated-proc)env の特殊変数($~ / $_)。設計意図は
   per-EC(`ec->root_svar`)で、escaped な shareable env については per-EC 化が実装済み
   (`lep_svar_in_env_p` → `ec->root_svar`)。しかし shareable env スロットへ直接書く残存経路
@@ -627,12 +630,22 @@ local GC では回収できず、global GC まで滞留し続けるからであ�
      objspace を main に併合する(§2.3)。
 10. 全 objspace の「global GC 中」の印を下ろし、バリアを解除する。
 
-**compaction について**: GC.compact / GC.auto_compact= / GC.verify_compaction_references
-は、オブジェクトの移動が全空間の参照更新を要するため per-Ractor objspace の世界では
-そのまま動かせない。当面は **objspace が複数あるときは非移動の full GC に degrade**
-する(誤って動くと heap corruption になる面は v1 で実証済み)。将来は **global GC
-(STW)の一部**として「各 objspace 内でのページ内移動 + バリア内での全空間参照更新」
-の形で実装する方針(所有権は変えない。バリア内なら参照更新は安全に行える)。
+**compaction について**(実装済み commit 0b23f634c): GC.compact / GC.auto_compact= /
+GC.verify_compaction_references は、オブジェクトの移動が全空間の参照更新を要する。
+objspace が 1 個のときは従来どおり local compaction。**複数のときは global GC(STW)の
+一部として実行する**。single-objspace の「move → 参照更新 → free」を、全 Ractor を
+バリアで止めたうえで全 objspace に **相ごとにループ**して適用する:
+
+1. **相①(move)**: 全 objspace を relocate し、移動元に T_MOVED forwarding を残す。
+2. **相②(update)**: 全 objspace の参照を更新する。相①で全 forwarding が確定しているので、
+   別 objspace の移動済みオブジェクトを指す cross-objspace 参照も解決できる。
+3. **相③(free)**: 全 objspace を page-sweep し、移動元ページと死オブジェクトを解放する。
+
+所有権は変えない。バリア内なので参照更新は安全。**per-objspace で move/free を交互に
+実行してはならない**(ある objspace の相③ free が別 objspace の相② update より先に T_MOVED
+source を解放すると壊れる)ので、必ず相ごとに全 objspace をループする。実装上の要点
+(mark/location/pin の objspace-context は driver の flag を見る、参照更新の VM-global 半分は
+1 回だけ、`rb_gc_impl_location` は全 objspace の T_MOVED を辿る 等)はコミットログ参照。
 
 ### 2.3 Ractor 終了 — objspace は join した者が、いなければ main が引き継ぐ
 
@@ -772,13 +785,32 @@ enable しても main の iseq が計装されない)。これを `rb_objspace_e
 objspace への割り当て)は必ず VM lock 下で行い、barrier を張った walker から差し替え中の
 状態が見えないようにする。
 
-### 2.5 compaction
+### 2.5 compaction (実装済み commit 0b23f634c)
 
-objspace が複数ある間は不可(オブジェクトを動かすと、他 objspace からの参照・shref_bits・
-「shareable は動かない」前提が全部壊れる)。`GC.compact` / `GC.verify_compaction_references` /
-`GC.auto_compact=` の **3 経路すべて**をガードする — どれか 1 つでも漏れると、worker の
-居る状態の full GC が compaction を実行してヒープ全体が壊れる。Ractor が 1 個のときは
-従来どおり許可。
+objspace が 1 個のときは従来どおり local compaction。**複数のときは global GC(STW)の
+一部として全 objspace を実 compact する**(§2.2 末尾に相構成)。以前は「動かすと他 objspace
+からの参照・shref_bits・『shareable は動かない』前提が壊れる」ため 3 経路
+(`GC.compact` / `GC.verify_compaction_references` / `GC.auto_compact=`)を非移動 full GC に
+degrade していたが、**global GC は既に全 Ractor をバリアで止めている**ので、その中でなら
+shareable も含めて安全に動かせる — 動かした後にバリア内で全 objspace の参照
+(cross-objspace 参照・shref 経由の子・VM-global root)を更新すればよい。
+
+要点(かつて「前提が壊れる」と言っていた各点が、バリア内でどう解決されるか):
+
+- **他 objspace からの参照**: 相①で全 objspace を move してから相②で全 objspace の参照を
+  更新するので、cross-objspace 参照も T_MOVED forwarding を辿って解決できる。相ごとに
+  全 objspace をループするのが必須(per-objspace 交互だと free が他 objspace の update を追い越す)。
+- **「shareable は動かない」前提**: これが崩れる箇所を global GC 時だけ全 objspace 対応に
+  した。特に `rb_gc_impl_location` は「foreign 参照は動かない」と即 return していたが、
+  global GC 中は `rlgc_global_pointer_to_heap_p` で全 objspace の T_MOVED を辿る。
+- **mark/pin/move の objspace-context**: `RB_GC_MARK_OR_TRAVERSE` / `gc_pin` は
+  `rb_gc_get_objspace()`(=driver)の flag を見るので、`during_reference_updating` /
+  `during_compacting` は全 objspace に立てる。pinned_slots reset や参照更新の VM-global
+  半分(1 回だけ)など、local compaction が gc_marks_start / gc_sweep で担う後始末を global GC
+  側で明示的に補う。
+
+検証: CHECK/ASAN/TSAN/YJIT の multi-Ractor compaction stress・`GC.verify_compaction_references`
+の multi-Ractor 実行・単一 objspace 回帰(test_gc_compact/gc/objspace/ractor)すべて green。
 
 ## 3. newobj 戦略
 
