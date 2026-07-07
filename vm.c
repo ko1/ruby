@@ -3932,14 +3932,18 @@ thread_mark(void *ptr)
         rb_fiber_mark_self(th->ec->fiber_ptr);
     }
 
-    /* No mark through th->ractor: a thread wrapper can outlive its
-     * rb_ractor_t (the struct dies with the Ractor object, while the
-     * wrapper of a dead Ractor's thread can be inherited through
-     * Ractor#value or linger until its own sweep -- with a live ec, if
-     * the root fiber wrapper is alive too). A live Ractor's object is
-     * rooted from the VM's ractor set, so this edge never carried any
-     * liveness; chasing the pointer here crashed real marks on merged
-     * dead-Ractor heaps. */
+    /* Upstream edge: a live thread wrapper keeps its Ractor's object (and
+     * through its dfree, the rb_ractor_t) alive. Under RLGCv2 this is what
+     * lets the zombie ledger keep a winding-down thread's Ractor around by
+     * marking just the wrapper, and what makes an inherited Thread
+     * (Ractor#value returning Thread.current) retain its dead Ractor's
+     * object exactly like upstream. The once-observed dangling th->ractor
+     * (307933468) came from the return-value graph being kept alive by a
+     * pin alone while the Ractor object died unreferenced; since the value
+     * graph is marked through the Ractor object's own dmark
+     * (ractor_sync_mark's r->sync.legacy), the two die together instead,
+     * and this edge is safe again. */
+    if (th->ractor) rb_gc_mark(rb_ractor_self(th->ractor));
     if (th->root_fiber) rb_fiber_mark_self(th->root_fiber);
 
     RUBY_ASSERT(th->ec == NULL || th->ec == rb_fiberptr_get_ec(th->ec->fiber_ptr));
