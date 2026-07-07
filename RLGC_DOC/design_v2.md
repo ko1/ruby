@@ -163,13 +163,16 @@ single writer から「割り当ても GC もロック不要」が出る。
   歩かない(列挙 SEGV を閉じる)。cross-Ractor 走査を使うのは **callback が C コードで
   yield しない sweep 系のみ**(TracePoint 計装・attr/bf コールキャッシュ一掃・coverage 削除)。
   自分の objspace だけ見たい caller は `rb_objspace_each_objects_local`(barrier は取るが
-  cross-Ractor 走査はしない): **`ObjectSpace.each_object`**・`ObjectSpace.dump_all`・
-  objspace 拡張・JIT の iseq 走査・method coverage。旧 `rb_objspace_each_objects_all` は撤去済み。
-  (注: `ObjectSpace.each_object` を cross-Ractor 化すると、他 Ractor の shareable を
-  **ユーザブロックへ yield** することになり、その yield が barrier + VM lock 保持中に
-  safepoint(trace 有効時など)で別スレッドへ制御を渡し VM lock 所有を乱す。cross-Ractor
-  each_object が要るなら「barrier 下で shareable を collect → lock 解放 → yield」の
-  collect-then-yield が必要で、現状は未実装。よって each_object は current-Ractor のみ。)
+  cross-Ractor 走査はしない): `ObjectSpace.dump_all`・objspace 拡張・JIT の iseq 走査・
+  method coverage。旧 `rb_objspace_each_objects_all` は撤去済み。
+  - **`ObjectSpace.each_object` は「自 objspace 全 + 他 Ractor の shareable」を列挙する
+    (実装済み、commit fdf633eef、§3.2)**。ユーザブロックへ yield するので単純な
+    cross-Ractor 走査は使えない(他 Ractor の shareable を yield すると、その yield が
+    barrier 保持中に safepoint で同 Ractor の別スレッドに制御を渡し、per-Ractor VM lock を
+    乱す/barrier を早期終了させる。ブロック系呼び出しなら parked Ractor と deadlock)。
+    そこで **2 相**にする: 相1=自 objspace は barrier 無しで直接 yield(single-Ractor と同一)、
+    相2=他 Ractor の shareable は barrier 下で Array に collect(純 C・yield 無し)→ barrier
+    解放 → yield。collect 中は buffer の backing 成長が GC を起こさないよう GC.disable。
 - **compaction は複数 objspace でも動く(global GC の一部として実装済み、commit 0b23f634c)**:
   `GC.compact` / `GC.auto_compact=` / `GC.verify_compaction_references` は、Ractor が 1 個の
   ときは従来どおり local compaction、複数のときはバリアで全 Ractor を止めた global GC が
@@ -766,23 +769,24 @@ enable しても main の iseq が計装されない)。これを `rb_objspace_e
 - **自分の objspace は全オブジェクト**を、**他の生きている Ractor の objspace は
   shareable オブジェクトだけ**を渡す(`shareable_bits` を索引に 1 スロットずつ callback。
   ページ丸ごとの range では他 Ractor の unshareable まで callback に渡ってしまい、
-  それを inspect する caller(例: `ObjectSpace.each_object` の `rb_ractor_shareable_p` →
-  per-Ractor な generic fields 参照)が別 Ractor の構造を誤って引く)。
+  それを inspect する caller(例: `ObjectSpace.each_object` の module フィルタ
+  `rb_obj_is_kind_of`、あるいは generic fields を per-Ractor 表から引く処理)が
+  別 Ractor の構造を誤って引く)。
 - **being-created / zombie の objspace は歩かない**(生成途中・撤収途中で heap が
   walkable でない — 従来の全 objspace 走査(`rb_gc_vm_each_objspace` 経由)がここを
   踏んで発生していた列挙 SEGV を、生きている Ractor だけに絞ることで閉じる)。
 - cross-Ractor 走査を使うのは、**callback が C コードで yield しない sweep 系だけ**
   (TracePoint 計装 `rb_iseq_trace_set_all`・attr/bf コールキャッシュ一掃・coverage 削除。
   1 スロット単位走査により foreign には FL_SHAREABLE だけが渡り、型チェックのみで安全)。
-- caller が「自分の objspace だけを見たい」/ callback がユーザブロックへ yield する場合は
-  **`rb_objspace_each_objects_local`**(barrier は取るが cross-Ractor 走査はしない)。
-  `ObjectSpace.each_object` / `ObjectSpace.dump_all` / objspace 拡張 / JIT の iseq 走査 /
-  method coverage はこれ。**`ObjectSpace.each_object` を cross-Ractor 化しない理由**: 他 Ractor
-  の shareable をユーザブロックへ yield すると、その yield が barrier + VM lock 保持中に
-  safepoint(trace 有効時など)で別スレッドへ制御を渡し、そのスレッドの Ractor 操作が VM lock
-  を取って所有を乱す(`vm_lock_leave` の `vm_locked` アサート / production では lock 不整合)。
-  cross-Ractor each_object には「barrier 下で shareable を collect → lock 解放 → yield」の
-  collect-then-yield が要り、現状は未実装。
+- caller が「自分の objspace だけを見たい」場合は **`rb_objspace_each_objects_local`**
+  (barrier は取るが cross-Ractor 走査はしない)。`ObjectSpace.dump_all` / objspace 拡張 /
+  JIT の iseq 走査 / method coverage はこれ。
+- **`ObjectSpace.each_object` は cross-Ractor 化済み(§3.2、collect-then-yield)**。ユーザ
+  ブロックへ yield するので単純な cross-Ractor 走査は使えない — 他 Ractor の shareable を
+  barrier 保持中に yield すると、その yield が safepoint(trace 有効時など)で **同 Ractor の
+  別スレッド**に制御を渡し、per-Ractor VM lock を乱す(`vm_lock_leave` の `vm_locked` アサート
+  / production では lock 不整合)/barrier を早期終了させる。だから barrier 下では collect
+  だけ行い、yield は barrier の外で行う(§3.2)。
 
 旧 `rb_objspace_each_objects_all`(全 objspace を無差別に走査)は撤去した。注意:
 `cr->objspace` はこの走査の入力なので、一時的に差し替える処理(Ractor 生成時の子
@@ -890,6 +894,32 @@ malloc 増加トリガ)で **両方を見て、どちらも false のときだ�
 内部 caller は per-objspace 側に置く。malloc-during-GC の guard は per-objspace の `dont_gc`
 を見るので、process 全体フラグでは満たされない(`[BUG] Cannot malloc during GC` になる)。
 process 全体フラグを内部が触らないことで、cross-Ractor の save/restore レースも生じない。
+
+### 3.2 ObjectSpace.each_object — collect-then-yield
+
+`each_object` は「呼んだ Ractor の objspace の全オブジェクト + 他の生きている Ractor の
+shareable」を列挙する。この 2 つは扱いが逆になる:
+
+- **相1(自 objspace)**: barrier 無しで直接 yield ＝ single-Ractor の each_object と同一。
+  walk(`rb_gc_impl_each_objects`)はページ一覧をスナップショットし、各ページを live list と
+  突き合わせて歩くので、並行 page-free に耐える。VM lock も不要で、ブロックは alloc / GC /
+  ブロックを自由に行える。
+
+- **相2(他 Ractor の shareable)**: 他 objspace は single-writer なので **barrier 下でしか
+  読めない**。だが **barrier 中にユーザブロックを yield してはいけない**(§2.4 の理由 —
+  safepoint で同 Ractor の別スレッドが per-Ractor VM lock を乱す/barrier を早期終了、または
+  ブロック系呼び出しで parked Ractor と deadlock)。よって **collect-then-yield**:
+  1. `GC.disable`(process 全体、§3.1)。
+  2. `RB_VM_LOCKING` + `rb_vm_barrier` の下で、`ractor.set` の各 objspace(self 除く)を
+     `each_objects_shareable`(`shareable_bits` 索引・shareable のみ)で歩き、Array に
+     `rb_ary_push` で **集めるだけ**(純 C — `internal_object_p` / `rb_obj_is_kind_of` /
+     `rb_ary_push` は object を作らず safepoint を踏まない。backing 成長は malloc だが
+     GC.disable で malloc-GC を抑止)。
+  3. barrier 解放 → `GC.enable`。
+  4. Array から yield(barrier 外＝通常実行。Array が shareable を root し、以降の GC / 
+     compaction でも生存・参照更新される)。
+
+  自 objspace に既にある shareable は相1 で yield 済み、相2 は self を除外するので重複しない。
 
 ## 4. message send 戦略
 
