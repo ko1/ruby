@@ -3278,6 +3278,12 @@ struct each_obj_data {
      * the rest of its (isolated) heap. */
     bool shareable_only;
 
+    /* RLGCv2: walking a FOREIGN objspace without settling its paused lazy
+     * sweep (that would run the owner's obj_free/dfree on this thread, see
+     * rb_gc_impl_each_objects_shareable): skip the objects that sweep is
+     * about to free -- on an unswept page, an unmarked object is dead. */
+    bool skip_unswept_dead;
+
     each_obj_callback *each_obj_callback;
     each_page_callback *each_page_callback;
     void *data;
@@ -3393,6 +3399,23 @@ objspace_each_objects_try(VALUE arg)
                     if (stop) break;
                 }
             }
+            else if (data->skip_unswept_dead &&
+                     is_lazy_sweeping(objspace) && page->flags.before_sweep) {
+                /* foreign page with its sweep pending: hand over live objects
+                 * one slot at a time, skipping the unmarked (dead) ones the
+                 * owner's sweep will free right after the barrier lifts. */
+                bool stop = false;
+                for (uintptr_t slot = pstart; slot < pend; slot += heap->slot_size) {
+                    if (!RVALUE_MARKED(objspace, (VALUE)slot)) continue;
+                    if (data->each_obj_callback &&
+                        (*data->each_obj_callback)((void *)slot, (void *)(slot + heap->slot_size),
+                                                   heap->slot_size, data->data)) {
+                        stop = true;
+                        break;
+                    }
+                }
+                if (stop) break;
+            }
             else {
                 if (data->each_obj_callback &&
                     (*data->each_obj_callback)((void *)pstart, (void *)pend, heap->slot_size, data->data)) {
@@ -3471,6 +3494,24 @@ rb_gc_impl_each_objects_shareable(void *objspace_ptr, each_obj_callback *callbac
      * lists are stable; the walk itself skips dead-but-unswept objects (see
      * the shareable_only branch of objspace_each_objects_try). The walker's
      * own incremental GC state is untouched -- this is not its objspace. */
+    objspace_each_exec(FALSE, &each_obj_data);
+}
+
+/* RLGCv2: walk EVERY object of a foreign Ractor's objspace (unshareables
+ * included). Only for callers that hold the barrier and whose callback is
+ * pure C (heap dump / memory accounting). Like the shareable walk above,
+ * the owner's paused lazy sweep is NOT settled here -- dead-but-unswept
+ * objects are skipped in the walk instead (skip_unswept_dead). */
+void
+rb_gc_impl_each_objects_foreign(void *objspace_ptr, each_obj_callback *callback, void *data)
+{
+    struct each_obj_data each_obj_data = {
+        .objspace = objspace_ptr,
+        .skip_unswept_dead = true,
+        .each_obj_callback = callback,
+        .each_page_callback = NULL,
+        .data = data,
+    };
     objspace_each_exec(FALSE, &each_obj_data);
 }
 
