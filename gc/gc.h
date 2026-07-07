@@ -113,6 +113,10 @@ MODULAR_GC_FN bool rb_gc_obj_free(void *objspace, VALUE obj);
 MODULAR_GC_FN void rb_gc_save_machine_context(void);
 MODULAR_GC_FN void rb_gc_mark_roots(void *objspace, const char **categoryp);
 MODULAR_GC_FN bool rb_gc_multi_ractor_p(void);
+/* RLGCv2: process-wide GC-disable flag (GC.disable / rb_gc_disable). Every GC
+ * trigger in the impl checks this so a global disable stops automatic GC in
+ * every Ractor. Per-objspace disabling is objspace->flags.dont_gc. */
+MODULAR_GC_FN bool rb_gc_gc_disabled_global_p(void);
 MODULAR_GC_FN bool rb_gc_shutdown_call_finalizer_p(VALUE obj);
 MODULAR_GC_FN void rb_gc_obj_changed_slot_size(VALUE obj, size_t slot_size);
 MODULAR_GC_FN void rb_gc_prepare_heap_process_object(VALUE obj);

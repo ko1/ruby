@@ -4972,10 +4972,46 @@ rb_gc_initial_stress_set(VALUE flag)
     initial_stress = flag;
 }
 
+/* RLGCv2: process-wide GC-disable flag. GC.disable / GC.enable and the no-arg
+ * public rb_gc_disable / rb_gc_enable / rb_gc_disable_no_rest toggle THIS
+ * (global) flag -- a disabled state stops automatic GC in every Ractor (every
+ * GC trigger checks rb_gc_gc_disabled_global_p). Per-objspace ("local")
+ * disabling, for internal critical sections that only need to suppress the
+ * current Ractor's own re-entrant GC, is rb_objspace_gc_* (explicit objspace,
+ * e.g. the verifier) and rb_gc_local_* (current objspace). */
+static bool ruby_gc_disabled_global = false;
+
+bool
+rb_gc_gc_disabled_global_p(void)
+{
+    return ruby_gc_disabled_global;
+}
+
 VALUE
 rb_gc_enable(void)
 {
-    return rb_objspace_gc_enable(rb_gc_get_objspace());
+    bool was_disabled = ruby_gc_disabled_global;
+    ruby_gc_disabled_global = false;
+    return RBOOL(was_disabled);
+}
+
+VALUE
+rb_gc_disable_no_rest(void)
+{
+    bool was_disabled = ruby_gc_disabled_global;
+    ruby_gc_disabled_global = true;
+    return RBOOL(was_disabled);
+}
+
+VALUE
+rb_gc_disable(void)
+{
+    bool was_disabled = ruby_gc_disabled_global;
+    if (!was_disabled) {
+        rb_gc_impl_gc_rest(rb_gc_get_objspace());
+    }
+    ruby_gc_disabled_global = true;
+    return RBOOL(was_disabled);
 }
 
 VALUE
@@ -4986,38 +5022,39 @@ rb_objspace_gc_enable(void *objspace)
     return RBOOL(disabled);
 }
 
-static VALUE
-gc_enable(rb_execution_context_t *ec, VALUE _)
-{
-    return rb_gc_enable();
-}
-
-static VALUE
-gc_disable_no_rest(void *objspace)
-{
-    bool disabled = !rb_gc_impl_gc_enabled_p(objspace);
-    rb_gc_impl_gc_disable(objspace, false);
-    return RBOOL(disabled);
-}
-
-VALUE
-rb_gc_disable_no_rest(void)
-{
-    return gc_disable_no_rest(rb_gc_get_objspace());
-}
-
-VALUE
-rb_gc_disable(void)
-{
-    return rb_objspace_gc_disable(rb_gc_get_objspace());
-}
-
 VALUE
 rb_objspace_gc_disable(void *objspace)
 {
     bool disabled = !rb_gc_impl_gc_enabled_p(objspace);
     rb_gc_impl_gc_disable(objspace, true);
     return RBOOL(disabled);
+}
+
+VALUE
+rb_gc_local_enable(void)
+{
+    return rb_objspace_gc_enable(rb_gc_get_objspace());
+}
+
+VALUE
+rb_gc_local_disable(void)
+{
+    return rb_objspace_gc_disable(rb_gc_get_objspace());
+}
+
+VALUE
+rb_gc_local_disable_no_rest(void)
+{
+    void *objspace = rb_gc_get_objspace();
+    bool disabled = !rb_gc_impl_gc_enabled_p(objspace);
+    rb_gc_impl_gc_disable(objspace, false);
+    return RBOOL(disabled);
+}
+
+static VALUE
+gc_enable(rb_execution_context_t *ec, VALUE _)
+{
+    return rb_gc_enable();
 }
 
 static VALUE
