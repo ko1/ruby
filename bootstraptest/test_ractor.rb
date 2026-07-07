@@ -1248,12 +1248,15 @@ assert_equal '[1, 4, 3, 2, 1]', %q{
   counts.inspect
 }
 
-# ObjectSpace.each_object can not handle unshareable objects with Ractors
-assert_equal '0', %q{
+# RLGCv2: ObjectSpace.each_object enumerates the calling Ractor's own objects
+# (unshareable ones included) and other Ractors' shareables -- but never
+# another Ractor's unshareables.
+assert_equal 'true', %q{
   Ractor.new{
-    n = 0
-    ObjectSpace.each_object{|o| n += 1 unless Ractor.shareable?(o)}
-    n
+    own = Object.new
+    seen = false
+    ObjectSpace.each_object{|o| seen = true if o.equal?(own)}
+    seen
   }.value
 }
 
