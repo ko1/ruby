@@ -434,6 +434,38 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  # ObjectSpace.each_object enumerates every object in the calling Ractor's own
+  # objspace plus the shareable objects owned by the other live Ractors (never
+  # their unshareable ones).
+  def test_each_object_own_all_and_foreign_shareables
+    assert_separately([], __FILE__, __LINE__, <<-'RUBY')
+      Warning[:experimental] = false
+      class Marker; end
+      main_un = 5.times.map { Marker.new }
+      main_sh = 3.times.map { Ractor.make_shareable(Marker.new) }
+      ready = Ractor::Port.new
+      ch = Ractor.new(ready) do |ready_port|
+        un = 7.times.map { Marker.new }               # unshareable: must NOT be seen
+        sh = 4.times.map { Ractor.make_shareable(Marker.new) }
+        ready_port << :built
+        Ractor.receive                                # keep this objspace alive
+        [un.size, sh.size]
+      end
+      ready.receive                                   # the child has built its markers
+
+      seen = 0
+      ObjectSpace.each_object(Marker) { seen += 1 }
+      # own 8 (unshareable 5 + shareable 3) + the child's 4 shareables
+      assert_equal 12, seen
+
+      ch.send(:go)
+      ch.value
+      # keep the roots alive across the walk
+      assert_equal 5, main_un.size
+      assert_equal 3, main_sh.size
+    RUBY
+  end
+
   def assert_make_shareable(obj)
     refute Ractor.shareable?(obj), "object was already shareable"
     Ractor.make_shareable(obj)
