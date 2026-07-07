@@ -50,8 +50,10 @@ single writer から「割り当ても GC もロック不要」が出る。
    `ractor_native_shallow_copy` の T_DATA ケース)で複製して解消(§4.4)。`_dump` を持たない他の
    T_DATA は Marshal fallback、それも無理なら送信エラー。`Ractor#value` は「併合してから返す」
    ので例外にならない(§4.3)。
-7. GC.enable / disable / stress / config / measure_total_time / stat / count は
-   呼んだ Ractor の objspace に対する操作・表示。
+7. GC.stress / config / measure_total_time / stat / count は呼んだ Ractor の
+   objspace に対する操作・表示。ただし **GC.disable / GC.enable は process 全体**
+   (§3.1)。「GC を止めたい」という要求は普通 process-wide なので、呼んだ Ractor だけ
+   止めても他 Ractor の割り当てが global GC を駆動してしまう。
 8. fork は「自分以外の Ractor を殺してから」と同じ意味にする(子プロセスで他 Ractor の
    objspace は引き継ぎ機構で main に併合される)。専用機構なし。
 9. VM 終了も「全 Ractor を殺す」だけ。全部が main に併合され、従来どおり main が
@@ -683,8 +685,10 @@ source を解放すると壊れる)ので、必ず相ごとに全 objspace を�
 併合の作業内容はどちらも同じ: ページを size pool ごとに引き継ぎ側のヒープへ繋ぎ替え、
 各ページの `page->objspace` を書き換え、finalizer テーブル・zombie・カウンタ類を併合し、
 空きページはページプールへ返し、objspace の殻を解放する。**併合の間は継承側の GC を
-禁止する**(`rb_gc_disable_no_rest`)— 併合内部の表挿入は確保を伴い得るので、放って
-おくと継承側の local GC がページ半繋ぎの状態で起動し得る。死んだ Ractor の deferred
+禁止する**(per-objspace の local disable — §3.1。generic_fields の表併合なら
+`rb_gc_local_disable_no_rest`、ページ繋ぎ替えなら `rb_gc_impl_gc_disable(dst, false)`)—
+併合内部の表挿入は確保を伴い得るので、放っておくと継承側の local GC がページ半繋ぎの
+状態で起動し得る。死んだ Ractor の deferred
 finalizer は以後**引き継いだ側のスレッド**が実行する(終了した Ractor にはそれを実行する
 スレッドが無い — 放置すると zombie が永遠に残り、objspace は決して空にならない。
 引き継ぎがその答えになっている)。
@@ -854,6 +858,38 @@ freelist が尽きたときの補充も全部「自分の物」で進む:
 - NEWOBJ / FREEOBJ の tracepoint: NEWOBJ は従来どおり(フック有効時のみ VM ロック下)。
   FREEOBJ のフックは worker の objspace には立てない(worker の local sweep 中に任意の
   Ruby / C コードが走ることを防ぐ。これが立たないことは安全性の前提)。
+
+### 3.1 GC.disable / GC.enable — process-wide と per-objspace の 2 枚のフラグ
+
+`GC.disable` は「GC を止めたい」という要求で、意味は **process 全体**である(呼んだ Ractor
+だけ止めても、他 Ractor の割り当てが global GC を駆動してしまう)。一方、内部コードには
+「いま自分の割り当てで GC が再入すると困る」ため一時的に GC を止める critical section が
+多数あり(autoload / const / cvar 表の splice、Ractor 生成窓、signal handler、NEWOBJ フック、
+id2ref 挿入、malloc-during-GC 領域など)、これらが止めたいのは **自 objspace の再入 GC だけ**
+(他 Ractor は VM ロック / バリアが排除済み)。よってフラグを 2 枚持つ:
+
+- **process 全体フラグ**(`ruby_gc_disabled_global`, gc.c) — ユーザの `GC.disable` /
+  `GC.enable` だけが読み書きする。どの Ractor が触っても効くので atomic
+  (`RUBY_ATOMIC_LOAD` / `SET`)。
+- **per-objspace フラグ**(`objspace->flags.dont_gc`, 既存) — 内部の critical section 用。
+
+**READ 側**: 自動 GC トリガの判定 3 点(`ready_to_gc`・`garbage_collect_with_gvl`・
+malloc 増加トリガ)で **両方を見て、どちらも false のときだけ** local GC を走らせる。
+`ready_to_gc` は global GC への昇格判定より前にあるので、process 全体フラグを立てると
+**全 Ractor の local GC も global GC 昇格も止まる** = 真に process-wide。明示 `GC.start` /
+`GC.compact` と method-cache GC(`GPR_FLAG_METHOD`)はどちらのフラグも貫通する(従来どおり)。
+
+**API の対応**:
+
+| 関数 | フラグ | 用途 |
+|---|---|---|
+| `GC.disable` / `GC.enable`、公開 C API `rb_gc_disable` / `rb_gc_enable` / `rb_gc_disable_no_rest` | process 全体 | ユーザの「GC を止める」 |
+| `rb_gc_local_disable` / `rb_gc_local_enable` / `rb_gc_local_disable_no_rest` | per-objspace(current) | 内部 critical section |
+| `rb_objspace_gc_disable` / `rb_objspace_gc_enable`(明示 objspace 引数) | per-objspace(指定) | verifier / VM 初期化 |
+
+内部 caller は per-objspace 側に置く。malloc-during-GC の guard は per-objspace の `dont_gc`
+を見るので、process 全体フラグでは満たされない(`[BUG] Cannot malloc during GC` になる)。
+process 全体フラグを内部が触らないことで、cross-Ractor の save/restore レースも生じない。
 
 ## 4. message send 戦略
 
