@@ -1821,10 +1821,34 @@ os_obj_of_i(void *vstart, void *vend, size_t stride, void *data)
     for (; v != (VALUE)vend; v += stride) {
         if (!internal_object_p(v)) {
             if (!oes->of || rb_obj_is_kind_of(v, oes->of)) {
-                if (!rb_multi_ractor_p() || rb_ractor_shareable_p(v)) {
-                    rb_yield(v);
-                    oes->num++;
-                }
+                rb_yield(v);
+                oes->num++;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* Like os_obj_of_i, but collects into an array instead of yielding -- used for
+ * the other Ractors' shareables, which are walked under the barrier where a
+ * yield is unsafe (see os_obj_of). Pure C: no object is allocated here
+ * (rb_ary_push only grows the backing store), so no safepoint is reached. */
+struct os_collect_struct {
+    VALUE of;
+    VALUE buffer;
+};
+
+static int
+os_obj_collect_i(void *vstart, void *vend, size_t stride, void *data)
+{
+    struct os_collect_struct *ocs = (struct os_collect_struct *)data;
+
+    VALUE v = (VALUE)vstart;
+    for (; v != (VALUE)vend; v += stride) {
+        if (!internal_object_p(v)) {
+            if (!ocs->of || rb_obj_is_kind_of(v, ocs->of)) {
+                rb_ary_push(ocs->buffer, v);
             }
         }
     }
@@ -1839,11 +1863,51 @@ os_obj_of(VALUE of)
 
     oes.num = 0;
     oes.of = of;
-    /* Current Ractor only. os_obj_of_i yields each object to a user block;
-     * doing that across the cross-Ractor walk runs user code (with its own
-     * safepoints) while this walk holds the VM lock + barrier, which lets
-     * another thread's Ractor work take the lock and unbalances it. */
-    rb_objspace_each_objects_local(os_obj_of_i, &oes);
+
+    /* Phase 1: this Ractor's own objspace. Yield every object directly, with no
+     * barrier -- exactly the single-Ractor each_object. The walk snapshots the
+     * page list and tolerates concurrent page frees (it re-checks each snapshot
+     * page against the live list), so it needs no VM lock, and the block is free
+     * to allocate, GC or block. */
+    rb_gc_impl_each_objects(rb_gc_get_objspace(), os_obj_of_i, &oes);
+
+    /* Phase 2 (multi-Ractor): also the shareable objects owned by other live
+     * Ractors. Their objspaces can only be read with the barrier held, but a
+     * user block must NOT run under the barrier: a safepoint there lets another
+     * thread of this Ractor unbalance the (per-Ractor) VM lock / end the barrier
+     * early, and a blocking call would deadlock the parked Ractors. So collect
+     * the shareables into a buffer under the barrier (pure C, no yield), then
+     * yield outside it. GC is disabled around the collection so the buffer's
+     * backing growth (a malloc, not a newobj) cannot trigger a GC while the
+     * world is stopped; the buffer roots the shareables for the yield phase. */
+    if (rb_multi_ractor_p()) {
+        struct os_collect_struct ocs;
+        ocs.of = of;
+        ocs.buffer = rb_ary_new();
+
+        int gc_was_disabled = RTEST(rb_gc_disable());
+        RB_VM_LOCKING() {
+            rb_vm_barrier();
+
+            void *self = rb_gc_get_objspace();
+            rb_vm_t *vm = GET_VM();
+            rb_ractor_t *r;
+            ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+                if (r->objspace && r->objspace != self) {
+                    rb_gc_impl_each_objects_shareable(r->objspace, os_obj_collect_i, &ocs);
+                }
+            }
+        }
+        if (!gc_was_disabled) rb_gc_enable();
+
+        long len = RARRAY_LEN(ocs.buffer);
+        for (long i = 0; i < len; i++) {
+            rb_yield(RARRAY_AREF(ocs.buffer, i));
+            oes.num++;
+        }
+        RB_GC_GUARD(ocs.buffer);
+    }
+
     return SIZET2NUM(oes.num);
 }
 
