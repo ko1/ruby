@@ -166,8 +166,12 @@ single writer から「割り当ても GC もロック不要」が出る。
   歩かない(列挙 SEGV を閉じる)。cross-Ractor 走査を使うのは **callback が C コードで
   yield しない sweep 系のみ**(TracePoint 計装・attr/bf コールキャッシュ一掃・coverage 削除)。
   自分の objspace だけ見たい caller は `rb_objspace_each_objects_local`(barrier は取るが
-  cross-Ractor 走査はしない): `ObjectSpace.dump_all`・objspace 拡張・JIT の iseq 走査・
-  method coverage。旧 `rb_objspace_each_objects_all` は撤去済み。
+  cross-Ractor 走査はしない): JIT の iseq 走査・method coverage。
+  **`ObjectSpace.dump_all` / objspace 拡張(memsize_of_all / count_*)は
+  `rb_objspace_each_objects_all`** — 全 live Ractor の全オブジェクト(unshareable 含む)を
+  歩く。callback が純 C で yield せず、barrier 下で text/数値しか出て行かない
+  (cross-Ractor 参照を作らない)ので安全。foreign の中断中 lazy sweep は settle せず
+  (owner の仕事)、unswept ページの未 mark(死骸)を walk 側で skip する。
   - **`ObjectSpace.each_object` は「自 objspace 全 + 他 Ractor の shareable」を列挙する
     (実装済み、commit fdf633eef、§3.2)**。ユーザブロックへ yield するので単純な
     cross-Ractor 走査は使えない(他 Ractor の shareable を yield すると、その yield が
@@ -782,8 +786,10 @@ enable しても main の iseq が計装されない)。これを `rb_objspace_e
   (TracePoint 計装 `rb_iseq_trace_set_all`・attr/bf コールキャッシュ一掃・coverage 削除。
   1 スロット単位走査により foreign には FL_SHAREABLE だけが渡り、型チェックのみで安全)。
 - caller が「自分の objspace だけを見たい」場合は **`rb_objspace_each_objects_local`**
-  (barrier は取るが cross-Ractor 走査はしない)。`ObjectSpace.dump_all` / objspace 拡張 /
-  JIT の iseq 走査 / method coverage はこれ。
+  (barrier は取るが cross-Ractor 走査はしない)。JIT の iseq 走査 / method coverage はこれ。
+- 「全 Ractor の全オブジェクト」が要る heap 診断(`ObjectSpace.dump_all` / objspace 拡張の
+  memsize_of_all / count_*)は **`rb_objspace_each_objects_all`**(callback 純 C・barrier 下・
+  foreign は settle せず unswept-dead skip)。
 - **`ObjectSpace.each_object` は cross-Ractor 化済み(§3.2、collect-then-yield)**。ユーザ
   ブロックへ yield するので単純な cross-Ractor 走査は使えない — 他 Ractor の shareable を
   barrier 保持中に yield すると、その yield が safepoint(trace 有効時など)で **同 Ractor の
@@ -791,7 +797,9 @@ enable しても main の iseq が計装されない)。これを `rb_objspace_e
   / production では lock 不整合)/barrier を早期終了させる。だから barrier 下では collect
   だけ行い、yield は barrier の外で行う(§3.2)。
 
-旧 `rb_objspace_each_objects_all`(全 objspace を無差別に走査)は撤去した。注意:
+旧 `rb_objspace_each_objects_all`(全 objspace を無差別に走査)は一度撤去した。現在の
+同名 API は安全形での再導入(barrier 下・live set のみ・creating/zombie skip・foreign は
+settle せず unswept-dead skip)で、heap 診断(dump_all / objspace 拡張)専用。注意:
 `cr->objspace` はこの走査の入力なので、一時的に差し替える処理(Ractor 生成時の子
 objspace への割り当て)は必ず VM lock 下で行い、barrier を張った walker から差し替え中の
 状態が見えないようにする。
