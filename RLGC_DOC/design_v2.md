@@ -160,26 +160,18 @@ single writer から「割り当ても GC もロック不要」が出る。
   shareable_bits を持つ(pinned-without-flag ではなく完全な FL_SHAREABLE)。それらが持つ
   unshareable な子(bmethod の proc、constcache の ice->value、iseq の once/coverage スロット、
   attr.location など)は WB(RB_OBJ_WRITE / RB_OBJ_WRITTEN)経由で記録される shref が守る。
-- **列挙モデル(§2.4、達成済み)**: `rb_objspace_each_objects` 自身が callee 側で VM barrier を
-  取り、「自分の objspace の全オブジェクト + 他の生きている Ractor の **shareable だけ**
-  (`shareable_bits` を索引に 1 スロットずつ)」を歩く。being-created / zombie の objspace は
-  歩かない(列挙 SEGV を閉じる)。cross-Ractor 走査を使うのは **callback が C コードで
-  yield しない sweep 系のみ**(TracePoint 計装・attr/bf コールキャッシュ一掃・coverage 削除)。
-  自分の objspace だけ見たい caller は `rb_objspace_each_objects_local`(barrier は取るが
-  cross-Ractor 走査はしない): JIT の iseq 走査・method coverage。
-  **`ObjectSpace.dump_all` / objspace 拡張(memsize_of_all / count_*)は
-  `rb_objspace_each_objects_all`** — 全 live Ractor の全オブジェクト(unshareable 含む)を
-  歩く。callback が純 C で yield せず、barrier 下で text/数値しか出て行かない
-  (cross-Ractor 参照を作らない)ので安全。foreign の中断中 lazy sweep は settle せず
-  (owner の仕事)、unswept ページの未 mark(死骸)を walk 側で skip する。
-  - **`ObjectSpace.each_object` は「自 objspace 全 + 他 Ractor の shareable」を列挙する
-    (実装済み、commit fdf633eef、§3.2)**。ユーザブロックへ yield するので単純な
-    cross-Ractor 走査は使えない(他 Ractor の shareable を yield すると、その yield が
-    barrier 保持中に safepoint で同 Ractor の別スレッドに制御を渡し、per-Ractor VM lock を
-    乱す/barrier を早期終了させる。ブロック系呼び出しなら parked Ractor と deadlock)。
-    そこで **2 相**にする: 相1=自 objspace は barrier 無しで直接 yield(single-Ractor と同一)、
-    相2=他 Ractor の shareable は barrier 下で Array に collect(純 C・yield 無し)→ barrier
-    解放 → yield。collect 中は buffer の backing 成長が GC を起こさないよう GC.disable。
+- **列挙モデル(§2.4、達成済み)**: 素名 `rb_objspace_each_objects` は callee 側で VM barrier を
+  取り、**upstream セマンティクス = 全 live Ractor の全オブジェクト**(unshareable 含む)を
+  歩く。being-created / zombie の objspace は歩かない(列挙 SEGV を閉じる)。foreign の
+  中断中 lazy sweep は settle せず(owner の obj_free/dfree をこのスレッドで走らせない)、
+  unswept ページの未 mark(死骸)は walk 側で skip。**callback は純 C で yield しないこと**
+  が caller 契約(TracePoint 計装・attr/bf コールキャッシュ一掃・coverage・JIT iseq 走査・
+  `ObjectSpace.dump_all`・objspace 拡張の memsize_of_all / count_*)。
+  自分の objspace だけ見たい caller は `rb_objspace_each_objects_local`。
+  他 Ractor の **shareable だけ**を 1 スロット単位で歩く impl 層の
+  `rb_gc_impl_each_objects_shareable`(`shareable_bits` 索引)は、ユーザブロックへ
+  yield する `ObjectSpace.each_object` の相2 collect 専用(§3.2)。
+
 - **compaction は複数 objspace でも動く(global GC の一部として実装済み、commit 0b23f634c)**:
   `GC.compact` / `GC.auto_compact=` / `GC.verify_compaction_references` は、Ractor が 1 個の
   ときは従来どおり local compaction、複数のときはバリアで全 Ractor を止めた global GC が
@@ -773,23 +765,23 @@ enable しても main の iseq が計装されない)。これを `rb_objspace_e
    page を free / move すると壊れるため。これは master でも正しい硬化なので上流に取り込んだ
   (`gc: take the VM barrier inside rb_objspace_each_objects`)。呼び出し側は自前の
   `RB_VM_LOCKING+rb_vm_barrier` を持たない(上流の iseq sweep 群と逐語一致)。
-- **自分の objspace は全オブジェクト**を、**他の生きている Ractor の objspace は
-  shareable オブジェクトだけ**を渡す(`shareable_bits` を索引に 1 スロットずつ callback。
-  ページ丸ごとの range では他 Ractor の unshareable まで callback に渡ってしまい、
-  それを inspect する caller(例: `ObjectSpace.each_object` の module フィルタ
-  `rb_obj_is_kind_of`、あるいは generic fields を per-Ractor 表から引く処理)が
-  別 Ractor の構造を誤って引く)。
+- **全 live Ractor の全オブジェクト**を渡す(upstream セマンティクス)。callback は
+  純 C・yield 無しが契約で、型チェック(iseq/cc/クラス等)で対象を選別する — barrier 下で
+  foreign unshareable の header/型を読むのは安全。foreign の中断中 lazy sweep は
+  settle しない(B-6)ので、unswept ページは 1 スロット単位で歩き未 mark(死骸)を skip。
+  yield が要る caller(`ObjectSpace.each_object`)はこの walk を使えず、impl 層の
+  shareable-only walk で collect-then-yield する(§3.2)。
 - **being-created / zombie の objspace は歩かない**(生成途中・撤収途中で heap が
   walkable でない — 従来の全 objspace 走査(`rb_gc_vm_each_objspace` 経由)がここを
   踏んで発生していた列挙 SEGV を、生きている Ractor だけに絞ることで閉じる)。
-- cross-Ractor 走査を使うのは、**callback が C コードで yield しない sweep 系だけ**
-  (TracePoint 計装 `rb_iseq_trace_set_all`・attr/bf コールキャッシュ一掃・coverage 削除。
-  1 スロット単位走査により foreign には FL_SHAREABLE だけが渡り、型チェックのみで安全)。
+- cross-Ractor 走査の caller は **callback が純 C で yield しないものだけ**
+  (TracePoint 計装 `rb_iseq_trace_set_all`・attr/bf コールキャッシュ一掃・coverage 削除・
+  JIT iseq 走査・dump_all / objspace 拡張)。
 - caller が「自分の objspace だけを見たい」場合は **`rb_objspace_each_objects_local`**
   (barrier は取るが cross-Ractor 走査はしない)。JIT の iseq 走査 / method coverage はこれ。
-- 「全 Ractor の全オブジェクト」が要る heap 診断(`ObjectSpace.dump_all` / objspace 拡張の
-  memsize_of_all / count_*)は **`rb_objspace_each_objects_all`**(callback 純 C・barrier 下・
-  foreign は settle せず unswept-dead skip)。
+- **素名 `rb_objspace_each_objects` = 全 live Ractor の全オブジェクト**(callback 純 C・
+  barrier 下・foreign は settle せず unswept-dead skip)。TracePoint 計装・cc 一掃・coverage・
+  JIT iseq 走査・dump_all・objspace 拡張がこれ。
 - **`ObjectSpace.each_object` は cross-Ractor 化済み(§3.2、collect-then-yield)**。ユーザ
   ブロックへ yield するので単純な cross-Ractor 走査は使えない — 他 Ractor の shareable を
   barrier 保持中に yield すると、その yield が safepoint(trace 有効時など)で **同 Ractor の
@@ -797,9 +789,9 @@ enable しても main の iseq が計装されない)。これを `rb_objspace_e
   / production では lock 不整合)/barrier を早期終了させる。だから barrier 下では collect
   だけ行い、yield は barrier の外で行う(§3.2)。
 
-旧 `rb_objspace_each_objects_all`(全 objspace を無差別に走査)は一度撤去した。現在の
-同名 API は安全形での再導入(barrier 下・live set のみ・creating/zombie skip・foreign は
-settle せず unswept-dead skip)で、heap 診断(dump_all / objspace 拡張)専用。注意:
+旧 `rb_objspace_each_objects_all`(全 objspace を無差別に走査)は撤去済み。素名
+`rb_objspace_each_objects` がその安全形(barrier 下・live set のみ・creating/zombie skip・
+foreign は settle せず unswept-dead skip)に相当する。注意:
 `cr->objspace` はこの走査の入力なので、一時的に差し替える処理(Ractor 生成時の子
 objspace への割り当て)は必ず VM lock 下で行い、barrier を張った walker から差し替え中の
 状態が見えないようにする。
