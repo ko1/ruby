@@ -3156,35 +3156,26 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
             rb_ractor_mark_local_roots(r);
             rb_ractor_repin_in_flight(r);
         }
-        /* RLGCv2: 終了して vm->ractor.set から外れたが、まだ継承（Ractor#value /
-         * orphan merge）されていない zombie の owner Ractor の「registered globals だけ」
-         * を mark する。これらの objspace は上の enumerate 対象として global GC が sweep
-         * するので、ここで registered roots（registered_addrs/registered_marks）を mark
-         * しないと、set に居ないぶん未 mark のまま sweep され、後で継承した joiner の
-         * registered リストに dangling ポインタが残る（freeze-hash UAF）。
-         *
-         * ここで rb_ractor_mark_local_roots（full）を呼んではならない: それは
-         * ractor_mark_unshareable_parts 経由で zombie の thread/EC も mark するため、
-         * 未 join のまま参照を手放した orphan Ractor object が到達可能になり、回収→
-         * disown→merge が起きず objspace が永久に merge されなくなる（v2_orphan_merge_pjob
-         * 回帰）。loc/name/threads 等の object-graph 部分は ractor_mark 側に委ねる:
-         * join 待ちなら Ractor object 到達可能で ractor_mark が覆い、orphan なら回収され
-         * るべき。orphan（Ractor object 回収済み, owner==NULL）は registered globals も
-         * ractor_free が main へ移管済みなので、そもそもここでは skip される。 */
-        for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
-            rb_ractor_t *zr = vm->gc.zombie_objspaces[i].owner;
-            if (zr) {
-                rb_ractor_mark_registered_globals(zr);
-            }
-        }
     }
     else {
         rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
     }
 
-    /* RLGCv2: VM-global だった登録済みオブジェクト（rb_gc_register_address /
-     * rb_vm_register_global_object）は今や Ractor-local になり、各 Ractor の
-     * rb_ractor_mark_local_roots から mark される。ここでは何もしない。 */
+    /* RLGCv2 (design §2.1 手順 3.e): registered globals は VM に 1 つのリスト。
+     * 登録スロット（*addr）には後から別 objspace の値も入り得るので、per-Ractor に
+     * 分割せず**全 Ractor の GC が全登録を保守的に見る**。local GC では mark_maybe /
+     * mark が自 objspace の値だけを実際に mark し（foreign は所有者の GC が同じ walk で
+     * 拾う）、global GC では driver が全値を mark する。zombie（終了・未継承）Ractor が
+     * 登録したものも同じリストに居るので、旧 per-Ractor 実装が必要とした zombie-owner
+     * 特例は不要。lock は leaf、mark 中の mark-stack 成長は raw malloc なので再入しない。 */
+    MARK_CHECKPOINT("registered_globals");
+    rb_native_mutex_lock(&vm->gc.registered_globals.lock);
+    for (size_t i = 0; i < vm->gc.registered_globals.addrs_cnt; i++) {
+        rb_gc_mark_maybe(*vm->gc.registered_globals.addrs[i]);
+    }
+    rb_gc_mark_vm_stack_values((long)vm->gc.registered_globals.marks_cnt,
+                               vm->gc.registered_globals.marks);
+    rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
 
     /* Same shape: a worker's at_exit/END proc sits in the VM-global
      * end_procs C list but lives in the worker's objspace, where only
@@ -3696,7 +3687,19 @@ rb_gc_register_mark_object(VALUE obj)
 void
 rb_gc_register_address(VALUE *addr)
 {
-    rb_ractor_register_address(GET_RACTOR(), addr);
+    rb_vm_t *vm = GET_VM();
+
+    rb_native_mutex_lock(&vm->gc.registered_globals.lock);
+    if (vm->gc.registered_globals.addrs_cnt == vm->gc.registered_globals.addrs_capa) {
+        size_t nc = vm->gc.registered_globals.addrs_capa ? vm->gc.registered_globals.addrs_capa * 2 : 64;
+        VALUE **p = realloc(vm->gc.registered_globals.addrs, nc * sizeof(VALUE *));
+        if (!p) rb_bug("rb_gc_register_address: out of memory");
+        vm->gc.registered_globals.addrs = p;
+        vm->gc.registered_globals.addrs_capa = nc;
+    }
+    vm->gc.registered_globals.addrs[vm->gc.registered_globals.addrs_cnt++] = addr;
+    rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
+
     /* 一部 C 拡張は代入前に登録するバグを持つため、ここで obj を GC から守る */
     RB_GC_GUARD(*addr);
 }
@@ -3704,38 +3707,21 @@ rb_gc_register_address(VALUE *addr)
 void
 rb_gc_unregister_address(VALUE *addr)
 {
-    if (rb_ractor_unregister_address(GET_RACTOR(), addr)) return;
+    rb_vm_t *vm = GET_VM();
 
-    /* RLGCv2: the registered-address lists are per-Ractor, so a C
-     * extension that registers on one Ractor and unregisters on another
-     * (Init on main, dfree on a worker's GC, ...) misses its own list.
-     * Leaving the foreign entry behind means the registering Ractor's
-     * root scan keeps reading *addr after the extension freed the slot
-     * (UAF read). No such caller is known -- core never does this -- so
-     * for now OBSERVE instead of silently repairing: scan the other
-     * Ractors under the VM lock (cold path) and rb_bug if the address is
-     * found, so a real-world hit tells us this contract needs deciding
-     * (search-and-remove vs "unregister where you registered").
-     * A full miss stays a silent no-op: upstream tolerates double
-     * unregister, and an entry may have been legitimately absorbed into
-     * main when its registering Ractor died (main unregistering it later
-     * finds it in main's own list above). */
-    if (rb_multi_ractor_p()) {
-        rb_ractor_t *self = GET_RACTOR();
-        RB_VM_LOCKING() {
-            rb_vm_t *vm = GET_VM();
-            rb_ractor_t *r;
-            ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
-                if (r == self) continue;
-                for (size_t i = 0; i < r->registered_addrs_cnt; i++) {
-                    if (r->registered_addrs[i] == addr) {
-                        rb_bug("rb_gc_unregister_address: %p is registered by another Ractor (#%u)",
-                               (void *)addr, (unsigned int)rb_ractor_id(r));
-                    }
-                }
-            }
+    /* single VM list: cross-Ractor register/unregister pairs (Init on main,
+     * dfree on another Ractor, ...) just work. A full miss stays a silent
+     * no-op -- upstream tolerates double unregister. */
+    rb_native_mutex_lock(&vm->gc.registered_globals.lock);
+    for (size_t i = 0; i < vm->gc.registered_globals.addrs_cnt; i++) {
+        if (vm->gc.registered_globals.addrs[i] == addr) {
+            MEMMOVE(&vm->gc.registered_globals.addrs[i], &vm->gc.registered_globals.addrs[i + 1],
+                    VALUE *, vm->gc.registered_globals.addrs_cnt - i - 1);
+            vm->gc.registered_globals.addrs_cnt--;
+            break;
         }
     }
+    rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
 }
 
 void
@@ -3915,8 +3901,8 @@ rb_gc_objspace_retire(void **objspace_slot)
             }
         }
         /* owner_slot は常に retire される Ractor の &r->objspace（vm_remove_ractor /
-         * ractor 終了パスから）。owner を記録しておき、global GC が set から外れた
-         * この zombie の registered roots も mark できるようにする。orphan 化
+         * ractor 終了パスから）。owner は global GC の generic_fields weak pass が
+         * この zombie の per-Ractor 表を舐めるために記録する。orphan 化
          * （Ractor object 回収）で owner は下の rb_gc_objspace_disown が NULL にする。 */
         struct rb_ractor_struct *owner =
             (struct rb_ractor_struct *)((char *)objspace_slot - offsetof(rb_ractor_t, objspace));
@@ -3949,9 +3935,8 @@ rb_gc_objspace_disown(void *objspace)
     for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
         if (vm->gc.zombie_objspaces[i].objspace == objspace) {
             vm->gc.zombie_objspaces[i].owner_slot = NULL;
-            /* Ractor object が回収されるので owner も落とす（root walk はこの
-             * zombie を skip する）。registered globals は ractor_free が既に main へ
-             * 移管済みで、main の root walk が覆う。 */
+            /* Ractor object が回収されるので owner も落とす。per-Ractor の
+             * generic_fields 表は ractor_free が main へ移送済み。 */
             vm->gc.zombie_objspaces[i].owner = NULL;
             found = true;
             break;

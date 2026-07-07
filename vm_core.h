@@ -773,8 +773,8 @@ typedef struct rb_vm_struct {
     unsigned int thread_ignore_deadlock: 1;
 
     /* object management */
-    /* RLGCv2: 旧 mark_object_ary / global_object_list（登録済み VM グローバル root）は
-     * Ractor-local になった（rb_ractor_struct::registered_marks / registered_addrs）。 */
+    /* RLGCv2: 旧 mark_object_ary / global_object_list は vm->gc.registered_globals
+     * （VM 単一リスト、全 Ractor の GC が保守的に walk）に置き換わった。 */
     const VALUE special_exceptions[ruby_special_error_count];
 
     /* Ruby Box */
@@ -821,13 +821,11 @@ typedef struct rb_vm_struct {
         struct rb_objspace_zombie {
             void *objspace;
             void **owner_slot;
-            /* RLGCv2: この zombie の所有 Ractor（終了して vm->ractor.set から外れたが
-             * まだ merge されていない）。global GC はこの objspace を毎回 sweep するが、
-             * owner は set に居ないので root walk がここを見て owner の registered roots
-             * （registered_addrs/registered_marks）も mark しないと、継承前に registered
-             * オブジェクトが sweep され dangling pin になる（freeze-hash 系 UAF）。
-             * orphan（Ractor object が global GC で回収済み）は NULL: その registered
-             * globals は ractor_free が main へ移管済みなので main の root walk で覆われる。 */
+            /* RLGCv2: この zombie の所有 Ractor（終了して vm->ractor.set から
+             * 外れたが、まだ merge されていない）。global GC の generic_fields
+             * weak pass が owner の per-Ractor 表を舐めるのに使う
+             * （rb_gc_vm_generic_fields_*_foreach）。orphan（Ractor object 回収
+             * 済み）は NULL: その表は ractor_free が main へ移送済み。 */
             struct rb_ractor_struct *owner;
             /* zombie が最後に測定された時点（retire 時。各 global cycle で
              * barrier 下に更新される）で保持していた heap page 数。下の合計値は
@@ -844,6 +842,20 @@ typedef struct rb_vm_struct {
 #if USE_MODULAR_GC
         struct gc_mark_func_data_struct *mark_func_data;
 #endif
+        /* RLGCv2 (design §2.1 手順 3.e): rb_gc_register_address /
+         * rb_gc_register_mark_object の登録先は VM に 1 つ。登録スロットには
+         * 後から別 objspace の値が入り得るため per-Ractor 分割はしない —
+         * 全 Ractor の GC が root walk で全登録を保守的に見る（自 objspace の
+         * 値だけが mark され、foreign は各所有者の GC が拾う）。lock は leaf
+         * （保持中に割り当て・GC をしない）。register/unregister は cold path、
+         * 配列は raw realloc（登録が GC を再入させないため）。 */
+        struct {
+            rb_nativethread_lock_t lock;
+            VALUE **addrs;              /* rb_gc_register_address: *addr を mark_maybe */
+            size_t addrs_cnt, addrs_capa;
+            VALUE *marks;               /* rb_gc_register_mark_object: pin */
+            size_t marks_cnt, marks_capa;
+        } registered_globals;
     } gc;
 
     rb_at_exit_list *at_exit;
