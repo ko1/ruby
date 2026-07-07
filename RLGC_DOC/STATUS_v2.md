@@ -78,11 +78,14 @@
 ## 今日見つけて直した代表バグ(詳細は各コミットログ)
 
 - M1b 系: Ractor dmark が他 Ractor の owner 変異構造を歩く(threads/EC ×1、queues/ports ×1)、deleted-key 機構の STW 前提、gc_enter の main 判定揺れ、interrupt queue の create→start 窓(v1 §6.4 残存面)、process-wide static の再書込
-- M5 系: end_procs / trap_list の封じ込め漏れ、_id2ref build の単一 objspace 走査、**圧縮ガード未移植**(multi-objspace で full GC に degrade)、**value 継承物の到達性穴**(legacy/stdio/Thread wrapper → 併合直後 shref pin)、**mark_func_data redirect 乗っ取り**(v1 during_gc ゲート未移植 — 4 オラクル一括治癒)、**svar 封じ込め**(shref 不発 + Ractor 間共有 svar の per-EC 退避 = `$~` 漏れ解消)、**昇格カウンタの driver 偏り**(major ペーシング歪み)
+- M5 系: end_procs / trap_list の封じ込め漏れ、_id2ref build の単一 objspace 走査、**圧縮ガード未移植**(multi-objspace で full GC に degrade。→ その後 commit 0b23f634c で degrade を撤廃し実 compaction を実装、残項目 1 参照)、**value 継承物の到達性穴**(legacy/stdio/Thread wrapper → 併合直後 shref pin)、**mark_func_data redirect 乗っ取り**(v1 during_gc ゲート未移植 — 4 オラクル一括治癒)、**svar 封じ込め**(shref 不発 + Ractor 間共有 svar の per-EC 退避 = `$~` 漏れ解消)、**昇格カウンタの driver 偏り**(major ペーシング歪み)
 
 ## 残項目(2026-06-11 設計合意済みの実装キュー — 上から順に)
 
-1. compaction の global-STW 実装(§2.2 末尾に方針記載済み。当面は degrade のまま)
+1. ~~compaction の global-STW 実装~~ **完了(commit 0b23f634c)**: 複数 objspace でも
+   global GC(STW)の一部として全 objspace を 3 相(move→update→free)で実 compact する
+   (§2.2 末尾)。degrade は撤廃。CHECK/ASAN/TSAN/YJIT stress・verify_compaction multi-Ractor
+   ・単一 objspace 回帰すべて green。
 2. generic_fields の per-objspace 分割(§2.4-2): 性能最適化(現ベンチでは非ホット)
 3. ASAN/TSan の CI 常設化(レシピ・suppression は完備)+ v1 オラクル 65 本の再掃引
 4. N=1 の残オーバーヘッド(~11%)/ TSan watch: `VM_FORCE_WRITE` 単発(ペア未捕獲)
