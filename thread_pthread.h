@@ -140,15 +140,6 @@ struct rb_thread_sched {
     bool is_running_timeslice;
     bool enable_mn_threads;
 
-    // A thread that completed its terminal coroutine transfer and handed this
-    // sched's lock off to the resuming context. Its th->sched.finished is set
-    // only after that context releases the lock (thread_sched_unlock_), i.e.
-    // after the dying thread's native thread is truly done touching this
-    // Ractor -- so the zombie ledger keeps the thread/Ractor alive past every
-    // teardown access (RLGCv2 M1b: a concurrent collector must not free them
-    // mid-teardown).
-    struct rb_thread_struct *dying_th;
-
     struct ccan_list_head readyq;
     int readyq_cnt;
     // ractor scheduling
