@@ -243,11 +243,6 @@ static RB_THREAD_LOCAL_SPECIFIER int malloc_increase_local;
     SLOT(32) SLOT(64) SLOT(128) SLOT(256) SLOT(512)
 #endif
 
-/* RLGCv2: there is no per-Ractor newobj cache.  The bump-pointer
- * allocation state (cursor / region chain) lives directly in rb_heap_t
- * with a single writer (the objspace's owning Ractor); see
- * RLGC_DOC/design_v2.md section 3. */
-
 typedef struct {
     size_t heap_init_bytes;
     size_t heap_free_slots;
@@ -596,9 +591,6 @@ typedef struct rb_objspace {
         unsigned int dont_incremental : 1;
         unsigned int during_gc : 1;
         unsigned int during_compacting : 1;
-        /* RLGCv2: set in gc_enter when this GC took the *barrier* VM lock
-         * (compaction), so gc_exit ends the barrier with a barrier unlock even
-         * after during_compacting was cleared by gc_compact_finish. */
         unsigned int gc_lock_barrier : 1;
         unsigned int during_reference_updating : 1;
         unsigned int gc_stressful: 1;
@@ -607,10 +599,6 @@ typedef struct rb_objspace {
         unsigned int measure_gc : 1;
     } flags;
 
-    /* RLGCv2 (design_v2.md §2.2 step 4): set on every objspace by the
-     * global GC driver inside the barrier; mark/sweep decisions that must
-     * lift the containment guards consult this. A byte (not a bitfield
-     * bit) so the cross-thread write rule stays uniform. */
     unsigned char during_global_gc;
 
     rb_event_flag_t hook_events;
