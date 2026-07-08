@@ -889,17 +889,9 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
 
     if (DEBUG) fprintf(stderr, "fiber_pool_stack_release: %p used=%"PRIuSIZE"\n", stack->base, stack->pool->used);
 
-    /* RLGCv2: serialize against a concurrent acquire (under the VM lock) on
-     * another Ractor and against other releases. Reached here either from a
-     * confined GC sweep (no VM lock held) or from paths already under the VM
-     * lock -- the NO_BARRIER acquire nests in the latter and, in the former,
-     * never joins a pending global barrier mid-collection (a forming barrier
-     * releases the mutex while it waits, so this brief wait cannot deadlock
-     * with it). Order-safe: a sweep never runs while holding a ractor lock
-     * (allocation under a ractor lock is malloc-only -- see malloc_gc_disabled
-     * -- so no GC work starts there), and vm_lock_enter's RACTOR_CHECK_MODE
-     * assert self-checks that. Releases are rare (dead fiber / pool churn),
-     * so the global lock is not a scalability concern here. */
+    /* Serialize pool access against a concurrent acquire on another Ractor:
+     * a per-Ractor GC sweep can free a fiber without the VM lock. NO_BARRIER
+     * so it never joins a forming global barrier (releases are rare). */
     unsigned int lev;
     RB_VM_LOCK_ENTER_LEV_NB(&lev);
 
@@ -1050,12 +1042,9 @@ fiber_stack_release(rb_fiber_t * fiber)
 static void
 fiber_stack_release_locked(rb_fiber_t *fiber)
 {
-    /* RLGCv2: this runs from the GC free path (cont_free). Under per-Ractor
-     * objspaces that is a Ractor's barrier-free confined GC sweep -- there is
-     * no VM lock or barrier, and the collection must not take the VM lock (it
-     * would join a pending global barrier mid-sweep). The stack return to the
-     * VM-global fiber pool is instead serialised by the pool's own leaf lock
-     * (fiber_pool_stack_release), so no VM-locking assertion holds here. */
+    /* Called from the GC free path, which for a per-Ractor objspace is a
+     * barrier-free sweep with no VM lock held; the pool return itself takes
+     * the lock (fiber_pool_stack_release), so no VM-locking assertion here. */
     fiber_stack_release(fiber);
 }
 
@@ -1326,10 +1315,9 @@ fiber_memsize(const void *ptr)
     const rb_execution_context_t *saved_ec = &fiber->cont.saved_ec;
 
     /*
-     * vm.c::thread_memsize already counts th->ec->local_storage (the root
-     * fiber's). Test first_proc rather than fiber != th->root_fiber: only a
-     * non-root fiber (first_proc != 0) owns storage not already counted by
-     * the thread, and this avoids dereferencing thread_ptr entirely.
+     * vm.c::thread_memsize already counts the root fiber's local_storage;
+     * first_proc != 0 selects a non-root fiber without dereferencing the
+     * thread (equivalent to fiber != th->root_fiber).
      */
     if (saved_ec->local_storage && fiber->first_proc != 0) {
         size += rb_id_table_memsize(saved_ec->local_storage);
