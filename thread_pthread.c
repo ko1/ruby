@@ -1757,14 +1757,6 @@ thread_sched_atfork(struct rb_thread_sched *sched)
     ccan_list_head_init(&vm->ractor.sched.timeslice_threads);
     ccan_list_head_init(&vm->ractor.sched.running_threads);
 
-    /* RLGCv2: fork keeps only the calling thread; the parked zombie thread
-     * wrappers have no native thread in the child to ever publish
-     * sched.finished, so rb_thread_sched_mark_zombies would keep marking
-     * them -- and each one's Ractor -- forever, leaking those objspaces
-     * (they are never absorbed). Their native threads are gone, so nothing
-     * needs them kept alive: drop the ledger like the other sched lists. */
-    ccan_list_head_init(&vm->ractor.sched.zombie_threads);
-
     rb_internal_thread_event_hooks_rw_lock_atfork();
 
     VM_ASSERT(sched->is_running);
