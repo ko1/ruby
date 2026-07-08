@@ -117,9 +117,6 @@ each_object_with_flags(each_obj_with_flags cb, void *ctx)
     struct obj_itr data;
     data.cb = cb;
     data.data = ctx;
-    /* every Ractor's objspace: these are process-wide accounting APIs
-     * (memsize_of_all / count_*), and the callbacks are pure C under the
-     * walker's VM lock + barrier. */
     rb_objspace_each_objects(heap_iter, &data);
 }
 
