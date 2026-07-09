@@ -940,6 +940,14 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         th->pending_interrupt_queue = 0;
         th->pending_interrupt_mask_stack = 0;
         th->pending_interrupt_queue_checked = 0;
+        /* Same reasoning for the inherited thread group: current_th->thgroup
+         * lives in the *parent* Ractor's objspace.  Holding it here makes the
+         * not-yet-started child's Thread wrapper (which lives in the child's
+         * own objspace) point at a foreign unshareable object with no shref --
+         * a containment violation.  thread_do_start_proc re-creates the group
+         * in the child's own objspace before any Ruby code runs, so leave it 0
+         * ("uninitialized thread") until then. */
+        th->thgroup = 0;
     }
     else {
         th->pending_interrupt_queue = rb_ary_hidden_new(0);
