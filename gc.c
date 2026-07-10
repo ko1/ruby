@@ -3168,25 +3168,36 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
             rb_ractor_mark_local_roots(r);
             rb_ractor_repin_in_flight(r);
         }
+        /* RLGCv2: a Ractor that has terminated (off vm->ractor.set) but whose
+         * struct is not yet freed still owns its rb_gc_register_mark_object
+         * pins; keep them alive until ractor_free hands them to main.  (Orphans,
+         * owner==NULL, already migrated to main above.)  Registration off the
+         * main Ractor is essentially nonexistent, so these lists are normally
+         * empty. */
+        for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
+            rb_ractor_t *owner = vm->gc.zombie_objspaces[i].owner;
+            if (owner) {
+                rb_gc_mark_vm_stack_values((long)owner->registered_marks_cnt,
+                                           owner->registered_marks);
+            }
+        }
     }
     else {
         rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
     }
 
-    /* RLGCv2 (design §2.1 手順 3.e): registered globals は VM に 1 つのリスト。
-     * 登録スロット（*addr）には後から別 objspace の値も入り得るので、per-Ractor に
-     * 分割せず**全 Ractor の GC が全登録を保守的に見る**。local GC では mark_maybe /
-     * mark が自 objspace の値だけを実際に mark し（foreign は所有者の GC が同じ walk で
-     * 拾う）、global GC では driver が全値を mark する。zombie（終了・未継承）Ractor が
-     * 登録したものも同じリストに居るので、旧 per-Ractor 実装が必要とした zombie-owner
-     * 特例は不要。lock は leaf、mark 中の mark-stack 成長は raw malloc なので再入しない。 */
+    /* RLGCv2 (design §2.1 手順 3.e): rb_gc_register_address のスロットだけが VM 単一
+     * リスト。*addr には後から別 objspace の値も入り得るので per-Ractor に分割せず、
+     * 全 Ractor の GC が全登録を保守的に見る（自 objspace の値だけ実際に mark され、
+     * foreign は所有者の GC が同じ walk で拾う）。lock は leaf、mark 中の mark-stack
+     * 成長は raw malloc なので再入しない。rb_gc_register_mark_object の pin は per-Ractor
+     * （rb_ractor_t.registered_marks）で、live は rb_ractor_mark_local_roots、zombie は
+     * その objspace 列挙で mark する。 */
     MARK_CHECKPOINT("registered_globals");
     rb_native_mutex_lock(&vm->gc.registered_globals.lock);
     for (size_t i = 0; i < vm->gc.registered_globals.addrs_cnt; i++) {
         rb_gc_mark_maybe(*vm->gc.registered_globals.addrs[i]);
     }
-    rb_gc_mark_vm_stack_values((long)vm->gc.registered_globals.marks_cnt,
-                               vm->gc.registered_globals.marks);
     rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
 
     /* Same shape: a worker's at_exit/END proc sits in the VM-global
