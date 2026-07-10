@@ -842,19 +842,17 @@ typedef struct rb_vm_struct {
 #if USE_MODULAR_GC
         struct gc_mark_func_data_struct *mark_func_data;
 #endif
-        /* RLGCv2 (design §2.1 手順 3.e): rb_gc_register_address /
-         * rb_gc_register_mark_object の登録先は VM に 1 つ。登録スロットには
-         * 後から別 objspace の値が入り得るため per-Ractor 分割はしない —
-         * 全 Ractor の GC が root walk で全登録を保守的に見る（自 objspace の
-         * 値だけが mark され、foreign は各所有者の GC が拾う）。lock は leaf
-         * （保持中に割り当て・GC をしない）。register/unregister は cold path、
-         * 配列は raw realloc（登録が GC を再入させないため）。 */
+        /* RLGCv2 (design §2.1 手順 3.e): rb_gc_register_address の登録先は VM に
+         * 1 つ。登録スロット（*addr）には後から別 objspace の値が入り得るため
+         * per-Ractor 分割はしない — 全 Ractor の GC が root walk で保守的に見る
+         * （自 objspace の値だけが mark され、foreign は各所有者の GC が拾う）。
+         * lock は leaf（保持中に割り当て・GC をしない）、register/unregister は
+         * cold path、配列は raw realloc（登録が GC を再入させないため）。
+         * rb_gc_register_mark_object の pin は per-Ractor（rb_ractor_t.registered_marks）。 */
         struct {
             rb_nativethread_lock_t lock;
             VALUE **addrs;              /* rb_gc_register_address: *addr を mark_maybe */
             size_t addrs_cnt, addrs_capa;
-            VALUE *marks;               /* rb_gc_register_mark_object: pin */
-            size_t marks_cnt, marks_capa;
         } registered_globals;
     } gc;
 

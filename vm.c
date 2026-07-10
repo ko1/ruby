@@ -3422,13 +3422,6 @@ rb_vm_mark(void *ptr)
             rb_box_entry_mark(vm->main_box);
         }
 
-        /* The main Ractor's registered mark objects (rb_gc_register_mark_object)
-         * are process-lifetime pins.  Mark them here as well as from ractor_mark
-         * so they stay live before the main Ractor joins vm->ractor.set, e.g.
-         * during early boot under GC.stress. */
-        if (vm->ractor.main_ractor && vm->ractor.main_ractor->mark_object_ary) {
-            rb_gc_mark_movable(vm->ractor.main_ractor->mark_object_ary);
-        }
         rb_gc_mark_movable(vm->orig_progname);
         rb_gc_mark_movable(vm->coverages);
         rb_gc_mark_movable(vm->me2counter);
@@ -4825,19 +4818,19 @@ rb_vm_register_global_object(VALUE obj)
       default:
         break;
     }
-    /* RLGCv2 (design §2.1 3.e): the registered-globals lists are VM-single;
-     * every Ractor's GC walks them conservatively (see rb_gc_mark_roots). */
-    rb_vm_t *vm = GET_VM();
-    rb_native_mutex_lock(&vm->gc.registered_globals.lock);
-    if (vm->gc.registered_globals.marks_cnt == vm->gc.registered_globals.marks_capa) {
-        size_t nc = vm->gc.registered_globals.marks_capa ? vm->gc.registered_globals.marks_capa * 2 : 64;
-        VALUE *p = realloc(vm->gc.registered_globals.marks, nc * sizeof(VALUE));
+    /* RLGCv2: register into the current Ractor's own pin list (raw array).  The
+     * owner's GC is the only one that appends or marks it (its own thread is
+     * stopped during its GC), so no lock is needed; a merge that inherits the
+     * list runs under the global-GC STW. */
+    rb_ractor_t *cr = GET_RACTOR();
+    if (cr->registered_marks_cnt == cr->registered_marks_capa) {
+        size_t nc = cr->registered_marks_capa ? cr->registered_marks_capa * 2 : 64;
+        VALUE *p = realloc(cr->registered_marks, nc * sizeof(VALUE));
         if (!p) rb_bug("rb_vm_register_global_object: out of memory");
-        vm->gc.registered_globals.marks = p;
-        vm->gc.registered_globals.marks_capa = nc;
+        cr->registered_marks = p;
+        cr->registered_marks_capa = nc;
     }
-    vm->gc.registered_globals.marks[vm->gc.registered_globals.marks_cnt++] = obj;
-    rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
+    cr->registered_marks[cr->registered_marks_cnt++] = obj;
     RB_GC_GUARD(obj);
 }
 
