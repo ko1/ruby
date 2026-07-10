@@ -978,6 +978,11 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
          * safepoint は無く、移送先 entry の key はまだ r の objspace に居るが merge 前に
          * 誰も引かないので安全。 */
         rb_ractor_absorb_generic_fields(GET_RACTOR(), r);
+        /* Same window for rb_gc_register_mark_object pins: the objspace merge
+         * below sweeps r's objspace, so move r's per-Ractor registrations to the
+         * joiner first or a pinned object left in r's objspace goes rootless
+         * (the freeze-hash crash). */
+        rb_ractor_absorb_registered_marks(GET_RACTOR(), r);
 
         rb_gc_objspace_absorb_into_current(&r->objspace);
 

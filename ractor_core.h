@@ -217,6 +217,7 @@ void rb_ractor_pin_inherited_parts(rb_ractor_t *r);
  * （Ractor#value join / orphan free）。実装は variable.c（表のセマンティクスを持つ）。
  * st は raw malloc なので sweep 中の呼び出しも安全。 */
 void rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src);
+void rb_ractor_absorb_registered_marks(rb_ractor_t *dst, rb_ractor_t *src);
 /* RLGCv2: この Ractor の per-Ractor generic_fields 表を解放（ractor_free）。 */
 void rb_ractor_free_generic_fields(rb_ractor_t *r);
 
