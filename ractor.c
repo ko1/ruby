@@ -345,6 +345,31 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
     rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
 }
 
+/* RLGCv2: move src's rb_gc_register_mark_object pins into dst.  Called when
+ * src's objspace is absorbed into dst (Ractor#value join -> joiner, orphan
+ * ractor_free -> main), BEFORE the objspace merge, so a pinned object is never
+ * left rootless in the window between "objspace moved" and "registrations
+ * moved" (the same window the generic_fields / freeze-hash absorb closes).
+ * Raw realloc: an absorb can run inside a GC sweep, so it must not re-enter GC. */
+void
+rb_ractor_absorb_registered_marks(rb_ractor_t *dst, rb_ractor_t *src)
+{
+    if (src->registered_marks_cnt == 0) return;
+    size_t need = dst->registered_marks_cnt + src->registered_marks_cnt;
+    if (need > dst->registered_marks_capa) {
+        size_t nc = dst->registered_marks_capa ? dst->registered_marks_capa : 64;
+        while (nc < need) nc *= 2;
+        VALUE *p = realloc(dst->registered_marks, nc * sizeof(VALUE));
+        if (!p) rb_bug("rb_ractor_absorb_registered_marks: out of memory");
+        dst->registered_marks = p;
+        dst->registered_marks_capa = nc;
+    }
+    MEMCPY(dst->registered_marks + dst->registered_marks_cnt,
+           src->registered_marks, VALUE, src->registered_marks_cnt);
+    dst->registered_marks_cnt = need;
+    src->registered_marks_cnt = 0;
+}
+
 static int
 free_targeted_hook_lists(st_data_t key, st_data_t val, st_data_t _arg)
 {
@@ -413,27 +438,13 @@ ractor_free(void *ptr)
      * NULL だが、main は shutdown 時に非 NULL のことがある。NULL は no-op。 */
     rb_ractor_free_generic_fields(r);
 
-    /* RLGCv2: hand this Ractor's rb_gc_register_mark_object pins to the main
-     * Ractor so they stay pinned.  We are inside the global GC's sweep (Ractor
-     * objects are shareable, freed only by the global GC under the barrier), so
-     * marking them from main is safe -- the STW marks every objspace, and the
-     * objspace is merged into main shortly after.  Raw realloc = no GC re-entry
-     * during sweep.  Non-main registration is essentially nonexistent in
-     * practice, so this list is normally empty. */
-    if (!r->main_ractor && r->registered_marks_cnt > 0) {
-        rb_ractor_t *m = GET_VM()->ractor.main_ractor;
-        size_t need = m->registered_marks_cnt + r->registered_marks_cnt;
-        if (need > m->registered_marks_capa) {
-            size_t nc = m->registered_marks_capa ? m->registered_marks_capa : 64;
-            while (nc < need) nc *= 2;
-            VALUE *p = realloc(m->registered_marks, nc * sizeof(VALUE));
-            if (!p) rb_bug("ractor_free: registered_marks migrate out of memory");
-            m->registered_marks = p;
-            m->registered_marks_capa = nc;
-        }
-        MEMCPY(m->registered_marks + m->registered_marks_cnt,
-               r->registered_marks, VALUE, r->registered_marks_cnt);
-        m->registered_marks_cnt = need;
+    /* RLGCv2: an orphaned Ractor (never joined) hands its rb_gc_register_mark_object
+     * pins to the main Ractor before its objspace is absorbed there.  (The join
+     * path does the same to the joiner in ractor_sync.c, before the objspace
+     * merge -- same "objspace moved but its registrations did not" window as the
+     * generic_fields / freeze-hash absorb.) */
+    if (!r->main_ractor) {
+        rb_ractor_absorb_registered_marks(GET_VM()->ractor.main_ractor, r);
     }
     free(r->registered_marks);
     r->registered_marks = NULL;
