@@ -241,11 +241,6 @@ mark_targeted_hook_list(st_data_t key, st_data_t value, st_data_t _arg)
 static void
 ractor_mark_unshareable_parts(rb_ractor_t *r)
 {
-    /* objects this Ractor pinned via rb_gc_register_mark_object (the
-     * pin_array_list wrapper itself is an unshareable internal object;
-     * updated in ractor_update_references) */
-    if (r->mark_object_ary) rb_gc_mark_movable(r->mark_object_ary);
-
     /* Single VALUE slots: stable enough for any GC to read (written by
      * the owner as one aligned word; their referents are foreign to a
      * foreign marker and skipped by containment anyway). */
@@ -343,6 +338,11 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
     rb_gc_mark(r->loc);
     rb_gc_mark(r->name);
     ractor_mark_unshareable_parts(r);
+
+    /* RLGCv2: this Ractor's rb_gc_register_mark_object pins.  Conservative:
+     * a local GC actually marks only its own residents; foreign/shareable
+     * entries are picked up by their owner's (or the global) GC. */
+    rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
 }
 
 static int
@@ -413,6 +413,32 @@ ractor_free(void *ptr)
      * NULL だが、main は shutdown 時に非 NULL のことがある。NULL は no-op。 */
     rb_ractor_free_generic_fields(r);
 
+    /* RLGCv2: hand this Ractor's rb_gc_register_mark_object pins to the main
+     * Ractor so they stay pinned.  We are inside the global GC's sweep (Ractor
+     * objects are shareable, freed only by the global GC under the barrier), so
+     * marking them from main is safe -- the STW marks every objspace, and the
+     * objspace is merged into main shortly after.  Raw realloc = no GC re-entry
+     * during sweep.  Non-main registration is essentially nonexistent in
+     * practice, so this list is normally empty. */
+    if (!r->main_ractor && r->registered_marks_cnt > 0) {
+        rb_ractor_t *m = GET_VM()->ractor.main_ractor;
+        size_t need = m->registered_marks_cnt + r->registered_marks_cnt;
+        if (need > m->registered_marks_capa) {
+            size_t nc = m->registered_marks_capa ? m->registered_marks_capa : 64;
+            while (nc < need) nc *= 2;
+            VALUE *p = realloc(m->registered_marks, nc * sizeof(VALUE));
+            if (!p) rb_bug("ractor_free: registered_marks migrate out of memory");
+            m->registered_marks = p;
+            m->registered_marks_capa = nc;
+        }
+        MEMCPY(m->registered_marks + m->registered_marks_cnt,
+               r->registered_marks, VALUE, r->registered_marks_cnt);
+        m->registered_marks_cnt = need;
+    }
+    free(r->registered_marks);
+    r->registered_marks = NULL;
+    r->registered_marks_cnt = r->registered_marks_capa = 0;
+
     if (!r->main_ractor) {
         SIZED_FREE(r);
     }
@@ -430,11 +456,8 @@ ractor_memsize(const void *ptr)
 static void
 ractor_update_references(void *ptr)
 {
-    rb_ractor_t *r = (rb_ractor_t *)ptr;
-    /* the registered mark objects list is marked movable in ractor_mark */
-    if (r->mark_object_ary) {
-        r->mark_object_ary = rb_gc_location(r->mark_object_ary);
-    }
+    /* RLGCv2: registered_marks are pinned (marked via rb_gc_mark_vm_stack_values),
+     * so nothing here needs compaction updating. */
 }
 
 static const rb_data_type_t ractor_data_type = {
