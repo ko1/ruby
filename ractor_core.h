@@ -167,15 +167,6 @@ struct rb_ractor_struct {
      * lock when the child joins the set. */
     void *creating_child_objspace;
 
-    /* RLGCv2 (design_v2.md section 1.3): the mark redirect installed by
-     * this Ractor's object-traversal API call, if any. Per Ractor so
-     * that a foreign Ractor's concurrent real GC never sees it; the
-     * redirect branch parks it to NULL around each callback, so this
-     * Ractor's own real GC (triggered by a callback's allocation)
-     * cannot be hijacked either. */
-    struct gc_mark_func_data_struct *mark_func_data;
-
-
     /* RLGCv2: この Ractor が所有する unshareable オブジェクトの generic fields
      * （旧 VM-global な generic_fields_tbl_ + generic_fields_lock を per-Ractor 化）。
      * generic_fields は VM の ivar 格納機能であって GC の機能ではないので、GC-impl の
@@ -245,7 +236,6 @@ rb_ractor_self(const rb_ractor_t *r)
 
 rb_ractor_t *rb_ractor_main_alloc(void);
 void rb_ractor_main_setup(rb_vm_t *vm, rb_ractor_t *main_ractor, rb_thread_t *main_thread);
-void rb_vm_ractor_migrate_mark_objects(rb_ractor_t *dst, rb_ractor_t *src);
 void rb_ractor_atexit(rb_execution_context_t *ec, VALUE result);
 void rb_ractor_atexit_exception(rb_execution_context_t *ec);
 void rb_ractor_teardown(rb_execution_context_t *ec);
