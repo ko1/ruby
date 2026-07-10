@@ -590,9 +590,6 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
 
     RB_VM_LOCK();
     {
-        /* keep this Ractor's registered mark objects alive under the main Ractor */
-        if (cr->mark_object_ary) rb_vm_ractor_migrate_mark_objects(vm->ractor.main_ractor, cr);
-
         RUBY_DEBUG_LOG("ractor.cnt:%u-- terminate_waiting:%d",
                        vm->ractor.cnt,  vm->ractor.sync.terminate_waiting);
 
