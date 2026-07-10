@@ -2462,10 +2462,15 @@ gf_drain_i(st_data_t key, st_data_t val, st_data_t data)
 {
     struct gf_drain_ctx *ctx = (struct gf_drain_ctx *)data;
     if (ctx->is_dead((VALUE)key)) {
-        /* weak pass の drain: dead key の entry を消し、その obj を root shape に戻す。
-         * こうすると後続の obj_free（rb_free_generic_ivar）が rb_obj_gen_fields_p==false
-         * で早期 return し、二重削除の rb_bug を避けられる（id2ref 等の weak table と同型）。 */
-        RBASIC_SET_SHAPE_ID((VALUE)key, ROOT_SHAPE_ID | SHAPE_ID_LAYOUT_OTHER);
+        /* weak pass の drain: dead key の entry を消すだけ。**key の本体には触らない**。
+         * rlgc_global_gc の step 3 が各 objspace の lazy sweep を settle した時点で、
+         * すでに free（slot poison）済みの key があり得る（その obj_free は during_global_gc
+         * ガードで per-Ractor delete を drain に委譲し、entry をここに残す）。その poison
+         * スロットへ RBASIC_SET_SHAPE_ID で書くと use-after-poison になるため、shape は
+         * いじらない。まだ生きている dead key（この cycle で死に step 9 で sweep される物）
+         * の shape reset は、その obj_free 自身が行う。entry は今ここで消えているので、
+         * step 9 の obj_free は during_global_gc ガードで st_delete を踏まず（二重削除の
+         * rb_bug 無し）、末尾で自分で root shape に戻す。 */
         return ST_DELETE;
     }
     return ST_CONTINUE;
