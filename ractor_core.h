@@ -98,9 +98,15 @@ struct rb_ractor_struct {
     struct rb_ractor_pub pub;
     struct rb_ractor_sync sync;
 
-    /* objects pinned via rb_gc_register_mark_object; this Ractor owns them and
-     * marks them, and hands them to the main Ractor when it terminates. */
-    VALUE mark_object_ary;
+    /* RLGCv2: objects pinned via rb_gc_register_mark_object are per-Ractor:
+     * the owner marks them (rb_ractor_mark_local_roots for a live Ractor, the
+     * zombie-objspace scan for a terminated-but-unmerged one) and a merge moves
+     * them to the survivor.  Raw malloc/realloc/free so a merge running during
+     * GC sweep never re-enters the GC.  (rb_gc_register_address stays VM-single
+     * in vm->gc.registered_globals: a slot's *addr can later hold any objspace's
+     * value, so it has no single owner.) */
+    VALUE *registered_marks;
+    size_t registered_marks_cnt, registered_marks_capa;
 
 #if !USE_MODULAR_GC
     /* traversal-API mark redirect (NULL outside a traversal).  Per Ractor so a
