@@ -9181,6 +9181,10 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
                 prev = dst->heap_pages.deferred_final;
                 RZOMBIE(tail_obj)->next = prev;
             } while (RUBY_ATOMIC_VALUE_CAS(dst->heap_pages.deferred_final, prev, src_deferred) != prev);
+            /* these zombies never had an owner to run them (the register's
+             * owner walk misses a dead Ractor); dst runs this merge, so
+             * schedule its job -- otherwise they wait for dst's next GC. */
+            rb_postponed_job_trigger(dst->finalize_deferred_pjob);
         }
     }
 
@@ -9195,14 +9199,19 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
 
     /* src's outstanding malloc pressure moves with its xmalloc'd buffers:
      * their later frees are accounted to dst, so without this transfer
-     * dst underestimates its heap and delays GC. */
+     * dst underestimates its heap and delays GC. dst is live, so take its
+     * counter lock where gc_counter_add is not atomic. */
     {
         int64_t inc = gc_malloc_counters_increase(src, &src->malloc_counters.counters);
+#if RGENGC_ESTIMATE_OLDMALLOC
+        int64_t oldinc = gc_malloc_counters_increase(src, &src->malloc_counters.oldcounters);
+#endif
+        MALLOC_COUNTERS_LOCK(dst);
         if (inc > 0) gc_counter_add(&dst->malloc_counters.counters.malloc, (size_t)inc);
 #if RGENGC_ESTIMATE_OLDMALLOC
-        inc = gc_malloc_counters_increase(src, &src->malloc_counters.oldcounters);
-        if (inc > 0) gc_counter_add(&dst->malloc_counters.oldcounters.malloc, (size_t)inc);
+        if (oldinc > 0) gc_counter_add(&dst->malloc_counters.oldcounters.malloc, (size_t)oldinc);
 #endif
+        MALLOC_COUNTERS_UNLOCK(dst);
     }
 
     /* free the shell (mirror rb_gc_impl_objspace_free) */
