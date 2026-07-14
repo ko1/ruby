@@ -9213,9 +9213,24 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
      * dst's view of the world on the next collection */
     dst->rgengc.need_major_gc |= GPR_FLAG_MAJOR_BY_FORCE;
 
-    /* free the shell */
+    /* src's outstanding malloc pressure moves with its xmalloc'd buffers:
+     * their later frees are accounted to dst, so without this transfer
+     * dst underestimates its heap and delays GC. */
+    {
+        int64_t inc = gc_malloc_counters_increase(src, &src->malloc_counters.counters);
+        if (inc > 0) gc_counter_add(&dst->malloc_counters.counters.malloc, (size_t)inc);
+#if RGENGC_ESTIMATE_OLDMALLOC
+        inc = gc_malloc_counters_increase(src, &src->malloc_counters.oldcounters);
+        if (inc > 0) gc_counter_add(&dst->malloc_counters.oldcounters.malloc, (size_t)inc);
+#endif
+    }
+
+    /* free the shell (mirror rb_gc_impl_objspace_free) */
+    free(src->profile.records);
     free_stack_chunks(&src->mark_stack);
     mark_stack_free_cache(&src->mark_stack);
+    GC_ASSERT(rb_darray_size(src->weak_references) == 0);
+    rb_darray_free_without_gc(src->weak_references);
 #ifdef MALLOC_COUNTERS_NEED_LOCK
     rb_native_mutex_destroy(&src->malloc_counters.lock);
 #endif
