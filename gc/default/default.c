@@ -2768,6 +2768,9 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
 #endif
 
     if (RB_UNLIKELY(flags & RUBY_FL_SHAREABLE)) {
+        /* RLGCv2 決定13: born-shareable は WB protected でなければならない
+         * (shareable の shref/remset 規律は WB 前提)。 */
+        GC_ASSERT(wb_protected);
         /* RLGCv2: mirror born-shareable into the page bitmap; the confined
          * GC roots shareables from it (rlgc_pinned_roots_mark). */
         struct heap_page *page = GET_HEAP_PAGE(obj);
