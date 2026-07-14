@@ -8697,18 +8697,20 @@ static int
 rlgc_genfields_mark_i(VALUE key, VALUE val, void *arg)
 {
     struct rlgc_genfields_mark_arg *a = (struct rlgc_genfields_mark_arg *)arg;
-    if (!RB_SPECIAL_CONST_P(val) &&
-        RVALUE_MARKED_BITMAP(key) && !RVALUE_MARKED_BITMAP(val)) {
-        /* host(key) を parent にして val(fields_obj) を mark する。これにより old(key)→
-         * young(val) の世代間エッジが remembered set に正しく記録される。parent を張らない
-         * （Qundef のままにする）と、val は mark されて今回は生き延びるが WB が記録されず、
-         * 次の minor GC が old key を走査せず young val を取りこぼす（CHECK verifier の
-         * "WB miss (O->Y)"）。confined GC 経路は rb_gc_mark_children(key) が既に parent=key を
-         * 張っているのでこの問題は無い。 */
-        gc_mark_set_parent(a->objspace, key);
-        gc_mark(a->objspace, val);
-        a->progress = true;
+    if (RB_SPECIAL_CONST_P(val) || !RVALUE_MARKED_BITMAP(key)) {
+        return ST_CONTINUE;
     }
+    /* host(key) を parent にして old(key)→young(val) の世代間エッジを remembered set に
+     * 記録する。val が既に mark 済みでも必ず記録する: owner Ractor の保守的マシンスタック
+     * 走査（や ec->gen_fields_cache）が生まれたての fields_obj を weak pass より前に parent
+     * 無しで mark し得るため、mark 有無で分岐すると key が remember されず、次の minor GC が
+     * old key を走査せず young val を取りこぼす（CHECK verifier の "WB miss (O->Y)"）。
+     * gc_mark は already-marked の早期 return より前に rgengc_check_relation を呼ぶので、
+     * 無条件に呼べば両ケースを被覆する。 */
+    bool newly = !RVALUE_MARKED_BITMAP(val);
+    gc_mark_set_parent(a->objspace, key);
+    gc_mark(a->objspace, val);
+    if (newly) a->progress = true;
     return ST_CONTINUE;
 }
 
