@@ -30,6 +30,19 @@ mark_cc_entry_i(VALUE ccs_ptr, void *data)
     VM_ASSERT(vm_ccs_p(ccs));
 
     if (METHOD_ENTRY_INVALIDATED(ccs->cme)) {
+        /* RLGCv2: every other in-place mutation of a published cc table runs
+         * under rb_vm_barrier(); this prune was safe only because the stock GC
+         * is STW. A multi-Ractor local GC runs concurrently with another
+         * Ractor's rb_vm_cc_table_dup and with the lock-free cache readers, so
+         * freeing/deleting here corrupts them. Keep the entry alive; the next
+         * global GC (STW) prunes it. */
+        if (rb_multi_ractor_p() && !rb_gc_during_global_gc_p()) {
+            rb_gc_mark_movable((VALUE)ccs->cme);
+            for (int i = 0; i < ccs->len; i++) {
+                rb_gc_mark_movable((VALUE)ccs->entries[i].cc);
+            }
+            return ID_TABLE_CONTINUE;
+        }
         /* Before detaching the CCs from this class, we need to invalidate the cc
          * since we will no longer be marking the cme on their behalf.
          */
