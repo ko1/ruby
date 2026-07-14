@@ -3725,8 +3725,10 @@ gc_finalize_deferred(void *dmy)
 static void
 gc_finalize_deferred_register(rb_objspace_t *objspace)
 {
-    /* will enqueue a call to gc_finalize_deferred */
-    rb_postponed_job_trigger(objspace->finalize_deferred_pjob);
+    /* will enqueue a call to gc_finalize_deferred on this objspace's owner
+     * Ractor (see rb_gc_trigger_finalize_deferred): a global GC can defer a
+     * finalizer in a foreign objspace, which must run there, not on the driver. */
+    rb_gc_trigger_finalize_deferred(objspace, objspace->finalize_deferred_pjob);
 }
 
 static int pop_mark_stack(mark_stack_t *stack, VALUE *data);

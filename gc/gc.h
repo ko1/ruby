@@ -13,6 +13,7 @@
 #include "ruby/assert.h"
 
 #include "ruby/thread_native.h"
+#include "ruby/debug.h"
 
 #ifndef VM_CHECK_MODE
 # define VM_CHECK_MODE RUBY_DEBUG
@@ -107,6 +108,7 @@ MODULAR_GC_FN void rb_gc_event_hook(VALUE obj, rb_event_flag_t event);
 MODULAR_GC_FN void *rb_gc_get_objspace(void);
 MODULAR_GC_FN void rb_gc_run_obj_finalizer(VALUE objid, long count, VALUE (*callback)(long i, void *data), void *data);
 MODULAR_GC_FN void rb_gc_set_pending_interrupt(void);
+MODULAR_GC_FN void rb_gc_trigger_finalize_deferred(void *objspace, rb_postponed_job_handle_t pjob);
 MODULAR_GC_FN void rb_gc_unset_pending_interrupt(void);
 MODULAR_GC_FN void rb_gc_obj_free_vm_weak_references(VALUE obj);
 MODULAR_GC_FN bool rb_gc_obj_free(void *objspace, VALUE obj);
