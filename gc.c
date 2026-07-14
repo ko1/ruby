@@ -305,12 +305,15 @@ rb_gc_set_pending_interrupt(void)
  * Ractor (which finalizes its own objspace), not on whichever Ractor drove the
  * sweep -- otherwise a quiescent owner would delay it indefinitely. Target the
  * owner; fall back to this EC for our own objspace or an ownerless zombie
- * (whose finalizers the orphan-merge absorb takes care of). */
+ * (whose finalizers the absorb reschedules onto the inheritor). */
 void
 rb_gc_trigger_finalize_deferred(void *objspace, rb_postponed_job_handle_t pjob)
 {
-    rb_ractor_t *cr = GET_RACTOR();
-    if (cr->objspace != objspace) {
+    rb_ractor_t *const cr = rb_current_ractor_raw(false);
+    if (cr == NULL || cr->objspace != objspace) {
+        /* only a global GC (STW) or an absorb settle (VM lock) defers a
+         * foreign objspace's finalizer, so the set is stable here */
+        ASSERT_vm_locking();
         rb_vm_t *vm = GET_VM();
         rb_ractor_t *r;
         ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
