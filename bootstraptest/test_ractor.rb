@@ -2742,3 +2742,25 @@ assert_equal '["MyStr", "MyAry", "MyHash"]', %q{
   end
   r.value.inspect
 }
+
+# Moving an object with a singleton class must keep the singleton methods
+# working and re-attach the singleton class to the rebuilt object -- the
+# sender-side attachment would otherwise keep pointing at the neutralized
+# source (a GC-marked edge). Covers T_OBJECT/String/Struct.
+assert_equal '[[:obj, true], [:str, true], [:strct, true]]', %q{
+  o = Object.new
+  def o.m; :obj end
+  s = +"str"
+  def s.m; :str end
+  st = Struct.new(:a).new(1)
+  def st.m; :strct end
+  r = Ractor.new do
+    3.times.map do
+      v = Ractor.receive
+      GC.start
+      [v.m, v.method(:m).owner.attached_object.equal?(v)]
+    end
+  end
+  [o, s, st].each { |x| r.send(x, move: true) }
+  r.value.inspect
+}
