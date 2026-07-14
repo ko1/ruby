@@ -2620,7 +2620,7 @@ move_capture(struct move_build *b, VALUE obj)
         b->c->nodes[id].kind = MOVE_K_STRUCT;
         b->c->nodes[id].u.strct.len = len;
         b->c->nodes[id].u.strct.elems = elems;
-        b->c->nodes[id].u.strct.klass = rb_obj_class(obj);
+        b->c->nodes[id].u.strct.klass = RBASIC_CLASS(obj);
         /* release the source's owned heap buffer (embedded structs have none) */
         if (RSTRUCT_EMBED_LEN(obj) == 0) {
             ruby_xfree((void *)RSTRUCT_CONST_PTR(obj));
@@ -2641,7 +2641,7 @@ move_capture(struct move_build *b, VALUE obj)
         b->c->nodes[id].u.match.str_id = sid;
         b->c->nodes[id].u.match.num_regs = nregs;
         b->c->nodes[id].u.match.regs = regs;
-        b->c->nodes[id].u.match.klass = rb_obj_class(obj);
+        b->c->nodes[id].u.match.klass = RBASIC_CLASS(obj);
         break;
       }
 
@@ -2804,15 +2804,21 @@ ractor_move_courier_build(VALUE obj)
     return c;
 }
 
-/* String/Array/Hash shells are built through their base class; if the moved
- * source was a subclass (or carried a singleton class), re-tag the shell so the
- * move preserves the class. The class is shareable, so the cross-objspace
- * reference carried in the node is sound (mirrors the T_OBJECT arm). */
+/* Shells are built through their base/real class; if the moved source was a
+ * subclass (or carried a singleton class), re-tag the shell so the move
+ * preserves the class. The class is shareable, so the cross-objspace
+ * reference carried in the node is sound. A singleton class additionally
+ * still has the sender's neutralized source as its attached object -- a
+ * GC-marked edge (gc.c marks RCLASS_ATTACHED_OBJECT) -- so re-attach it to
+ * the shell; RCLASS_SET_ATTACHED_OBJECT's write barrier records the shref. */
 static void
 move_apply_moved_klass(VALUE shell, VALUE klass)
 {
     if (klass != RBASIC_CLASS(shell)) {
         RBASIC_SET_CLASS(shell, klass);
+    }
+    if (RB_UNLIKELY(FL_TEST_RAW(klass, FL_SINGLETON))) {
+        rb_singleton_class_attached(klass, shell);
     }
 }
 
@@ -2845,25 +2851,22 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
             move_apply_moved_klass(shell, n->u.hash.klass);
             break;
           case MOVE_K_OBJECT:
-            if (FL_TEST_RAW(n->u.obj.klass, FL_SINGLETON)) {
-                /* can't allocate through a singleton class; build a plain
-                 * instance of the real class and re-attach the (shared)
-                 * singleton class so its methods stay reachable */
-                shell = rb_obj_alloc(rb_class_real(n->u.obj.klass));
-                RBASIC_SET_CLASS(shell, n->u.obj.klass);
-            }
-            else {
-                shell = rb_obj_alloc(n->u.obj.klass);
-            }
+            /* can't allocate through a singleton class; build an instance
+             * of the real class, then re-tag/re-attach */
+            shell = rb_obj_alloc(rb_class_real(n->u.obj.klass));
+            move_apply_moved_klass(shell, n->u.obj.klass);
             break;
           case MOVE_K_STRUCT:
-            shell = rb_obj_alloc(n->u.strct.klass);
+            shell = rb_obj_alloc(rb_class_real(n->u.strct.klass));
+            move_apply_moved_klass(shell, n->u.strct.klass);
             break;
           case MOVE_K_MATCH:
-            shell = rb_match_move_alloc(n->u.match.klass, n->u.match.num_regs);
+            shell = rb_match_move_alloc(rb_class_real(n->u.match.klass), n->u.match.num_regs);
+            move_apply_moved_klass(shell, n->u.match.klass);
             break;
           case MOVE_K_IO:
-            shell = rb_obj_alloc(n->u.io.klass);
+            shell = rb_obj_alloc(rb_class_real(n->u.io.klass));
+            move_apply_moved_klass(shell, n->u.io.klass);
             RFILE(shell)->fptr = n->u.io.fptr;
             n->u.io.fptr->self = shell;
             n->u.io.fptr = NULL; /* consumed: the new IO owns it now */
@@ -3001,6 +3004,15 @@ ractor_move_courier_mark(struct rb_ractor_move_courier *c)
         }
         else if (n->kind == MOVE_K_IO) {
             rb_gc_mark(n->u.io.klass);
+        }
+        else if (n->kind == MOVE_K_STRING) {
+            rb_gc_mark(n->u.str.klass);
+        }
+        else if (n->kind == MOVE_K_ARRAY) {
+            rb_gc_mark(n->u.ary.klass);
+        }
+        else if (n->kind == MOVE_K_HASH) {
+            rb_gc_mark(n->u.hash.klass);
         }
     }
 }
