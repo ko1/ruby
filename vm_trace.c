@@ -2027,9 +2027,12 @@ rb_postponed_job_flush(rb_vm_t *vm)
         RUBY_VM_SET_POSTPONED_JOB_INTERRUPT(GET_EC());
     }
     /* likewise with any remaining-to-be-executed bits of the preregistered postponed
-     * job table */
+     * job table. Re-post them to THIS Ractor's own mask, not the global bitset:
+     * the merged bits may include Ractor-targeted jobs
+     * (rb_postponed_job_trigger_for_ractor) that must not run on another Ractor,
+     * and globally-triggered bits are fine to run here too. */
     if (triggered_bits) {
-        RUBY_ATOMIC_OR(pjq->triggered_bitset, triggered_bits);
+        RUBY_ATOMIC_OR(rb_ec_ractor_ptr(ec)->postponed_job_triggered_bits, triggered_bits);
         RUBY_VM_SET_POSTPONED_JOB_INTERRUPT(GET_EC());
     }
 }
