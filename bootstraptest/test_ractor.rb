@@ -2672,3 +2672,57 @@ assert_equal 'ok', %q{
     :ok  # platform without fork
   end
 }
+
+# A Ractor creation that fails after the child objspace exists (IsolationError)
+# must clean up the creator's creating_child_objspace cover, or later global
+# GCs enumerate the dead child's objspace twice / read a freed shell through
+# the dangling cover.
+assert_equal 'ok', %q{
+  x = 42 # captured outer local => IsolationError at Ractor.new
+  worker = Ractor.new { loop { break if Ractor.receive == :quit } }
+  begin
+    Ractor.new { x }
+    raise "isolation error did not fire"
+  rescue Ractor::IsolationError
+  end
+  10.times { GC.start; 500.times { Object.new } }
+  worker.send(:quit)
+  worker.value
+  100.times do |i|
+    begin
+      Ractor.new { x }
+      raise "isolation error did not fire"
+    rescue Ractor::IsolationError
+    end
+    if (i % 20).zero?
+      Ractor.new { :ok }.value
+      GC.start
+    end
+  end
+  GC.start
+  :ok
+}
+
+# Moving a CoW shared-ROOT string (frozen root carrying an unshareable ivar)
+# must not steal the root's buffer: the sharers left behind would read freed
+# memory after the courier releases it.
+assert_equal 'ok', %q{
+  30.times do
+    r = Ractor.new do
+      v = Ractor.receive
+      v.bytesize
+      :done
+    end
+    f = "x" * 4096
+    f.instance_variable_set(:@x, []) # unshareable ivar => move, not passthrough
+    f.freeze
+    g = f.dup            # shares f's buffer -> f becomes a shared root
+    h = f[10, 3000]      # long substring also shares the buffer
+    r.send(f, move: true)
+    r.value
+    GC.start
+    10.times { "z" * 4096 }
+    raise "sharer corrupted" unless g == "x" * 4096 && h == "x" * 3000
+  end
+  :ok
+}
