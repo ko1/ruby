@@ -2371,30 +2371,6 @@ rb_copy_generic_ivar(VALUE dest, VALUE obj)
     }
 }
 
-void
-rb_replace_generic_ivar(VALUE clone, VALUE obj)
-{
-    st_data_t fields_tbl = 0, obj_data = (st_data_t)obj;
-    /* RLGCv2: obj の generic_fields entry を clone へ付け替える。obj と clone は同じ
-     * shareable 状態を前提とする（同じ表に属す）。insert は malloc しうるので
-     * rb_obj_set_fields と同じ GC 無効化の作法に従う。 */
-    struct st_table *tbl = generic_fields_tbl_for(obj, true);
-    bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
-    generic_fields_write_lock(tbl);
-    int moved = st_delete(tbl, &obj_data, &fields_tbl);
-    if (moved) {
-        st_insert(tbl, (st_data_t)clone, fields_tbl);
-    }
-    generic_fields_write_unlock(tbl);
-    if (!gc_disabled) rb_gc_local_enable();
-    if (moved) {
-        RB_OBJ_WRITTEN(clone, Qundef, fields_tbl);
-    }
-    else {
-        rb_bug("unreachable");
-    }
-}
-
 /* RLGCv2: すべての generic_fields 表（shareable 用の global 表 + 全 Ractor の
  * per-Ractor 表 + まだ merge されていない zombie owner の per-Ractor 表）について
  * cb(tbl, arg) を呼ぶ。global GC の weak pass（STW）と、compaction の参照更新
