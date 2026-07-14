@@ -300,6 +300,29 @@ rb_gc_set_pending_interrupt(void)
     ec->interrupt_mask |= PENDING_INTERRUPT_MASK;
 }
 
+/* RLGCv2: schedule an objspace's deferred finalizers. A global GC sweeps
+ * foreign objspaces too; a finalizer deferred in one must run on its owner
+ * Ractor (which finalizes its own objspace), not on whichever Ractor drove the
+ * sweep -- otherwise a quiescent owner would delay it indefinitely. Target the
+ * owner; fall back to this EC for our own objspace or an ownerless zombie
+ * (whose finalizers the orphan-merge absorb takes care of). */
+void
+rb_gc_trigger_finalize_deferred(void *objspace, rb_postponed_job_handle_t pjob)
+{
+    rb_ractor_t *cr = GET_RACTOR();
+    if (cr->objspace != objspace) {
+        rb_vm_t *vm = GET_VM();
+        rb_ractor_t *r;
+        ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+            if (r->objspace == objspace) {
+                rb_postponed_job_trigger_for_ractor(pjob, r->pub.self);
+                return;
+            }
+        }
+    }
+    rb_postponed_job_trigger(pjob);
+}
+
 void
 rb_gc_unset_pending_interrupt(void)
 {
