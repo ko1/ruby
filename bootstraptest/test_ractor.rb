@@ -2726,3 +2726,19 @@ assert_equal 'ok', %q{
   end
   :ok
 }
+
+# Moving a String/Array/Hash subclass (via the move courier, forced by an
+# unshareable ivar) must preserve the class, not degrade to the base class.
+assert_equal '["MyStr", "MyAry", "MyHash"]', %q{
+  class MyStr < String; end
+  class MyAry < Array; end
+  class MyHash < Hash; end
+  r = Ractor.new do
+    3.times.map { Ractor.receive.class.name }
+  end
+  [MyStr.new("x"), (MyAry.new << 1), (h=MyHash.new; h[:a]=1; h)].each do |o|
+    o.instance_variable_set(:@x, []) # unshareable ivar => move path
+    r.send(o, move: true)
+  end
+  r.value.inspect
+}

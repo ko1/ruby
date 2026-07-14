@@ -2344,9 +2344,9 @@ struct move_node {
     uint32_t *iv_vals;   /* courier owns; node ids */
     union {
         VALUE ref;
-        struct { char *ptr; long len; int encidx; } str;        /* courier owns ptr */
-        struct { long len; uint32_t *elems; } ary;              /* courier owns elems */
-        struct { long size; uint32_t *kv; uint32_t ifnone_id; bool compare_by_id; bool proc_default; } hash; /* owns kv (2*size) */
+        struct { char *ptr; long len; int encidx; VALUE klass; } str;        /* courier owns ptr */
+        struct { long len; uint32_t *elems; VALUE klass; } ary;              /* courier owns elems */
+        struct { long size; uint32_t *kv; uint32_t ifnone_id; bool compare_by_id; bool proc_default; VALUE klass; } hash; /* owns kv (2*size) */
         struct { VALUE klass; } obj;
         struct { long len; uint32_t *elems; VALUE klass; } strct; /* owns elems */
         struct { uint32_t regexp_id, str_id; int num_regs; void *regs; VALUE klass; } match; /* owns regs */
@@ -2530,6 +2530,7 @@ move_capture(struct move_build *b, VALUE obj)
             ptr[len] = '\0';
         }
         b->c->nodes[id].kind = MOVE_K_STRING;
+        b->c->nodes[id].u.str.klass = RBASIC_CLASS(obj);
         b->c->nodes[id].u.str.ptr = ptr;
         b->c->nodes[id].u.str.len = len;
         b->c->nodes[id].u.str.encidx = encidx;
@@ -2543,6 +2544,7 @@ move_capture(struct move_build *b, VALUE obj)
             elems[i] = move_capture(b, RARRAY_AREF(obj, i));
         }
         b->c->nodes[id].kind = MOVE_K_ARRAY;
+        b->c->nodes[id].u.ary.klass = RBASIC_CLASS(obj);
         b->c->nodes[id].u.ary.len = len;
         b->c->nodes[id].u.ary.elems = elems;
         /* Release the source's owned heap buffer (children already read).
@@ -2562,6 +2564,7 @@ move_capture(struct move_build *b, VALUE obj)
         struct move_hash_ctx hc = { b, kv, 0 };
         rb_hash_stlike_foreach(obj, move_capture_hash_i, (st_data_t)&hc);
         b->c->nodes[id].kind = MOVE_K_HASH;
+        b->c->nodes[id].u.hash.klass = RBASIC_CLASS(obj);
         b->c->nodes[id].u.hash.size = size;
         b->c->nodes[id].u.hash.kv = kv;
         b->c->nodes[id].u.hash.ifnone_id = ifnone_id;
@@ -2773,6 +2776,18 @@ ractor_move_courier_build(VALUE obj)
     return c;
 }
 
+/* String/Array/Hash shells are built through their base class; if the moved
+ * source was a subclass (or carried a singleton class), re-tag the shell so the
+ * move preserves the class. The class is shareable, so the cross-objspace
+ * reference carried in the node is sound (mirrors the T_OBJECT arm). */
+static void
+move_apply_moved_klass(VALUE shell, VALUE klass)
+{
+    if (klass != RBASIC_CLASS(shell)) {
+        RBASIC_SET_CLASS(shell, klass);
+    }
+}
+
 /* Rebuild the courier's graph in the current Ractor's objspace and return the
  * root.  Two passes (allocate shells, then fill) resolve reference cycles. */
 VALUE
@@ -2791,12 +2806,15 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
             break;
           case MOVE_K_STRING:
             shell = rb_enc_str_new(n->u.str.ptr, n->u.str.len, rb_enc_from_index(n->u.str.encidx));
+            move_apply_moved_klass(shell, n->u.str.klass);
             break;
           case MOVE_K_ARRAY:
             shell = rb_ary_new_capa(n->u.ary.len);
+            move_apply_moved_klass(shell, n->u.ary.klass);
             break;
           case MOVE_K_HASH:
             shell = n->u.hash.compare_by_id ? rb_ident_hash_new() : rb_hash_new();
+            move_apply_moved_klass(shell, n->u.hash.klass);
             break;
           case MOVE_K_OBJECT:
             if (FL_TEST_RAW(n->u.obj.klass, FL_SINGLETON)) {
