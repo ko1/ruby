@@ -61,7 +61,8 @@ void rb_imemo_fields_record_shrefs(VALUE fields_obj);
 
 /* global GC 用の generic_fields weak pass。mark_foreach は全表（shareable 用 global と
  * 全 Ractor の per-Ractor）の各 (key,val) で cb を呼び live key の val を mark する。
- * drain_dead は is_dead(key) が真の entry を削除し key を root shape に戻す。 */
+ * drain_dead は is_dead(key) が真の entry を削除する。key は既に free/poison 済みかも
+ * しれないので key 本体や shape には触らない。 */
 void rb_gc_vm_generic_fields_mark_foreach(int (*cb)(VALUE key, VALUE val, void *arg), void *arg);
 void rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key));
 /* 全 generic_fields 表（global + 全 Ractor per-Ractor）について cb(tbl,arg) を呼ぶ。
