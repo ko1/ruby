@@ -2315,23 +2315,25 @@ move_alloc_node(struct rb_ractor_move_courier *c)
 }
 
 /* move 済み source を、flags==0 を経ずに正当な RactorMovedObject へ変える
- * （並行 foreign marker が常に元 object か shell のどちらかを見るように）。
- * shape id 0 で古い body が ivar として読まれない。 */
+ * （並行 foreign marker が常に元 object か shell のどちらかを見るように）。 */
 static void
 move_neutralize_source(VALUE obj)
 {
+    /* 殻は元のスロットに残るので capacity ビットを保持したまま、フィールド無しの
+     * ROBJECT レイアウト・frozen な shape を与える。古い body が ivar として読まれず、
+     * compaction の slot_size と shape_slot_size 一致検査も満たす。フラグ潰しの前に取る。 */
+    shape_id_t shape_id = (RBASIC_SHAPE_ID(obj) & SHAPE_ID_CAPACITY_MASK) |
+                          ROOT_SHAPE_ID | SHAPE_ID_LAYOUT_ROBJECT | SHAPE_ID_FL_FROZEN;
+
     /* source が非 T_OBJECT ホスト（ivar 持ちの String/Array 等）なら generic_fields
-     * entry を削除する。下で shape を 0 に潰すと obj は host でなくなり fields_obj が
-     * 回収されるので、消さないと freed 値を指す stale entry が残り global GC が踏む。 */
+     * entry を削除する。下で obj は host でなくなり fields_obj が回収されるので、消さないと
+     * freed 値を指す stale entry が残り global GC が踏む。 */
     rb_free_generic_ivar(obj);
 
     VALUE flags = T_OBJECT | FL_FREEZE | (RBASIC(obj)->flags & FL_PROMOTED);
     RBASIC_SET_CLASS_RAW(obj, rb_cRactorMovedObject);
     RBASIC(obj)->flags = flags;
-    /* 殻は元の大きいスロットに残るので、フィールド無しの ROOT shape を物理スロット幅に
-     * 合わせて与える。古い body が ivar として読まれず、compaction の slot_size と
-     * shape_slot_size 一致検査も満たす。 */
-    RBASIC_SET_FULL_SHAPE_ID(obj, rb_shape_transition_slot_size(ROOT_SHAPE_ID, rb_gc_obj_slot_size(obj)));
+    RBASIC_SET_FULL_SHAPE_ID(obj, shape_id);
 }
 
 struct move_hash_ctx {
