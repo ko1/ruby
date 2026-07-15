@@ -31,6 +31,7 @@
 #include "internal/vm.h"
 #include "ruby/encoding.h"
 #include "variable.h"
+#include "shape.h"
 #include "yjit.h"
 #include "zjit.h"
 
@@ -2337,10 +2338,11 @@ move_neutralize_source(VALUE obj)
 
     VALUE flags = T_OBJECT | FL_FREEZE | (RBASIC(obj)->flags & FL_PROMOTED);
     RBASIC_SET_CLASS_RAW(obj, rb_cRactorMovedObject);
-#if RBASIC_SHAPE_ID_FIELD
-    RBASIC(obj)->shape_id = 0;
-#endif
     RBASIC(obj)->flags = flags;
+    /* 殻は元の大きいスロットに残るので、フィールド無しの ROOT shape を物理スロット幅に
+     * 合わせて与える。古い body が ivar として読まれず、compaction の slot_size と
+     * shape_slot_size 一致検査も満たす。 */
+    RBASIC_SET_FULL_SHAPE_ID(obj, rb_shape_transition_slot_size(ROOT_SHAPE_ID, rb_gc_obj_slot_size(obj)));
 }
 
 struct move_hash_ctx {
