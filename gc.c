@@ -300,9 +300,9 @@ rb_gc_set_pending_interrupt(void)
     ec->interrupt_mask |= PENDING_INTERRUPT_MASK;
 }
 
-/* objspace の遅延 finalizer を実行予約する。他 Ractor の objspace も sweep する
- * global GC が遅延した分は、sweep 駆動側でなく所有 Ractor で走らせる。所有者を狙い、
- * 自 objspace や所有者なし zombie は呼び出し側 EC に落とす。 */
+/* objspace の遅延 finalizer を実行予約する。他 Ractor の objspace も sweep する global GC
+ * が遅延した分は、sweep 駆動側でなく所有 Ractor で走らせる。所有者を狙い、自 objspace は
+ * 呼び出し側で trigger する。所有者なし zombie の分は absorb 後に継承先で実行される。 */
 void
 rb_gc_trigger_finalize_deferred(void *objspace, rb_postponed_job_handle_t pjob)
 {
