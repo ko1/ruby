@@ -573,8 +573,8 @@ rb_mmtk_builder_init(void)
 void *
 rb_gc_impl_global_objspace_alloc(void)
 {
-    /* RLGCv2: MMTk does not use rb_global_objspace yet; return a non-NULL
-     * placeholder so boot can store it. */
+    /* MMTk はまだ global objspace を使わない。boot が保存できるよう
+     * 非 NULL のダミーを返す。 */
     static char rlgc_global_objspace_placeholder;
     return &rlgc_global_objspace_placeholder;
 }
@@ -1197,13 +1197,13 @@ rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj)
 void
 rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
 {
-    /* RLGCv2: MMTk does not track per-page shareable bits. */
+    /* MMTk はページ単位の shareable ビットを持たない。 */
 }
 
 void
 rb_gc_impl_pin_in_flight_message(void *objspace_ptr, VALUE obj)
 {
-    /* RLGCv2: MMTk has a single objspace; nothing to pin. */
+    /* MMTk は objspace が単一なので pin するものがない。 */
 }
 
 void
@@ -1756,19 +1756,19 @@ rb_gc_impl_during_global_gc_p(void *objspace_ptr)
 bool
 rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
 {
-    /* single objspace: no cross-objspace pin bookkeeping */
+    /* objspace が単一なので objspace 間の pin 管理は不要 */
     return false;
 }
 
 size_t
 rb_gc_impl_heap_page_count(void *objspace_ptr)
 {
-    /* single objspace: the zombie ledger is always empty */
+    /* objspace が単一なので zombie 台帳は常に空 */
     return 0;
 }
 
 void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
-    /* single objspace */
+    /* objspace が単一 */
 }

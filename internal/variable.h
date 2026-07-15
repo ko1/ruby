@@ -59,11 +59,9 @@ VALUE rb_ivar_get_at_no_ractor_check(VALUE obj, attr_index_t index);
 void rb_generic_fields_lock_atfork(void);
 void rb_imemo_fields_record_shrefs(VALUE fields_obj);
 
-/* RLGCv2 generic_fields weak pass（gc-impl の global GC から呼ぶ）。
- * mark_foreach: 全 generic_fields 表（shareable 用 global + 全 Ractor の per-Ractor）の
- *   各 (key,val) について cb(key,val,arg) を呼ぶ。cb は live key の val を mark する。
- * drain_dead: 同じ表を舐め、is_dead(key) が真の entry を削除し key を root shape に戻す
- *   （obj_free の rb_free_generic_ivar を no-op 化する）。 */
+/* global GC 用の generic_fields weak pass。mark_foreach は全表（shareable 用 global と
+ * 全 Ractor の per-Ractor）の各 (key,val) で cb を呼び live key の val を mark する。
+ * drain_dead は is_dead(key) が真の entry を削除し key を root shape に戻す。 */
 void rb_gc_vm_generic_fields_mark_foreach(int (*cb)(VALUE key, VALUE val, void *arg), void *arg);
 void rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key));
 /* 全 generic_fields 表（global + 全 Ractor per-Ractor）について cb(tbl,arg) を呼ぶ。

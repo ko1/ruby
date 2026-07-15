@@ -66,18 +66,9 @@ static void setup_const_entry(rb_const_entry_t *, VALUE, VALUE, rb_const_flag_t)
 static VALUE rb_const_search(VALUE klass, ID id, int exclude, int recurse, int visibility, VALUE *found_in);
 static st_table *generic_fields_tbl_;
 
-/* RLGCv2 (design_v2.md §2.4): generic_fields_tbl_ is read and written
- * by the lock-free local GC path (rb_mark_generic_ivar on mark,
- * rb_free_generic_ivar on sweep), which must never block on the VM
- * lock -- a thread waiting for it joins a pending barrier, and joining
- * mid-mark/mid-sweep would expose a half-collected heap to the global
- * GC. So the table synchronizes on its own native mutex instead.
- * Sections that may allocate (a growing st_insert) disable GC first:
- * an allocation can start this thread's own local GC, whose mark and
- * sweep take the same mutex. The global GC's weak-table pass
- * (vm_weak_table_gen_fields_foreach) runs under the STW barrier with
- * every mutator and local GC parked outside these (non-blocking)
- * critical sections, so it needs no mutex. */
+/* shareable 用の共有 generic_fields 表を守る mutex。local GC の mark/sweep が
+ * この表を引くが VM lock を待てない（barrier 合流で half-collected heap を露出する）
+ * ため専用 mutex を使う。alloc しうる区間は先に GC を無効化して自己再入を防ぐ。 */
 static rb_nativethread_lock_t generic_fields_lock;
 
 typedef int rb_ivar_foreach_callback_func(ID key, VALUE val, st_data_t arg);
@@ -86,7 +77,7 @@ static void rb_field_foreach(VALUE obj, rb_ivar_foreach_callback_func *func, st_
 void
 rb_generic_fields_lock_atfork(void)
 {
-    /* another thread may hold it at fork time: give the child a fresh one */
+    /* fork 時に他スレッドが保持しているかもしれないので子には作り直す */
     rb_native_mutex_initialize(&generic_fields_lock);
 }
 
@@ -1266,17 +1257,15 @@ rb_generic_fields_tbl_get(void)
     return generic_fields_tbl_;
 }
 
-/* RLGCv2: この obj の generic_fields entry がどの表に属すかを返す（owner 側の
- * write / local read 用）。shareable → shared な global 表（narrow lock 継続、稀ケース）。
- * unshareable → owner Ractor（=GET_RACTOR()）の per-Ractor 表。create=true なら
+/* この obj の generic_fields entry がどの表に属すかを返す。shareable は共有 global 表
+ * （narrow lock 継続）、unshareable は owner Ractor の per-Ractor 表。create=true なら
  * per-Ractor 表を必要に応じて生成する。 */
 static inline bool
 generic_fields_shared_p(VALUE obj)
 {
-    /* SHAREABLE フラグ「だけ」を見る（深い rb_ractor_shareable_p は使わない: それは
-     * traverse で alloc しうるので GC mark 中に呼ぶと "allocation during GC" になる）。
-     * entry がどちらの表に居るかはフラグと 1:1: make_shareable がフラグを立てる瞬間に
-     * per-Ractor 表 → global 表へ移送するため（rb_mv_generic_ivar_to_shared）。 */
+    /* SHAREABLE フラグだけを見る（深い rb_ractor_shareable_p は traverse で alloc しうる）。
+     * entry の所属はフラグと 1:1: make_shareable がフラグを立てる瞬間に per-Ractor 表から
+     * global 表へ移送する（rb_mv_generic_ivar_to_shared）。 */
     return RB_OBJ_SHAREABLE_P(obj);
 }
 
@@ -1314,10 +1303,9 @@ generic_fields_write_unlock(struct st_table *tbl)
 void
 rb_mark_generic_ivar(VALUE obj)
 {
-    /* RLGCv2: global GC（STW）では per-object 引きを行わない。driver の
-     * GET_RACTOR() は owner と一致しないので per-Ractor 表を引けない（finding-B）。
-     * その代わり global GC は mark 後に全 Ractor の表を舐める weak pass
-     * （rb_gc_vm_generic_fields_mark_foreach）で live key の val を mark する。 */
+    /* global GC（STW）では per-object 引きをしない。driver の GET_RACTOR() は owner と
+     * 一致せず per-Ractor 表を引けないため。代わりに mark 後、全 Ractor の表を舐める
+     * weak pass（rb_gc_vm_generic_fields_mark_foreach）で live key の val を mark する。 */
     if (rb_gc_during_global_gc_p()) {
         return;
     }
@@ -1341,10 +1329,9 @@ rb_mark_generic_ivar(VALUE obj)
     }
 }
 
-/* RLGCv2: cross-Ractor read（materialize 中の native copy）で、foreign な owner の
- * per-Ractor 表から obj の fields を引く。owner が誰か分からない（sender、または既に
- * merge された joiner/main）ので、全 live Ractor と未 merge の zombie owner を、それぞれの
- * per-Ractor mutex 越しに探索する。自分の表は呼び出し側が既に引いているので飛ばす。 */
+/* obj の generic fields を引く。shareable は共有 global 表、unshareable は owner の
+ * per-Ractor 表。materialize 中の snapshot host は自表に無いので、送信時同梱の
+ * 対応表（gen_fields_materialize）から引く。 */
 VALUE
 rb_obj_fields_generic_uncached(VALUE obj)
 {
@@ -1362,11 +1349,9 @@ rb_obj_fields_generic_uncached(VALUE obj)
         if (cr->generic_fields_tbl != NULL) {
             found = st_lookup(cr->generic_fields_tbl, (st_data_t)obj, (st_data_t *)&fields_obj);
         }
-        /* RLGCv2: Ractor#send の native copy を受信側で materialize している最中は、obj は
-         * sender の objspace に pin された snapshot host であり、自分の表には無い。sender の
-         * per-Ractor 表を跨いで引く代わりに、送信時に同梱した対応表から fields_obj を得る
-         * （gen_fields_materialize、ractor_sync.c で設定）。fields_obj は snapshot と共に
-         * sender 側で生きている frozen オブジェクトなので、その中身を読むのは安全。 */
+        /* materialize 中の snapshot host は sender の objspace に pin され自表に無い。
+         * sender の表を跨がず、送信時同梱の対応表から fields_obj を得る（gen_fields_materialize、
+         * ractor_sync.c で設定）。fields_obj は sender 側で生きている frozen なので読取安全。 */
         if (!found && cr->gen_fields_materialize != NULL) {
             found = st_lookup(cr->gen_fields_materialize, (st_data_t)obj, (st_data_t *)&fields_obj);
         }
@@ -1467,22 +1452,13 @@ rb_free_generic_ivar(VALUE obj)
                     ec->gen_fields_cache.obj = Qundef;
                     ec->gen_fields_cache.fields_obj = Qundef;
                 }
-                /* mutator / confined local sweep（host の obj_free）から走る。いずれも
-                 * owner=GET_RACTOR() の write なので per-Ractor 表は無ロック（shareable のみ
-                 * global mutex）。st_delete はアロケートしない。RLGCv2: global GC の sweep
-                 * からはここに来ない（weak pass の drain が dead key を先に削除し root shape に
-                 * 戻すので入口ガードで弾かれる）。absorb（join/orphan）は objspace merge の前に
-                 * 表を移送済みなので、joiner が merge 中に src の dead host を掃くときも entry は
-                 * joiner の表に居る。 */
+                /* mutator / confined local sweep（host の obj_free）から走る write。owner
+                 * 専有なので per-Ractor 表は無ロック（shareable のみ global mutex）。global GC
+                 * の sweep からは来ない（下の during_global_gc ガードで弾く）。 */
                 if (rb_gc_during_global_gc_p()) {
-                    /* RLGCv2 finding-B: the global GC driver's GET_RACTOR() is
-                     * not this object's owner (e.g. the driver settling another
-                     * Ractor's leftover lazy sweep in rlgc_global_gc step 3), so
-                     * generic_fields_tbl_for() would pick the driver's table and
-                     * miss the entry, which lives in the owner's table. The
-                     * global GC's weak-pass drain removes every dead key's entry
-                     * across all tables, so leave the delete to it (mirrors
-                     * rb_mark_generic_ivar's during-global-gc skip). */
+                    /* global GC の driver の GET_RACTOR() は owner と一致せず、表を取り違えて
+                     * entry を見失う。dead key の削除は weak pass の drain が全表で行うので
+                     * ここでは委譲する（rb_mark_generic_ivar の skip と同じ）。 */
                     break;
                 }
                 struct st_table *tbl = generic_fields_tbl_for(obj, false);
@@ -1535,10 +1511,9 @@ rb_obj_set_fields(VALUE obj, VALUE fields_obj, ID field_name, VALUE original_fie
           default:
           generic_fields:
             {
-                /* st_insert は malloc しうる。先に GC を無効化しておけば、この表を
-                 * mark/sweep で引く自スレッドの local GC を st resize の途中で起動できない
-                 * （自己再入回避）。owner=GET_RACTOR() の write なので per-Ractor 表は無ロック
-                 * （shareable のみ global mutex）。 */
+                /* st_insert は malloc しうる。先に GC を無効化し、この表を引く自スレッドの
+                 * local GC が st resize 途中で起動するのを防ぐ（自己再入回避）。owner 専有
+                 * なので per-Ractor 表は無ロック（shareable のみ global mutex）。 */
                 struct st_table *tbl = generic_fields_tbl_for(obj, true);
                 bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
                 generic_fields_write_lock(tbl);
@@ -1852,19 +1827,17 @@ static int
 imemo_fields_shref_i(ID key, VALUE val, st_data_t arg)
 {
     VALUE fields_obj = (VALUE)arg;
-    /* RLGCv2: fields_obj just became shareable (rb_obj_set_shareable_no_assert)
-     * while this field value stayed unshareable -- some field values (e.g. a
-     * hidden [path,line] location ivar) are not reached by the make_shareable
-     * traversal and so are never deep-shared. Record the shref the write
-     * barrier would have, so the shareable -> unshareable edge is tracked. */
+    /* fields_obj が shareable 化した（rb_obj_set_shareable_no_assert）のに、この
+     * field value が unshareable のまま（例: 隠れた [path,line] ivar は make_shareable の
+     * traverse に届かない）。shareable から unshareable への辺を追うため shref を記録する。 */
     if (!SPECIAL_CONST_P(val) && !RB_OBJ_SHAREABLE_P(val)) {
         rb_gc_writebarrier(fields_obj, val);
     }
     return ST_CONTINUE;
 }
 
-/* Record shrefs for any still-unshareable values held by a fields imemo that
- * has just been promoted to shareable. */
+/* shareable に昇格したばかりの fields imemo が持つ、まだ unshareable な値について
+ * shref を記録する。 */
 void
 rb_imemo_fields_record_shrefs(VALUE fields_obj)
 {
@@ -2371,11 +2344,9 @@ rb_copy_generic_ivar(VALUE dest, VALUE obj)
     }
 }
 
-/* RLGCv2: すべての generic_fields 表（shareable 用の global 表 + 全 Ractor の
- * per-Ractor 表 + まだ merge されていない zombie owner の per-Ractor 表）について
- * cb(tbl, arg) を呼ぶ。global GC の weak pass（STW）と、compaction の参照更新
- * （single-objspace なので実質 main の 1 本 + global）から使う。いずれも barrier 下
- * なので、Ractor リストや zombie ledger の走査にロックは要らない。 */
+/* すべての generic_fields 表（shareable 用の global 表 + 全 Ractor の per-Ractor 表 +
+ * 未 merge の zombie owner の表）について cb(tbl, arg) を呼ぶ。global GC の weak pass と
+ * compaction の参照更新から使う。いずれも barrier 下なので走査にロックは要らない。 */
 void
 rb_generic_fields_tables_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg)
 {
@@ -2392,10 +2363,9 @@ rb_generic_fields_tables_foreach(void (*cb)(struct st_table *tbl, void *arg), vo
         }
     }
 
-    /* 終了して vm->ractor.set から外れたが、まだ Ractor#value / orphan merge されて
-     * いない zombie owner の per-Ractor 表も舐める（そこに残る entry の key/val は
-     * まだ回収され得るので weak pass の対象）。orphan（owner==NULL）は ractor_free が
-     * 表を main へ移送済みなので main 側で拾われる。 */
+    /* 終了して vm->ractor.set から外れたが未 merge の zombie owner の表も舐める
+     * （残る entry は weak pass の対象）。orphan（owner==NULL）は ractor_free が表を
+     * main へ移送済みなので main 側で拾われる。 */
     for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
         rb_ractor_t *zr = vm->gc.zombie_objspaces[i].owner;
         if (zr != NULL && zr->generic_fields_tbl != NULL) {
@@ -2438,15 +2408,9 @@ gf_drain_i(st_data_t key, st_data_t val, st_data_t data)
 {
     struct gf_drain_ctx *ctx = (struct gf_drain_ctx *)data;
     if (ctx->is_dead((VALUE)key)) {
-        /* weak pass の drain: dead key の entry を消すだけ。**key の本体には触らない**。
-         * rlgc_global_gc の step 3 が各 objspace の lazy sweep を settle した時点で、
-         * すでに free（slot poison）済みの key があり得る（その obj_free は during_global_gc
-         * ガードで per-Ractor delete を drain に委譲し、entry をここに残す）。その poison
-         * スロットへ RBASIC_SET_SHAPE_ID で書くと use-after-poison になるため、shape は
-         * いじらない。まだ生きている dead key（この cycle で死に step 9 で sweep される物）
-         * の shape reset は、その obj_free 自身が行う。entry は今ここで消えているので、
-         * step 9 の obj_free は during_global_gc ガードで st_delete を踏まず（二重削除の
-         * rb_bug 無し）、末尾で自分で root shape に戻す。 */
+        /* weak pass の drain: dead key の entry を消すだけで key 本体には触らない。
+         * global GC が他 objspace の lazy sweep を settle した時点で key は既に free
+         * （slot poison）済みかもしれず、shape を書くと use-after-poison になるため。 */
         return ST_DELETE;
     }
     return ST_CONTINUE;
@@ -2465,22 +2429,9 @@ rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key))
     rb_generic_fields_tables_foreach(gf_drain_table_cb, &ctx);
 }
 
-/* RLGCv2: promote obj to shareable, moving its generic_fields entry from the
- * owner's per-Ractor table to the shared global table. The field lookup picks
- * the table by RB_OBJ_SHAREABLE_P(obj), so the order matters against a foreign
- * reader (e.g. a worker polling a constant that names obj): if FL_SHAREABLE
- * became visible before the entry reached the global table, that reader would
- * consult the global table, miss, and rb_bug "missing entry in
- * generic_fields_tbl" (review A-5).
- *
- * Order: insert into the global table AND flip FL_SHAREABLE while holding
- * generic_fields_lock, then drop the owner-exclusive per-Ractor entry. Every
- * global-table read takes the same lock, so a reader that observes the flag
- * blocks until this insert is committed and always finds the entry; a reader
- * that has not yet seen the flag still finds it in the per-Ractor table (the
- * delete is after the flag is published, and that table is owner-exclusive).
- * The flag flip is the caller's FL_SHAREABLE set for this path, so callers
- * must NOT set it themselves before calling this. */
+/* obj を shareable 化し、generic_fields entry を owner の per-Ractor 表から共有 global 表へ
+ * 移す。表選択は RB_OBJ_SHAREABLE_P で決まるので、global 表への insert と FL_SHAREABLE の
+ * セットを lock 下で行い、その後 per-Ractor entry を消す（フラグは呼び出し側で立てない）。 */
 void
 rb_mv_generic_ivar_to_shared(VALUE obj)
 {
@@ -2488,9 +2439,9 @@ rb_mv_generic_ivar_to_shared(VALUE obj)
     struct st_table *src = cr->generic_fields_tbl;
 
     st_data_t key = (st_data_t)obj, val = 0;
-    /* an st_insert may allocate (resize); keep this thread's own confined GC
-     * out -- its mark/sweep take generic_fields_lock (self-deadlock) and could
-     * observe the entry mid-move. */
+    /* st_insert は alloc（resize）しうる。自 Ractor の confined GC を止める: その
+     * mark/sweep は generic_fields_lock を取る（自己 deadlock）し、移送途中の entry を
+     * 観測しうる。 */
     bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
     bool has_entry = (src != NULL) && st_lookup(src, key, &val);
 
@@ -2503,7 +2454,7 @@ rb_mv_generic_ivar_to_shared(VALUE obj)
     rb_native_mutex_unlock(&generic_fields_lock);
 
     if (has_entry) {
-        st_delete(src, &key, NULL);  /* owner-exclusive per-Ractor table */
+        st_delete(src, &key, NULL);  /* owner 専有の per-Ractor 表 */
     }
 
     if (!gc_disabled) rb_gc_local_enable();
@@ -2521,13 +2472,9 @@ gf_absorb_i(st_data_t key, st_data_t val, st_data_t data)
     return ST_CONTINUE;
 }
 
-/* RLGCv2: src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする。
- * Ractor#value join（joiner が受け継ぐ）や orphan free（main へ移送）から呼ばれる。
- * dst が空なら表ごと引き渡す（O(1)）。要素移送する場合、st_insert が dst 表を resize
- * すると st.c の malloc(=ruby_xmalloc)が malloc 会計を跨いで dst の GC を誘発し得る
- * (A-7 と同型)。その GC が半移送の表を触る／src の未移送値を回収するのを防ぐため、
- * 移送ループは dst の GC を disable した窓の中で行う（GENERIC_FIELDS_PLAN.md 準拠、
- * 他の全 insert サイトと同じ規律）。 */
+/* src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする（Ractor#value
+ * join / orphan free）。dst が空なら表ごと引き渡す。要素移送では st_insert の resize が
+ * dst の GC を誘発しうるので、移送ループは dst の GC を disable した窓の中で行う。 */
 void
 rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src)
 {

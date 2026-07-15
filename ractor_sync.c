@@ -18,7 +18,7 @@ static VALUE ractor_send(rb_execution_context_t *ec, const struct ractor_port *r
 static VALUE ractor_try_send(rb_execution_context_t *ec, const struct ractor_port *rp, VALUE obj, VALUE move);
 static void ractor_add_port(rb_ractor_t *r, st_data_t id);
 
-// RLGCv2 (design_v2.md §4.5): off-heap move courier, defined in ractor.c
+// off-heap な move 用 courier。実体は ractor.c にある。
 struct rb_ractor_move_courier *ractor_move_courier_build(VALUE obj);
 VALUE ractor_move_courier_materialize(struct rb_ractor_move_courier *c);
 void ractor_move_courier_free(struct rb_ractor_move_courier *c);
@@ -212,18 +212,14 @@ struct ractor_basket {
     struct {
         VALUE v;
         bool exception;
-        /* RLGCv2 (design_v2.md §4.2): true when v is a Marshal byte
-         * String snapshot (the graph contained a type the native copier
-         * does not support); the receiver materializes it with
-         * Marshal.load instead of the native traversal. */
+        /* v が native copier 非対応の型を含み Marshal バイト列 String に
+         * なった場合 true。受信側は native 走査でなく Marshal.load で復元する。 */
         bool marshaled;
-        /* RLGCv2 (design_v2.md §4.5): for basket_type_move, the off-heap
-         * (xmalloc'd) move courier; v is unused for move baskets. */
+        /* basket_type_move 用の off-heap（xmalloc）courier。move basket では v は未使用。 */
         struct rb_ractor_move_courier *move_courier;
-        /* RLGCv2: native copy snapshot（basket_type_copy かつ !marshaled）の generic-ivar
-         * 対応表 {snapshot host -> fields_obj}。送信時に構築（copy_enter）、受信側 materialize
-         * が引く（sender の per-Ractor 表を跨がないため）。値 fields_obj は snapshot と一緒に
-         * sender の objspace で pin されて生き続けるので、この表を別途 mark する必要はない。
+        /* native copy snapshot の generic-ivar 対応表 {snapshot host -> fields_obj}。
+         * 送信時に構築し受信側 materialize が引く（sender の per-Ractor 表を跨がないため）。
+         * 値は snapshot と共に sender objspace で pin され生きるので別途 mark 不要。
          * 対応表が無い（generic ivar 無し / marshaled / move）ときは NULL。 */
         struct st_table *gen_fields;
     } p; // payload
@@ -249,7 +245,7 @@ static void
 ractor_basket_mark(const struct ractor_basket *b)
 {
     if (b->type == basket_type_move) {
-        /* the courier is off-heap; mark only the shareable VALUEs it carries */
+        /* courier は off-heap。運んでいる shareable な VALUE だけを mark する。 */
         ractor_move_courier_mark(b->p.move_courier);
     }
     else {
@@ -261,12 +257,12 @@ static void
 ractor_basket_free(struct ractor_basket *b)
 {
     if (b->type == basket_type_move && b->p.move_courier) {
-        /* an unconsumed move courier (e.g. the queue is being torn down) */
+        /* 未消費の move courier（例: queue の破棄途中）。 */
         ractor_move_courier_free(b->p.move_courier);
         b->p.move_courier = NULL;
     }
     else if (b->type != basket_type_move && b->p.gen_fields) {
-        /* RLGCv2: native copy の generic-ivar 対応表（st は raw malloc）。 */
+        /* native copy の generic-ivar 対応表（st は raw malloc）。 */
         st_free_table(b->p.gen_fields);
         b->p.gen_fields = NULL;
     }
@@ -569,14 +565,10 @@ struct ractor_monitor {
     struct ccan_list_node node;
 };
 
-/* No GC mark walks r->sync.monitors. The entries only carry a copied
- * port (a ractor pointer + ids, no VALUEs), and the watcher Ractor's
- * object -- the only thing the old walk marked -- is rooted from the
- * VM's ractor set for as long as the watcher lives. Walking here was
- * also unsound: FOREIGN Ractors register/unregister themselves in this
- * list (under r's sync lock), so the owner's lock-free local GC raced
- * their ccan-list pointer updates (TSan: ractor_mark_monitors vs
- * ractor_monitor). */
+/* r->sync.monitors は GC mark で辿らない。entry は複製 port（ractor ポインタと
+ * id のみで VALUE を持たない）だけを運び、監視側 Ractor のオブジェクトは生きている
+ * 間 VM の ractor 集合から root される。また foreign Ractor が自分をこのリストに
+ * 登録/解除するため、所有者のロックフリー local GC が辿ると競合して不健全。 */
 
 static VALUE
 ractor_exit_token(bool exc)
@@ -700,63 +692,52 @@ ractor_mark_ports_i(st_data_t key, st_data_t val, st_data_t data)
 static void
 ractor_sync_mark(rb_ractor_t *r)
 {
-    /* default_port_value is a stable single slot (set once at creation,
-     * written by the owner as one aligned word): safe to read from any GC. */
+    /* default_port_value は安定した単一スロット（生成時に一度だけ、所有者が
+     * アラインされた 1 word で書く）なので、どの GC から読んでも安全。 */
     rb_gc_mark(r->sync.default_port_value);
 
-    /* RLGCv2 M1b: the queues, the port table, the monitor list AND the
-     * materialize-frame chain are mutated by the owner under its sync
-     * lock (or, for the frame chain, written by the owner during a
-     * receive), so a lock-free foreign mark (main's local GC traversing this
-     * Ractor object) reads them torn -- and by containment everything in
-     * them is foreign to that marker anyway (payload snapshots stay alive
-     * through the sender's in-flight pin: the shref for copy, the move
-     * manager for move; ports through the shareable pin). Walk them only
-     * when no concurrent owner can exist: our own Ractor, a terminated one,
-     * or under the global GC's barrier. */
+    /* queue・port 表・monitor リスト・materialize フレーム鎖は所有者が sync lock
+     * 下で（フレーム鎖は receive 中に）書き換えるので、ロックフリーな foreign mark
+     * が辿ると壊れて読める。しかも containment によりその中身はどれもこの marker に
+     * とって foreign（payload snapshot は sender の in-flight pin で、port は
+     * shareable pin で生存）。並行する所有者が居ない場合のみ辿る: 自 Ractor、
+     * 終了済み Ractor、または global GC の barrier 下。 */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p()) {
-        /* snapshots/couriers being materialized by receives (baskets
-         * already popped); off the queue, rooted only here for the global
-         * GC's re-pin. A chain: nested receives from user load hooks each
-         * push a frame. A foreign marker must not read it. */
+        /* receive が復元中の snapshot / courier。既に queue から外れ、global GC の
+         * re-pin のためここだけが root。user の load フックからの入れ子 receive が
+         * 各々フレームを push して鎖になる。foreign marker は読んではならない。 */
         for (const struct rlgc_materialize_frame *f = r->sync.materialize_frames;
              f != NULL; f = f->prev) {
             rb_gc_mark(f->snapshot);
-            /* the move courier is off-heap; mark the shareable VALUEs it
-             * carries so a concurrent global GC keeps them */
+            /* courier は off-heap。運ぶ shareable な VALUE を mark し、並行 global GC
+             * に維持させる。 */
             ractor_move_courier_mark(f->courier);
         }
 
-        /* the return value (set at exit, read by Ractor#value) lives in this
-         * now-terminated Ractor's objspace; until value-time inheritance pins
-         * it (rb_ractor_pin_inherited_parts) its only sure root is here. Plain
-         * slot written by the owner, so mark under the same gate; Qundef (not
-         * terminated) is a no-op. Otherwise its liveness leans on the dead
-         * main thread's th->value/errinfo aliasing, which the exception
-         * teardown path can drop -> Ractor#value raising a freed object. */
+        /* 戻り値（exit 時に設定、Ractor#value が読む）は今や終了済み Ractor の
+         * objspace に在る。value 時の継承が pin する（rb_ractor_pin_inherited_parts）
+         * までは、確実な root はここだけ。所有者が書く単純スロットなので同じゲートで
+         * mark する（Qundef=未終了なら no-op）。さもないと死んだ main thread の
+         * th->value/errinfo 別名に生存を頼ることになり、例外 teardown 経路がそれを
+         * 落とすと Ractor#value が解放済みオブジェクトを返してしまう。 */
         rb_gc_mark(r->sync.legacy);
 
         if (r->sync.ports) {
-            /* The recv_queue (and the ports table) are written by foreign
-             * SENDERS that hold r's sync lock (ractor_queue_enq under
-             * RACTOR_LOCK). When this is our own concurrent local GC
-             * (r == cr, and not a stop-the-world global GC) a sender on
-             * another thread can mutate the queue while we walk it -- a real
-             * data race (ractor_queue_mark vs ractor_queue_enq). Take the lock
-             * to exclude senders. This cannot self-deadlock: holding any
-             * ractor lock disables malloc-triggered GC (malloc_gc_disabled,
-             * gc.c), so a GC marker never itself already holds r's lock. Under
-             * a global GC every sender is stopped, and a terminated Ractor has
-             * none, so neither of those cases needs the lock. */
+            /* recv_queue（と ports 表）は r の sync lock を持つ foreign な送信側が
+             * 書く（RACTOR_LOCK 下の ractor_queue_enq）。これが自分の並行 local GC
+             * （r == cr かつ STW な global GC でない）だと、別スレッドの送信側が
+             * 走査中に queue を変更しうる=真のデータ競合。lock を取り送信側を排除する。
+             * 自己 deadlock はしない: いずれかの ractor lock 保持中は malloc 起因の
+             * GC が無効なので、GC marker が既に r の lock を持つことはない。global GC
+             * 下は全送信側が停止、終了済み Ractor には送信側が無く、どちらも lock 不要。 */
             bool lock_against_senders = (r == cr) && !rb_gc_during_global_gc_p();
             if (lock_against_senders) RACTOR_LOCK(r);
             ractor_queue_mark(r->sync.recv_queue);
             st_foreach(r->sync.ports, ractor_mark_ports_i, 0);
             if (lock_against_senders) RACTOR_UNLOCK(r);
         }
-        /* monitors are not walked -- see the comment above
-         * ractor_monitor's data structures */
+        /* monitors は辿らない。理由は ractor_monitor 定義上のコメント参照。 */
     }
 }
 
@@ -765,8 +746,8 @@ ractor_queue_repin_in_flight(const struct ractor_queue *rq)
 {
     const struct ractor_basket *b;
     ccan_list_for_each(&rq->set, b, node) {
-        /* move baskets carry an off-heap courier (no shref to re-pin); their
-         * shareable VALUEs are marked through ractor_basket_mark instead. */
+        /* move basket は off-heap courier を運ぶ（re-pin する shref は無い）。運ぶ
+         * shareable な VALUE は代わりに ractor_basket_mark で mark される。 */
         if (b->type == basket_type_copy) {
             rb_gc_pin_in_flight_message(b->p.v);
         }
@@ -780,10 +761,9 @@ ractor_repin_ports_i(st_data_t key, st_data_t val, st_data_t data)
     return ST_CONTINUE;
 }
 
-/* RLGCv2 (design_v2.md §2.2 step 6): the global GC clears all shref bits,
- * so every in-flight payload (queued baskets and the snapshot a receive
- * is currently materializing) must be re-pinned before the unified mark.
- * Runs on the driver under the barrier. */
+/* global GC は全 shref ビットを消すので、unified mark の前に全 in-flight payload
+ * （queue 済み basket と receive が今 materialize 中の snapshot）を re-pin する
+ * 必要がある。barrier 下で driver 上で走る。 */
 void
 rb_ractor_repin_in_flight(rb_ractor_t *r)
 {
@@ -859,7 +839,7 @@ ractor_sync_init(rb_ractor_t *r)
     // legacy
     r->sync.legacy = Qundef;
 
-    // RLGCv2: no receive is rebuilding a payload yet
+    // payload を再構築中の receive はまだ無い
     r->sync.materialize_frames = NULL;
 
 #ifndef RUBY_THREAD_PTHREAD_H
@@ -891,17 +871,14 @@ ractor_make_remote_exception(VALUE cause, VALUE sender)
     return err;
 }
 
-/* RLGCv2 (design_v2.md section 4.3): after Ractor#value absorbed the
- * dead Ractor's objspace, everything still referenced from its C struct
- * (the legacy value for repeat #value calls, its stdio, its local
- * storage) belongs to the CALLER's objspace but is reachable only
- * through the Ractor object, which usually lives in some other
- * Ractor's objspace -- whose marks foreign-skip our objects, while our
- * own GC never traverses the foreign Ractor object. Pin each top-level
- * slot with the shref bit: our pages, our thread, plain stores. Their
- * children survive through the normal root traversal, and the global
- * GC re-derives these exact bits from the shareable Ractor object's
- * s->u edges for as long as the Ractor object lives. */
+/* Ractor#value が死んだ Ractor の objspace を吸収した後、その C struct から今も
+ * 参照される物（再度の #value 用 legacy 値、stdio、local storage）は呼び出し側の
+ * objspace に属すが、経路は Ractor オブジェクト経由のみ。そのオブジェクトは通常
+ * 別 Ractor の objspace に在り、その mark は我々のオブジェクトを foreign-skip し、
+ * 我々の GC は foreign な Ractor オブジェクトを辿らない。各トップレベルスロットを
+ * shref ビットで pin する（今や我々のページなので通常のストア）。子は通常の root
+ * 走査で生き、global GC は Ractor オブジェクトが生きる間、その shareable エッジから
+ * 同じビットを再導出する。 */
 void
 rb_ractor_pin_inherited_parts(rb_ractor_t *r)
 {
@@ -916,19 +893,17 @@ rb_ractor_pin_inherited_parts(rb_ractor_t *r)
         }
     }
 
-    /* The dead Ractor's local storage is unreachable to Ruby code from
-     * now on (Ractor#[] works only from inside): release it here rather
-     * than pinning it -- its values can then die naturally, and neither
-     * ractor_mark nor ractor_free walks a stale table later. */
+    /* 死んだ Ractor の local storage はこれ以降 Ruby コードから到達不能
+     * （Ractor#[] は内側からのみ動く）。pin せずここで解放する。値は自然に死ね、
+     * ractor_mark も ractor_free も後で stale な表を辿らずに済む。 */
     ractor_local_storage_free(r);
     r->local_storage = NULL;
     r->idkey_local_storage = NULL;
 
-    /* The dead Ractor's main thread stays on its threads list, and its
-     * Thread/Fiber wrapper objects were born in the dead objspace
-     * (thread.c, rb_thread_create_ractor) -- inherited with everything
-     * else. Pinning the wrappers is enough: their dmarks reach the rest
-     * of the thread state (th->value and friends) transitively. */
+    /* 死んだ Ractor の main thread は threads リストに残り、その Thread/Fiber の
+     * ラッパオブジェクトは死んだ objspace で生まれた（thread.c の
+     * rb_thread_create_ractor）ので他と共に継承される。ラッパを pin すれば十分:
+     * その dmark が残りの thread 状態（th->value など）へ推移的に到達する。 */
     rb_thread_t *th = 0;
     ccan_list_for_each(&r->threads.set, th, lt_node) {
         if (th->self && !SPECIAL_CONST_P(th->self)) {
@@ -957,44 +932,32 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
     rb_ractor_t *sr = ractor_set_successor_once(r, cr);
 
     if (sr == cr) {
-        /* RLGCv2 (design_v2.md section 4.3): the value is returned by
-         * reference, so inherit the dead Ractor's objspace into ours
-         * first -- after the merge the return value is our own object
-         * and containment holds without any copy.
-         * The monitor-port wakeup precedes the end of the dying thread's
-         * teardown (vm_remove_ractor still touches the objspace), so wait
-         * for the terminated status, which is set under the VM lock after
-         * the teardown's last objspace access. */
+        /* 値は参照で返すので、まず死んだ Ractor の objspace を我々のものへ継承する。
+         * merge 後は戻り値も我々のオブジェクトになり、コピー無しで containment が成立。
+         * monitor-port の wakeup は死ぬ thread の teardown 終了より前に起こる
+         * （vm_remove_ractor がまだ objspace を触る）ので、terminated 状態を待つ。
+         * これは teardown 最後の objspace アクセス後に VM lock 下で設定される。 */
         while (!rb_ractor_status_p(r, ractor_terminated)) {
             rb_thread_schedule();
         }
 
-        /* RLGCv2: r の per-Ractor generic_fields 表を joiner へ移送する。これは objspace
-         * merge より「前」に行う必要がある: rb_gc_objspace_absorb_into_current は内部で
-         * src(=r) の objspace を gc_sweep_rest で掃くので、その最中に r の dead host が
-         * obj_free→rb_free_generic_ivar を呼ぶ。その時点の GET_RACTOR() は joiner なので
-         * entry を joiner 表に引きに行く。先に移送しておかないと「objspace は移ったが
-         * 登録情報が未移送」の窓（freeze-hash と同型）で miss する。移送〜merge 間に GC
-         * safepoint は無く、移送先 entry の key はまだ r の objspace に居るが merge 前に
-         * 誰も引かないので安全。 */
+        /* r の per-Ractor generic_fields 表を joiner へ移送する。objspace merge より
+         * 前に行う必要がある: 下の absorb は内部で r の objspace を sweep し、その最中に
+         * r の dead host が obj_free 経由で rb_free_generic_ivar を呼ぶが、その時点の
+         * GET_RACTOR() は joiner なので entry を joiner 表に引きに行く。先に移送しないと
+         * 「objspace は移ったが登録情報は未移送」の窓で miss する。移送から merge の間に
+         * GC safepoint は無く、移送先 key はまだ r の objspace だが誰も引かないので安全。 */
         rb_ractor_absorb_generic_fields(GET_RACTOR(), r);
-        /* Same window for rb_gc_register_mark_object pins: the objspace merge
-         * below sweeps r's objspace, so move r's per-Ractor registrations to the
-         * joiner first or a pinned object left in r's objspace goes rootless
-         * (the freeze-hash crash). */
+        /* rb_gc_register_mark_object の pin も同じ窓。下の merge が r の objspace を
+         * sweep するので、先に r の per-Ractor 登録を joiner へ移さないと、r の objspace
+         * に残った pin 済みオブジェクトが root を失う。 */
         rb_ractor_absorb_registered_marks(GET_RACTOR(), r);
 
         rb_gc_objspace_absorb_into_current(&r->objspace);
 
-        /* inherit したオブジェクトは今や我々のものだが、それらへの唯一の
-         * 経路は死んだ Ractor の C struct であり、Ractor オブジェクトを
-         * 所有する者（通常は別の Ractor で、その mark は我々のオブジェクトを
-         * foreign-skip する）だけがそれを traverse する。それらを shref
-         * ビットで pin する（今や我々がそのページを所有するので通常のストア）。
-         * すると我々の local GC がそれらを root し、次の global GC は Ractor
-         * オブジェクト自体が生存する間ずっと、shareable-Ractor-object ->
-         * unshareable のエッジから同一のビットを再導出する。それはまさに
-         * それらの生存期間に等しい。 */
+        /* 継承したオブジェクトへの唯一の経路は死んだ Ractor の C struct であり、
+         * 我々の local GC はそれを辿らない。トップレベルスロットを shref ビットで
+         * pin して root にする（詳細は rb_ractor_pin_inherited_parts 参照）。 */
         rb_ractor_pin_inherited_parts(r);
 
         ractor_reset_belonging(r->sync.legacy);
@@ -1036,22 +999,20 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
             return obj;
         }
         else {
-            /* design_v2.md §4.2 / decision 11: snapshot copy on the
-             * sender, without calling the user-visible #clone. Core
-             * types are deep-copied natively; any other type makes the
-             * snapshot a Marshal byte string (whose user hooks run here,
-             * on the sender, like #clone hooks used to). */
+            /* 送信側で、利用者に見える #clone を呼ばずに snapshot コピーする。中核型は
+             * native に deep copy し、それ以外は snapshot を Marshal バイト列にする
+             * （その利用者フックはここ、送信側で走る）。 */
             *ptype = basket_type_copy;
-            /* RLGCv2: native copy 中、copy_enter が snapshot の generic-ivar host の
-             * fields_obj を cr->gen_fields_capture に記録する（host が出て初めて遅延確保）。
-             * ractor_basket_new が basket に移して回収する。Marshal fallback 時は破棄。 */
+            /* native copy 中、copy_enter が snapshot の generic-ivar host の fields_obj を
+             * cr->gen_fields_capture に記録する（host が出て初めて遅延確保）。
+             * ractor_basket_new が basket へ移して回収し、Marshal fallback 時は破棄する。 */
             rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
             VM_ASSERT(!cr->gen_fields_capturing && cr->gen_fields_capture == NULL);
             cr->gen_fields_capturing = true;
             VALUE snapshot = Qundef;
-            /* the native copy can raise (allocation, async interrupt);
-             * a stuck capturing flag would fail the next send's assert
-             * and leak a stale capture map into its basket */
+            /* native copy は raise しうる（確保・非同期割り込み）。capturing フラグが
+             * 立ちっぱなしだと次の send の assert に失敗し、stale な capture 表がその
+             * basket に漏れる。 */
             enum ruby_tag_type state;
             EC_PUSH_TAG(ec);
             if ((state = EC_EXEC_TAG()) == TAG_NONE) {
@@ -1091,9 +1052,9 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     b->p.gen_fields = NULL;
 
     if (type == basket_type_move) {
-        /* RLGCv2 (design_v2.md §4.5): serialize the graph into an off-heap
-         * courier; the originals become RactorMovedObject. Nothing in flight
-         * is a GC object, so the sender's GC never marks/sweeps/moves it. */
+        /* グラフを off-heap courier へ直列化する。元オブジェクトは RactorMovedObject に
+         * なる。in-flight 中は GC オブジェクトが無いので、送信側の GC が mark/sweep/move
+         * することはない。 */
         b->type = basket_type_move;
         b->p.v = Qfalse;
         b->p.move_courier = ractor_move_courier_build(obj);
@@ -1102,12 +1063,12 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
         bool marshaled = false;
         VALUE v = ractor_prepare_payload(ec, obj, &type, &marshaled);
         if (type == basket_type_copy) {
-            /* RLGCv2: the copy snapshot (native graph or Marshal string)
-             * lives in the sender's objspace until the receiver materializes
-             * it.  Pin it (shref) so the sender's confined GC keeps it. */
+            /* copy snapshot（native グラフまたは Marshal 文字列）は受信側が
+             * materialize するまで送信側の objspace に在る。shref で pin し、
+             * 送信側の local GC に維持させる。 */
             rb_gc_pin_in_flight_message(v);
-            /* RLGCv2: native copy の generic-ivar 対応表を basket へ移す（prepare_payload
-             * が cr->gen_fields_capture に構築、marshaled/generic-ivar 無しなら空/NULL）。 */
+            /* native copy の generic-ivar 対応表を basket へ移す（prepare_payload が
+             * cr->gen_fields_capture に構築、marshaled/generic-ivar 無しなら空/NULL）。 */
             b->p.gen_fields = rb_ec_ractor_ptr(ec)->gen_fields_capture;
             rb_ec_ractor_ptr(ec)->gen_fields_capture = NULL;
         }
@@ -1118,19 +1079,18 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     return b;
 }
 
-/* RLGCv2: true while this Ractor is materializing an incoming copy
- * (ractor_basket_value -> ractor_copy_native_try). During that window the
- * half-built result legitimately holds edges into the sender-resident snapshot
- * (pinned via sync.in_flight_materializing), so the confined-GC verifier must
- * not flag those as containment violations -- the copy's own allocations can
- * trigger that GC mid-traversal. */
+/* この Ractor が到着した copy を materialize 中の間 true
+ * （ractor_basket_value -> ractor_copy_native_try）。その窓では作りかけの結果が
+ * 送信側常駐の snapshot（pin 済み）へのエッジを正当に持つので、local GC の verifier は
+ * それを containment 違反と誤検出してはならない（copy 自身の確保がその GC を途中で
+ * 起こしうる）。 */
 bool
 rb_gc_current_ractor_materializing_p(void)
 {
     const rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (cr == NULL) return false;
-    /* true only for a COPY materialize (snapshot != Qfalse): move shells
-     * reference other shells in this objspace, never the sender's graph */
+    /* true になるのは COPY の materialize のみ（snapshot != Qfalse）。move の殻は
+     * この objspace 内の他の殻を参照し、送信側のグラフは参照しない。 */
     for (const struct rlgc_materialize_frame *f = cr->sync.materialize_frames;
          f != NULL; f = f->prev) {
         if (f->snapshot != Qfalse) return true;
@@ -1145,25 +1105,18 @@ ractor_basket_value(struct ractor_basket *b)
       case basket_type_ref:
         break;
       case basket_type_copy: {
-        /* RLGCv2 M3 (design_v2.md §4.2): materialize the sender-side
-         * snapshot into the receiving Ractor's objspace. Handing the
-         * sender-resident graph over by reference would create
-         * unshareable cross-objspace edges that neither confined GC may
-         * traverse (the receiver's stores into it would also bypass the
-         * owner's write barrier accounting). The snapshot stays pinned
-         * (in-flight shref) in the sender's objspace and becomes garbage
-         * there once this copy is made. Marshal.load allocates through
-         * the ordinary newobj/write-barrier paths of this Ractor.
-         * The basket is already off the queue, so the materialize frame
-         * is what keeps the snapshot rooted (and re-pinnable by a global
-         * GC) for the duration of the copy.
+        /* 送信側の snapshot を受信 Ractor の objspace へ materialize する。送信側常駐の
+         * グラフを参照で渡すと、どちらの local GC も辿れない unshareable な
+         * cross-objspace エッジを作ってしまう。snapshot は送信側 objspace に pin された
+         * まま残り、このコピー完了後にそこで garbage になる。Marshal.load はこの Ractor の
+         * 通常の newobj/write-barrier 経路で確保する。basket は既に queue から外れており、
+         * コピー中は materialize フレームが snapshot を root（かつ global GC が re-pin 可）
+         * に保つ。
          *
-         * The rebuild can raise -- marshal_load/_load hooks and autoload
-         * are user code, and async interrupts (Timeout, Thread#raise)
-         * can land anywhere in it -- and those same hooks can run a
-         * nested Ractor.receive. Push a machine-stack frame (nesting)
-         * and pop it under TAG protection (unwind), so the chain never
-         * leaks a dead materialization or drops an outer one. */
+         * 再構築は raise しうる（marshal の load フックや autoload は利用者コード、
+         * 非同期割り込みもどこでも起きうる）し、それらフックが入れ子の Ractor.receive を
+         * 走らせうる。マシンスタックにフレームを push し TAG 保護下で pop するので、鎖が
+         * 死んだ materialization を漏らしたり外側を落としたりしない。 */
         rb_execution_context_t *ec = rb_current_ec_noinline();
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         struct rlgc_materialize_frame frame = {
@@ -1179,10 +1132,10 @@ ractor_basket_value(struct ractor_basket *b)
                 result = rb_marshal_load(b->p.v);
             }
             else {
-                /* RLGCv2: materialize 中、snapshot host の generic-ivar を読むとき（native copy
-                 * の rb_copy_generic_ivar）、sender の per-Ractor 表を跨がずこの対応表から
-                 * fields_obj を引く（rb_obj_fields_generic_uncached が gen_fields_materialize
-                 * を参照）。 */
+                /* materialize 中、snapshot host の generic-ivar を読む際（native copy の
+                 * rb_copy_generic_ivar）、送信側の per-Ractor 表を跨がずこの対応表から
+                 * fields_obj を引く（rb_obj_fields_generic_uncached が
+                 * gen_fields_materialize を参照）。 */
                 cr->gen_fields_materialize = b->p.gen_fields;
                 result = ractor_copy_native_try(b->p.v);
                 if (UNDEF_P(result)) rb_bug("ractor_basket_value: native snapshot not natively copyable");
@@ -1191,35 +1144,32 @@ ractor_basket_value(struct ractor_basket *b)
         EC_POP_TAG();
         cr->gen_fields_materialize = prev_gf;
         cr->sync.materialize_frames = frame.prev;
-        /* rb_copy_generic_ivar populated this EC's gen_fields_cache with the
-         * SENDER's snapshot host + fields_obj (both sender-resident). The
-         * snapshot is garbage on the sender now; if the page pool later hands
-         * the receiver a new object at the snapshot host's freed address, a
-         * stale cache.obj == obj hit would deref the foreign freed fields_obj.
-         * Invalidate the cache (also on the raise path via the same reset). */
+        /* rb_copy_generic_ivar はこの EC の gen_fields_cache に送信側の snapshot host と
+         * fields_obj（共に送信側常駐）を入れた。snapshot は今や送信側で garbage であり、
+         * その解放アドレスに後で受信側が新オブジェクトを得ると、stale な cache ヒットが
+         * foreign な解放済み fields_obj を deref しうる。cache を無効化する
+         * （raise 経路でも同じリセットで行う）。 */
         ec->gen_fields_cache.obj = Qundef;
         ec->gen_fields_cache.fields_obj = Qundef;
         if (state != TAG_NONE) EC_JUMP_TAG(ec, state);
-        /* keep the result stack-rooted past the frame being popped */
+        /* フレームが pop された後も result をスタックから root し続ける */
         ractor_reset_belonging(result);
         b->p.v = result;
         RB_GC_GUARD(result);
         break;
       }
       case basket_type_move: {
-        /* RLGCv2 (design_v2.md §4.5): rebuild the moved graph from the
-         * off-heap courier into THIS Ractor's objspace. The originals are
-         * already RactorMovedObject (set when the courier was built), so
-         * move's snapshot semantics hold. The courier is xmalloc'd, not a GC
-         * object, so the sender's concurrent confined GC never marked, swept,
-         * moved or raced it -- no keep-alive trick, no STW. The only VALUEs it
-         * carries are shareables/immediates; the materialize frame roots them
-         * for a global GC while we rebuild.
+        /* move されたグラフを off-heap courier からこの Ractor の objspace へ再構築する。
+         * 元オブジェクトは既に RactorMovedObject（courier 構築時に設定）なので move の
+         * snapshot 意味論が成り立つ。courier は xmalloc で GC オブジェクトでないため、
+         * 送信側の並行 local GC が mark/sweep/move/競合することはない。運ぶ VALUE は
+         * shareable/即値のみで、再構築中は materialize フレームがそれらを global GC に対し
+         * root する。
          *
-         * The rebuild can raise here too (rb_hash_aset on moved keys with a
-         * custom #hash runs user code; async interrupts): same frame + TAG
-         * discipline. On a raise the courier stays owned by the basket
-         * (b->p.move_courier != NULL), so basket teardown frees it. */
+         * ここでも再構築は raise しうる（custom #hash を持つ move 済み key への
+         * rb_hash_aset は利用者コード、非同期割り込みも）。同じフレーム + TAG 規律。
+         * raise 時は courier が basket 所有のまま（b->p.move_courier != NULL）なので
+         * basket の teardown が解放する。 */
         rb_execution_context_t *ec = rb_current_ec_noinline();
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         struct rb_ractor_move_courier *courier = b->p.move_courier;
@@ -1227,12 +1177,11 @@ ractor_basket_value(struct ractor_basket *b)
             .snapshot = Qfalse, .courier = courier, .prev = cr->sync.materialize_frames,
         };
         cr->sync.materialize_frames = &frame;
-        /* Keep the materialized graph on the machine stack (result) across the
-         * whole post-materialize sequence. Once the frame is popped it
-         * is the ONLY root for the graph until it reaches the caller's stack;
-         * ractor_move_courier_free walks a big free-loop here, a wide enough
-         * window for a concurrent global GC (main's GC.start(full)) to collect
-         * the graph if it lived only in the malloc'd basket's p.v. */
+        /* materialize したグラフを、以降の一連の処理の間ずっとマシンスタック（result）に
+         * 保持する。フレームを pop した後は、それが呼び出し側スタックへ届くまで唯一の
+         * root。ここで ractor_move_courier_free が長い解放ループを回るので、グラフが
+         * malloc された basket の p.v にしか無ければ、並行 global GC に回収されうる窓が
+         * 広く開く。 */
         VALUE result = Qundef;
         enum ruby_tag_type state;
         EC_PUSH_TAG(ec);

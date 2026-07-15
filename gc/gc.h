@@ -90,17 +90,17 @@ MODULAR_GC_FN void rb_gc_vm_barrier(void);
 MODULAR_GC_FN void rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data);
 MODULAR_GC_FN size_t rb_gc_vm_zombie_total_pages(void);
 MODULAR_GC_FN void rb_gc_vm_refresh_zombie_pages(void);
-/* no MODULAR_GC_FN: also called from VM code (ractor.c), so it must keep
- * external linkage in non-modular builds too (see internal/gc.h) */
+/* MODULAR_GC_FN を付けない: VM 側（ractor.c）からも呼ぶので、非モジュラービルドでも
+ * 外部リンケージが要る（internal/gc.h 参照）。 */
 bool rb_gc_single_objspace_p(void);
 MODULAR_GC_FN void rb_gc_vm_forget_zombie(void *objspace);
 MODULAR_GC_FN size_t rb_gc_obj_optimal_size(VALUE obj);
 MODULAR_GC_FN void rb_gc_mark_children(void *objspace, VALUE obj);
 MODULAR_GC_FN bool rb_gc_vm_weak_table_essential_p(enum rb_gc_vm_weak_tables table);
 MODULAR_GC_FN void rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback, vm_table_update_callback_func update_callback, void *data, bool weak_only, enum rb_gc_vm_weak_tables table);
-/* RLGCv2: generic_fields の global GC 用 weak pass（variable.c 実装、gc-impl から呼ぶ）。
- * MODULAR_GC_FN は付けない: 実体は VM 側の variable.c にあり、gc-impl の TU から呼ぶので
- * 非モジュラービルドでも外部リンケージが要る（rb_gc_single_objspace_p と同じ扱い）。 */
+/* generic_fields の global GC 用 weak pass（実体は variable.c、gc-impl から呼ぶ）。
+ * MODULAR_GC_FN を付けないのは非モジュラービルドでも外部リンケージが要るため
+ * （rb_gc_single_objspace_p と同じ）。 */
 void rb_gc_vm_generic_fields_mark_foreach(int (*cb)(VALUE key, VALUE val, void *arg), void *arg);
 void rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key));
 MODULAR_GC_FN void rb_gc_update_object_references(void *objspace, VALUE obj);
@@ -116,9 +116,9 @@ MODULAR_GC_FN bool rb_gc_obj_free(void *objspace, VALUE obj);
 MODULAR_GC_FN void rb_gc_save_machine_context(void);
 MODULAR_GC_FN void rb_gc_mark_roots(void *objspace, const char **categoryp);
 MODULAR_GC_FN bool rb_gc_multi_ractor_p(void);
-/* RLGCv2: process-wide GC-disable flag (GC.disable / rb_gc_disable). Every GC
- * trigger in the impl checks this so a global disable stops automatic GC in
- * every Ractor. Per-objspace disabling is objspace->flags.dont_gc. */
+/* プロセス全体の GC 無効フラグ（GC.disable / rb_gc_disable）。impl の各 GC trigger が
+ * これを見るので、無効化すると全 Ractor の自動 GC が止まる。
+ * per-objspace の無効化は objspace->flags.dont_gc。 */
 MODULAR_GC_FN bool rb_gc_gc_disabled_global_p(void);
 MODULAR_GC_FN bool rb_gc_shutdown_call_finalizer_p(VALUE obj);
 MODULAR_GC_FN void rb_gc_obj_changed_slot_size(VALUE obj, size_t slot_size);

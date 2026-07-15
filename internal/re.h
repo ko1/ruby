@@ -65,7 +65,7 @@ long rb_reg_search0(VALUE, VALUE, long, int, int, VALUE *);
 VALUE rb_reg_match_p(VALUE re, VALUE str, long pos);
 VALUE rb_reg_regsub_match(VALUE str, VALUE src, VALUE match);
 VALUE rb_match_init_copy(VALUE copy, VALUE orig);
-/* RLGCv2 (design_v2.md §4.5): MatchData transfer for the move courier (ractor.c) */
+/* move courier（ractor.c）用の MatchData 転送。 */
 void *rb_match_move_dump(VALUE match, VALUE *regexp_out, VALUE *str_out, int *num_regs_out);
 VALUE rb_match_move_alloc(VALUE klass, int num_regs);
 void rb_match_move_load(VALUE match, VALUE regexp, VALUE str, int num_regs, const void *blob);
