@@ -174,9 +174,9 @@ struct rb_gc_object_metadata_entry {
  * need to temporarily disable the GC to allow the malloc to happen.
  * Allocating memory during GC is a bad idea, so use this only when absolutely
  * necessary. */
-/* This suppresses only the current objspace's re-entrant GC (the malloc happens
- * in this Ractor), so it uses the local disable -- the malloc-during-GC guard
- * checks the per-objspace dont_gc flag, not the process-wide one. */
+/* 抑止するのは現 objspace の再入 GC だけ（malloc はこの Ractor 内で起きる）なので
+ * local disable を使う。GC 中 malloc ガードはプロセス全体でなく per-objspace の
+ * dont_gc フラグを見る。 */
 #define DURING_GC_COULD_MALLOC_REGION_START() \
     assert(rb_during_gc()); \
     VALUE _already_disabled = rb_gc_local_disable_no_rest()
@@ -249,10 +249,9 @@ void rb_objspace_each_objects_local(
 size_t rb_gc_obj_slot_size(VALUE obj);
 
 VALUE rb_gc_disable_no_rest(void);
-/* RLGCv2: per-objspace ("local") GC disable/enable for the current Ractor --
- * suppresses only this objspace's own GC, unlike rb_gc_disable* which are now
- * process-wide. Exported because the DURING_GC_COULD_MALLOC_REGION macro above
- * expands to them in bundled extensions (ext/objspace, weakmap). */
+/* 現 Ractor の objspace だけを対象にした local な GC 無効/有効化。プロセス全体になった
+ * rb_gc_disable* とは違い自分の objspace の GC のみ抑止する。上の
+ * DURING_GC_COULD_MALLOC_REGION が同梱拡張で展開するため export する。 */
 VALUE rb_gc_local_enable(void);
 VALUE rb_gc_local_disable(void);
 VALUE rb_gc_local_disable_no_rest(void);

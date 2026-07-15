@@ -141,9 +141,8 @@ class TestRactor < Test::Unit::TestCase
   end
 
   def test_sending_object_with_broken_clone
-    # The message copy does not call the user-visible #clone (RLGCv2
-    # design decision 11), so a broken #clone cannot corrupt the send;
-    # the singleton class it defines makes the object uncopyable instead.
+    # メッセージの複製はユーザ可視の #clone を呼ばないので、壊れた #clone は送信を
+    # 壊せない。代わりに #clone が定義する特異クラスで複製不可になる
     assert_ractor(<<~'RUBY')
       o = Object.new
       def o.clone
@@ -404,9 +403,8 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
-  # Per-Ractor GC: a finalizer's registration, table and execution all
-  # belong to the object's Ractor; defining one on another Ractor's
-  # object (shareable ones included) is rejected.
+  # per-Ractor GC では finalizer の登録・テーブル・実行はすべてオブジェクトの
+  # Ractor に属する。他 Ractor のオブジェクト（shareable も含む）への定義は拒否する
   def test_define_finalizer_on_foreign_object
     assert_separately([], __FILE__, __LINE__, <<-'RUBY')
       Warning[:experimental] = false
@@ -434,9 +432,8 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
-  # ObjectSpace.each_object enumerates every object in the calling Ractor's own
-  # objspace plus the shareable objects owned by the other live Ractors (never
-  # their unshareable ones).
+  # ObjectSpace.each_object は呼び出し元 Ractor 自身の objspace の全オブジェクトと、
+  # 他の生存 Ractor が持つ shareable を列挙する（他 Ractor の unshareable は列挙しない）
   def test_each_object_own_all_and_foreign_shareables
     assert_separately([], __FILE__, __LINE__, <<-'RUBY')
       Warning[:experimental] = false
@@ -445,22 +442,22 @@ class TestRactor < Test::Unit::TestCase
       main_sh = 3.times.map { Ractor.make_shareable(Marker.new) }
       ready = Ractor::Port.new
       ch = Ractor.new(ready) do |ready_port|
-        un = 7.times.map { Marker.new }               # unshareable: must NOT be seen
+        un = 7.times.map { Marker.new }               # unshareable なので見えてはならない
         sh = 4.times.map { Ractor.make_shareable(Marker.new) }
         ready_port << :built
-        Ractor.receive                                # keep this objspace alive
+        Ractor.receive                                # この objspace を生かし続ける
         [un.size, sh.size]
       end
-      ready.receive                                   # the child has built its markers
+      ready.receive                                   # 子がマーカーを作り終えた
 
       seen = 0
       ObjectSpace.each_object(Marker) { seen += 1 }
-      # own 8 (unshareable 5 + shareable 3) + the child's 4 shareables
+      # 自分の 8（unshareable 5 + shareable 3）＋子の shareable 4
       assert_equal 12, seen
 
       ch.send(:go)
       ch.value
-      # keep the roots alive across the walk
+      # 走査中もルートを生かしておく
       assert_equal 5, main_un.size
       assert_equal 3, main_sh.size
     RUBY

@@ -129,13 +129,9 @@ update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_
     rb_execution_context_t *ec = rb_current_execution_context(false);
     unsigned int lev;
 
-    // Take the VM lock only when there is a current Ractor to take it as.
-    // ec == NULL on MMTK during ractor hook-list free. And under the RLGCv2
-    // global-GC sweep a dead Ractor's hook list is freed (ractor_free) with ec
-    // resolved through the GC's vm_context but GET_RACTOR() == NULL -- here
-    // vm_lock_enter would dereference a NULL Ractor (and barrier-join with it),
-    // and the global GC already holds the barrier, so the lock is both unsafe
-    // and unnecessary.
+    // 現在の Ractor がある時だけ VM lock を取る。MMTK の hook-list free では
+    // ec==NULL。global GC の sweep 中も GET_RACTOR()==NULL で死んだ Ractor の
+    // hook list を free するため、lock は不安全(NULL deref)かつ不要(既に barrier 保持)。
     const bool vm_locked_here = ec && GET_RACTOR() != NULL;
     if (vm_locked_here) {
         RB_VM_LOCK_ENTER_LEV(&lev);
@@ -2027,10 +2023,9 @@ rb_postponed_job_flush(rb_vm_t *vm)
         RUBY_VM_SET_POSTPONED_JOB_INTERRUPT(GET_EC());
     }
     /* likewise with any remaining-to-be-executed bits of the preregistered postponed
-     * job table. Re-post them to THIS Ractor's own mask, not the global bitset:
-     * the merged bits may include Ractor-targeted jobs
-     * (rb_postponed_job_trigger_for_ractor) that must not run on another Ractor,
-     * and globally-triggered bits are fine to run here too. */
+     * job table. マージされた bit には別 Ractor で実行してはならない Ractor 宛
+     * ジョブ(rb_postponed_job_trigger_for_ractor)が含まれ得るので、global bitset
+     * ではなくこの Ractor 自身の mask に post し直す。 */
     if (triggered_bits) {
         RUBY_ATOMIC_OR(rb_ec_ractor_ptr(ec)->postponed_job_triggered_bits, triggered_bits);
         RUBY_VM_SET_POSTPONED_JOB_INTERRUPT(GET_EC());

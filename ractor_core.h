@@ -12,8 +12,7 @@
 // experimental flag because it is not sure it is the common pattern
 #define RUBY_TYPED_FROZEN_SHAREABLE_NO_REC RUBY_FL_FINALIZE
 
-/* RLGCv2 (design_v2.md §4.5): an in-flight move payload, serialized off-heap
- * (defined in ractor.c). */
+/* 転送中の move payload。off-heap にシリアライズされる（ractor.c で定義）。 */
 struct rb_ractor_move_courier;
 struct rlgc_materialize_frame;
 
@@ -48,28 +47,17 @@ struct rb_ractor_sync {
     VALUE legacy;
     bool legacy_exc;
 
-    /* RLGCv2 (design_v2.md §4.2/§4.5): chain of in-flight
-     * materializations, newest first -- one frame per receive currently
-     * rebuilding its payload on this Ractor. The basket is already off
-     * the queue, so these frames are what let the root scan and the
-     * global GC's in-flight re-pin keep the sender-resident snapshot
-     * (copy) alive and the courier's shareable VALUEs (move) marked
-     * while the rebuild runs. A CHAIN, not a single slot, because the
-     * rebuild can run user code (marshal_load/_load hooks, autoload,
-     * custom #hash of moved keys) that may do a nested Ractor.receive --
-     * a single slot would lose the outer snapshot's root and re-pin.
-     * Frames live on the receiving thread's machine stack (no
-     * allocation) and are pushed/popped under TAG protection in
-     * ractor_basket_value, so any raise out of the rebuild (user hook,
-     * async interrupt like Timeout) restores the chain -- a dead Ractor
-     * never keeps naming a sender-collected snapshot. */
+    /* 転送中の materialize の chain（新しい順、receive 1 件に 1 frame）。root scan と
+     * global GC の re-pin が再構築中も sender 側 snapshot（copy）や courier の shareable
+     * VALUE（move）を生かす。ネスト receive に備え chain とし、machine stack 上で TAG
+     * 保護下に push/pop するので raise でも復元される。 */
     struct rlgc_materialize_frame *materialize_frames;
 };
 
-/* one in-flight payload rebuild (lives on the receiver's machine stack) */
+/* 転送中の payload 再構築 1 件（受信側の machine stack 上に置かれる） */
 struct rlgc_materialize_frame {
-    VALUE snapshot;                          /* copy: sender-resident snapshot; Qfalse for move */
-    struct rb_ractor_move_courier *courier;  /* move: off-heap courier; NULL for copy */
+    VALUE snapshot;                          /* copy: sender 側 snapshot、move では Qfalse */
+    struct rb_ractor_move_courier *courier;  /* move: off-heap courier、copy では NULL */
     struct rlgc_materialize_frame *prev;
 };
 
@@ -98,13 +86,9 @@ struct rb_ractor_struct {
     struct rb_ractor_pub pub;
     struct rb_ractor_sync sync;
 
-    /* RLGCv2: objects pinned via rb_gc_register_mark_object are per-Ractor:
-     * the owner marks them (rb_ractor_mark_local_roots for a live Ractor, the
-     * zombie-objspace scan for a terminated-but-unmerged one) and a merge moves
-     * them to the survivor.  Raw malloc/realloc/free so a merge running during
-     * GC sweep never re-enters the GC.  (rb_gc_register_address stays VM-single
-     * in vm->gc.registered_globals: a slot's *addr can later hold any objspace's
-     * value, so it has no single owner.) */
+    /* rb_gc_register_mark_object で pin したオブジェクトは per-Ractor: owner が mark し
+     * （live は rb_ractor_mark_local_roots、未 merge の zombie は zombie-objspace scan）、
+     * merge で survivor へ移る。sweep 中の merge が GC へ再入しないよう raw malloc/realloc/free。 */
     VALUE *registered_marks;
     size_t registered_marks_cnt, registered_marks_capa;
 
@@ -159,66 +143,44 @@ struct rb_ractor_struct {
     bool main_ractor;
     void *newobj_cache;
 
-    /* RLGCv2: this Ractor's objspace.  The main Ractor receives the boot
-     * objspace in rb_objspace_alloc; non-main Ractors share the main
-     * objspace (NULL here) until M1 gives each Ractor its own. */
+    /* この Ractor の objspace。main Ractor は rb_objspace_alloc で boot objspace を
+     * 受け取る。非main Ractor は自分の objspace を持つまで（NULL の間）main と共有する。 */
     void *objspace;
 
-    /* RLGCv2: while this Ractor is creating a child, the child's objspace is
-     * already populated (its Thread/Fiber wrappers are born there) but the
-     * child is not yet in vm->ractor.set, so a whole-VM walk would miss it. The
-     * creator parks the child's objspace here for the window between the wrapper
-     * allocation and vm_insert_ractor, so the global GC enumerates it. Per
-     * Ractor (concurrent creators each have their own), cleared under the VM
-     * lock when the child joins the set. */
+    /* 子 Ractor 作成中、子の objspace は populate 済み（Thread/Fiber wrapper がそこで
+     * 生まれる）だがまだ vm->ractor.set に無く whole-VM walk が取りこぼす。wrapper 確保から
+     * vm_insert_ractor までの窓で子 objspace をここに預け global GC に列挙させる。子が
+     * set に入る時 VM lock 下でクリアする。 */
     void *creating_child_objspace;
 
-    /* RLGCv2: この Ractor が所有する unshareable オブジェクトの generic fields
-     * （旧 VM-global な generic_fields_tbl_ + generic_fields_lock を per-Ractor 化）。
-     * generic_fields は VM の ivar 格納機能であって GC の機能ではないので、GC-impl の
-     * objspace ではなく Ractor に持つ。owner のみが触る（containment）ため無ロック。
-     * shareable オブジェクトの分は今も variable.c の global 表 + narrow lock に残る。
-     * weak-KEY: key=host obj が死ねば entry は消え、値 fields_obj は live key の strong
-     * child。confined GC は per-object の rb_mark_generic_ivar でこの表を引く。global GC
-     * は per-object を止め、mark 後に全 Ractor の本表を舐めて drain する（variable.c の
-     * rb_gc_vm_generic_fields_* を参照）。lazy に生成する（NULL = まだ空）。
-     *
-     * この表は owner 専有＝完全無ロック。unshareable オブジェクトは containment により
-     * owner=GET_RACTOR() だけが触る。唯一の例外だった Ractor#send の native copy による
-     * cross-Ractor read は、送信時に「host→fields_obj の対応表」をメッセージに同梱し
-     * （gen_fields_capture / basket->p.gen_fields）、受信側 materialize がそれを引く
-     * （gen_fields_materialize）ことで排除した。write は st resize 中の自 Ractor confined
-     * GC 再入を避けるため GC 無効化下で行うが、ロックは要らない。 */
+    /* この Ractor 所有の unshareable オブジェクトの generic fields 表（owner 専有＝無ロック、
+     * shareable 分は variable.c の global 表）。weak-key で host obj が死ねば entry も消える。
+     * confined GC は rb_mark_generic_ivar で引き、global GC は mark 後に全表を drain する。
+     * lazy に生成（NULL = まだ空）。 */
     struct st_table *generic_fields_tbl;
-    /* RLGCv2: Ractor#send の native copy 中の generic-ivar 対応表。
-     *   gen_fields_capturing:  送信側の snapshot 作成中だけ true。generic-ivar host が
-     *                          出たとき初めて gen_fields_capture を遅延確保する合図
-     *                          （generic ivar 無しのメッセージでは表を確保しない）。
-     *   gen_fields_capture:    上の間、copy(snapshot node) が generic-ivar host なら
-     *                          その fields_obj をここに記録する（copy_enter）。
-     *   gen_fields_materialize: 受信側 materialize 中、rb_obj_fields_generic_uncached が
-     *                          自表に無い snapshot host の fields_obj をここから引く。
-     * これで受信側が sender の per-Ractor 表を跨がない。 */
+    /* Ractor#send の native copy 中の generic-ivar 対応表。capturing=送信側 snapshot 作成中
+     * だけ true で、host が出たら capture を遅延確保しその fields_obj を記録。materialize=
+     * 受信側で snapshot host の fields_obj を引く。これで受信側が sender の表を跨がない。 */
     bool gen_fields_capturing;
     struct st_table *gen_fields_capture;
     struct st_table *gen_fields_materialize;
 }; // rb_ractor_t is defined in vm_core.h
 
-/* RLGCv2: mark Ractor r's GC roots from its C structure (gc.c root scan). */
+/* Ractor r の C 構造体から GC root を mark する（gc.c の root scan）。 */
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
 void rb_ractor_pin_inherited_parts(rb_ractor_t *r);
 
-/* RLGCv2: Ractor-local 化した VM グローバル root（旧 vm->global_object_list /
- * vm->mark_object_ary）の登録・解除・移管。migration は GC sweep（ractor_free）
- * からも呼ばれるので raw malloc/realloc/free のみを使う。 */
+/* Ractor-local 化した VM グローバル root（旧 vm->global_object_list /
+ * vm->mark_object_ary）の登録・解除・移管。GC sweep（ractor_free）からも呼ばれるので
+ * raw malloc/realloc/free のみを使う。 */
 
-/* RLGCv2: src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする
- * （Ractor#value join / orphan free）。実装は variable.c（表のセマンティクスを持つ）。
- * st は raw malloc なので sweep 中の呼び出しも安全。 */
+/* src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする
+ * （Ractor#value join / orphan free）。実装は variable.c。st は raw malloc なので
+ * sweep 中の呼び出しも安全。 */
 void rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src);
 void rb_ractor_absorb_registered_marks(rb_ractor_t *dst, rb_ractor_t *src);
-/* RLGCv2: この Ractor の per-Ractor generic_fields 表を解放（ractor_free）。 */
+/* この Ractor の per-Ractor generic_fields 表を解放（ractor_free）。 */
 void rb_ractor_free_generic_fields(rb_ractor_t *r);
 
 enum ractor_wakeup_status {

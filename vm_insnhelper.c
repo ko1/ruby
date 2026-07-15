@@ -516,14 +516,9 @@ vm_env_write_slowpath(const VALUE *ep, int index, VALUE v)
     const VALUE envval = VM_ENV_ENVVAL(ep);
 
     if (RB_FL_TEST_RAW(envval, RUBY_FL_SHAREABLE)) {
-        /* RLGCv2 (design_v2.md section 2.1): writing into a SHAREABLE
-         * env (an isolated proc's -- e.g. its svar slot, written on
-         * every regexp match inside it) makes an s->u edge whenever v
-         * is unshareable. Only the full barrier sets the shref bit
-         * that keeps v alive for its owner's local GC; the bare
-         * remember below does not. And WB_REQUIRED must STAY set:
-         * every future store into this env needs the same barrier,
-         * not the remembered-until-next-GC fast path. */
+        /* SHAREABLE な env(isolated proc)への書き込みは v が unshareable のとき
+         * shareable から unshareable への参照を作る。full barrier だけが v を所有者の
+         * local GC まで生かす shref bit を立てる。WB_REQUIRED は以後の書き込み用に残す。 */
         if (!SPECIAL_CONST_P(v)) {
             rb_gc_writebarrier(envval, v);
         }
@@ -599,25 +594,18 @@ vm_svar_valid_p(VALUE svar)
 }
 #endif
 
-/* RLGCv2: should this frame's special variables live in the env's svar
- * slot? A SHAREABLE env (an isolated proc's) is invoked from many
- * Ractors at once: its svar slot would be cross-Ractor shared mutable
- * state, holding young foreign objects (the caller's MatchData) that no
- * objspace roots -- and $~/$_ would leak between Ractors sharing the
- * proc. Keep such frames' special variables in the per-EC slot instead;
- * the env slot keeps holding the cref chain untouched. */
+/* このフレームの特殊変数を env の svar スロットに置くべきか。SHAREABLE な
+ * env(isolated proc)は複数 Ractor から同時に呼ばれ、svar が Ractor 間共有
+ * 可変状態になり foreign オブジェクト保持や $~/$_ 漏れを招くので per-EC に置く。 */
 static inline bool
 lep_svar_in_env_p(const rb_execution_context_t *ec, const VALUE *lep)
 {
     if (!lep) return false;
     if (ec == NULL) return true;
     if (ec->root_lep == lep) return false;
-    /* lep may be the stale on-stack ep of a frame whose env has since
-     * escaped: vm_make_env_each() leaves the imemo_env VALUE in lep[0] as a
-     * GC-mark anchor, so the flags slot is no longer a FIXNUM and reading
-     * VM_ENV_ESCAPED_P(lep) would assert. Such a frame cannot be a live
-     * shareable proc's env (those keep a valid env header), so fall back to
-     * the in-env svar slot -- the same lep[ME_CREF] read upstream does. */
+    /* lep は env が既に escape したフレームの stale な on-stack ep かもしれず、
+     * lep[0] は imemo_env を残すため flags が FIXNUM でなく VM_ENV_ESCAPED_P が
+     * assert する。生きた shareable proc の env ではないので in-env に fall back。 */
     if (FIXNUM_P(lep[VM_ENV_DATA_INDEX_FLAGS]) &&
             VM_ENV_ESCAPED_P(lep) &&
             RB_FL_TEST_RAW(VM_ENV_ENVVAL(lep), RUBY_FL_SHAREABLE)) {

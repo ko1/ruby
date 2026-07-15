@@ -773,8 +773,6 @@ typedef struct rb_vm_struct {
     unsigned int thread_ignore_deadlock: 1;
 
     /* object management */
-    /* RLGCv2: 旧 mark_object_ary / global_object_list は vm->gc.registered_globals
-     * （VM 単一リスト、全 Ractor の GC が保守的に walk）に置き換わった。 */
     const VALUE special_exceptions[ruby_special_error_count];
 
     /* Ruby Box */
@@ -806,49 +804,36 @@ typedef struct rb_vm_struct {
     int coverage_mode;
 
     struct {
-        /* RLGCv2: the VM points only at rb_global_objspace (process-wide GC
-         * data such as the page pool).  Each Ractor owns its rb_objspace via
-         * r->objspace; the boot objspace belongs to the main Ractor. */
+        /* VM は rb_global_objspace(page pool 等のプロセス全体の GC データ)のみを
+         * 指す。各 Ractor は r->objspace で自分の rb_objspace を所有し、boot
+         * objspace は main Ractor に属する。 */
         struct rb_global_objspace *global_objspace;
-        /* RLGCv2 (design_v2.md §2.2 step 5): objspaces of terminated, not
-         * yet inherited Ractors. The owner thread is gone, so nothing
-         * mutates them, but the global GC must enumerate them in every
-         * pass (one missed objspace leaves stale mark bits behind = UAF).
-         * owner_slot is the dead Ractor's r->objspace: inheritance
-         * (Ractor#value, the global GC's orphan merge, VM shutdown)
-         * clears it together with dropping the entry, under the VM lock,
-         * so nobody can reach the absorbed shell through the Ractor. */
+        /* 終了したがまだ継承されていない Ractor の objspace 群。誰も変更しないが
+         * global GC は毎回列挙する必要がある(取りこぼすと stale mark bits = UAF)。
+         * owner_slot は死んだ Ractor の r->objspace で、継承時に VM lock 下でクリア。 */
         struct rb_objspace_zombie {
             void *objspace;
             void **owner_slot;
-            /* RLGCv2: この zombie の所有 Ractor（終了して vm->ractor.set から
-             * 外れたが、まだ merge されていない）。global GC の generic_fields
-             * weak pass が owner の per-Ractor 表を舐めるのに使う
-             * （rb_gc_vm_generic_fields_*_foreach）。orphan（Ractor object 回収
-             * 済み）は NULL: その表は ractor_free が main へ移送済み。 */
+            /* この zombie の所有 Ractor(終了して vm->ractor.set を外れたがまだ未 merge)。
+             * global GC の generic_fields weak pass が owner の per-Ractor 表を舐めるのに
+             * 使う。orphan(Ractor object 回収済み)は NULL で、表は main へ移送済み。 */
             struct rb_ractor_struct *owner;
-            /* zombie が最後に測定された時点（retire 時。各 global cycle で
-             * barrier 下に更新される）で保持していた heap page 数。下の合計値は
-             * エントリ単位で正確に同期し続ける。 */
+            /* この zombie が保持する heap page 数(retire 時に測定、各 global cycle
+             * の barrier 下で更新)。下の合計値はエントリ単位で正確に同期する。 */
             size_t pages;
         } *zombie_objspaces;
         size_t zombie_objspaces_count;
         size_t zombie_objspaces_capa;
-        /* design_v2.md section 2.2 trigger 3: sum of .pages over the
-         * ledger. Between global cycles it is an upper bound (a
-         * zombie's heap never grows; only a global cycle shrinks it). */
+        /* ledger 全体の .pages の合計。global cycle 間では上限値
+         * (zombie のヒープは増えず、global cycle でのみ縮む)。 */
         size_t zombie_total_pages;
 
 #if USE_MODULAR_GC
         struct gc_mark_func_data_struct *mark_func_data;
 #endif
-        /* RLGCv2 (design §2.1 手順 3.e): rb_gc_register_address の登録先は VM に
-         * 1 つ。登録スロット（*addr）には後から別 objspace の値が入り得るため
-         * per-Ractor 分割はしない — 全 Ractor の GC が root walk で保守的に見る
-         * （自 objspace の値だけが mark され、foreign は各所有者の GC が拾う）。
-         * lock は leaf（保持中に割り当て・GC をしない）、register/unregister は
-         * cold path、配列は raw realloc（登録が GC を再入させないため）。
-         * rb_gc_register_mark_object の pin は per-Ractor（rb_ractor_t.registered_marks）。 */
+        /* rb_gc_register_address の登録先は VM に 1 つ。登録スロットには後から別
+         * objspace の値が入り得るので per-Ractor 分割せず、全 Ractor の GC が root
+         * walk で保守的に見る。lock は leaf、register/unregister は cold path。 */
         struct {
             rb_nativethread_lock_t lock;
             VALUE **addrs;              /* rb_gc_register_address: *addr を mark_maybe */

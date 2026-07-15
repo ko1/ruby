@@ -889,9 +889,9 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
 
     if (DEBUG) fprintf(stderr, "fiber_pool_stack_release: %p used=%"PRIuSIZE"\n", stack->base, stack->pool->used);
 
-    /* Serialize pool access against a concurrent acquire on another Ractor:
-     * a per-Ractor GC sweep can free a fiber without the VM lock. NO_BARRIER
-     * so it never joins a forming global barrier (releases are rare). */
+    /* 別 Ractor の acquire と競合しないよう pool アクセスを直列化する。
+     * Ractor ごとの GC sweep は VM lock 無しで fiber を解放しうる。release は稀なので
+     * NO_BARRIER で取得し、形成中の global barrier に合流しない。 */
     unsigned int lev;
     RB_VM_LOCK_ENTER_LEV_NB(&lev);
 
@@ -1042,9 +1042,9 @@ fiber_stack_release(rb_fiber_t * fiber)
 static void
 fiber_stack_release_locked(rb_fiber_t *fiber)
 {
-    /* Called from the GC free path, which for a per-Ractor objspace is a
-     * barrier-free sweep with no VM lock held; the pool return itself takes
-     * the lock (fiber_pool_stack_release), so no VM-locking assertion here. */
+    /* GC の解放処理から呼ばれる。Ractor ごとの objspace では barrier 無し・VM lock
+     * 無しの sweep なので、pool への返却側 (fiber_pool_stack_release) が lock を取る。
+     * ここでは VM lock の assertion を置かない。 */
     fiber_stack_release(fiber);
 }
 
@@ -1314,11 +1314,9 @@ fiber_memsize(const void *ptr)
     size_t size = sizeof(*fiber);
     const rb_execution_context_t *saved_ec = &fiber->cont.saved_ec;
 
-    /*
-     * vm.c::thread_memsize already counts the root fiber's local_storage;
-     * first_proc != 0 selects a non-root fiber without dereferencing the
-     * thread (equivalent to fiber != th->root_fiber).
-     */
+    /* root fiber の local_storage は vm.c の thread_memsize が計上済み。
+     * first_proc != 0 は thread を deref せず非 root fiber を選ぶ
+     * (fiber != th->root_fiber と等価)。 */
     if (saved_ec->local_storage && fiber->first_proc != 0) {
         size += rb_id_table_memsize(saved_ec->local_storage);
         size += rb_obj_memsize_of(saved_ec->storage);
