@@ -396,17 +396,6 @@ race:gc_verify_compaction_references
 # Same upstream class.c family as the rb_class_set_initialized note above.
 race:do_include_modules_at
 
-# UPSTREAM non-ractor-safe dtoa (missing/dtoa.c, vendored, not RLGCv2): pow5mult
-# walks a process-wide `static Bigint *p5s` powers-of-5 cache while building a
-# float<->string conversion. Ruby defines ACQUIRE_DTOA_LOCK/FREE_DTOA_LOCK as
-# no-ops ("unused right now", dtoa.c:507-508), relying on the GVL -- which Ractors
-# break by running float conversion in parallel. Observed via l_marshal_deep_send
-# (Marshal of Floats across Ractors, w_float/ruby_dtoa + r_object_for/ruby_strtod).
-# git blame = upstream (Nobuyoshi Nakada); 0 RLGC markers; not GC code; CHECK+ASAN
-# clean. This is a genuine UPSTREAM Ractor thread-safety gap in vendored dtoa, not
-# RLGCv2's doing -- worth reporting upstream, but out of scope here.
-race:pow5mult
-
 # UPSTREAM MN-scheduler lock-free handoff hints (thread_pthread.c / ractor_core.h,
 # not RLGCv2): the scheduler tracks two per-Ractor fast-path hints that one native
 # thread publishes under sched->lock_ (M0) while another reads them lock-free during
