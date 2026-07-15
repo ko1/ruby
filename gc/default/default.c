@@ -7449,15 +7449,11 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
 
   retry:
     if (!is_incremental_marking(objspace)) {
-        /* 世代間 barrier はこの objspace の remembered set だけに関わるので、同一 objspace の
-         * old->young エッジにのみ適用する。foreign な parent a や child b はここでは生きた葉で、
-         * この objspace の minor GC は traverse しないので remember しても無意味。かつその old bit は
-         * 他 objspace（や global GC）の所有で、この検査や gc_writebarrier_generational の RVALUE_OLD_P
-         * assert と並行して変わりうるので読むのは危険（同一 objspace のオブジェクトは所有者
-         * スレッドが store と GC の両方を行うので安全）。foreign な a は必ず shareable で、上で
-         * 記録した shref が既に b を生かし、a は remembered bit に関係なく毎回 local mark で再 mark
-         * される。foreign なオブジェクトの old bit を読まないよう locality を先に検査する。 */
-        if (GET_HEAP_OBJSPACE(a) != objspace || GET_HEAP_OBJSPACE(b) != objspace ||
+        /* 世代間 barrier は同一 objspace の old->young エッジだけが対象。foreign な a/b の old bit は
+         * 他 objspace 所有で並行変更され読むのが危険なので、multi-Ractor 時のみ locality を先に検査する
+         * (foreign な a は shareable で shref が既に b を生かすため remember は不要)。単一 Ractor は foreign 無し。 */
+        if ((rb_multi_ractor_p() &&
+                (GET_HEAP_OBJSPACE(a) != objspace || GET_HEAP_OBJSPACE(b) != objspace)) ||
                 !RVALUE_OLD_P(objspace, a) || RVALUE_OLD_P(objspace, b)) {
             // do nothing
         }
