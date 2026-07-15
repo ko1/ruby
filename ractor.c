@@ -1333,13 +1333,30 @@ rb_ractor_targeted_hooks(rb_ractor_t *cr)
     return &cr->pub.targeted_hooks;
 }
 
+/* upstream が gc.c 内の static inline に移したので、ここで同じ判定を持つ。
+ * generic fields 表を使う object かどうかの純粋な型/フラグ検査。 */
+static inline bool
+ractor_obj_using_gen_fields_table_p(VALUE obj)
+{
+    switch (BUILTIN_TYPE(obj)) {
+      case T_DATA:
+        return false;
+      case T_STRUCT:
+        if (!FL_TEST_RAW(obj, RSTRUCT_GEN_FIELDS)) return false;
+        break;
+      default:
+        break;
+    }
+    return rb_obj_gen_fields_p(obj);
+}
+
 static void
 rb_obj_set_shareable_no_assert(VALUE obj)
 {
     /* FL_SHAREABLE を立てる。generic fields が per-Ractor 表にある object は、
      * flag 反転を generic_fields_lock 下の共有表への移送と交錯させるので、
      * ここでは flag を立てない。それ以外は直接立てる。 */
-    if (rb_obj_gen_fields_p(obj) && rb_obj_using_gen_fields_table_p(obj)) {
+    if (rb_obj_gen_fields_p(obj) && ractor_obj_using_gen_fields_table_p(obj)) {
         rb_mv_generic_ivar_to_shared(obj); /* sets FL_SHAREABLE + pin, in order */
     }
     else {
