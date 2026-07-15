@@ -768,16 +768,16 @@ typedef struct rb_objspace {
  * lock は leaf lock で、保持中は割り当ても GC もしない。 */
 struct rlgc_page_arena {
     struct rlgc_page_arena *next;
-    char *start;                /* HEAP_PAGE_ALIGN-aligned usable area */
-    size_t size;                /* usable bytes (multiple of HEAP_PAGE_SIZE) */
+    char *start;                /* HEAP_PAGE_ALIGN 整列の使用可能領域 */
+    size_t size;                /* 使用可能バイト数（HEAP_PAGE_SIZE の倍数） */
 };
 
 typedef struct rb_global_objspace {
     struct {
         rb_nativethread_lock_t lock;
-        struct heap_page_body *freelist; /* recycled bodies; the next pointer is stored in the body itself */
-        struct rlgc_page_arena *arenas;  /* all arenas, newest first */
-        char *arena_cursor;              /* next uncarved body in the newest arena */
+        struct heap_page_body *freelist; /* 再利用する body。next ポインタは body 内に置く */
+        struct rlgc_page_arena *arenas;  /* 全アリーナ。新しい順 */
+        char *arena_cursor;              /* 最新アリーナの未切り出しの先頭 body */
         char *arena_end;
     } page_pool;
 } rb_global_objspace_t;
@@ -1892,8 +1892,8 @@ RVALUE_DEMOTE(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(RVALUE_OLD_P(objspace, obj));
 
     if (!is_incremental_marking(objspace) && RVALUE_REMEMBERED(objspace, obj)) {
-        /* atomic: a plain &= ~mask could lose a concurrent write
-         * barrier's set of ANOTHER object's bit in the same word */
+        /* atomic。素の &= ~mask だと、並行する write barrier による同じ word 内の別オブジェクトの
+         * bit セットを失いうる。 */
         struct heap_page *page = GET_HEAP_PAGE(obj);
         gc_bitmap_atomic_clear(page->remembered_bits, page, obj);
     }
@@ -2303,8 +2303,7 @@ page_pool_add_arena(rb_global_objspace_t *g)
     errno = 0;
 #endif
 
-    /* Trim the unaligned head and tail so the usable area is
-     * HEAP_PAGE_ALIGN-aligned. */
+    /* 使用領域が HEAP_PAGE_ALIGN に整列するよう、非整列の先頭と末尾を削る。 */
     char *aligned = ptr + HEAP_PAGE_ALIGN;
     aligned -= ((uintptr_t)aligned & (HEAP_PAGE_ALIGN - 1));
     GC_ASSERT(aligned > ptr);
@@ -5981,7 +5980,7 @@ check_children_i(const VALUE child, void *ptr)
 {
     struct verify_internal_consistency_struct *data = (struct verify_internal_consistency_struct *)ptr;
 
-    /* fast path: a child of this objspace (99.99% of edges) */
+    /* fast path: この objspace の子（エッジの 99.99%）。 */
     if (RB_LIKELY(is_pointer_to_heap(data->objspace, (void *)child))) {
         if (check_rvalue_consistency_force(data->objspace, child, FALSE) != 0) {
             fprintf(stderr, "check_children_i: %s has error (referenced from %s)",
@@ -6529,7 +6528,7 @@ gc_remember_unprotected(rb_objspace_t *objspace, VALUE obj)
     if (!MARKED_IN_BITMAP(uncollectible_bits, obj)) {
         page->flags.has_uncollectible_wb_unprotected_objects = TRUE;
         MARK_IN_BITMAP(uncollectible_bits, obj);
-        /* on the object's objspace, as in RVALUE_PAGE_OLD_UNCOLLECTIBLE_SET */
+        /* RVALUE_PAGE_OLD_UNCOLLECTIBLE_SET と同様、そのオブジェクトの objspace に数える。 */
         page->objspace->rgengc.uncollectible_wb_unprotected_objects++;
 
 #if RGENGC_PROFILE > 0
@@ -6673,7 +6672,7 @@ gc_marks_finish(rb_objspace_t *objspace)
         for (int i = 0; i < HEAP_COUNT; i++) {
             rlgc_pinned_roots_mark(objspace, &heaps[i]);
         }
-        /* and everything they keep alive */
+        /* そしてそれらが生かすもの全て。 */
         gc_mark_stacked_objects_all(objspace);
         objspace->rlgc.stalled_shareables = objspace->marked_slots - marked_before;
     }
@@ -7193,12 +7192,10 @@ rgengc_remembersetbits_set(rb_objspace_t *objspace, VALUE obj)
     struct heap_page *page = GET_HEAP_PAGE(obj);
     bits_t *bits = &page->remembered_bits[0];
 
-    /* Atomic: the lock-free write barrier remembers shareable objects
-     * from any Ractor's thread, concurrently with the owner's GC and
-     * with other writers on the same word. Set the bit FIRST, then the
-     * page flag, so a concurrent rgengc_rememberset_mark (which clears
-     * the flag before draining the bits) leaves the page flagged for a
-     * rescan rather than skipping a freshly remembered object. */
+    /* atomic。lock-free write barrier は任意の Ractor スレッドから、所有者の GC や同じ word の
+     * 他 writer と並行して shareable を remember する。bit を先に立ててからページフラグを立てる。
+     * これにより、bit を drain する前にフラグを消す並行 rgengc_rememberset_mark は、remember
+     * 直後のオブジェクトを飛ばさずページを再走査対象として残す。 */
     const bool newly = gc_bitmap_atomic_set(bits, page, obj);
     page->flags.has_remembered_objects = TRUE;
     return newly ? TRUE : FALSE;
@@ -7285,13 +7282,11 @@ rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
             else if (page->flags.has_remembered_objects) has_old++;
             else if (page->flags.has_uncollectible_wb_unprotected_objects) has_shady++;
 #endif
-            /* Clear has_remembered_objects BEFORE draining the bits: a
-             * concurrent lock-free write barrier (another Ractor
-             * remembering a shareable on this page) sets its bit first
-             * and the flag after, so clearing the flag first keeps the
-             * page flagged for a rescan if such a set races in. The
-             * per-word drain is an atomic read-and-clear so a racing
-             * set is never lost (it lands on the zeroed word). */
+            /* bit を drain する前に has_remembered_objects を消す。並行する lock-free write
+             * barrier（他 Ractor がこのページの shareable を remember）は bit を先に、フラグを後に
+             * 立てるので、先にフラグを消せば、その set が割り込んでもページを再走査対象に残せる。
+             * word ごとの drain は atomic な読み取り兼クリアなので、割り込んだ set は失われない
+             * （0 化された word に着く）。 */
             page->flags.has_remembered_objects = FALSE;
             for (j=0; j < (size_t)bitmap_plane_count; j++) {
                 bits[j] = RUBY_ATOMIC_SIZE_EXCHANGE(*(volatile size_t *)&remembered_bits[j], 0)
@@ -7326,12 +7321,10 @@ rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
         memset(&page->mark_bits[0],       0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->uncollectible_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->marking_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
-        /* The plain memset can lose a concurrent write barrier's
-         * remember, but only a SHAREABLE can be remembered from another
-         * Ractor's thread, and shareables are re-marked by every local
-         * mark (rlgc_pinned_roots_mark) regardless of their remembered
-         * bit, while the major this clear precedes rescans everything
-         * anyway. */
+        /* 素の memset は並行 write barrier の remember を失いうるが、他 Ractor のスレッドから
+         * remember されうるのは shareable だけで、shareable は remembered bit に関係なく毎回の
+         * local mark（rlgc_pinned_roots_mark）で再 mark される。かつこの clear が先立つ major は
+         * どのみち全体を再走査する。 */
         memset(&page->remembered_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->pinned_bits[0],     0, HEAP_PAGE_BITMAP_SIZE);
         page->flags.has_uncollectible_wb_unprotected_objects = FALSE;
@@ -7352,7 +7345,7 @@ gc_writebarrier_generational(VALUE a, VALUE b, rb_objspace_t *objspace)
         if (is_incremental_marking(objspace)) rb_bug("gc_writebarrier_generational: called while incremental marking: %s -> %s", rb_obj_info(a), rb_obj_info(b));
     }
 
-    /* mark `a' and remember (default behavior)。
+    /* a を mark して remember する（既定動作）。
      * lock なし。remembered bit の set は atomic（rgengc_remembersetbits_set）で、並行する
      * local GC や他 Ractor の write barrier が競合しうるのはそこだけ。 */
     if (!RVALUE_REMEMBERED(objspace, a)) {
@@ -7800,8 +7793,8 @@ garbage_collect(rb_objspace_t *objspace, unsigned int reason)
     objspace->profile.prepare_time = getrusage_time() - objspace->profile.prepare_time;
 #endif
 
-    /* the global-vs-local decision lives at the top of gc_start, the
-     * single point every entry (incl. the allocation slow path) passes */
+    /* global か local かの判定は、全入口（割り当て slow path も含む）が通る唯一の地点である
+     * gc_start の先頭に置く。 */
     ret = gc_start(objspace, reason);
 
     return ret;
@@ -7871,7 +7864,7 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
         objspace->flags.during_incremental_marking = do_full_mark;
     }
 
-    /* Explicitly enable compaction (GC.compact)。
+    /* 明示的な compaction 有効化（GC.compact）。
      * compaction はオブジェクトを動かすので、per-Ractor objspace（cross-objspace 参照、
      * shareable 不動の不変条件、ページ常駐 bitmap）と相容れない。単一 objspace でのみ走る。 */
     if (do_full_mark && ruby_enable_autocompact && rb_gc_single_objspace_p()) {
@@ -8107,9 +8100,8 @@ gc_clock_end(struct timespec *ts)
     return 0;
 }
 
-/* 非 global の local GC が実行の間じゅう no-barrier VM lock を保持するか。main objspace は常に
- * （VM グローバル root を歩くため）、RGENGC_CHECK_MODE では全 objspace が保持する（mid-collection
- * verify の cross-objspace 反復を lock 安全にし、global GC を割り込ませないため）。gc_enter 参照。 */
+/* 非 global の local GC が実行の間じゅう no-barrier VM lock を保持するか。main の通常 local GC は
+ * lock-free で、main の compaction か JIT 有効時だけ保持する（理由は本体コメント参照）。 */
 static inline bool
 gc_local_gc_holds_vm_lock(const rb_objspace_t *objspace)
 {
@@ -8631,8 +8623,8 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
         for (size_t i = 0; i < rlgc_global.count; i++) {
             rb_objspace_t *os = rlgc_global.list[i];
             gc_sweeping_enter(os);
-            gc_sweep_start(os);        /* mode -> sweeping, sort heap for compaction */
-            gc_compact_relocate(os);   /* mode -> compacting, move */
+            gc_sweep_start(os);        /* mode を sweeping へ、compaction 用に heap を整列 */
+            gc_compact_relocate(os);   /* mode を compacting へ、move */
         }
 
         /* pass 2 (update): 全 forwarding pointer が揃ったので全 objspace の参照を更新する
@@ -11986,7 +11978,7 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
 #ifdef MALLOC_COUNTERS_NEED_LOCK
     rb_native_mutex_initialize(&objspace->malloc_counters.lock);
 #endif
-    /* Shared across objspaces; preregister dedupes on (func, data). */
+    /* 全 objspace で共有する。preregister は (func, data) で重複排除する。 */
     objspace->finalize_deferred_pjob = rb_postponed_job_preregister(0, gc_finalize_deferred, NULL);
     if (objspace->finalize_deferred_pjob == POSTPONED_JOB_HANDLE_INVALID) {
         rb_bug("Could not preregister postponed job for GC");
