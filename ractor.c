@@ -241,28 +241,20 @@ mark_targeted_hook_list(st_data_t key, st_data_t value, st_data_t _arg)
 static void
 ractor_mark_unshareable_parts(rb_ractor_t *r)
 {
-    /* Single VALUE slots: stable enough for any GC to read (written by
-     * the owner as one aligned word; their referents are foreign to a
-     * foreign marker and skipped by containment anyway). */
+    /* 単一 VALUE スロット。owner が 1 語で書くのでどの GC からも安全に読める。
+     * 参照先は foreign marker には他 Ractor のものなので containment で skip される。 */
     rb_gc_mark(r->r_stdin);
     rb_gc_mark(r->r_stdout);
     rb_gc_mark(r->r_stderr);
     rb_gc_mark(r->verbose);
     rb_gc_mark(r->debug);
 
-    // mark received messages (gates its owner-mutated structures itself)
+    // 受信メッセージを mark（owner が変更する構造は内部で自らガードする）
     ractor_sync_mark(r);
 
-    /* RLGCv2 M1b: everything below reads structures the owner mutates
-     * while running -- thread structs / ECs / fibers are even freed
-     * concurrently (design_v2.md section 2.1: never walk other
-     * Ractors' stacks), and the hook and storage tables are resized in
-     * place. Walk them only when no concurrent owner can exist: our
-     * own Ractor, a terminated one (the status is set after the
-     * teardown's last access), or under the global GC's barrier.
-     * Nothing is lost for a live foreign Ractor: it roots its own
-     * belongings via rb_ractor_mark_local_roots, and their contents
-     * are foreign to the marking objspace anyway. */
+    /* 以下は owner が実行中に変更する構造（thread/EC/fiber は並行に free もされる）。
+     * 並行 owner が居ない時だけ walk する。自分・終了済み・global GC barrier 下。
+     * 生きた他 Ractor は自分で local root を張るので取りこぼさない。 */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (!(r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p())) {
         return;
@@ -278,18 +270,14 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
         ccan_list_for_each(&r->threads.set, th, lt_node) {
             VM_ASSERT(th != NULL);
             rb_gc_mark(th->self);
-            /* RLGCv2: also mark the execution context directly.  Under a
-             * confined GC the Thread wrapper may live in another objspace
-             * (until it is re-homed), in which case its mark function does
-             * not run here, yet the stacks must stay alive. */
+            /* EC も直接 mark する。confined GC では Thread wrapper が別 objspace に
+             * ある場合があり（re-home まで）その mark 関数がここで走らないが、
+             * stack は生かす必要がある。 */
             if (th->ec) rb_execution_context_mark(th->ec);
 
-            /* RLGCv2 (design_v2.md §1.5): the thread's ec lives inside the
-             * root fiber struct, which is freed together with its wrapper
-             * object -- and for a Ractor's main thread that wrapper may
-             * live in the creating Ractor's objspace, where nothing else
-             * roots it.  Mark the fiber wrappers from here so whichever
-             * objspace owns them keeps them (a foreign mark is a no-op). */
+            /* thread の ec は root fiber 構造体内にあり、その wrapper object と共に
+             * free される。main thread の wrapper は生成元 Ractor の objspace に
+             * あり他に root が無いので、ここで fiber wrapper を mark して生かす。 */
             if (th->root_fiber) {
                 VALUE root_fiber_self = rb_fiberptr_self(th->root_fiber);
                 if (root_fiber_self) rb_gc_mark(root_fiber_self);
@@ -299,13 +287,9 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
                 if (fiber_self) rb_gc_mark(fiber_self);
             }
 
-            /* RLGCv2: thread_mark does not run in this thread's own local
-             * GC when its wrapper lives in another objspace (above), so the
-             * rest of the thread's owned roots are unreachable from here
-             * unless marked directly.  The thgroup is allocated in this
-             * Ractor's own objspace at thread_do_start_proc and is rooted
-             * from nowhere else; without this the owner's local GC frees it
-             * mid-run and the next global mark hits a T_NONE thgroup. */
+            /* wrapper が別 objspace にあると thread_mark が走らず、thread 所有の
+             * 残り root が到達不能になる。特に thgroup はこの Ractor の objspace に
+             * あり他に root が無いので、直接 mark しないと local GC に free される。 */
             rb_thread_mark_owned_roots(th);
         }
     }
@@ -328,10 +312,9 @@ ractor_mark(void *ptr)
     }
 }
 
-/* RLGCv2 (design_v2.md §2.1): Ractor r の C 構造体から到達可能な GC root を
- * mark する。confined GC は heap 上の Ractor/Thread wrapper object に頼れない
- * （それらは別の objspace に存在する場合がある）ため、現在の Ractor の所有物は
- * ここから直接 root にされる。 */
+/* Ractor r の C 構造体から到達可能な GC root を mark する。confined GC は heap 上の
+ * Ractor/Thread wrapper object に頼れない（別 objspace にある場合がある）ため、
+ * この Ractor の所有物はここから直接 root にする。 */
 void
 rb_ractor_mark_local_roots(rb_ractor_t *r)
 {
@@ -339,18 +322,14 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
     rb_gc_mark(r->name);
     ractor_mark_unshareable_parts(r);
 
-    /* RLGCv2: this Ractor's rb_gc_register_mark_object pins.  Conservative:
-     * a local GC actually marks only its own residents; foreign/shareable
-     * entries are picked up by their owner's (or the global) GC. */
+    /* この Ractor の rb_gc_register_mark_object pin。保守的に扱い、local GC は
+     * 自分の住人だけ mark する。foreign/shareable entry は owner か global GC が拾う。 */
     rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
 }
 
-/* RLGCv2: move src's rb_gc_register_mark_object pins into dst.  Called when
- * src's objspace is absorbed into dst (Ractor#value join -> joiner, orphan
- * ractor_free -> main), BEFORE the objspace merge, so a pinned object is never
- * left rootless in the window between "objspace moved" and "registrations
- * moved" (the same window the generic_fields / freeze-hash absorb closes).
- * Raw realloc: an absorb can run inside a GC sweep, so it must not re-enter GC. */
+/* src の rb_gc_register_mark_object pin を dst へ移す。src の objspace が dst に
+ * 吸収される際、objspace merge の前に呼び、pin object が無 root になる窓を防ぐ。
+ * absorb は GC sweep 中に走りうるので生 realloc で GC を再入させない。 */
 void
 rb_ractor_absorb_registered_marks(rb_ractor_t *dst, rb_ractor_t *src)
 {
@@ -391,10 +370,9 @@ ractor_free(void *ptr)
     RUBY_DEBUG_LOG("free r:%d", rb_ractor_id(r));
 
     if (!r->main_ractor) {
-        /* RLGCv2: この Ractor の per-Ractor generic_fields 表を main へ移送する。
-         * この struct と共に失われると、objspace が後で main に merge された後に
-         * host obj の obj_free が entry を見つけられず rb_bug になる。st は raw malloc
-         * なので sweep 中でも安全（registered globals と同型の移送）。 */
+        /* この Ractor の generic_fields 表を main へ移送する。struct と共に失うと、
+         * objspace が後で main に merge された後、host の obj_free が entry を見つけられず
+         * rb_bug になる。st は raw malloc なので sweep 中でも安全。 */
         rb_ractor_absorb_generic_fields(GET_VM()->ractor.main_ractor, r);
     }
 
@@ -414,19 +392,9 @@ ractor_free(void *ptr)
         r->newobj_cache = NULL;
     }
 
-    /* RLGCv2 (design_v2.md section 2.3): this Ractor died unjoined and
-     * its handle is now gone, so nobody can ever inherit its objspace
-     * through Ractor#value. Only the global GC collects Ractor objects
-     * (they are shareable), so we are inside its sweep, under the
-     * barrier: disown the zombie-ledger entry (this struct is freed
-     * below) and post the merge to the main Ractor as a postponed job;
-     * main absorbs the objspace at its next safepoint.
-     *
-     * The main Ractor gets here only from the free-at-exit walk
-     * (rb_objspace_free_objects), which is driven by the main objspace
-     * itself: leave it alone (ruby_vm_destruct frees it last), and keep
-     * r->objspace set so rb_gc_get_objspace() stays valid for the
-     * remaining dfree calls of the walk. */
+    /* unjoin で死んだ Ractor（handle も消え誰も継げない）。ここは global GC barrier 下の
+     * sweep なので zombie ledger を放し objspace merge を main に postponed job で渡す。
+     * main は free-at-exit walk で来るので触らず、objspace も残す（VM destruct が最後に free）。 */
     if (r->objspace && !r->main_ractor) {
         rb_gc_objspace_disown(r->objspace);
         r->objspace = NULL;
@@ -434,15 +402,13 @@ ractor_free(void *ptr)
 
     ractor_sync_free(r);
 
-    /* RLGCv2: per-Ractor generic_fields 表を解放。非 main は上で main へ移送済みで
-     * NULL だが、main は shutdown 時に非 NULL のことがある。NULL は no-op。 */
+    /* generic_fields 表を解放。非 main は上で main へ移送済み（NULL）だが、
+     * main は shutdown 時に非 NULL のことがある。NULL は no-op。 */
     rb_ractor_free_generic_fields(r);
 
-    /* RLGCv2: an orphaned Ractor (never joined) hands its rb_gc_register_mark_object
-     * pins to the main Ractor before its objspace is absorbed there.  (The join
-     * path does the same to the joiner in ractor_sync.c, before the objspace
-     * merge -- same "objspace moved but its registrations did not" window as the
-     * generic_fields / freeze-hash absorb.) */
+    /* orphan Ractor（未 join）は objspace を main に吸収される前に
+     * rb_gc_register_mark_object pin を main へ渡す。join 側も同様に、
+     * objspace merge の前に joiner へ渡す（registration 未移送の窓を防ぐ）。 */
     if (!r->main_ractor) {
         rb_ractor_absorb_registered_marks(GET_VM()->ractor.main_ractor, r);
     }
@@ -467,8 +433,8 @@ ractor_memsize(const void *ptr)
 static void
 ractor_update_references(void *ptr)
 {
-    /* RLGCv2: registered_marks are pinned (marked via rb_gc_mark_vm_stack_values),
-     * so nothing here needs compaction updating. */
+    /* registered_marks は pin されている（rb_gc_mark_vm_stack_values で mark）ので、
+     * compaction による更新は不要。 */
 }
 
 static const rb_data_type_t ractor_data_type = {
@@ -537,10 +503,8 @@ vm_insert_ractor0(rb_vm_t *vm, rb_ractor_t *r, bool single_ractor_mode)
     RUBY_DEBUG_LOG("r:%u ractor.cnt:%u++", r->pub.id, vm->ractor.cnt);
     VM_ASSERT(single_ractor_mode || RB_VM_LOCKED_P());
 
-    /* RLGCv2: becoming multi-objspace. Incremental marking only runs in
-     * the single-objspace world, so finish an in-flight cycle while the
-     * current objspace still is that world (nothing below allocates
-     * before the count flips). */
+    /* multi-objspace になる直前。incremental marking は single-objspace の
+     * 世界でしか走らないので、count が変わる前に進行中の cycle を終える。 */
     if (vm->ractor.cnt == 1) {
         rb_gc_finish_in_flight_gc();
     }
@@ -576,10 +540,9 @@ vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
         {
             vm_insert_ractor0(vm, r, false);
             vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
-            /* RLGCv2: the child is now in the set and enumerated on its own;
-             * stop covering it through the creator (else it would be enumerated
-             * twice). Cleared here, under the same VM lock that added it, so no
-             * whole-VM walk ever sees both. */
+            /* child は set に入り単独で列挙されるので、生成元経由の被覆をやめる
+             * （二重列挙を防ぐ）。追加と同じ VM lock 下でクリアするので、
+             * whole-VM walk が両方を見ることはない。 */
             rb_ractor_t *cur = rb_current_ractor_raw(false);
             if (cur && cur->creating_child_objspace == r->objspace) {
                 cur->creating_child_objspace = NULL;
@@ -598,15 +561,9 @@ vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
             cancel_single_ractor_mode();
             vm_insert_ractor0(vm, r, true);
             vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
-            /* RLGCv2: the child is now in the set, so stop covering it through
-             * the creator -- exactly as the multi-Ractor branch above does.
-             * The single->multi transition path used to skip this: the creator
-             * kept creating_child_objspace == r->objspace, so a later global GC
-             * enumerated the child's objspace twice (once via the set, once via
-             * the creator) and swept it twice. The second sweep -- after
-             * gc_setup_mark_bits reset the page's mark bits -- frees the child's
-             * still-live main Thread/root Fiber, nulling its ec->thread_ptr and
-             * crashing the child's startup (GET_RACTOR()==NULL). */
+            /* child は set に入ったので生成元経由の被覆をやめる（上の multi-Ractor 分岐と同じ）。
+             * single->multi 経路はこれを飛ばしていたため、global GC が child の objspace を
+             * 二重列挙・二重 sweep し、生きた main Thread/root Fiber を free して起動を壊した。 */
             rb_ractor_t *cur = rb_current_ractor_raw(false);
             if (cur && cur->creating_child_objspace == r->objspace) {
                 cur->creating_child_objspace = NULL;
@@ -638,8 +595,8 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         rb_gc_ractor_cache_free(cr->newobj_cache);
         cr->newobj_cache = NULL;
 
-        /* RLGCv2: the objspace loses its owner thread here; keep it
-         * enumerable for the global GC until inheritance merges it. */
+        /* ここで objspace は owner thread を失う。継承で merge されるまで
+         * global GC から列挙可能に保つ。 */
         if (cr->objspace) {
             rb_gc_objspace_retire(&cr->objspace);
         }
@@ -675,9 +632,8 @@ rb_ractor_t *
 rb_ractor_main_alloc(void)
 {
     rb_ractor_t *r = &_main_ractor;
-    /* RLGCv2: the main Ractor is allocated before the objspace exists, so
-     * the newobj cache is created later in Init_BareVM, after
-     * rb_objspace_alloc assigned r->objspace. */
+    /* main Ractor は objspace 生成前に確保されるので、newobj cache は後で
+     * Init_BareVM（rb_objspace_alloc が r->objspace を設定した後）で作る。 */
     ruby_single_main_ractor = r;
 
     return r;
@@ -708,9 +664,8 @@ rb_ractor_terminate_atfork(rb_vm_t *vm, rb_ractor_t *r)
     rb_gc_ractor_cache_free(r->newobj_cache);
     r->newobj_cache = NULL;
     r->status_ = ractor_terminated;
-    /* RLGCv2 (design decision 8): in the forked child every other Ractor
-     * becomes terminated-unjoined; keep its objspace enumerable so the
-     * GC passes see it, until a join or the global GC merges it. */
+    /* fork した子では他の全 Ractor が terminated-unjoined になる。join か
+     * global GC が merge するまで objspace を列挙可能に保つ。 */
     if (r->objspace) {
         rb_gc_objspace_retire(&r->objspace);
     }
@@ -786,9 +741,8 @@ ractor_create(rb_execution_context_t *ec, VALUE self, VALUE loc, VALUE name, VAL
     r->verbose = cr->verbose;
     r->debug = cr->debug;
 
-    /* RLGCv2 (design_v2.md §1.1): every Ractor owns an objspace.  It must
-     * exist before the Ractor's thread runs (its very first allocations go
-     * there via rb_gc_get_objspace). */
+    /* 全 Ractor は objspace を持つ。thread が走る前に存在させる必要がある
+     * （最初の allocation が rb_gc_get_objspace 経由でそこへ行く）。 */
     r->objspace = rb_gc_objspace_alloc_local();
 
     rb_yjit_before_ractor_spawn();
@@ -1126,10 +1080,8 @@ rb_ractor_terminate_all(void)
     }
     RB_VM_UNLOCK();
 
-    /* RLGCv2 (design decision 9): every other Ractor is dead now; main
-     * inherits all their uninherited objspaces, so the at-exit passes
-     * that follow (finalizers, IO flush, free-at-exit) see every object
-     * as before per-Ractor objspaces existed. */
+    /* 他の全 Ractor は死んだ。main が未継承の objspace を全て継ぐので、
+     * 後続の at-exit 処理（finalizer, IO flush, free-at-exit）が全 object を見られる。 */
     rb_gc_objspace_absorb_all_zombies();
 }
 
@@ -1383,11 +1335,9 @@ rb_ractor_targeted_hooks(rb_ractor_t *cr)
 static void
 rb_obj_set_shareable_no_assert(VALUE obj)
 {
-    /* Flip FL_SHAREABLE. For an object whose generic fields live in the
-     * per-Ractor table, the flag flip is interleaved with the table move to
-     * the shared table under generic_fields_lock (review A-5), so a foreign
-     * reader that observes the flag never misses the entry -- do NOT set the
-     * flag here in that case. Every other object flips it directly. */
+    /* FL_SHAREABLE を立てる。generic fields が per-Ractor 表にある object は、
+     * flag 反転を generic_fields_lock 下の共有表への移送と交錯させるので、
+     * ここでは flag を立てない。それ以外は直接立てる。 */
     if (rb_obj_gen_fields_p(obj) && rb_obj_using_gen_fields_table_p(obj)) {
         rb_mv_generic_ivar_to_shared(obj); /* sets FL_SHAREABLE + pin, in order */
     }
@@ -1397,18 +1347,9 @@ rb_obj_set_shareable_no_assert(VALUE obj)
     }
 
     if (BUILTIN_TYPE(obj) == T_FILE && RFILE(obj)->fptr) {
-        /* RLGCv2: the fptr's VALUE members (gc.c's T_FILE mark set) are not
-         * reached by the make_shareable traversal -- they sit in a C struct,
-         * were stored without the write barrier (File.open predates this
-         * promotion), and some can never become shareable (write_lock is a
-         * Mutex). Without a record the now-shareable IO holds naked edges to
-         * owner-confined objects: a local GC never traverses a shareable
-         * (mark-only), so once the owner collects them (or dies and its
-         * objspace is absorbed) the live IO's T_FILE mark walks freed memory
-         * ([BUG] try to mark T_NONE). Record the shrefs the write barrier
-         * would have -- the same discipline as rb_imemo_fields_record_shrefs
-         * below; every global full mark recomputes them from then on
-         * (gc_mark's during_global_gc shref pass). */
+        /* fptr の VALUE メンバは make_shareable の traversal で到達されず（C struct 内、
+         * WB 無しで格納）、shareable IO が owner 限定 object へ裸の辺を持つ。local GC は
+         * shareable を辿らないので、owner が回収すると T_FILE mark が freed を踏む。shref を記録する。 */
         const struct rb_io *const fptr = RFILE(obj)->fptr;
         const VALUE members[] = {
             fptr->self, fptr->pathv, fptr->tied_io_for_writing,
@@ -1425,18 +1366,17 @@ rb_obj_set_shareable_no_assert(VALUE obj)
     }
 
     if (rb_obj_gen_fields_p(obj)) {
-        /* obj は既に shareable（table-backed なら上で表移送込みで昇格済み、それ以外は
-         * fields_obj を inline に持つ）なので、rb_obj_fields_no_ractor_check は正しい表
-         * （shareable → global）を引く。ここでは fields imemo 自身を shareable 化し、
-         * traversal で届かない隠しフィールド値の shref を記録する。 */
+        /* obj は既に shareable なので rb_obj_fields_no_ractor_check は正しい表を引く。
+         * ここでは fields imemo 自身を shareable 化し、traversal で届かない
+         * 隠しフィールド値の shref を記録する。 */
         VALUE fields = rb_obj_fields_no_ractor_check(obj);
         if (imemo_type_p(fields, imemo_fields)) {
             // no recursive mark
             FL_SET_RAW(fields, FL_SHAREABLE);
             rb_gc_obj_became_shareable(fields);
-            // ...but field values not reached by the make_shareable traversal
-            // (e.g. hidden internal ivars) may stay unshareable; record their
-            // shrefs so the shareable fields imemo keeps a valid edge record.
+            // ただし traversal で到達しない field 値（隠し内部 ivar 等）は
+            // unshareable のままになりうるので、shref を記録して
+            // shareable fields imemo が正しい辺記録を保つようにする。
             rb_imemo_fields_record_shrefs(fields);
         }
     }
@@ -1838,7 +1778,7 @@ rb_ractor_make_shareable(VALUE obj)
     return obj;
 }
 
-static VALUE ractor_copy(VALUE obj); // below
+static VALUE ractor_copy(VALUE obj); // 後述
 
 VALUE
 rb_ractor_make_shareable_copy(VALUE obj)
@@ -1951,15 +1891,9 @@ struct obj_traverse_replace_data {
     rb_obj_traverse_replace_enter_func enter_func;
     rb_obj_traverse_replace_leave_func leave_func;
 
-    /* old -> new mapping. A plain st table: the OLD keys may live in
-     * another Ractor's objspace (the receive-side pass of copy/move
-     * walks the sender-resident snapshot), so they must not become GC
-     * edges of this Ractor -- a hidden ident Hash here once made the
-     * consistency verifier flag worker->foreign key edges, and marking
-     * a freed foreign key's page is a real (if narrow) UAF. Keys are
-     * compared by address only; their liveness belongs to the
-     * in-flight pin / materializing slot. The REPLACEMENTS (this
-     * Ractor's fresh objects) are kept alive by rec_keepalive. */
+    /* old -> new 対応表（素の st table）。OLD key は別 Ractor の objspace に
+     * ある場合があるので、この Ractor の GC 辺にしてはならない（freed foreign key の
+     * mark は UAF）。key は address 比較のみ。REPLACEMENT は rec_keepalive で生かす。 */
     st_table *rec;
     VALUE rec_keepalive;
 
@@ -2070,14 +2004,9 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
         return 0;
     }
 
-    /* Dedup BEFORE enter_func: a shared or cyclic node visited again must
-     * reuse its recorded replacement without re-running enter_func. The copy
-     * path's enter_func makes a shallow copy whose children still point at the
-     * source; on a revisit that copy is immediately discarded by the dedup,
-     * but until it is swept it is a live object holding cross-objspace edges,
-     * which violates RLGCv2's per-objspace containment invariant (caught by
-     * GC.verify_internal_consistency) -- besides being wasted work and, for the
-     * move path, a double enter_func on the same node. */
+    /* enter_func の前に dedup する。再訪した共有/循環 node は記録済み replacement を
+     * enter_func 無しで再利用する。さもないと copy 経路が作る一時 copy が
+     * cross-objspace 辺を持ち objspace containment 不変条件を破る（無駄でもある）。 */
     if (UNLIKELY(st_lookup(obj_traverse_replace_rec(data), (st_data_t)obj, &replacement))) {
         data->replacement = (VALUE)replacement;
         return 0;
@@ -2288,8 +2217,8 @@ rb_obj_traverse_replace(VALUE obj,
 
     int stopped = obj_traverse_replace_i(obj, &data);
 
-    /* enter/leave funcs report failure as traverse_stop instead of
-     * raising, so this is the single exit for the table */
+    /* enter/leave 関数は失敗を raise でなく traverse_stop で返すので、
+     * ここが table の唯一の解放点。 */
     if (data.rec) st_free_table(data.rec);
     RB_GC_GUARD(data.rec_keepalive);
 
@@ -2301,30 +2230,12 @@ rb_obj_traverse_replace(VALUE obj,
     }
 }
 
-/* ===== RLGCv2 move courier (design_v2.md §4.5) =====
- *
- * A Ractor#send(obj, move: true) payload is serialized into an xmalloc'd
- * "move courier" that is NOT a GC object in any objspace.  Because nothing in
- * flight is GC-managed, the sender's confined GC never marks, sweeps, moves
- * (compacts) or races it -- the keep-alive / compaction / rewrite-race
- * problems of an in-heap snapshot all disappear at once.
- *
- * The courier is a special in-memory Marshal: the object graph is captured as
- * a flat array of nodes, references between nodes are node ids (so shared
- * subgraphs and reference CYCLES are handled by a src->id dedup map), and
- * move's zero-copy intent is honoured by carrying malloc'd buffers across
- * (the String char buffer; IO's fd; later the container buffers) rather than
- * byte-copying them.  No user marshal hooks run (decision 11).  The originals
- * are turned into RactorMovedObject as each is captured (move semantics).
- *
- * The receiver rebuilds the graph in its own objspace in two passes (shells
- * first, then fill -- so cycles resolve), then frees the courier.  The only
- * VALUEs the courier holds are shareables/immediates (REF nodes and object
- * classes); those are marked (ractor_move_courier_mark) so a global GC keeps
- * them, and marking a shareable never races (it is read-only). */
+/* move courier: Ractor#send(move: true) の payload を、どの objspace にも属さない
+ * xmalloc 構造体に直列化する（GC 管理外なので送信側 GC が mark/sweep/compact/race しない）。
+ * node 配列＋id 参照で共有・循環を扱い、受信側が自 objspace で 2 パス再構築する。 */
 
 enum move_node_kind {
-    MOVE_K_REF,       /* immediate or shareable: carried by value */
+    MOVE_K_REF,       /* immediate か shareable: 値で運ぶ */
     MOVE_K_STRING,
     MOVE_K_ARRAY,
     MOVE_K_HASH,
@@ -2337,26 +2248,25 @@ enum move_node_kind {
 struct move_node {
     enum move_node_kind kind;
     bool frozen;
-    /* instance / generic ivars carried by every non-REF node (a String or
-     * Array may carry generic ivars too) */
+    /* 全 non-REF node が持つ instance/generic ivar（String や Array も
+     * generic ivar を持ちうる） */
     uint32_t niv;
-    ID *iv_ids;          /* courier owns */
-    uint32_t *iv_vals;   /* courier owns; node ids */
+    ID *iv_ids;          /* courier 所有 */
+    uint32_t *iv_vals;   /* courier 所有; node id */
     union {
         VALUE ref;
-        struct { char *ptr; long len; int encidx; VALUE klass; } str;        /* courier owns ptr */
-        struct { long len; uint32_t *elems; VALUE klass; } ary;              /* courier owns elems */
-        struct { long size; uint32_t *kv; uint32_t ifnone_id; bool compare_by_id; bool proc_default; VALUE klass; } hash; /* owns kv (2*size) */
+        struct { char *ptr; long len; int encidx; VALUE klass; } str;        /* courier が ptr を所有 */
+        struct { long len; uint32_t *elems; VALUE klass; } ary;              /* courier が elems を所有 */
+        struct { long size; uint32_t *kv; uint32_t ifnone_id; bool compare_by_id; bool proc_default; VALUE klass; } hash; /* kv(2*size) を所有 */
         struct { VALUE klass; } obj;
-        struct { long len; uint32_t *elems; VALUE klass; } strct; /* owns elems */
-        struct { uint32_t regexp_id, str_id; int num_regs; void *regs; VALUE klass; } match; /* owns regs */
+        struct { long len; uint32_t *elems; VALUE klass; } strct; /* elems を所有 */
+        struct { uint32_t regexp_id, str_id; int num_regs; void *regs; VALUE klass; } match; /* regs を所有 */
         struct {
-            struct rb_io *fptr;  /* carried across by pointer (owns the fd) */
+            struct rb_io *fptr;  /* ポインタで持ち越す（fd を所有） */
             VALUE klass;
-            /* the fptr's sender-resident VALUE members travel as ordinary
-             * child nodes; the capture severs them from the fptr (see the
-             * T_FILE arm) and the rebuild writes the receiver-side shells
-             * back with RB_OBJ_WRITE */
+            /* fptr の送信側 VALUE メンバは通常の child node として運ぶ。capture が
+             * fptr から切り離し（T_FILE 節参照）、rebuild が受信側 shell を
+             * RB_OBJ_WRITE で書き戻す。 */
             uint32_t pathv_id, ecopts_id, wc_pre_ecopts_id, wc_asciicompat_id, timeout_id;
         } io;
     } u;
@@ -2386,19 +2296,15 @@ move_alloc_node(struct rb_ractor_move_courier *c)
     return c->count++;
 }
 
-/* Turn a moved-out source into a valid RactorMovedObject without ever passing
- * through flags==0 (a concurrent foreign marker must always see either the
- * intact original or the shell). Shape id 0 (ROOT_SHAPE) means the stale body
- * is never read as ivars. Mirrors move_leave's neutralisation. */
+/* move 済み source を、flags==0 を経ずに正当な RactorMovedObject へ変える
+ * （並行 foreign marker が常に元 object か shell のどちらかを見るように）。
+ * shape id 0 で古い body が ivar として読まれない。 */
 static void
 move_neutralize_source(VALUE obj)
 {
-    /* RLGCv2: source が非 T_OBJECT ホスト（String/Array/… with ivars）なら、その
-     * generic_fields entry を削除しておく。下で shape を 0（root）に潰すと obj はもう
-     * gen-fields ホストではなくなり、その fields_obj は到達不能になって回収される。
-     * entry を消さないと、host が生きたまま値だけ freed の stale entry が残り、global GC
-     * の weak pass（全表を舐める）がその freed 値を mark して UAF になる（旧 per-object
-     * mark は非ホストを触らなかったので露呈しなかった）。owner=GET_RACTOR() の write。 */
+    /* source が非 T_OBJECT ホスト（ivar 持ちの String/Array 等）なら generic_fields
+     * entry を削除する。下で shape を 0 に潰すと obj は host でなくなり fields_obj が
+     * 回収されるので、消さないと freed 値を指す stale entry が残り global GC が踏む。 */
     rb_free_generic_ivar(obj);
 
     VALUE flags = T_OBJECT | FL_FREEZE | (RBASIC(obj)->flags & FL_PROMOTED);
@@ -2450,9 +2356,8 @@ move_capture_ivar_i(ID name, VALUE val, st_data_t arg)
     return ST_CONTINUE;
 }
 
-/* Capture obj's instance/generic ivars into node id (recurses into values).
- * Works for any type (T_OBJECT inline ivars and generic ivars on String /
- * Array / ... alike). */
+/* obj の instance/generic ivar を node id に取り込む（値へ再帰）。
+ * T_OBJECT の inline ivar も String/Array 等の generic ivar も扱う。 */
 static void
 move_capture_ivars(struct move_build *b, VALUE obj, uint32_t id)
 {
@@ -2463,12 +2368,9 @@ move_capture_ivars(struct move_build *b, VALUE obj, uint32_t id)
     b->c->nodes[id].iv_vals = oc.vals;
 }
 
-/* Capture obj into the courier, recursing into children, and return its node
- * id.  The id is registered BEFORE recursing so a cycle back to obj resolves
- * to the same node.  c->nodes may be reallocated by nested move_alloc_node
- * calls, so node fields are written via c->nodes[id] AFTER recursion.  All
- * recursion happens while the source is intact; the source is neutralized
- * (turned into RactorMovedObject) only once, after the switch. */
+/* obj を courier に取り込み子へ再帰し node id を返す。id は再帰前に登録するので
+ * obj への循環は同じ node に解決する。c->nodes は再帰中に realloc されうるので
+ * node フィールドは再帰後に書く。source の neutralize は switch 後に一度だけ。 */
 static uint32_t
 move_capture(struct move_build *b, VALUE obj)
 {
@@ -2490,41 +2392,33 @@ move_capture(struct move_build *b, VALUE obj)
         return id;
     }
 
-    /* reject early what we can't move, before mutating anything */
+    /* 変更を始める前に move 不可を早期に弾く */
     if (BUILTIN_TYPE(obj) == T_FILE && RFILE(obj)->fptr == NULL) {
         rb_raise(rb_eRactorError, "can not move an uninitialized IO");
     }
 
     bool frozen = OBJ_FROZEN(obj);
     b->c->nodes[id].frozen = frozen;
-    move_capture_ivars(b, obj, id);   /* common: instance/generic ivars */
+    move_capture_ivars(b, obj, id);   /* 共通: instance/generic ivar */
 
     switch (BUILTIN_TYPE(obj)) {
       case T_STRING: {
-        /* Make the source own a private buffer (un-shares a sharer and
-         * copies a static STR_NOFREE one); frozen strings are fine -- this
-         * changes buffer ownership, not content. After this the string is
-         * embedded, owns an exclusive malloc'd heap buffer, or is a
-         * shared ROOT (make_independent is a no-op for a root: its buffer
-         * is exactly what its live CoW children read). */
+        /* source に専有 buffer を持たせる（sharer を解除、静的 STR_NOFREE を複製）。
+         * frozen でも内容でなく所有権を変えるだけで安全。以後 string は embed か、
+         * 専有 heap buffer 所有か、shared ROOT（root には no-op）のいずれか。 */
         rb_str_make_independent(obj);
         long len = RSTRING_LEN(obj);
         int encidx = ENCODING_GET(obj);
         char *ptr;
         if (!STR_EMBED_P(obj) && rb_str_reembeddable_p(obj)) {
-            /* owns an exclusive heap buffer: carry it across by pointer
-             * (zero-copy); the source becomes a shell that never frees it. */
+            /* 専有 heap buffer 所有: ポインタで持ち越す（zero-copy）。
+             * source は buffer を free しない shell になる。 */
             ptr = RSTRING(obj)->as.heap.ptr;
         }
         else {
-            /* embedded, or still a shared root: copy the bytes into a
-             * courier-owned buffer. Stealing a root's buffer would dangle
-             * every child still pointing into it (str.dup CoW) once the
-             * receiver materializes and the courier frees it -- leave the
-             * buffer with the children instead, exactly like the
-             * ARY_SHARED_ROOT_P exclusion in the T_ARRAY branch below.
-             * (An embedded slot is released the normal way when the husk
-             * is swept.) */
+            /* embed か shared root: byte を courier 所有 buffer に複製する。
+             * root の buffer を奪うと CoW child が dangling するので child に残す
+             * （下の T_ARRAY の ARY_SHARED_ROOT_P 除外と同じ）。 */
             ptr = ALLOC_N(char, len + 1);
             if (len) memcpy(ptr, RSTRING_PTR(obj), len);
             ptr[len] = '\0';
@@ -2547,10 +2441,8 @@ move_capture(struct move_build *b, VALUE obj)
         b->c->nodes[id].u.ary.klass = RBASIC_CLASS(obj);
         b->c->nodes[id].u.ary.len = len;
         b->c->nodes[id].u.ary.elems = elems;
-        /* Release the source's owned heap buffer (children already read).
-         * Skip embedded (no heap buffer), a sharer (the root owns the buffer),
-         * and a shared-root (other live arrays still point into the buffer --
-         * freeing it would dangle them; they keep it alive instead). */
+        /* source の専有 heap buffer を解放（child は読み終えた）。embed（buffer 無し）、
+         * sharer（root が所有）、shared-root（他の array が指すので解放で dangling）は skip。 */
         if (!ARY_EMBED_P(obj) && !ARY_SHARED_P(obj) && !ARY_SHARED_ROOT_P(obj)) {
             ruby_xfree((void *)RARRAY_CONST_PTR(obj));
         }
@@ -2570,16 +2462,15 @@ move_capture(struct move_build *b, VALUE obj)
         b->c->nodes[id].u.hash.ifnone_id = ifnone_id;
         b->c->nodes[id].u.hash.compare_by_id = RTEST(rb_hash_compare_by_id_p(obj));
         b->c->nodes[id].u.hash.proc_default = FL_TEST_RAW(obj, RHASH_PROC_DEFAULT) != 0;
-        /* release the source's st-table internals (ar tables are in-slot) */
+        /* source の st-table 内部を解放（ar table は slot 内） */
         rb_hash_free(obj);
         break;
       }
 
       case T_OBJECT:
         b->c->nodes[id].kind = MOVE_K_OBJECT;
-        /* keep the real class (possibly a singleton, which is shareable so a
-         * cross-objspace reference to it is sound); the rebuild re-attaches it
-         * after allocating through the non-singleton class. */
+        /* 本来の class を保持（singleton でも shareable なので cross-objspace 参照は安全）。
+         * rebuild が非 singleton class で確保した後で付け直す。 */
         b->c->nodes[id].u.obj.klass = RBASIC_CLASS(obj);
         break;
 
@@ -2593,7 +2484,7 @@ move_capture(struct move_build *b, VALUE obj)
         b->c->nodes[id].u.strct.len = len;
         b->c->nodes[id].u.strct.elems = elems;
         b->c->nodes[id].u.strct.klass = RBASIC_CLASS(obj);
-        /* release the source's owned heap buffer (embedded structs have none) */
+        /* source の専有 heap buffer を解放（embed struct は持たない） */
         if (RSTRUCT_EMBED_LEN(obj) == 0) {
             ruby_xfree((void *)RSTRUCT_CONST_PTR(obj));
         }
@@ -2601,8 +2492,8 @@ move_capture(struct move_build *b, VALUE obj)
       }
 
       case T_MATCH: {
-        /* the regexp and matched string travel as ordinary children; re.c
-         * dumps the registers (releasing the source's onig/char_offset) */
+        /* regexp と matched string は通常の child として運ぶ。re.c が
+         * register を dump する（source の onig/char_offset を解放）。 */
         VALUE re, st;
         int nregs;
         void *regs = rb_match_move_dump(obj, &re, &st, &nregs);
@@ -2619,20 +2510,9 @@ move_capture(struct move_build *b, VALUE obj)
 
       case T_FILE:
       {
-        /* RLGCv2 (design_v2.md §4.5): carry the whole fptr (and its fd)
-         * across by pointer; the source becomes a shell that never closes
-         * it. The fptr's VALUE members are sender-objspace objects: once
-         * the source is husked nothing on the sender roots them, so the
-         * sender's next local GC (or an in-flight global GC) would
-         * collect them under the receiver (File always has a pathv --
-         * io.path/inspect would read freed memory). Capture them as
-         * ordinary child nodes and SEVER them from the fptr: the ridden
-         * fptr is marked by nobody in flight, and on the receiver the
-         * shell's T_FILE mark runs before the fill pass rewrites these
-         * slots, so a stale pointer left here would get marked. The
-         * rebuild writes the receiver-side shells back; write_lock and
-         * wakeup_mutex are lazily (re)created by io.c on demand, and a
-         * tied/mid-close IO is rejected in move_preflight. */
+        /* fptr（と fd）を丸ごとポインタで持ち越し、source は close しない shell になる。
+         * fptr の VALUE メンバは送信側 object で husk 後は無 root になるので、通常の
+         * child node として capture し fptr から切り離す。rebuild が受信側 shell を書き戻す。 */
         struct rb_io *fptr = RFILE(obj)->fptr;
         VM_ASSERT(!RTEST(fptr->tied_io_for_writing) && !RTEST(fptr->wakeup_mutex));
         uint32_t pathv_id   = move_capture(b, fptr->pathv);
@@ -2640,7 +2520,7 @@ move_capture(struct move_build *b, VALUE obj)
         uint32_t wc_pre_id  = move_capture(b, fptr->writeconv_pre_ecopts);
         uint32_t wc_ac_id   = move_capture(b, fptr->writeconv_asciicompat);
         uint32_t timeout_id = move_capture(b, fptr->timeout);
-        fptr->self = Qnil;   /* points at the husk otherwise; rebuilt on attach */
+        fptr->self = Qnil;   /* husk を指すため; attach 時に再構築 */
         fptr->pathv = Qnil;
         fptr->encs.ecopts = Qnil;
         fptr->writeconv_pre_ecopts = Qnil;
@@ -2648,7 +2528,7 @@ move_capture(struct move_build *b, VALUE obj)
         fptr->timeout = Qnil;
         fptr->write_lock = Qnil;
         fptr->wakeup_mutex = Qnil;
-        fptr->tied_io_for_writing = 0;  /* io.c tests this by C truthiness: 0, not Qnil */
+        fptr->tied_io_for_writing = 0;  /* io.c は C 真偽で判定するので Qnil でなく 0 */
         b->c->nodes[id].kind = MOVE_K_IO;
         b->c->nodes[id].u.io.fptr = fptr;
         b->c->nodes[id].u.io.klass = RBASIC_CLASS(obj);
@@ -2686,13 +2566,9 @@ move_preflight_hash_i(st_data_t key, st_data_t val, st_data_t arg)
     return ST_CONTINUE;
 }
 
-/* Pre-flight walk, mirroring move_capture's decision tree WITHOUT mutating
- * anything. move_capture husks each original (and steals buffers) as it
- * goes, so a mid-capture raise on an unmovable child used to leave the
- * already-captured part of the graph husked, its data marooned in a leaked
- * courier -- unrecoverable, where the pre-move graph was still intact.
- * Raise all "can not move" errors here, before the first mutation; after
- * this pass the capture itself can only fail on allocation failure. */
+/* move_capture の判定木を変更なしで辿る事前walk。capture は各 object を
+ * husk しながら進むので、途中で move 不可に当たると graph が壊れ回復不能になる。
+ * 「can not move」系のエラーは最初の変更前にここで全て raise する。 */
 static void
 move_preflight(VALUE obj, st_table *seen)
 {
@@ -2703,9 +2579,9 @@ move_preflight(VALUE obj, st_table *seen)
     switch (BUILTIN_TYPE(obj)) {
       case T_STRING:
       case T_OBJECT:
-        break;                       /* children = ivars only (below) */
+        break;                       /* child は ivar のみ（下記） */
       case T_MATCH:
-        break;                       /* children = Regexp (shareable) + String */
+        break;                       /* child = Regexp（shareable）+ String */
       case T_ARRAY:
         for (long i = 0; i < RARRAY_LEN(obj); i++) {
             move_preflight(RARRAY_AREF(obj, i), seen);
@@ -2726,12 +2602,12 @@ move_preflight(VALUE obj, st_table *seen)
             rb_raise(rb_eRactorError, "can not move an uninitialized IO");
         }
         if (RTEST(fptr->tied_io_for_writing)) {
-            /* a popen("r+")-style pair: moving one half would leave the
-             * tied writer dangling on the sender */
+            /* popen("r+") 系の対: 片方を move すると tied writer が
+             * 送信側で dangling する */
             rb_raise(rb_eRactorError, "can not move an IO tied to a writer IO");
         }
         if (RTEST(fptr->wakeup_mutex)) {
-            /* close in progress: threads are blocked on this IO */
+            /* close 進行中: thread がこの IO で block している */
             rb_raise(rb_eRactorError, "can not move an IO that is being closed");
         }
         move_preflight(fptr->pathv, seen);
@@ -2749,13 +2625,13 @@ move_preflight(VALUE obj, st_table *seen)
     rb_ivar_foreach(obj, move_preflight_ivar_i, (st_data_t)seen);
 }
 
-/* Build a move courier from obj, turning every captured original into a
- * RactorMovedObject (move semantics).  Returns the xmalloc'd courier. */
+/* obj から move courier を作り、capture した元 object を全て RactorMovedObject 化する
+ * （move セマンティクス）。xmalloc した courier を返す。 */
 struct rb_ractor_move_courier *
 ractor_move_courier_build(VALUE obj)
 {
-    /* two-phase (preflight, then commit): all move-eligibility errors
-     * raise from the read-only walk while the graph is still intact */
+    /* 2 相（preflight → commit）。move 可否のエラーは graph が無傷のうちに
+     * read-only walk から raise する。 */
     {
         st_table *pf_seen = st_init_numtable();
         enum ruby_tag_type state;
@@ -2776,13 +2652,9 @@ ractor_move_courier_build(VALUE obj)
     return c;
 }
 
-/* Shells are built through their base/real class; if the moved source was a
- * subclass (or carried a singleton class), re-tag the shell so the move
- * preserves the class. The class is shareable, so the cross-objspace
- * reference carried in the node is sound. A singleton class additionally
- * still has the sender's neutralized source as its attached object -- a
- * GC-marked edge (gc.c marks RCLASS_ATTACHED_OBJECT) -- so re-attach it to
- * the shell; RCLASS_SET_ATTACHED_OBJECT's write barrier records the shref. */
+/* shell は base/real class で作るので、元が subclass や singleton class を持つ場合は
+ * shell に付け直して class を保つ（class は shareable なので参照は安全）。singleton は
+ * attached object も送信側 source のままなので shell に re-attach する。 */
 static void
 move_apply_moved_klass(VALUE shell, VALUE klass)
 {
@@ -2794,13 +2666,13 @@ move_apply_moved_klass(VALUE shell, VALUE klass)
     }
 }
 
-/* Rebuild the courier's graph in the current Ractor's objspace and return the
- * root.  Two passes (allocate shells, then fill) resolve reference cycles. */
+/* courier の graph を現在の Ractor の objspace に再構築し root を返す。
+ * 2 パス（shell 確保 → fill）で参照循環を解く。 */
 VALUE
 ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
 {
-    /* a hidden Array roots every shell while later allocations (which can
-     * trigger this Ractor's GC) build the rest of the graph */
+    /* 隠し Array が全 shell を root する。後続の allocation（この Ractor の
+     * GC を起こしうる）が graph の残りを作る間、生かしておくため。 */
     VALUE shells = rb_ary_hidden_new(c->count);
 
     for (uint32_t i = 0; i < c->count; i++) {
@@ -2823,8 +2695,8 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
             move_apply_moved_klass(shell, n->u.hash.klass);
             break;
           case MOVE_K_OBJECT:
-            /* can't allocate through a singleton class; build an instance
-             * of the real class, then re-tag/re-attach */
+            /* singleton class では確保できないので real class の instance を作り、
+             * 後で付け直す */
             shell = rb_obj_alloc(rb_class_real(n->u.obj.klass));
             move_apply_moved_klass(shell, n->u.obj.klass);
             break;
@@ -2841,7 +2713,7 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
             move_apply_moved_klass(shell, n->u.io.klass);
             RFILE(shell)->fptr = n->u.io.fptr;
             n->u.io.fptr->self = shell;
-            n->u.io.fptr = NULL; /* consumed: the new IO owns it now */
+            n->u.io.fptr = NULL; /* 消費済み: 新 IO が所有 */
             break;
           default:
             rb_bug("ractor_move_courier_materialize: bad node kind");
@@ -2863,7 +2735,7 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
                 rb_hash_aset(shell, RARRAY_AREF(shells, n->u.hash.kv[2 * j]),
                              RARRAY_AREF(shells, n->u.hash.kv[2 * j + 1]));
             }
-            /* restore the default value / default proc (set before freezing) */
+            /* default 値 / default proc を復元（freeze 前に設定） */
             VALUE ifnone = RARRAY_AREF(shells, n->u.hash.ifnone_id);
             if (n->u.hash.proc_default) {
                 rb_hash_set_default_proc(shell, ifnone);
@@ -2884,9 +2756,8 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
                                n->u.match.num_regs, n->u.match.regs);
             break;
           case MOVE_K_IO: {
-            /* write the rebuilt VALUE members back into the ridden fptr
-             * (severed at capture); write_lock / wakeup_mutex stay nil,
-             * io.c re-creates them lazily on demand */
+            /* 再構築した VALUE メンバを fptr に書き戻す（capture で切り離した）。
+             * write_lock / wakeup_mutex は nil のままで io.c が遅延再生成する。 */
             struct rb_io *fptr = RFILE(shell)->fptr;
             RB_OBJ_WRITE(shell, &fptr->pathv, RARRAY_AREF(shells, n->u.io.pathv_id));
             RB_OBJ_WRITE(shell, &fptr->encs.ecopts, RARRAY_AREF(shells, n->u.io.ecopts_id));
@@ -2898,13 +2769,13 @@ ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
           default:
             break;
         }
-        /* restore instance/generic ivars (every non-REF node may carry them) */
+        /* instance/generic ivar を復元（全 non-REF node が持ちうる） */
         for (uint32_t j = 0; j < n->niv; j++) {
             rb_ivar_set(shell, n->iv_ids[j], RARRAY_AREF(shells, n->iv_vals[j]));
         }
     }
 
-    /* freeze after filling, so frozen containers/strings can still be built */
+    /* fill 後に freeze する。frozen container/string も構築できるように。 */
     for (uint32_t i = 0; i < c->count; i++) {
         VALUE shell = RARRAY_AREF(shells, i);
         if (c->nodes[i].frozen && !RB_SPECIAL_CONST_P(shell)) {
@@ -2941,9 +2812,8 @@ ractor_move_courier_free(struct rb_ractor_move_courier *c)
             rb_match_move_free(n->u.match.regs);
             break;
           case MOVE_K_IO:
-            /* a consumed IO has fptr==NULL; an unconsumed one (queue
-             * teardown before receive) keeps its fd/fptr -- a v1 leak that
-             * only happens when a moved IO is dropped undelivered. */
+            /* 消費済み IO は fptr==NULL。未消費（受信前に queue が壊れた）は
+             * fd/fptr を保持したままになる。未配送 IO を捨てた時だけの leak。 */
             break;
           default:
             break;
@@ -2953,9 +2823,9 @@ ractor_move_courier_free(struct rb_ractor_move_courier *c)
     ruby_xfree(c);
 }
 
-/* Mark the only VALUEs the courier carries: shareables/immediates (REF) and
- * object classes.  These are shareable, so marking them is race-free and a
- * global GC keeps them reachable through the in-flight courier. */
+/* courier が持つ唯一の VALUE を mark する: shareable/immediate（REF）と
+ * object の class。どれも shareable なので mark は race せず、global GC が
+ * courier 経由で到達可能に保つ。 */
 void
 ractor_move_courier_mark(struct rb_ractor_move_courier *c)
 {
@@ -2989,23 +2859,16 @@ ractor_move_courier_mark(struct rb_ractor_move_courier *c)
     }
 }
 
-/* RLGCv2 / design decision 11: the message-copy traversal never calls the
- * user-visible #clone / #initialize_clone. Core container types get a
- * native shallow copy here (the traversal machinery then rewrites the
- * children inside the copy); every other unshareable type falls back to
- * a whole-graph Marshal round-trip (ractor_prepare_payload).
- * The native copies always build fresh buffers: a #clone-based copy of a
- * long String/Array shares the buffer root with the source, which under
- * per-Ractor objspaces would leave the receiver's contents pointing into
- * the sender's heap. */
+/* message copy の traversal は #clone / #initialize_clone を呼ばない。中核の
+ * container 型はここで native な shallow copy を作り（traversal が copy 内の child を
+ * 書き換える）、他の unshareable 型は全体を Marshal 往復に fallback する。 */
 static VALUE
 ractor_native_shallow_copy(VALUE obj)
 {
     VALUE copy;
 
-    /* An object with a singleton class is not natively copyable (the
-     * #clone-based copy used to carry the singleton over); let it fall
-     * through to Marshal, which raises a proper error for it. */
+    /* singleton class を持つ object は native copy 不可。Marshal に
+     * fallback させ、適切なエラーを出させる。 */
     VALUE klass = RBASIC_CLASS(obj);
     if (klass == 0 || FL_TEST_RAW(klass, FL_SINGLETON)) {
         return Qundef;
@@ -3034,8 +2897,8 @@ ractor_native_shallow_copy(VALUE obj)
         rb_match_init_copy(copy, obj);
         break;
       case T_DATA:
-        /* a copied exception must not smuggle a raw pointer to the
-         * sender-resident backtrace across objspaces (design_v2.md §4.4) */
+        /* copy した例外が送信側 backtrace への生ポインタを objspace 跨ぎで
+         * 持ち込まないようにする */
         if (rb_backtrace_p(obj)) {
             copy = rb_backtrace_dup(obj);
             break;
@@ -3045,16 +2908,13 @@ ractor_native_shallow_copy(VALUE obj)
         return Qundef;
     }
 
-    /* non-T_OBJECT hosts keep their instance variables in the generic
-     * fields table; #clone used to carry them over. */
+    /* 非 T_OBJECT ホストは instance 変数を generic fields 表に持つので複製する。 */
     if (BUILTIN_TYPE(obj) != T_OBJECT && UNLIKELY(rb_obj_gen_fields_p(obj))) {
         rb_copy_generic_ivar(copy, obj);
     }
 
-    /* The traversal machinery rewrites the children inside the copy with
-     * raw stores, so the frozen bit can be set up front. (At leave time
-     * the original is no longer in view: the walker swaps obj for the
-     * replacement before descending.) */
+    /* traversal が copy 内の child を raw store で書き換えるので、frozen bit は
+     * 先に立ててよい（leave 時には元 object はもう見えない）。 */
     if (OBJ_FROZEN(obj)) {
         RB_FL_SET_RAW(copy, RUBY_FL_FREEZE);
     }
@@ -3070,14 +2930,11 @@ copy_enter(VALUE obj, struct obj_traverse_replace_data *data)
     }
     else {
         VALUE copy = ractor_native_shallow_copy(obj);
-        if (UNDEF_P(copy)) return traverse_stop; /* not natively copyable */
+        if (UNDEF_P(copy)) return traverse_stop; /* native copy 不可 */
         data->replacement = copy;
-        /* RLGCv2: 送信側の snapshot 作成中（gen_fields_capturing）、copy(snapshot node) が
-         * generic-ivar host なら、その fields_obj を対応表に記録する。こうしておくと受信側
-         * materialize が sender の per-Ractor 表を跨いで読まずに済む（rb_obj_fields_generic_uncached
-         * が gen_fields_materialize から引く）。owner=送信側 なので rb_obj_fields_no_ractor_check
-         * は local read。表は host が出て初めて遅延確保する（make_shareable の copy や受信側の
-         * copy では capturing=false なので記録しない）。 */
+        /* snapshot 作成中に copy が generic-ivar host なら、その fields_obj を対応表に
+         * 記録する。こうすると受信側 materialize が送信側の per-Ractor 表を跨いで
+         * 読まずに済む。表は host が出て初めて遅延確保する。 */
         rb_ractor_t *cr = GET_RACTOR();
         if (cr->gen_fields_capturing &&
             BUILTIN_TYPE(copy) != T_OBJECT && rb_obj_gen_fields_p(copy)) {
@@ -3097,16 +2954,16 @@ copy_leave(VALUE obj, struct obj_traverse_replace_data *data)
     return traverse_cont;
 }
 
-/* Native deep copy of obj's graph; Qundef if the graph contains a type
- * the native copier does not support (callers fall back to Marshal). */
+/* obj の graph の native deep copy。native copier が非対応の型を含むと Qundef
+ * （呼び出し側は Marshal に fallback）。 */
 static VALUE
 ractor_copy_native_try(VALUE obj)
 {
     return rb_obj_traverse_replace(obj, copy_enter, copy_leave, false);
 }
 
-/* Same-objspace deep copy (Ractor.make_shareable(obj, copy: true)):
- * native first, whole-graph Marshal round-trip otherwise. */
+/* 同一 objspace の deep copy（Ractor.make_shareable(obj, copy: true)）。
+ * まず native、駄目なら全体を Marshal 往復する。 */
 static VALUE
 ractor_copy(VALUE obj)
 {
@@ -3154,15 +3011,9 @@ ractor_local_storage_mark(rb_ractor_t *r)
     if (r->local_storage) {
         st_foreach(r->local_storage, ractor_local_storage_mark_i, 0);
 
-        /* RLGCv2 M1b: deleted keys are purged from every Ractor's
-         * storage in ONE collection and their structs freed at its end
-         * (rb_ractor_finish_marking) -- that requires a collection that
-         * visits every Ractor with no other marker running, i.e. the
-         * global GC (or the single-objspace world). A concurrent local
-         * GC must neither purge (its cycle covers only one Ractor, so
-         * the structs would be freed under other storages still holding
-         * entries) nor race the list. Until a global cycle runs, dead
-         * keys just keep their entries alive. */
+        /* 削除済み key は 1 回の collection で全 Ractor の storage から purge し、
+         * その struct を最後に free する。これは全 Ractor を他 marker 無しで
+         * 巡る collection、つまり global GC（か single-objspace）でのみ可能。 */
         if (rb_gc_single_objspace_p() || rb_gc_during_global_gc_p()) {
             for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
                 rb_ractor_local_key_t key = freed_ractor_local_keys.keys[i];
@@ -3343,13 +3194,9 @@ rb_ractor_local_storage_ptr_set(rb_ractor_local_key_t key, void *ptr)
 void
 rb_ractor_finish_marking(void)
 {
-    /* RLGCv2 M1b: the freed-key structs may be released only by a
-     * collection whose mark pass purged them from EVERY Ractor's
-     * storage with no other marker running -- the global GC or the
-     * single-objspace world (see ractor_local_storage_mark). Local GCs
-     * also reach here via gc_marks_finish: do nothing then, both for
-     * correctness (other storages still hold entries) and because
-     * concurrent finishers would double-free the list. */
+    /* freed-key の struct は、全 Ractor の storage から他 marker 無しで purge した
+     * collection、つまり global GC（か single-objspace）でのみ解放できる。local GC も
+     * gc_marks_finish 経由でここに来るが、その時は何もしない（二重 free 防止）。 */
     if (!(rb_gc_single_objspace_p() || rb_gc_during_global_gc_p())) {
         return;
     }

@@ -3409,10 +3409,6 @@ rb_vm_mark(void *ptr)
             rb_gc_mark(rb_ractor_self(r));
         }
 
-        /* RLGCv2: 旧 global_object_list / mark_object_ary（登録済み VM グローバル
-         * root）は Ractor-local になり、各 Ractor の rb_ractor_mark_local_roots で
-         * mark される。ここでは何もしない。 */
-
         rb_gc_mark_movable(vm->self);
 
         if (vm->root_box) {
@@ -3874,15 +3870,9 @@ thread_compact(void *ptr)
     th->self = rb_gc_location(th->self);
 }
 
-/* Mark the heap-object roots a thread owns, other than its ec and fibers
- * (the caller marks those). Factored out of thread_mark so that the RLGCv2
- * confined GC can root these directly from a Ractor's local roots
- * (rb_ractor_mark_local_roots): a Ractor's main Thread wrapper may live in
- * the *creating* Ractor's objspace, so thread_mark never runs in this
- * thread's own local GC, and any of these roots allocated in the thread's
- * own objspace (the thgroup, born at thread_do_start_proc) would otherwise
- * be freed mid-run and crash the next global mark. Keeping this the single
- * list of a thread's owned roots stops the two markers from drifting. */
+/* スレッドが所有するヒープオブジェクトの root を mark する(ec と fiber は
+ * 呼び出し側が担当)。confined GC が Ractor の local roots から直接これらを
+ * root にできるよう thread_mark から分離(rb_ractor_mark_local_roots)。 */
 void
 rb_thread_mark_owned_roots(rb_thread_t *th)
 {
@@ -3925,17 +3915,9 @@ thread_mark(void *ptr)
         rb_fiber_mark_self(th->ec->fiber_ptr);
     }
 
-    /* Upstream edge: a live thread wrapper keeps its Ractor's object (and
-     * through its dfree, the rb_ractor_t) alive. Under RLGCv2 this is what
-     * lets the zombie ledger keep a winding-down thread's Ractor around by
-     * marking just the wrapper, and what makes an inherited Thread
-     * (Ractor#value returning Thread.current) retain its dead Ractor's
-     * object exactly like upstream. The once-observed dangling th->ractor
-     * (307933468) came from the return-value graph being kept alive by a
-     * pin alone while the Ractor object died unreferenced; since the value
-     * graph is marked through the Ractor object's own dmark
-     * (ractor_sync_mark's r->sync.legacy), the two die together instead,
-     * and this edge is safe again. */
+    /* 生きた thread wrapper はその Ractor オブジェクト(dfree 経由で rb_ractor_t)
+     * を生かす。これにより zombie ledger は wrapper を mark するだけで終了中の
+     * Ractor を保持でき、継承された Thread も死んだ Ractor を upstream 同様に保つ。 */
     if (th->ractor) rb_gc_mark(rb_ractor_self(th->ractor));
     if (th->root_fiber) rb_fiber_mark_self(th->root_fiber);
 
@@ -4750,8 +4732,8 @@ Init_BareVM(void)
     vm_init2(vm);
 
     ruby_current_vm_ptr = vm;
-    /* RLGCv2: boot objspace は main Ractor に属するので、rb_objspace_alloc が
-     * それを割り当てる前に main Ractor が存在していなければならない。 */
+    /* boot objspace は main Ractor に属するので、rb_objspace_alloc が割り当てる
+     * 前に main Ractor が存在していなければならない。 */
     vm->ractor.main_ractor = rb_ractor_main_alloc();
     rb_objspace_alloc();
     vm->ractor.main_ractor->newobj_cache = rb_gc_ractor_cache_alloc(vm->ractor.main_ractor);
@@ -4818,10 +4800,9 @@ rb_vm_register_global_object(VALUE obj)
       default:
         break;
     }
-    /* RLGCv2: register into the current Ractor's own pin list (raw array).  The
-     * owner's GC is the only one that appends or marks it (its own thread is
-     * stopped during its GC), so no lock is needed; a merge that inherits the
-     * list runs under the global-GC STW. */
+    /* 現在の Ractor 自身の pin リスト(生配列)に登録する。append と mark は所有者の
+     * GC だけが行う(GC 中は自スレッド停止)ためロック不要。リストを継承する merge は
+     * global GC の STW 下で走る。 */
     rb_ractor_t *cr = GET_RACTOR();
     if (cr->registered_marks_cnt == cr->registered_marks_capa) {
         size_t nc = cr->registered_marks_capa ? cr->registered_marks_capa * 2 : 64;

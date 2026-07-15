@@ -1080,13 +1080,9 @@ match_set_regs(VALUE match, int num_regs, const OnigPosition *beg, const OnigPos
     rm->num_regs = num_regs;
 }
 
-/* RLGCv2 (design_v2.md §4.5): Ractor#send(move:) carries a MatchData across
- * objspaces through the off-heap move courier (ractor.c). re.c owns the
- * MatchData internals, so the courier dumps the match's registers into a plain
- * (onig-free) blob -- releasing the source's malloc'd region/char_offset so the
- * source can become a RactorMovedObject husk without leaking -- and rebuilds a
- * match from that blob on the receiving Ractor. The regexp and string travel
- * as ordinary courier children (they are re-homed like any other reference). */
+/* Ractor#send(move:) で MatchData を別 objspace へ移送する補助。
+ * match のレジスタを onig 非依存の blob へ書き出し、元の malloc 領域を解放して
+ * 移送元を空殻にできるようにし、受信側で blob から match を組み立て直す。 */
 void *
 rb_match_move_dump(VALUE match, VALUE *regexp_out, VALUE *str_out, int *num_regs_out)
 {

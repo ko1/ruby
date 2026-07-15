@@ -586,12 +586,9 @@ backtrace_alloc_capa(long num_frames, rb_backtrace_t **backtrace)
     return btobj;
 }
 
-/* RLGCv2 (design_v2.md §4.2 / §4.4): duplicate a backtrace object so a
- * copied exception does not smuggle a raw pointer to the sender's
- * backtrace across objspaces. The frames reference only shareable
- * iseq / method-entry imemos (decision 17), so the copy is
- * objspace-clean; the lazily built string / location arrays are left
- * unset and re-materialize in the receiver. */
+/* 例外コピーが送信元 backtrace への生ポインタを別 objspace へ持ち込まないよう複製する。
+ * frame は shareable な iseq / method entry の imemo のみ参照するので複製は安全。
+ * 遅延生成の文字列/location 配列は未設定のまま残し、受信側で再生成する。 */
 VALUE
 rb_backtrace_dup(VALUE btobj)
 {
