@@ -4603,10 +4603,18 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
         break;
       }
       case RB_GC_VM_GENERIC_FIELDS_TABLE: {
-        /* shared な global 表 + 全 Ractor の per-Ractor 表を舐める（compaction は
-         * single-objspace でのみ走るので per-Ractor は実質 main の 1 本）。各 entry の
-         * 再挿入先が正しい表になるよう、表ポインタを foreach_data に渡す。 */
-        rb_generic_fields_tables_foreach(vm_weak_table_gen_fields_tbl_cb, (void *)&foreach_data);
+        /* global GC は STW なので shared 表 + 全 Ractor 表を安全に舐められる。ローカル GC は
+         * 自分の Ractor の表だけを掃除する。他 Ractor や shared 表は並行アクセス中で触れず、
+         * それらの掃除は global GC が担う。各 entry の再挿入先が正しい表になるよう表ポインタを渡す。 */
+        if (rb_gc_during_global_gc_p()) {
+            rb_generic_fields_tables_foreach(vm_weak_table_gen_fields_tbl_cb, (void *)&foreach_data);
+        }
+        else {
+            rb_ractor_t *cr = rb_current_ractor_raw(false);
+            if (cr && cr->generic_fields_tbl != NULL) {
+                vm_weak_table_gen_fields_tbl_cb(cr->generic_fields_tbl, (void *)&foreach_data);
+            }
+        }
         break;
       }
       case RB_GC_VM_FROZEN_STRINGS_TABLE: {
