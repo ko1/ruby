@@ -496,3 +496,16 @@ race:rb_gc_impl_handle_weak_references_alive_p
 # via h_objid_compact / n4_method_churn_hierarchy (TSan exit 66); the write
 # frames symbolize to vm_exec_core (inlined), so suppress by the global's name.
 race:rb_vm_insn_count
+
+# UPSTREAM RACTOR_CHECK_MODE recursive-lock assertions (ractor.c, not RLGCv2, byte
+# identical to origin/master): ractor_lock() writes r->sync.locked_by AFTER taking
+# r->sync.lock (ractor.c:99), but two assert helpers READ locked_by BEFORE taking
+# the lock -- ASSERT_ractor_unlocking (ractor.c:63, from ractor_lock) and
+# ractor_lock_self (ractor.c:111). Two threads locking the same Ractor race
+# read-vs-write on that field. The whole locked_by mechanism only exists under
+# RACTOR_CHECK_MODE > 0 (absent in production), and each assert only compares
+# locked_by against the CURRENT Ractor's self, so a stale cross-Ractor read cannot
+# produce a false rb_bug. Same benign recACQ detector-race family. Observed via
+# p_fiber_enum (TSan exit 66).
+race:ASSERT_ractor_unlocking
+race:ractor_lock_self
