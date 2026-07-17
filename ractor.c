@@ -302,15 +302,11 @@ static void
 ractor_mark(void *ptr)
 {
     rb_ractor_t *r = (rb_ractor_t *)ptr;
-    bool checking_shareable = rb_gc_checking_shareable();
 
+    /* wrapper 直参照のみ。unshareable な root は owner の local GC と global GC の
+     * root scan（rb_ractor_mark_local_roots）が mark する。終了済みは zombie 台帳。 */
     rb_gc_mark(r->loc);
     rb_gc_mark(r->name);
-
-    if (!checking_shareable) {
-        // may unshareable objects
-        ractor_mark_unshareable_parts(r);
-    }
 }
 
 /* Ractor r の C 構造体から到達可能な GC root を mark する。local GC は heap 上の
@@ -326,6 +322,22 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
     /* この Ractor の rb_gc_register_mark_object pin。保守的に扱い、local GC は
      * 自分の住人だけ mark する。foreign/shareable entry は owner か global GC が拾う。 */
     rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
+}
+
+/* 終了済みで未 free の Ractor の join 用スロット（戻り値・default port・stdin 等）を mark
+ * かつ pin する。global GC が zombie 台帳から呼ぶ。default port は他 Ractor が終了後も
+ * send/value で読む。zombie の C-struct 参照は compaction で更新されないので movable に
+ * mark すると移動して stale 化する。pin_inherited_parts と同じスロットを固定する。 */
+void
+rb_ractor_mark_terminated_join_value(rb_ractor_t *r)
+{
+    VALUE slots[] = {
+        r->sync.legacy,
+        r->sync.default_port_value,
+        r->r_stdin, r->r_stdout, r->r_stderr,
+        r->verbose, r->debug,
+    };
+    rb_gc_mark_vm_stack_values((long)numberof(slots), slots);
 }
 
 /* src の rb_gc_register_mark_object pin を dst へ移す。src の objspace が dst に
@@ -649,6 +661,10 @@ rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th)
     // initialize as a main ractor
     vm->ractor.cnt = 0;
     vm->ractor.blocking_cnt = 0;
+    /* fork 後は main Ractor だけが生きる。生成中カバーは無効化する。set は直前の
+     * rb_vm_living_threads_init が空にし、zombie 台帳は terminate_atfork が退避した
+     * 非main objspace を保持したまま orphan merge に委ねる。 */
+    th->ractor->creating_child_objspace = NULL;
     ruby_single_main_ractor = th->ractor;
     th->ractor->status_ = ractor_created;
 
@@ -724,6 +740,7 @@ rb_ractor_main_setup(rb_vm_t *vm, rb_ractor_t *r, rb_thread_t *th)
     ractor_init(r, Qnil, Qnil);
     r->threads.main = th;
     rb_ractor_living_threads_insert(r, th);
+    rb_ractor_setup_default_port(r);
 
     RB_GC_GUARD(rv);
 }
