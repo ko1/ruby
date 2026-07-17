@@ -845,9 +845,9 @@ ractor_sync_init(rb_ractor_t *r)
 
     // ports
     r->sync.ports = st_init_numtable();
-    r->sync.default_port_value = ractor_port_new(r);
-    FL_SET_RAW(r->sync.default_port_value, RUBY_FL_SHAREABLE); // only default ports are shareable
-    rb_gc_obj_became_shareable(r->sync.default_port_value);
+    /* default port は Ractor が vm->ractor.set に入った後に ractor_setup_default_port で
+     * 作る。生成〜set 参加の窓で shareable な port を global GC が root 無しで解放するのを防ぐ。 */
+    r->sync.default_port_value = Qfalse;
 
     // legacy
     r->sync.legacy = Qundef;
@@ -858,6 +858,17 @@ ractor_sync_init(rb_ractor_t *r)
 #ifndef RUBY_THREAD_PTHREAD_H
     rb_native_cond_initialize(&r->sync.wakeup_cond);
 #endif
+}
+
+/* default port を作る。Ractor が vm->ractor.set に入った後に呼ぶこと
+ * （root scan が shareable な port を生成〜参照の窓で mark できるようにするため）。 */
+void
+rb_ractor_setup_default_port(rb_ractor_t *r)
+{
+    VM_ASSERT(r->sync.default_port_value == Qfalse);
+    r->sync.default_port_value = ractor_port_new(r);
+    FL_SET_RAW(r->sync.default_port_value, RUBY_FL_SHAREABLE); // only default ports are shareable
+    rb_gc_obj_became_shareable(r->sync.default_port_value);
 }
 
 // Ractor#value
@@ -913,28 +924,9 @@ rb_ractor_pin_inherited_parts(rb_ractor_t *r)
     r->local_storage = NULL;
     r->idkey_local_storage = NULL;
 
-    /* 死んだ Ractor の main thread は threads リストに残り、その Thread/Fiber の
-     * ラッパオブジェクトは死んだ objspace で生まれた（thread.c の
-     * rb_thread_create_ractor）ので他と共に継承される。ラッパを pin すれば十分:
-     * その dmark が残りの thread 状態（th->value など）へ推移的に到達する。 */
-    rb_thread_t *th = 0;
-    ccan_list_for_each(&r->threads.set, th, lt_node) {
-        if (th->self && !SPECIAL_CONST_P(th->self)) {
-            rb_gc_pin_in_flight_message(th->self);
-        }
-        if (th->root_fiber) {
-            VALUE fself = rb_fiberptr_self(th->root_fiber);
-            if (fself && !SPECIAL_CONST_P(fself)) {
-                rb_gc_pin_in_flight_message(fself);
-            }
-        }
-        if (th->ec && th->ec->fiber_ptr) {
-            VALUE fself = rb_fiberptr_self(th->ec->fiber_ptr);
-            if (fself && !SPECIAL_CONST_P(fself)) {
-                rb_gc_pin_in_flight_message(fself);
-            }
-        }
-    }
+    /* 死んだ Ractor の main thread wrapper は pin しない。戻り値は legacy として上で
+     * pin 済み、thread struct 自体は native thread teardown が別 context を reclaim する
+     * ので不要。ここで threads.set を walk しないので free 済み thread も踏まない。 */
 }
 
 static VALUE
