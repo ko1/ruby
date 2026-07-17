@@ -168,6 +168,7 @@ struct rb_ractor_struct {
 
 /* Ractor r の C 構造体から GC root を mark する（gc.c の root scan）。 */
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
+void rb_ractor_mark_terminated_join_value(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
 void rb_ractor_pin_inherited_parts(rb_ractor_t *r);
 
@@ -210,6 +211,7 @@ void rb_ractor_atexit_exception(rb_execution_context_t *ec);
 void rb_ractor_teardown(rb_execution_context_t *ec);
 void rb_ractor_receive_parameters(rb_execution_context_t *ec, rb_ractor_t *g, int len, VALUE *ptr);
 void rb_ractor_send_parameters(rb_execution_context_t *ec, rb_ractor_t *g, VALUE args);
+void rb_ractor_setup_default_port(rb_ractor_t *r);
 
 VALUE rb_thread_create_ractor(rb_ractor_t *g, VALUE args, VALUE proc); // defined in thread.c
 
