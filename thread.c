@@ -906,7 +906,6 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         th->invoke_arg.proc.proc = rb_proc_isolate_bang(params->proc, Qnil);
         th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
-        rb_ractor_send_parameters(ec, params->g, params->args);
         break;
 
       case thread_invoke_type_func:
@@ -944,6 +943,13 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     RUBY_DEBUG_LOG("r:%u th:%u", rb_ractor_id(th->ractor), rb_th_serial(th));
 
     rb_ractor_living_threads_insert(th->ractor, th);
+
+    if (th->invoke_type == thread_invoke_type_ractor_proc) {
+        /* 子が vm->ractor.set に入ってから default port を作り引数を送る。生成〜参照の間に
+         * global GC が走っても root scan が子の default_port を mark する。 */
+        rb_ractor_setup_default_port(params->g);
+        rb_ractor_send_parameters(ec, params->g, params->args);
+    }
 
     /* kick thread */
     err = native_thread_create(th);
