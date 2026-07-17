@@ -4859,6 +4859,13 @@ gc_sweep_rest(rb_objspace_t *objspace)
             gc_sweep_step(objspace, heap);
         }
     }
+
+    /* 生きたページが無い objspace は gc_sweep_step を通らず gc_sweep_finish に達しないので
+     * mode が sweeping/compacting のまま残り、次サイクルの gc_sweep_start が assert する。
+     * 全 heap の sweep が尽きているならここで none へ確定させる。 */
+    if (gc_mode(objspace) != gc_mode_none && !has_sweeping_pages(objspace)) {
+        gc_sweep_finish(objspace);
+    }
 }
 
 static void

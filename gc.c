@@ -3180,6 +3180,9 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
             if (owner) {
                 rb_gc_mark_vm_stack_values((long)owner->registered_marks_cnt,
                                            owner->registered_marks);
+                /* 終了済み Ractor の join 用の値（Ractor#value が読む）を wrapper 到達性に
+                 * 依存せず生かす。thread は歩かない。 */
+                rb_ractor_mark_terminated_join_value(owner);
             }
         }
     }
