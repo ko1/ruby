@@ -891,9 +891,12 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
 
     /* 別 Ractor の acquire と競合しないよう pool アクセスを直列化する。
      * Ractor ごとの GC sweep は VM lock 無しで fiber を解放しうる。release は稀なので
-     * NO_BARRIER で取得し、形成中の global barrier に合流しない。 */
-    unsigned int lev;
-    RB_VM_LOCK_ENTER_LEV_NB(&lev);
+     * NO_BARRIER で取得し、形成中の global barrier に合流しない。VM destruct の
+     * free-at-exit walk 中は単一スレッドかつ thread struct が先に free 済みなので
+     * lock 不要（vm_locked が current Ractor を deref すると UAF）。 */
+    unsigned int lev = 0;
+    const bool lock_here = !ruby_vm_during_cleanup;
+    if (lock_here) RB_VM_LOCK_ENTER_LEV_NB(&lev);
 
     // Copy the stack details into the vacancy area:
     vacancy->stack = *stack;
@@ -926,7 +929,7 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
     }
 #endif
 
-    RB_VM_LOCK_LEAVE_LEV_NB(&lev);
+    if (lock_here) RB_VM_LOCK_LEAVE_LEV_NB(&lev);
 }
 
 static inline void
