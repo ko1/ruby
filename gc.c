@@ -234,9 +234,22 @@ rb_gc_event_hook(VALUE obj, rb_event_flag_t event)
 #endif
 }
 
+/* VM destruct の free-at-exit walk は thread/ractor struct を先に free しうるので、
+ * current-Ractor 経由の解決が UAF になる。walk 開始前に stash した objspace を返す。 */
+static void *ruby_vm_cleanup_objspace;
+
+void
+rb_gc_stash_cleanup_objspace(void)
+{
+    ruby_vm_cleanup_objspace = rb_gc_get_objspace();
+}
+
 void *
 rb_gc_get_objspace(void)
 {
+    if (RB_UNLIKELY(ruby_vm_during_cleanup) && ruby_vm_cleanup_objspace) {
+        return ruby_vm_cleanup_objspace;
+    }
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (cr == NULL) {
         /* current Ractor を持たないスレッド（GVL 無しの native thread が

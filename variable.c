@@ -1455,10 +1455,12 @@ rb_free_generic_ivar(VALUE obj)
                 /* mutator / local GC の sweep（host の obj_free）から走る write。owner
                  * 専有なので per-Ractor 表は無ロック（shareable のみ global mutex）。global GC
                  * の sweep からは来ない（下の during_global_gc ガードで弾く）。 */
-                if (rb_gc_during_global_gc_p()) {
+                if (rb_gc_during_global_gc_p() || ruby_vm_during_cleanup) {
                     /* global GC の driver の GET_RACTOR() は owner と一致せず、表を取り違えて
                      * entry を見失う。dead key の削除は weak pass の drain が全表で行うので
-                     * ここでは委譲する（rb_mark_generic_ivar の skip と同じ）。 */
+                     * ここでは委譲する（rb_mark_generic_ivar の skip と同じ）。VM destruct の
+                     * free-at-exit walk も thread struct が先に free され GET_RACTOR() が
+                     * 使えず、表ごと破棄されるので per-entry 削除は不要。 */
                     break;
                 }
                 struct st_table *tbl = generic_fields_tbl_for(obj, false);
