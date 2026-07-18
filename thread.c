@@ -1113,7 +1113,10 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
         cr->objspace = parent_objspace;
         /* 子の objspace は wrapper を持つがまだ vm->ractor.set に無い。列挙可能に
          * 保つ(ここと vm_insert_ractor の間に走る global GC が取りこぼし mark で
-         * ループするのを防ぐ)。vm_insert_ractor が set 参加時に VM lock 下でクリア。 */
+         * ループするのを防ぐ)。vm_insert_ractor が set 参加時に VM lock 下でクリア。
+         * 単一スロット。set〜clear の間に GVL 解放は無く同 Ractor の生成は直列なので
+         * 上書き衝突は起きない(将来 GVL を手放す変更が入ると破れるので assert)。 */
+        RUBY_ASSERT(cr->creating_child_objspace == NULL);
         cr->creating_child_objspace = r->objspace;
     }
 
