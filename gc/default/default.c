@@ -2428,6 +2428,10 @@ heap_page_resurrect(rb_objspace_t *objspace)
         objspace->empty_pages_count--;
         page = objspace->empty_pages;
         objspace->empty_pages = page->free_next;
+        /* 空にした際の flag 残留を再利用時に払う。残すと shareable/shref の各走査が
+         * 空 bitmap を恒久的に舐め続ける。 */
+        page->has_shareable_objects = FALSE;
+        page->has_shref_objects = FALSE;
     }
 
     return page;
@@ -4646,15 +4650,20 @@ gc_sweep_start(rb_objspace_t *objspace)
         gc_sweep_freeobj_hooks(objspace);
     }
 
-    for (int table = 0; table < RB_GC_VM_WEAK_TABLE_COUNT; table++) {
-        if (!rb_gc_vm_weak_table_essential_p(table)) continue;
-        rb_gc_vm_weak_table_foreach(
-            gc_sweep_weak_table_i,
-            NULL,
-            objspace,
-            true,
-            table
-        );
+    /* VM グローバル表の掃除。global GC では全 objspace の sweep がここを通るが、
+     * 表は VM に 1 つで判定は mark bit（ページ相対）なので反復は冪等な無駄。
+     * rlgc_global_gc が sweep 前に 1 回だけ実施する。 */
+    if (!objspace->during_global_gc) {
+        for (int table = 0; table < RB_GC_VM_WEAK_TABLE_COUNT; table++) {
+            if (!rb_gc_vm_weak_table_essential_p(table)) continue;
+            rb_gc_vm_weak_table_foreach(
+                gc_sweep_weak_table_i,
+                NULL,
+                objspace,
+                true,
+                table
+            );
+        }
     }
 
 #if GC_CAN_COMPILE_COMPACTION
@@ -8651,6 +8660,13 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
      * barrier 内のうちに key の struct を解放する（local GC は決してできない。
      * rb_ractor_finish_marking 参照）。 */
     rb_ractor_finish_marking();
+
+    /* VM グローバル weak 表の掃除を全 objspace の sweep に先立ち 1 回だけ行う
+     * （gc_sweep_start は global 中スキップ。判定は unified mark で objspace 非依存）。 */
+    for (int table = 0; table < RB_GC_VM_WEAK_TABLE_COUNT; table++) {
+        if (!rb_gc_vm_weak_table_essential_p(table)) continue;
+        rb_gc_vm_weak_table_foreach(gc_sweep_weak_table_i, NULL, driver, true, table);
+    }
 
     /* step 9: barrier 内で全 objspace を lazy でなく sweep する。dead な shareable はここで回収し、
      * 空きページは pool に戻る。 */
