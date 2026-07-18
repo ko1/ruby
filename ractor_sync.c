@@ -1217,7 +1217,21 @@ ractor_basket_value(struct ractor_basket *b)
 static VALUE
 ractor_basket_accept(struct ractor_basket *b)
 {
-    VALUE v = ractor_basket_value(b);
+    /* materialize は raise しうる（marshal load フック・割り込み）。basket は既に
+     * queue を離れて他に所有者が居ないので、ここで解放してから伝播させる。move の
+     * raise 時は courier が basket 所有のまま（basket_free が解放）。 */
+    rb_execution_context_t *ec = GET_EC();
+    VALUE v = Qundef;
+    enum ruby_tag_type state;
+    EC_PUSH_TAG(ec);
+    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+        v = ractor_basket_value(b);
+    }
+    EC_POP_TAG();
+    if (state != TAG_NONE) {
+        ractor_basket_free(b);
+        EC_JUMP_TAG(ec, state);
+    }
 
     if (b->p.exception) {
         VALUE err = ractor_make_remote_exception(v, b->sender);
