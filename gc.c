@@ -4101,6 +4101,14 @@ rb_gc_objspace_absorb_all_zombies(void)
     while (vm->gc.zombie_objspaces_count > 0) {
         size_t before = vm->gc.zombie_objspaces_count;
         GC_ASSERT(vm->gc.zombie_objspaces[0].owner_slot != NULL);
+        /* join と同じ順序で表と pin を merge より先に移送する。merge 内の sweep が
+         * owner の dead host を obj_free し、現 Ractor の generic_fields 表を引くため
+         * (ractor_value 参照)。未移送だと表 miss の rb_bug / pin の root 喪失になる。 */
+        rb_ractor_t *owner = vm->gc.zombie_objspaces[0].owner;
+        if (owner) {
+            rb_ractor_absorb_generic_fields(GET_RACTOR(), owner);
+            rb_ractor_absorb_registered_marks(GET_RACTOR(), owner);
+        }
         rb_gc_objspace_absorb_into_current(vm->gc.zombie_objspaces[0].owner_slot);
         if (vm->gc.zombie_objspaces_count >= before) {
             rb_bug("rb_gc_objspace_absorb_all_zombies: zombie list did not shrink");
