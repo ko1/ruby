@@ -7103,6 +7103,9 @@ rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
                             }
                             else if (gc_mark_set(objspace, obj)) {
                                 gc_aging(objspace, obj);         /* shareable: mark, no traverse */
+                                /* compaction 併走時は pin も立てる。shareable が動くと他 Ractor の
+                                 * C 構造体スロット（sync の port 等）は参照更新されず stale になる。 */
+                                gc_pin(objspace, obj);
                             }
                             break;
                         }
@@ -7919,6 +7922,12 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     }
     else {
         objspace->flags.during_compacting = !!(reason & GPR_FLAG_COMPACT);
+        /* GC.compact は単一 objspace の判定で local 経路に入るが、ここに至るまでに他 Ractor が
+         * 生まれうる。複数 objspace での local compaction は shareable を動かして C 構造体
+         * スロット（他 Ractor の sync 等）を壊すので、多重化していたら中止する。 */
+        if (objspace->flags.during_compacting && !rb_gc_single_objspace_p()) {
+            objspace->flags.during_compacting = FALSE;
+        }
     }
 
     if (!GC_ENABLE_LAZY_SWEEP || objspace->flags.dont_incremental) {
