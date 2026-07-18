@@ -1050,23 +1050,21 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
 static struct ractor_basket *
 ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type type, bool exc)
 {
-    struct ractor_basket *b = ractor_basket_alloc();
-    b->p.exception = exc;
-    b->p.marshaled = false;
-    b->p.move_courier = NULL;
-    b->p.gen_fields = NULL;
+    /* payload の準備は raise しうる（copy/move 不能）。basket の確保より先に行い、
+     * 失敗時に basket を leak しない。 */
+    VALUE v = Qfalse;
+    bool marshaled = false;
+    struct rb_ractor_move_courier *courier = NULL;
+    st_table *gen_fields = NULL;
 
     if (type == basket_type_move) {
         /* グラフを off-heap courier へ直列化する。元オブジェクトは RactorMovedObject に
          * なる。in-flight 中は GC オブジェクトが無いので、送信側の GC が mark/sweep/move
          * することはない。 */
-        b->type = basket_type_move;
-        b->p.v = Qfalse;
-        b->p.move_courier = rb_ractor_move_courier_build(obj);
+        courier = rb_ractor_move_courier_build(obj);
     }
     else {
-        bool marshaled = false;
-        VALUE v = ractor_prepare_payload(ec, obj, &type, &marshaled);
+        v = ractor_prepare_payload(ec, obj, &type, &marshaled);
         if (type == basket_type_copy) {
             /* copy snapshot（native グラフまたは Marshal 文字列）は受信側が
              * materialize するまで送信側の objspace に在る。shref で pin し、
@@ -1074,13 +1072,18 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
             rb_gc_pin_in_flight_message(v);
             /* native copy の generic-ivar 対応表を basket へ移す（prepare_payload が
              * cr->gen_fields_capture に構築、marshaled/generic-ivar 無しなら空/NULL）。 */
-            b->p.gen_fields = rb_ec_ractor_ptr(ec)->gen_fields_capture;
+            gen_fields = rb_ec_ractor_ptr(ec)->gen_fields_capture;
             rb_ec_ractor_ptr(ec)->gen_fields_capture = NULL;
         }
-        b->type = type;
-        b->p.v = v;
-        b->p.marshaled = marshaled;
     }
+
+    struct ractor_basket *b = ractor_basket_alloc();
+    b->type = type;
+    b->p.exception = exc;
+    b->p.v = v;
+    b->p.marshaled = marshaled;
+    b->p.move_courier = courier;
+    b->p.gen_fields = gen_fields;
     return b;
 }
 
