@@ -1915,7 +1915,7 @@ os_obj_of(VALUE of)
         ocs.of = of;
         ocs.buffer = rb_ary_new();
 
-        int gc_was_disabled = RTEST(rb_gc_disable());
+        rb_gc_critical_disable();
         RB_VM_LOCKING() {
             rb_vm_barrier();
 
@@ -1928,7 +1928,7 @@ os_obj_of(VALUE of)
                 }
             }
         }
-        if (!gc_was_disabled) rb_gc_enable();
+        rb_gc_critical_enable();
 
         long len = RARRAY_LEN(ocs.buffer);
         for (long i = 0; i < len; i++) {
@@ -4999,10 +4999,28 @@ rb_gc_initial_stress_set(VALUE flag)
 /* atomic。どの Ractor も切り替えてよく、各 Ractor の ready_to_gc が読む。 */
 static rb_atomic_t ruby_gc_disabled_global = 0;
 
+/* barrier 下の収集など「途中で GC が起きてはならない」内部区間のカウンタ。ユーザの
+ * GC.enable は boolean フラグしか触れないので、並行する区間を破れない。 */
+static rb_atomic_t ruby_gc_disabled_critical = 0;
+
+void
+rb_gc_critical_disable(void)
+{
+    rb_gc_impl_gc_rest(rb_gc_get_objspace());
+    RUBY_ATOMIC_INC(ruby_gc_disabled_critical);
+}
+
+void
+rb_gc_critical_enable(void)
+{
+    RUBY_ATOMIC_DEC(ruby_gc_disabled_critical);
+}
+
 bool
 rb_gc_gc_disabled_global_p(void)
 {
-    return RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0;
+    return RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0 ||
+           RUBY_ATOMIC_LOAD(ruby_gc_disabled_critical) != 0;
 }
 
 VALUE
