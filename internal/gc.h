@@ -308,6 +308,7 @@ void rb_gc_objspace_absorb_into_current(void **objspace_slot);
 void rb_gc_objspace_absorb_all_zombies(void);
 void rb_gc_objspace_disown(void *objspace);
 void rb_gc_zombie_objspaces_atfork(void);
+void rb_gc_atfork_global_locks(void);
 void rb_gc_finish_in_flight_gc(void);
 bool rb_gc_during_global_gc_p(void);
 bool rb_gc_single_objspace_p(void);
