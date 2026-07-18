@@ -585,14 +585,14 @@ rb_gc_guarded_ptr_val(volatile VALUE *ptr, VALUE val)
 
 static const char *obj_type_name(VALUE obj);
 
-void
-rb_gc_init_global_locks(void)
-{
-}
-
+/* fork の親が registered_globals.lock を保持したまま fork しうる（全 Ractor の
+ * root scan が取る）。子で locked のまま継承すると最初の GC が永久待ちになるので
+ * 作り直す。generic_fields lock と同じ扱い。 */
 void
 rb_gc_atfork_global_locks(void)
 {
+    rb_vm_t *vm = GET_VM();
+    rb_native_mutex_initialize(&vm->gc.registered_globals.lock);
 }
 
 #include "gc/default/default.c"
