@@ -254,12 +254,10 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
     ractor_sync_mark(r);
 
     /* 以下は owner が実行中に変更する構造（thread/EC/fiber は並行に free もされる）。
-     * 並行 owner が居ない時だけ walk する。自分・終了済み・global GC barrier 下。
-     * 生きた他 Ractor は自分で local root を張るので取りこぼさない。 */
-    rb_ractor_t *cr = rb_current_ractor_raw(false);
-    if (!(r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p())) {
-        return;
-    }
+     * 呼び出しは root scan のみ: local GC は自分自身、global GC は barrier 下で set の
+     * 全員。終了済みは set を離れ zombie 台帳が担うので、ここには来ない。 */
+    VM_ASSERT(r == rb_current_ractor_raw(false) || rb_gc_during_global_gc_p());
+    VM_ASSERT(!rb_ractor_status_p(r, ractor_terminated));
 
     rb_hook_list_mark(&r->pub.hooks);
     if (r->pub.targeted_hooks.num_entries) {
