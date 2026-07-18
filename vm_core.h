@@ -1077,6 +1077,8 @@ struct rb_waiting_list {
     struct rb_fiber_struct *fiber;
 };
 
+struct rlgc_materialize_frame;
+
 struct rb_execution_context_struct {
     /* execution information */
     VALUE *vm_stack;		/* must free, must mark */
@@ -1127,6 +1129,10 @@ struct rb_execution_context_struct {
         VALUE obj;
         VALUE fields_obj;
     } gen_fields_cache;
+
+    /* この EC 上で materialize 中の receive の frame 鎖（LIFO、実体は C スタック）。
+     * thread/fiber 切替があっても各 EC の鎖はその EC の入れ子だけなので崩れない。 */
+    struct rlgc_materialize_frame *materialize_frames;
 
     /* for GC */
     struct {

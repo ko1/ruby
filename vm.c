@@ -3853,6 +3853,18 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     rb_gc_mark(ec->local_storage_recursive_hash_for_trace);
     rb_gc_mark(ec->private_const_reference);
 
+    /* materialize 中の receive の snapshot/courier。queue を既に離れており、ここが root。
+     * snapshot は送信側常駐なので自 local GC では containment が skip し、global GC が
+     * mark + shref 再 pin する（step5 が全 shref を消すため）。 */
+    for (const struct rlgc_materialize_frame *f = ec->materialize_frames; f != NULL; f = f->prev) {
+        extern void rb_ractor_move_courier_mark(struct rb_ractor_move_courier *c);
+        rb_gc_mark(f->snapshot);
+        rb_ractor_move_courier_mark(f->courier);
+        if (f->snapshot && !RB_SPECIAL_CONST_P(f->snapshot) && rb_gc_during_global_gc_p()) {
+            rb_gc_pin_in_flight_message(f->snapshot);
+        }
+    }
+
     rb_gc_mark_movable(ec->storage);
 }
 
