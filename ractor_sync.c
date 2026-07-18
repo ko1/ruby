@@ -704,17 +704,8 @@ ractor_sync_mark(rb_ractor_t *r)
      * 終了済み Ractor、または global GC の barrier 下。 */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p()) {
-        /* receive が復元中の snapshot / courier。既に queue から外れ、global GC の
-         * re-pin のためここだけが root。user の load フックからの入れ子 receive が
-         * 各々フレームを push して鎖になる。foreign marker は読んではならない。 */
-        for (const struct rlgc_materialize_frame *f = r->sync.materialize_frames;
-             f != NULL; f = f->prev) {
-            rb_gc_mark(f->snapshot);
-            /* courier は off-heap。運ぶ shareable な VALUE を mark し、並行 global GC
-             * に維持させる。 */
-            rb_ractor_move_courier_mark(f->courier);
-        }
-
+        /* materialize 中の snapshot/courier の root は各 EC の frame 鎖
+         * （rb_execution_context_mark が mark/re-pin する）。 */
         /* 戻り値（exit 時に設定、Ractor#value が読む）は今や終了済み Ractor の
          * objspace に在る。value 時の継承が pin する（rb_ractor_pin_inherited_parts）
          * までは、確実な root はここだけ。所有者が書く単純スロットなので同じゲートで
@@ -771,12 +762,8 @@ rb_ractor_repin_in_flight(rb_ractor_t *r)
         ractor_queue_repin_in_flight(r->sync.recv_queue);
         st_foreach(r->sync.ports, ractor_repin_ports_i, 0);
     }
-    for (const struct rlgc_materialize_frame *f = r->sync.materialize_frames;
-         f != NULL; f = f->prev) {
-        if (f->snapshot && !RB_SPECIAL_CONST_P(f->snapshot)) {
-            rb_gc_pin_in_flight_message(f->snapshot);
-        }
-    }
+    /* materialize 中の snapshot の再 pin は EC の frame 鎖から行う
+     * （rb_execution_context_mark。suspend 中の fiber の EC も traversal が拾う）。 */
 }
 
 static int
@@ -840,7 +827,7 @@ ractor_sync_init(rb_ractor_t *r)
     r->sync.legacy = Qundef;
 
     // payload を再構築中の receive はまだ無い
-    r->sync.materialize_frames = NULL;
+    r->sync.materializing_copies = 0;
 
 #ifndef RUBY_THREAD_PTHREAD_H
     rb_native_cond_initialize(&r->sync.wakeup_cond);
@@ -1084,13 +1071,9 @@ rb_gc_current_ractor_materializing_p(void)
 {
     const rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (cr == NULL) return false;
-    /* true になるのは COPY の materialize のみ（snapshot != Qfalse）。move の殻は
-     * この objspace 内の他の殻を参照し、送信側のグラフは参照しない。 */
-    for (const struct rlgc_materialize_frame *f = cr->sync.materialize_frames;
-         f != NULL; f = f->prev) {
-        if (f->snapshot != Qfalse) return true;
-    }
-    return false;
+    /* true になるのは COPY の materialize のみ。move の殻はこの objspace 内の他の殻を
+     * 参照し、送信側のグラフは参照しない。fiber 切替があっても数は Ractor 単位で正確。 */
+    return cr->sync.materializing_copies > 0;
 }
 
 static VALUE
@@ -1115,9 +1098,10 @@ ractor_basket_value(struct ractor_basket *b)
         rb_execution_context_t *ec = rb_current_ec_noinline();
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         struct rlgc_materialize_frame frame = {
-            .snapshot = b->p.v, .courier = NULL, .prev = cr->sync.materialize_frames,
+            .snapshot = b->p.v, .courier = NULL, .prev = ec->materialize_frames,
         };
-        cr->sync.materialize_frames = &frame;
+        ec->materialize_frames = &frame;
+        cr->sync.materializing_copies++;
         struct st_table *prev_gf = cr->gen_fields_materialize;
         VALUE result = Qundef;
         enum ruby_tag_type state;
@@ -1138,7 +1122,8 @@ ractor_basket_value(struct ractor_basket *b)
         }
         EC_POP_TAG();
         cr->gen_fields_materialize = prev_gf;
-        cr->sync.materialize_frames = frame.prev;
+        ec->materialize_frames = frame.prev;
+        cr->sync.materializing_copies--;
         /* rb_copy_generic_ivar はこの EC の gen_fields_cache に送信側の snapshot host と
          * fields_obj（共に送信側常駐）を入れた。snapshot は今や送信側で garbage であり、
          * その解放アドレスに後で受信側が新オブジェクトを得ると、stale な cache ヒットが
@@ -1166,12 +1151,11 @@ ractor_basket_value(struct ractor_basket *b)
          * raise 時は courier が basket 所有のまま（b->p.move_courier != NULL）なので
          * basket の teardown が解放する。 */
         rb_execution_context_t *ec = rb_current_ec_noinline();
-        rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         struct rb_ractor_move_courier *courier = b->p.move_courier;
         struct rlgc_materialize_frame frame = {
-            .snapshot = Qfalse, .courier = courier, .prev = cr->sync.materialize_frames,
+            .snapshot = Qfalse, .courier = courier, .prev = ec->materialize_frames,
         };
-        cr->sync.materialize_frames = &frame;
+        ec->materialize_frames = &frame;
         /* materialize したグラフを、以降の一連の処理の間ずっとマシンスタック（result）に
          * 保持する。フレームを pop した後は、それが呼び出し側スタックへ届くまで唯一の
          * root。ここで rb_ractor_move_courier_free が長い解放ループを回るので、グラフが
@@ -1184,7 +1168,7 @@ ractor_basket_value(struct ractor_basket *b)
             result = rb_ractor_move_courier_materialize(courier);
         }
         EC_POP_TAG();
-        cr->sync.materialize_frames = frame.prev;
+        ec->materialize_frames = frame.prev;
         if (state != TAG_NONE) EC_JUMP_TAG(ec, state);
         rb_ractor_move_courier_free(courier);
         b->p.move_courier = NULL;

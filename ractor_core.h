@@ -51,7 +51,8 @@ struct rb_ractor_sync {
      * global GC の re-pin が再構築中も sender 側 snapshot（copy）や courier の shareable
      * VALUE（move）を生かす。ネスト receive に備え chain とし、machine stack 上で TAG
      * 保護下に push/pop するので raise でも復元される。 */
-    struct rlgc_materialize_frame *materialize_frames;
+    /* copy を materialize 中の receive の数（owner threads のみが GVL 下で更新）。 */
+    int materializing_copies;
 };
 
 /* 転送中の payload 再構築 1 件（受信側の machine stack 上に置かれる） */
