@@ -946,9 +946,20 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
 
     if (th->invoke_type == thread_invoke_type_ractor_proc) {
         /* 子が vm->ractor.set に入ってから default port を作り引数を送る。生成〜参照の間に
-         * global GC が走っても root scan が子の default_port を mark する。 */
+         * global GC が走っても root scan が子の default_port を mark する。send が失敗
+         * (copy 不可等)したら set への参加を巻き戻す。残すと terminate_all が待ち続ける。 */
         rb_ractor_setup_default_port(params->g);
-        rb_ractor_send_parameters(ec, params->g, params->args);
+        enum ruby_tag_type state;
+        EC_PUSH_TAG(ec);
+        if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+            rb_ractor_send_parameters(ec, params->g, params->args);
+        }
+        EC_POP_TAG();
+        if (state != TAG_NONE) {
+            th->status = THREAD_KILLED;
+            rb_ractor_stillborn_remove(params->g, th);
+            EC_JUMP_TAG(ec, state);
+        }
     }
 
     /* kick thread */
