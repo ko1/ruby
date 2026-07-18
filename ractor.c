@@ -3297,6 +3297,23 @@ rb_ractor_finish_marking(void)
         return;
     }
 
+    /* zombie（終了済み・未 merge）の storage には root scan の purge が届かない
+     * （set に居らず、台帳は join スロットしか mark しない）。struct を解放する前に
+     * ここで purge しないと、後の ractor_free が解放済み key を読む。barrier 下。 */
+    rb_vm_t *vm = GET_VM();
+    for (size_t zi = 0; zi < vm->gc.zombie_objspaces_count; zi++) {
+        rb_ractor_t *owner = vm->gc.zombie_objspaces[zi].owner;
+        if (owner == NULL || owner->local_storage == NULL) continue;
+        for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
+            rb_ractor_local_key_t key = freed_ractor_local_keys.keys[i];
+            st_data_t val, k = (st_data_t)key;
+            if (st_delete(owner->local_storage, &k, &val) &&
+                (key = (rb_ractor_local_key_t)k)->type->free) {
+                (*key->type->free)((void *)val);
+            }
+        }
+    }
+
     for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
         SIZED_FREE(freed_ractor_local_keys.keys[i]);
     }
