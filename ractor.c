@@ -941,6 +941,38 @@ ractor_check_blocking(rb_ractor_t *cr, unsigned int remained_thread_cnt, const c
 }
 
 
+/* 生成中に send_parameters が失敗した stillborn 子を set から外す。creator が呼ぶ
+ * (rb_ractor_living_threads_remove は自 Ractor 前提)。objspace の disown まで同一
+ * VM lock 内で行い、set 離脱〜台帳の間に列挙漏れの窓を作らない。 */
+void
+rb_ractor_stillborn_remove(rb_ractor_t *r, rb_thread_t *th)
+{
+    RACTOR_LOCK(r);
+    {
+        ccan_list_del(&th->lt_node);
+        r->threads.cnt--;
+    }
+    RACTOR_UNLOCK(r);
+
+    RB_VM_LOCK();
+    {
+        rb_vm_t *vm = th->vm;
+        VM_ASSERT(vm->ractor.cnt > 1);
+        ccan_list_del(&r->vmlr_node);
+        vm->ractor.cnt--;
+
+        rb_gc_ractor_cache_free(r->newobj_cache);
+        r->newobj_cache = NULL;
+
+        if (r->objspace) {
+            rb_gc_objspace_disown(r->objspace);
+            r->objspace = NULL;
+        }
+        r->status_ = ractor_terminated;
+    }
+    RB_VM_UNLOCK();
+}
+
 void
 rb_ractor_living_threads_remove(rb_ractor_t *cr, rb_thread_t *th)
 {
