@@ -1131,7 +1131,12 @@ ractor_basket_value(struct ractor_basket *b)
          * （raise 経路でも同じリセットで行う）。 */
         ec->gen_fields_cache.obj = Qundef;
         ec->gen_fields_cache.fields_obj = Qundef;
-        if (state != TAG_NONE) EC_JUMP_TAG(ec, state);
+        if (state != TAG_NONE) {
+            /* basket は queue を離れ他に所有者が居ない。raise は accept を素通りするので
+             * ここで解放してから伝播する。gen_fields 表(raw malloc)も basket_free が始末。 */
+            ractor_basket_free(b);
+            EC_JUMP_TAG(ec, state);
+        }
         /* フレームが pop された後も result をスタックから root し続ける */
         ractor_reset_belonging(result);
         b->p.v = result;
@@ -1169,7 +1174,11 @@ ractor_basket_value(struct ractor_basket *b)
         }
         EC_POP_TAG();
         ec->materialize_frames = frame.prev;
-        if (state != TAG_NONE) EC_JUMP_TAG(ec, state);
+        if (state != TAG_NONE) {
+            /* 未消費 courier は b->p.move_courier のまま。basket_free が courier を解放する。 */
+            ractor_basket_free(b);
+            EC_JUMP_TAG(ec, state);
+        }
         rb_ractor_move_courier_free(courier);
         b->p.move_courier = NULL;
         ractor_reset_belonging(result);
@@ -1188,21 +1197,7 @@ ractor_basket_value(struct ractor_basket *b)
 static VALUE
 ractor_basket_accept(struct ractor_basket *b)
 {
-    /* materialize は raise しうる（marshal load フック・割り込み）。basket は既に
-     * queue を離れて他に所有者が居ないので、ここで解放してから伝播させる。move の
-     * raise 時は courier が basket 所有のまま（basket_free が解放）。 */
-    rb_execution_context_t *ec = GET_EC();
-    VALUE v = Qundef;
-    enum ruby_tag_type state;
-    EC_PUSH_TAG(ec);
-    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
-        v = ractor_basket_value(b);
-    }
-    EC_POP_TAG();
-    if (state != TAG_NONE) {
-        ractor_basket_free(b);
-        EC_JUMP_TAG(ec, state);
-    }
+    VALUE v = ractor_basket_value(b);
 
     if (b->p.exception) {
         VALUE err = ractor_make_remote_exception(v, b->sender);
