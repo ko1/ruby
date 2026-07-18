@@ -796,6 +796,9 @@ static rb_global_objspace_t *global_objspace = NULL;
  * （小さな Ractor の objspace は約 13 ページなので大量廃棄でも越えにくく、肥えた
  * zombie は 1 つで越える）。 */
 #define RLGC_ZOMBIE_PAGES_TRIGGER 256
+/* 前回 global サイクル後に残った zombie ページ数（≒生存データ）。barrier 下で更新、
+ * 読み手（rlgc_global_wanted_p）は racy でよい。 */
+static size_t rlgc_zombie_pages_survivors = 0;
 
 /* mark/sweep の述語は objspace ごとの during_global_gc を見る。これは driver が
  * barrier 下で取る反復用スナップショット。 */
@@ -7821,9 +7824,15 @@ rlgc_global_wanted_p(rb_objspace_t *objspace)
 {
     if (rb_gc_single_objspace_p()) return false;
     if (objspace->rlgc.shareable_objects > objspace->rlgc.shareable_objects_limit) return true;
-    /* zombie は heap ページを保持する。global サイクルはその garbage を回収し、disown された
-     * ものは merge が shell を回収する。 */
-    if (rb_gc_vm_zombie_total_pages() >= RLGC_ZOMBIE_PAGES_TRIGGER) return true;
+    /* zombie は heap ページを保持し、その garbage は global サイクルしか回収できない。
+     * ただし前回 global の残存分は生きているデータなので、それを基準に「新たに」
+     * TRIGGER ぶん増えた時だけ再トリガする。生存ページの多い未 join zombie が
+     * 全 Ractor の GC を恒久的に STW 化するのを防ぐ。 */
+    {
+        size_t zp = rb_gc_vm_zombie_total_pages();
+        size_t base = rlgc_zombie_pages_survivors < zp ? rlgc_zombie_pages_survivors : zp;
+        if (zp - base >= RLGC_ZOMBIE_PAGES_TRIGGER) return true;
+    }
     /* retention。自分の root から到達不能な shareable（mark 末尾の pin で数える）が、前回の
      * global サイクルの survivor 数（shareable_objects_limit = survivors x 2, floor 付き）の
      * 規模まで溜まった。 */
@@ -8783,6 +8792,7 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
      * 無いと、どの pass も merge しない joinable(slotted) zombie の retire 時の stale な数値で
      * 上のページ trigger が発火し続ける。 */
     rb_gc_vm_refresh_zombie_pages();
+    rlgc_zombie_pages_survivors = rb_gc_vm_zombie_total_pages();
 
     /* 上の sweep が未 join の Ractor オブジェクトを回収した場合、ractor_free がその zombie ledger
      * エントリを disown し merge を main Ractor へ postponed job として投げている。objspace は
