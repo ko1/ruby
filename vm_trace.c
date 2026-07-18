@@ -132,7 +132,9 @@ update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_
     // 現在の Ractor がある時だけ VM lock を取る。MMTK の hook-list free では
     // ec==NULL。global GC の sweep 中も GET_RACTOR()==NULL で死んだ Ractor の
     // hook list を free するため、lock は不安全(NULL deref)かつ不要(既に barrier 保持)。
-    const bool vm_locked_here = ec && GET_RACTOR() != NULL;
+    // VM destruct の free-at-exit walk 中は thread struct が先に free されており、
+    // GET_RACTOR() の ec->thread_ptr 読みが UAF になる。単一スレッドなので lock 不要。
+    const bool vm_locked_here = ec && !ruby_vm_during_cleanup && GET_RACTOR() != NULL;
     if (vm_locked_here) {
         RB_VM_LOCK_ENTER_LEV(&lev);
         rb_vm_barrier();
