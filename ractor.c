@@ -323,12 +323,14 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
      * 自分の住人だけ mark する。foreign/shareable entry は owner か global GC が拾う。 */
     rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
 
-    /* #value で吸収した終了 Ractor の join value(legacy/default port)を mark+pin。それらは
-     * この Ractor の objspace 在住で C struct 経由のみ到達可能なため、compaction で move
-     * させないよう pin する。 */
+    /* #value で吸収した終了 Ractor の戻り値(legacy)を mark+pin。この Ractor の objspace
+     * 在住で C struct 経由のみ到達可能なため compaction で move させない。default port は
+     * #value が返さず（successor は受け取らない）終了 Ractor では teardown で解放されうる。
+     * 解放済みスロットを pin すると poison するのでここでは触らない。 */
     rb_ractor_t *taken;
     ccan_list_for_each(&r->value_taken, taken, value_held_node) {
-        rb_ractor_mark_terminated_join_value(taken);
+        VALUE slot[] = { taken->sync.legacy };
+        rb_gc_mark_vm_stack_values((long)numberof(slot), slot);
     }
 }
 
