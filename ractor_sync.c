@@ -949,6 +949,12 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
         bool first_absorb = (r->objspace != NULL);
         rb_gc_objspace_absorb_into_current(&r->objspace);
 
+        /* legacy を value_taken 登録まで C ローカルで生かす。下の RB_VM_LOCKING は
+         * safepoint で、その間に他 Ractor 発の global GC が走ると shref pin は clear され、
+         * value_taken 未登録の legacy は C struct からしか届かず無 root で回収される。保守的な
+         * machine-stack mark に拾わせて回収と move の両方を防ぐ（登録後は value_taken が守る）。 */
+        volatile VALUE legacy_keep = r->sync.legacy;
+
         /* 継承したオブジェクトへの唯一の経路は死んだ Ractor の C struct であり、
          * 我々の local GC はそれを辿らない。トップレベルスロットを shref ビットで
          * pin して root にする（local GC 一巡用。詳細は rb_ractor_pin_inherited_parts）。 */
@@ -963,6 +969,7 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
                 ccan_list_add_tail(&GET_RACTOR()->value_taken, &r->value_held_node);
             }
         }
+        RB_GC_GUARD(legacy_keep);
 
         ractor_reset_belonging(r->sync.legacy);
 
