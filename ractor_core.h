@@ -125,6 +125,11 @@ struct rb_ractor_struct {
     enum ractor_status status_;
 
     struct ccan_list_node vmlr_node;
+    /* #value で吸収した終了 Ractor を successor(この Ractor)が繋ぐリスト。継承した
+     * join value(legacy/default port)は C struct 経由でしか到達できず compaction で
+     * C slot が更新されないので、successor の root scan がここから mark+pin する。 */
+    struct ccan_list_head value_taken;
+    struct ccan_list_node value_held_node; /* value_taken に繋ぐ node（吸収された側） */
 
     // ractor local data
 

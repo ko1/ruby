@@ -302,7 +302,9 @@ ractor_mark(void *ptr)
     rb_ractor_t *r = (rb_ractor_t *)ptr;
 
     /* wrapper 直参照のみ。unshareable な root は owner の local GC と global GC の
-     * root scan（rb_ractor_mark_local_roots）が mark する。終了済みは zombie 台帳。 */
+     * root scan（rb_ractor_mark_local_roots）が mark する。終了済みは zombie 台帳。
+     * shareable な wrapper から unshareable を辿ると shref 制約に反するので、ここでは
+     * 触らない（inter-Ractor 値の被覆は root scan 側で行う）。 */
     rb_gc_mark(r->loc);
     rb_gc_mark(r->name);
 }
@@ -320,6 +322,14 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
     /* この Ractor の rb_gc_register_mark_object pin。保守的に扱い、local GC は
      * 自分の住人だけ mark する。foreign/shareable entry は owner か global GC が拾う。 */
     rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
+
+    /* #value で吸収した終了 Ractor の join value(legacy/default port)を mark+pin。それらは
+     * この Ractor の objspace 在住で C struct 経由のみ到達可能なため、compaction で move
+     * させないよう pin する。 */
+    rb_ractor_t *taken;
+    ccan_list_for_each(&r->value_taken, taken, value_held_node) {
+        rb_ractor_mark_terminated_join_value(taken);
+    }
 }
 
 /* 終了済みで未 free の Ractor の join 用スロット（戻り値・default port・stdin 等）を mark
@@ -329,11 +339,13 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
 void
 rb_ractor_mark_terminated_join_value(rb_ractor_t *r)
 {
+    /* 他 Ractor が終了後も読む値のみ。戻り値(legacy)と default port。stdin/stdout/
+     * stderr と verbose/debug は終了 Ractor の local 環境で、終了後は誰も読まない
+     * (rb_ractor_stdin 等は現在の Ractor 用)。pin すると freed slot 再 pin で poison
+     * するので、ここでは持たず自然に回収させる。 */
     VALUE slots[] = {
         r->sync.legacy,
         r->sync.default_port_value,
-        r->r_stdin, r->r_stdout, r->r_stderr,
-        r->verbose, r->debug,
     };
     rb_gc_mark_vm_stack_values((long)numberof(slots), slots);
 }
@@ -379,6 +391,10 @@ ractor_free(void *ptr)
 {
     rb_ractor_t *r = (rb_ractor_t *)ptr;
     RUBY_DEBUG_LOG("free r:%d", rb_ractor_id(r));
+
+    /* value_held_ractors に載っていれば外す(#value 済み・未 free だった Ractor)。
+     * node は ractor_init で初期化済みなので未登録でも安全。 */
+    ccan_list_del_init(&r->value_held_node);
 
     if (!r->main_ractor) {
         /* この Ractor の generic_fields 表を main へ移送する。struct と共に失うと、
@@ -711,6 +727,8 @@ ractor_init(rb_ractor_t *r, VALUE name, VALUE loc)
     // thread management
     rb_thread_sched_init(&r->threads.sched, false);
     rb_ractor_living_threads_init(r);
+    ccan_list_head_init(&r->value_taken);
+    ccan_list_node_init(&r->value_held_node);
 
     // naming
     if (!NIL_P(name)) {
