@@ -893,10 +893,10 @@ ractor_make_remote_exception(VALUE cause, VALUE sender)
 void
 rb_ractor_pin_inherited_parts(rb_ractor_t *r)
 {
+    /* legacy(戻り値)のみ pin。stdin/stdout/stderr と verbose/debug は終了 Ractor の
+     * local 環境で終了後は誰も読まないため持たない(rb_ractor_stdin 等は現在の Ractor 用)。 */
     VALUE slots[] = {
         r->sync.legacy,
-        r->r_stdin, r->r_stdout, r->r_stderr,
-        r->verbose, r->debug,
     };
     for (size_t i = 0; i < numberof(slots); i++) {
         if (!SPECIAL_CONST_P(slots[i])) {
@@ -945,12 +945,24 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
          * に残った pin 済みオブジェクトが root を失う。 */
         rb_ractor_absorb_registered_marks(GET_RACTOR(), r);
 
+        /* 初回 absorb かは吸収前の objspace 有無で判る（absorb が NULL 化する）。 */
+        bool first_absorb = (r->objspace != NULL);
         rb_gc_objspace_absorb_into_current(&r->objspace);
 
         /* 継承したオブジェクトへの唯一の経路は死んだ Ractor の C struct であり、
          * 我々の local GC はそれを辿らない。トップレベルスロットを shref ビットで
-         * pin して root にする（詳細は rb_ractor_pin_inherited_parts 参照）。 */
+         * pin して root にする（local GC 一巡用。詳細は rb_ractor_pin_inherited_parts）。 */
         rb_ractor_pin_inherited_parts(r);
+
+        /* legacy は successor の objspace に在り C struct 経由でしか到達できない。shref pin
+         * は sweep からは守るが compaction では move し C slot が stale 化する。successor の
+         * value_taken に載せ、その root scan(rb_ractor_mark_local_roots)で mark+pin(不動化)する。
+         * wrapper 回収時 ractor_free が外す。 */
+        if (first_absorb) {
+            RB_VM_LOCKING() {
+                ccan_list_add_tail(&GET_RACTOR()->value_taken, &r->value_held_node);
+            }
+        }
 
         ractor_reset_belonging(r->sync.legacy);
 
