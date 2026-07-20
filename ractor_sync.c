@@ -947,11 +947,9 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
         /* legacy は successor の objspace に在り C struct 経由でしか到達できない。shref pin
          * は sweep からは守るが compaction では move し C slot が stale 化する。successor の
          * value_taken に載せ、その root scan(rb_ractor_mark_local_roots)で mark+pin(不動化)する。
-         * wrapper 回収時 ractor_free が外す。 */
+         * wrapper 回収時 ractor_free が外す(add/unlink/scan は value_taken_lock で直列化)。 */
         if (first_absorb) {
-            RB_VM_LOCKING() {
-                ccan_list_add_tail(&GET_RACTOR()->value_taken, &r->value_held_node);
-            }
+            rb_ractor_value_taken_add(GET_RACTOR(), r);
         }
         RB_GC_GUARD(legacy_keep);
 
