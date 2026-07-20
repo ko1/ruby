@@ -22,7 +22,6 @@ static void ractor_add_port(rb_ractor_t *r, st_data_t id);
 struct rb_ractor_move_courier *rb_ractor_move_courier_build(VALUE obj);
 VALUE rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c);
 void rb_ractor_move_courier_free(struct rb_ractor_move_courier *c);
-void rb_ractor_move_courier_mark(struct rb_ractor_move_courier *c);
 
 static void
 ractor_port_mark(void *ptr)
@@ -244,11 +243,9 @@ ractor_basket_none_p(const struct ractor_basket *b)
 static void
 ractor_basket_mark(const struct ractor_basket *b)
 {
-    if (b->type == basket_type_move) {
-        /* courier は off-heap。運んでいる shareable な VALUE だけを mark する。 */
-        rb_ractor_move_courier_mark(b->p.move_courier);
-    }
-    else {
+    /* move courier は off-heap で、運ぶ shareable REF は in-flight registry が
+     * global GC の root として mark+pin する(ractor.c)。ここでは何もしない。 */
+    if (b->type != basket_type_move) {
         rb_gc_mark(b->p.v);
     }
 }
@@ -1117,7 +1114,7 @@ ractor_basket_value(struct ractor_basket *b)
         rb_execution_context_t *ec = rb_current_ec_noinline();
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         struct rlgc_materialize_frame frame = {
-            .snapshot = b->p.v, .courier = NULL, .prev = ec->materialize_frames,
+            .snapshot = b->p.v, .prev = ec->materialize_frames,
         };
         ec->materialize_frames = &frame;
         cr->sync.materializing_copies++;
@@ -1167,24 +1164,18 @@ ractor_basket_value(struct ractor_basket *b)
          * 元オブジェクトは既に RactorMovedObject（courier 構築時に設定）なので move の
          * snapshot 意味論が成り立つ。courier は xmalloc で GC オブジェクトでないため、
          * 送信側の並行 local GC が mark/sweep/move/競合することはない。運ぶ VALUE は
-         * shareable/即値のみで、再構築中は materialize フレームがそれらを global GC に対し
-         * root する。
+         * shareable/即値のみで、in-flight registry が global GC の root として mark+pin
+         * する(ractor.c)。
          *
          * ここでも再構築は raise しうる（custom #hash を持つ move 済み key への
-         * rb_hash_aset は利用者コード、非同期割り込みも）。同じフレーム + TAG 規律。
-         * raise 時は courier が basket 所有のまま（b->p.move_courier != NULL）なので
-         * basket の teardown が解放する。 */
+         * rb_hash_aset は利用者コード、非同期割り込みも）。raise 時は courier が
+         * basket 所有のまま（b->p.move_courier != NULL）なので basket の teardown が解放する。 */
         rb_execution_context_t *ec = rb_current_ec_noinline();
         struct rb_ractor_move_courier *courier = b->p.move_courier;
-        struct rlgc_materialize_frame frame = {
-            .snapshot = Qfalse, .courier = courier, .prev = ec->materialize_frames,
-        };
-        ec->materialize_frames = &frame;
         /* materialize したグラフを、以降の一連の処理の間ずっとマシンスタック（result）に
-         * 保持する。フレームを pop した後は、それが呼び出し側スタックへ届くまで唯一の
-         * root。ここで rb_ractor_move_courier_free が長い解放ループを回るので、グラフが
-         * malloc された basket の p.v にしか無ければ、並行 global GC に回収されうる窓が
-         * 広く開く。 */
+         * 保持する。それが呼び出し側スタックへ届くまで唯一の root。ここで
+         * rb_ractor_move_courier_free が長い解放ループを回るので、グラフが malloc された
+         * basket の p.v にしか無ければ、並行 global GC に回収されうる窓が広く開く。 */
         VALUE result = Qundef;
         enum ruby_tag_type state;
         EC_PUSH_TAG(ec);
@@ -1192,7 +1183,6 @@ ractor_basket_value(struct ractor_basket *b)
             result = rb_ractor_move_courier_materialize(courier);
         }
         EC_POP_TAG();
-        ec->materialize_frames = frame.prev;
         if (state != TAG_NONE) {
             /* 未消費 courier は b->p.move_courier のまま。basket_free が courier を解放する。 */
             ractor_basket_free(b);
