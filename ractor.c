@@ -1273,9 +1273,17 @@ ractor_moved_missing(int argc, VALUE *argv, VALUE self)
  *
  */
 
+/* 転送中 move courier の VM グローバルな registry(定義は上、詳細は move_courier_registry_add
+ * 付近のコメント)。Init_Ractor より前に置き、Init と registry 関数の両方から見えるようにする。 */
+static struct ccan_list_head move_courier_registry;
+static rb_nativethread_lock_t move_courier_registry_lock;
+
 void
 Init_Ractor(void)
 {
+    ccan_list_head_init(&move_courier_registry);
+    rb_native_mutex_initialize(&move_courier_registry_lock);
+
     rb_cRactor = rb_define_class("Ractor", rb_cObject);
     rb_undef_alloc_func(rb_cRactor);
 
@@ -2390,7 +2398,46 @@ struct rb_ractor_move_courier {
     uint32_t count;
     uint32_t capa;
     uint32_t root;
+    struct ccan_list_node reg_node;  /* in-flight courier registry(生存期間中の GC root) */
 };
+
+/* 転送中(in-flight)の move courier を繋ぐ VM グローバルなリスト。courier は off-heap で、
+ * shareable REF を生ポインタで運ぶ。生存期間中に queue/materialize frame から漏れる
+ * transient(stack-local messages 等)を通る窓があり、その間の global GC が REF を回収しうる。
+ * build から free まで登録し、global GC の root pass で mark+pin して守る。REF は shareable のみで
+ * shareable は global GC でしか回収しないので、mark は global GC でだけ必要。register/remove は
+ * 各 Ractor から並行に走るので lock を取るが、mark は STW なので lock 不要。lockless mark が
+ * 成り立つのは add/remove が safepoint を含まない（allocation も割込み検査も無い）ため。ここに
+ * それらを足すと half-linked list を barrier 越しに mark しうるので禁止。
+ * (実体は move_courier_registry / move_courier_registry_lock、Init_Ractor より前で定義。) */
+
+static void
+move_courier_registry_add(struct rb_ractor_move_courier *c)
+{
+    rb_native_mutex_lock(&move_courier_registry_lock);
+    ccan_list_add(&move_courier_registry, &c->reg_node);
+    rb_native_mutex_unlock(&move_courier_registry_lock);
+}
+
+static void
+move_courier_registry_remove(struct rb_ractor_move_courier *c)
+{
+    rb_native_mutex_lock(&move_courier_registry_lock);
+    ccan_list_del(&c->reg_node);
+    rb_native_mutex_unlock(&move_courier_registry_lock);
+}
+
+void rb_ractor_move_courier_mark(struct rb_ractor_move_courier *c);
+
+/* global GC の root pass から呼ぶ(STW なので lock 不要)。 */
+void
+rb_ractor_move_courier_registry_mark(void)
+{
+    struct rb_ractor_move_courier *c;
+    ccan_list_for_each(&move_courier_registry, c, reg_node) {
+        rb_ractor_move_courier_mark(c);
+    }
+}
 
 struct move_build {
     struct rb_ractor_move_courier *c;
@@ -2406,7 +2453,16 @@ move_alloc_node(struct rb_ractor_move_courier *c)
         c->capa = c->capa ? c->capa * 2 : 8;
         REALLOC_N(c->nodes, struct move_node, c->capa);
     }
-    return c->count++;
+    uint32_t id = c->count++;
+    /* 構築途中でも courier mark（送信中 GC root）が安全に走れるよう、mark 無害な
+     * REF/Qnil に初期化する。捕捉が確定した node を後で上書きする。 */
+    c->nodes[id].kind = MOVE_K_REF;
+    c->nodes[id].frozen = false;
+    c->nodes[id].niv = 0;
+    c->nodes[id].iv_ids = NULL;
+    c->nodes[id].iv_vals = NULL;
+    c->nodes[id].u.ref = Qnil;
+    return id;
 }
 
 /* move 済み source を、flags==0 を経ずに正当な RactorMovedObject へ変える
@@ -2763,8 +2819,27 @@ rb_ractor_move_courier_build(VALUE obj)
 
     struct rb_ractor_move_courier *c = ZALLOC(struct rb_ractor_move_courier);
     struct move_build b = { c, st_init_numtable() };
-    c->root = move_capture(&b, obj);
+
+    /* off-heap courier の shareable REF は、送信〜受信 materialize の間、queue や materialize
+     * frame に載らない transient(stack-local messages 等)を通る窓で無 root になり、その間の
+     * global GC に回収されうる。生存期間を通じ registry の root で mark+pin して守る。husk 前に
+     * 登録するので、mark 安全に初期化した partial node を mark しても無害。 */
+    move_courier_registry_add(c);
+
+    enum ruby_tag_type state;
+    rb_execution_context_t *ec = GET_EC();
+    EC_PUSH_TAG(ec);
+    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+        c->root = move_capture(&b, obj);
+    }
+    EC_POP_TAG();
     st_free_table(b.seen);
+    if (state != TAG_NONE) {
+        /* move_capture が raise した(move 不能型/割込み等)。registry から外して courier を
+         * 解放してから再送出する。partial node は mark 安全に初期化済みで free も安全。 */
+        rb_ractor_move_courier_free(c);
+        EC_JUMP_TAG(ec, state);
+    }
     return c;
 }
 
@@ -2935,6 +3010,7 @@ rb_ractor_move_courier_free(struct rb_ractor_move_courier *c)
             break;
         }
     }
+    move_courier_registry_remove(c);
     ruby_xfree(c->nodes);
     ruby_xfree(c);
 }
