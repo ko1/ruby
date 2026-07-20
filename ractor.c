@@ -309,6 +309,20 @@ ractor_mark(void *ptr)
     rb_gc_mark(r->name);
 }
 
+/* value_taken リストの直列化。add は successor の実行 thread、unlink は任意 Ractor の
+ * sweep(ractor_free)、scan は owner の local GC と global GC から並行に走るので leaf lock で
+ * 守る。臨界区間は純粋なポインタ操作のみで safepoint を含まない（含めると STW mark が
+ * half-linked list を見る）。Init_Ractor で初期化。 */
+static rb_nativethread_lock_t value_taken_lock;
+
+static void
+rb_ractor_value_taken_add(rb_ractor_t *successor, rb_ractor_t *taken)
+{
+    rb_native_mutex_lock(&value_taken_lock);
+    ccan_list_add_tail(&successor->value_taken, &taken->value_held_node);
+    rb_native_mutex_unlock(&value_taken_lock);
+}
+
 /* Ractor r の C 構造体から到達可能な GC root を mark する。local GC は heap 上の
  * Ractor/Thread wrapper object に頼れない（別 objspace にある場合がある）ため、
  * この Ractor の所有物はここから直接 root にする。 */
@@ -328,10 +342,12 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
      * #value が返さず（successor は受け取らない）終了 Ractor では teardown で解放されうる。
      * 解放済みスロットを pin すると poison するのでここでは触らない。 */
     rb_ractor_t *taken;
+    rb_native_mutex_lock(&value_taken_lock);
     ccan_list_for_each(&r->value_taken, taken, value_held_node) {
         VALUE slot[] = { taken->sync.legacy };
         rb_gc_mark_vm_stack_values((long)numberof(slot), slot);
     }
+    rb_native_mutex_unlock(&value_taken_lock);
 }
 
 /* 終了済みで未 free の Ractor の join 用スロット（戻り値・default port・stdin 等）を mark
@@ -394,9 +410,20 @@ ractor_free(void *ptr)
     rb_ractor_t *r = (rb_ractor_t *)ptr;
     RUBY_DEBUG_LOG("free r:%d", rb_ractor_id(r));
 
-    /* value_held_ractors に載っていれば外す(#value 済み・未 free だった Ractor)。
-     * node は ractor_init で初期化済みなので未登録でも安全。 */
+    /* successor の value_taken に載っていれば外す(#value 済み・未 free だった Ractor)。
+     * node は ractor_init で初期化済みなので未登録でも安全。加えて自分の value_taken に
+     * 残る子を全て unlink する。これを怠ると、この struct の解放後に子の ractor_free の
+     * ccan_list_del が freed head へ prev/next を書く(UAF write)。同一 sweep で successor
+     * と子が共に回収される時(#value 連鎖 + global GC)に顕在化する。 */
+    rb_native_mutex_lock(&value_taken_lock);
     ccan_list_del_init(&r->value_held_node);
+    {
+        rb_ractor_t *taken, *nxt;
+        ccan_list_for_each_safe(&r->value_taken, taken, nxt, value_held_node) {
+            ccan_list_del_init(&taken->value_held_node);
+        }
+    }
+    rb_native_mutex_unlock(&value_taken_lock);
 
     if (!r->main_ractor) {
         /* この Ractor の generic_fields 表を main へ移送する。struct と共に失うと、
@@ -1283,6 +1310,7 @@ Init_Ractor(void)
 {
     ccan_list_head_init(&move_courier_registry);
     rb_native_mutex_initialize(&move_courier_registry_lock);
+    rb_native_mutex_initialize(&value_taken_lock);
 
     rb_cRactor = rb_define_class("Ractor", rb_cObject);
     rb_undef_alloc_func(rb_cRactor);
