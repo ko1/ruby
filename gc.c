@@ -3239,6 +3239,15 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
         rb_vm_mark(vm);
         if (vm_mark_needs_lock) RB_GC_VM_UNLOCK_NO_BARRIER(vm_mark_lock_lev);
 
+        if (global_gc) {
+            /* 転送中の move courier(off-heap)が運ぶ shareable REF を mark+pin する。生存期間中に
+             * queue/materialize frame から漏れる transient を通る窓を塞ぐ。REF は shareable のみで
+             * global GC でしか回収されないので、この pass は global GC でだけ要る。 */
+            MARK_CHECKPOINT("move_couriers");
+            void rb_ractor_move_courier_registry_mark(void);
+            rb_ractor_move_courier_registry_mark();
+        }
+
         MARK_CHECKPOINT("global_tbl");
         rb_gc_mark_global_tbl();
 
