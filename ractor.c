@@ -9,7 +9,6 @@
 #include "vm_sync.h"
 #include "ractor_core.h"
 #include "internal/complex.h"
-#include "internal/cont.h"
 #include "internal/error.h"
 #include "internal/gc.h"
 #include "internal/hash.h"
@@ -24,16 +23,17 @@
 #include "internal/io.h"
 #include "internal/ractor.h"
 #include "internal/rational.h"
-#include "internal/re.h"
-#include "internal/struct.h"
 #include "internal/st.h"
 #include "internal/thread.h"
 #include "internal/vm.h"
-#include "ruby/encoding.h"
 #include "variable.h"
 #include "shape.h"
 #include "yjit.h"
 #include "zjit.h"
+
+/* internal/cont.h は iseq.h 経由で prism ヘッダ一式を引き込むので include せず、
+ * 使う 1 関数だけ宣言する。 */
+VALUE rb_fiberptr_self(struct rb_fiber_struct *fiber);
 
 VALUE rb_cRactor;
 static VALUE rb_cRactorSelector;
