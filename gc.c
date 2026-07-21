@@ -616,7 +616,6 @@ rb_gc_atfork_global_locks(void)
 
 typedef struct gc_function_map {
     // Bootup
-    void *(*global_objspace_alloc)(void);
     void *(*objspace_alloc)(void);
     void (*objspace_init)(void *objspace_ptr);
     void *(*ractor_cache_alloc)(void *objspace_ptr, void *ractor);
@@ -802,7 +801,6 @@ ruby_modular_gc_init(void)
 } while (0)
 
     // Bootup
-    load_modular_gc_func(global_objspace_alloc);
     load_modular_gc_func(objspace_alloc);
     load_modular_gc_func(objspace_init);
     load_modular_gc_func(ractor_cache_alloc);
@@ -897,7 +895,6 @@ ruby_modular_gc_init(void)
 }
 
 // Bootup
-# define rb_gc_impl_global_objspace_alloc rb_gc_functions.global_objspace_alloc
 # define rb_gc_impl_objspace_alloc rb_gc_functions.objspace_alloc
 # define rb_gc_impl_objspace_init rb_gc_functions.objspace_init
 # define rb_gc_impl_ractor_cache_alloc rb_gc_functions.ractor_cache_alloc
@@ -1002,10 +999,6 @@ rb_gc_init_objspaces(void)
 #endif
 
     rb_vm_t *vm = ruby_current_vm_ptr;
-
-    /* VM は global objspace のみを指す。起動時の objspace は main Ractor に属する。
-     * Init_BareVM がここを呼ぶ前に main Ractor を確保している。 */
-    vm->gc.global_objspace = rb_gc_impl_global_objspace_alloc();
 
     void *objspace = rb_gc_impl_objspace_alloc();
     RUBY_ASSERT(vm->ractor.main_ractor != NULL);
@@ -1900,6 +1893,9 @@ os_shareable_collect_i(void *vstart, void *vend, size_t stride, void *data)
 
     return 0;
 }
+
+static void rb_gc_critical_disable(void);
+static void rb_gc_critical_enable(void);
 
 static VALUE
 os_obj_of(VALUE of)
@@ -3832,17 +3828,6 @@ rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *
     }
 }
 
-/* rb_objspace_each_objects と同じだが現在の Ractor の objspace のみ対象。自分の
- * ヒープ内に留まる必要のある呼び出し用（例: ObjectSpace.dump_all。さもないと
- * 他 Ractor のオブジェクトを分離越しに漏らす）。 */
-void
-rb_objspace_each_objects_local(int (*callback)(void *, void *, size_t, void *), void *data)
-{
-    RB_VM_LOCKING() {
-        rb_vm_barrier();
-        rb_gc_impl_each_objects(rb_gc_get_objspace(), callback, data);
-    }
-}
 
 
 /* プロセス内の全 objspace を列挙する。live Ractor のものと終了済み未継承の zombie の
@@ -3904,20 +3889,26 @@ zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot, struct rb_
 /* join されずに終了した Ractor で呼ばれる。objspace は所有スレッドを失うが、ページには
  * 他 Ractor から到達可能な shareable が残るので、継承がマージするまで列挙可能に保つ。
  * 所有 r->objspace スロットは残したまま、継承経路が objspace を取ると clear される。 */
+/* orphan objspace 併合 job の handle を（未登録なら）確保する。全 retire/disown 経路で
+ * 共有。二重の preregister は冪等（同じ func + data で重複排除される）。 */
+static void
+rlgc_orphan_merge_pjob_ensure(void)
+{
+    if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+        GET_VM()->gc.orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
+        if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+            rb_bug("Could not preregister postponed job for GC");
+        }
+    }
+}
+
 void
 rb_gc_objspace_retire(void **objspace_slot)
 {
     rb_vm_t *vm = GET_VM();
 
     RB_VM_LOCKING() {
-        /* 全 retire/disown 経路で共有。二重の preregister は冪等（同じ func + data で
-         * 重複排除される）。 */
-        if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
-            GET_VM()->gc.orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
-            if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
-                rb_bug("Could not preregister postponed job for GC");
-            }
-        }
+        rlgc_orphan_merge_pjob_ensure();
         /* owner_slot は常に retire 対象 Ractor の &r->objspace。owner は global GC の
          * generic_fields weak pass がこの zombie の per-Ractor 表を舐めるために記録する。
          * orphan 化すると rb_gc_objspace_disown が owner を NULL にする。 */
@@ -3951,14 +3942,8 @@ rb_gc_objspace_disown(void *objspace)
     }
 
     /* トリガは wait-free（atomic ビット + interrupt フラグ）で sweep 内でも安全。
-     * 他 Ractor が存在する前は disown 対象が無く、その頃には handle は preregister
-     * 済み（最初の retire で）。一度も開始しなかった Ractor の経路も念のため覆う。 */
-    if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
-        GET_VM()->gc.orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
-        if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
-            rb_bug("Could not preregister postponed job for GC");
-        }
-    }
+     * 一度も開始しなかった Ractor の経路も覆う。 */
+    rlgc_orphan_merge_pjob_ensure();
     rb_postponed_job_trigger_for_ractor(GET_VM()->gc.orphan_merge_pjob, vm->ractor.main_ractor->pub.self);
 }
 
@@ -3970,7 +3955,7 @@ rb_gc_during_global_gc_p(void)
     return rb_gc_impl_during_global_gc_p(rb_gc_get_objspace());
 }
 
-void
+static void
 rb_gc_vm_forget_zombie(void *objspace)
 {
     rb_vm_t *vm = GET_VM();
@@ -5008,22 +4993,17 @@ rb_gc_initial_stress_set(VALUE flag)
     initial_stress = flag;
 }
 
-/* プロセス全体の GC 無効化フラグ。GC.disable/enable と引数なしの rb_gc_disable/enable/
- * disable_no_rest はこれを切り替え、全 Ractor の自動 GC を止める。現在の Ractor 自身の
- * 再入 GC だけを抑える objspace 単位の無効化は rb_objspace_gc_* と rb_gc_local_*。 */
-/* atomic。どの Ractor も切り替えてよく、各 Ractor の ready_to_gc が読む。 */
+/* GC 停止 holder の増減(実体は vm->gc.disable_holders。vm_core.h 参照)。critical は
+ * barrier 下の収集など「途中で GC が起きてはならない」内部区間用の匿名 holder。 */
 
-/* barrier 下の収集など「途中で GC が起きてはならない」内部区間のカウンタ。ユーザの
- * GC.enable は boolean フラグしか触れないので、並行する区間を破れない。 */
-
-void
+static void
 rb_gc_critical_disable(void)
 {
     rb_gc_impl_gc_rest(rb_gc_get_objspace());
     RUBY_ATOMIC_INC(GET_VM()->gc.disable_holders);
 }
 
-void
+static void
 rb_gc_critical_enable(void)
 {
     RUBY_ATOMIC_DEC(GET_VM()->gc.disable_holders);
@@ -5098,11 +5078,6 @@ rb_gc_local_enable(void)
     return rb_objspace_gc_enable(rb_gc_get_objspace());
 }
 
-VALUE
-rb_gc_local_disable(void)
-{
-    return rb_objspace_gc_disable(rb_gc_get_objspace());
-}
 
 VALUE
 rb_gc_local_disable_no_rest(void)

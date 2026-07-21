@@ -241,9 +241,6 @@ void rb_objspace_each_objects(
     int (*callback)(void *start, void *end, size_t stride, void *data),
     void *data);
 
-void rb_objspace_each_objects_local(
-    int (*callback)(void *start, void *end, size_t stride, void *data),
-    void *data);
 
 size_t rb_gc_obj_slot_size(VALUE obj);
 
@@ -252,7 +249,6 @@ VALUE rb_gc_disable_no_rest(void);
  * rb_gc_disable* とは違い自分の objspace の GC のみ抑止する。上の
  * DURING_GC_COULD_MALLOC_REGION が同梱拡張で展開するため export する。 */
 VALUE rb_gc_local_enable(void);
-VALUE rb_gc_local_disable(void);
 VALUE rb_gc_local_disable_no_rest(void);
 
 #define RB_GC_MAX_NAME_LEN 20
@@ -310,8 +306,6 @@ void rb_gc_objspace_disown(void *objspace);
 void rb_gc_zombie_objspaces_atfork(void);
 void rb_gc_atfork_global_locks(void);
 void rb_gc_stash_cleanup_objspace(void);
-void rb_gc_critical_disable(void);
-void rb_gc_critical_enable(void);
 void rb_gc_finish_in_flight_gc(void);
 bool rb_gc_during_global_gc_p(void);
 bool rb_gc_single_objspace_p(void);

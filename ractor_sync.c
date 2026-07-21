@@ -697,18 +697,16 @@ ractor_sync_mark(rb_ractor_t *r)
      * 下で（フレーム鎖は receive 中に）書き換えるので、ロックフリーな foreign mark
      * が辿ると壊れて読める。しかも containment によりその中身はどれもこの marker に
      * とって foreign（payload snapshot は sender の in-flight pin で、port は
-     * shareable pin で生存）。並行する所有者が居ない場合のみ辿る: 自 Ractor、
-     * 終了済み Ractor、または global GC の barrier 下。 */
+     * shareable pin で生存）。並行する所有者が居ない場合のみ辿る: 自 Ractor か
+     * global GC の barrier 下（終了済み Ractor は set/台帳経由でここへ来ない）。 */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
-    if (r == cr || rb_ractor_status_p(r, ractor_terminated) || rb_gc_during_global_gc_p()) {
-        /* materialize 中の snapshot/courier の root は各 EC の frame 鎖
+    if (r == cr || rb_gc_during_global_gc_p()) {
+        /* materialize 中の copy snapshot の root は各 EC の frame 鎖
          * （rb_execution_context_mark が mark/re-pin する）。 */
-        /* 戻り値（exit 時に設定、Ractor#value が読む）は今や終了済み Ractor の
-         * objspace に在る。value 時の継承が pin する（rb_ractor_pin_inherited_parts）
-         * までは、確実な root はここだけ。所有者が書く単純スロットなので同じゲートで
-         * mark する（Qundef=未終了なら no-op）。さもないと死んだ main thread の
-         * th->value/errinfo 別名に生存を頼ることになり、例外 teardown 経路がそれを
-         * 落とすと Ractor#value が解放済みオブジェクトを返してしまう。 */
+        /* 戻り値（exit 時に設定、Ractor#value が読む）の、吸収されるまでの確実な root は
+         * ここだけ（Qundef=未終了なら no-op）。吸収後は successor の value_taken が守る。
+         * さもないと死んだ main thread の th->value/errinfo 別名に生存を頼ることになり、
+         * 例外 teardown 経路がそれを落とすと Ractor#value が解放済みを返す。 */
         rb_gc_mark(r->sync.legacy);
 
         if (r->sync.ports) {
@@ -718,7 +716,7 @@ ractor_sync_mark(rb_ractor_t *r)
              * 走査中に queue を変更しうる=真のデータ競合。lock を取り送信側を排除する。
              * 自己 deadlock はしない: いずれかの ractor lock 保持中は malloc 起因の
              * GC が無効なので、GC marker が既に r の lock を持つことはない。global GC
-             * 下は全送信側が停止、終了済み Ractor には送信側が無く、どちらも lock 不要。 */
+             * 下は全送信側が停止しているので lock 不要。 */
             bool lock_against_senders = (r == cr) && !rb_gc_during_global_gc_p();
             if (lock_against_senders) RACTOR_LOCK(r);
             ractor_queue_mark(r->sync.recv_queue);
@@ -866,40 +864,6 @@ ractor_make_remote_exception(VALUE cause, VALUE sender)
     return err;
 }
 
-/* Ractor#value が死んだ Ractor の objspace を吸収した後、その C struct から今も
- * 参照される物（再度の #value 用 legacy 値、stdio、local storage）は呼び出し側の
- * objspace に属すが、経路は Ractor オブジェクト経由のみ。そのオブジェクトは通常
- * 別 Ractor の objspace に在り、その mark は我々のオブジェクトを foreign-skip し、
- * 我々の GC は foreign な Ractor オブジェクトを辿らない。各トップレベルスロットを
- * shref ビットで pin する（今や我々のページなので通常のストア）。子は通常の root
- * 走査で生き、global GC は Ractor オブジェクトが生きる間、その shareable エッジから
- * 同じビットを再導出する。 */
-void
-rb_ractor_pin_inherited_parts(rb_ractor_t *r)
-{
-    /* legacy(戻り値)のみ pin。stdin/stdout/stderr と verbose/debug は終了 Ractor の
-     * local 環境で終了後は誰も読まないため持たない(rb_ractor_stdin 等は現在の Ractor 用)。 */
-    VALUE slots[] = {
-        r->sync.legacy,
-    };
-    for (size_t i = 0; i < numberof(slots); i++) {
-        if (!SPECIAL_CONST_P(slots[i])) {
-            rb_gc_pin_in_flight_message(slots[i]);
-        }
-    }
-
-    /* 死んだ Ractor の local storage はこれ以降 Ruby コードから到達不能
-     * （Ractor#[] は内側からのみ動く）。pin せずここで解放する。値は自然に死ね、
-     * ractor_mark も ractor_free も後で stale な表を辿らずに済む。 */
-    ractor_local_storage_free(r);
-    r->local_storage = NULL;
-    r->idkey_local_storage = NULL;
-
-    /* 死んだ Ractor の main thread wrapper は pin しない。戻り値は legacy として上で
-     * pin 済み、thread struct 自体は native thread teardown が別 context を reclaim する
-     * ので不要。ここで threads.set を walk しないので free 済み thread も踏まない。 */
-}
-
 static VALUE
 ractor_value(rb_execution_context_t *ec, VALUE self)
 {
@@ -933,16 +897,17 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
         bool first_absorb = (r->objspace != NULL);
         rb_gc_objspace_absorb_into_current(&r->objspace);
 
-        /* legacy を value_taken 登録まで C ローカルで生かす。下の RB_VM_LOCKING は
-         * safepoint で、その間に他 Ractor 発の global GC が走ると shref pin は clear され、
-         * value_taken 未登録の legacy は C struct からしか届かず無 root で回収される。保守的な
-         * machine-stack mark に拾わせて回収と move の両方を防ぐ（登録後は value_taken が守る）。 */
+        /* legacy を value_taken 登録まで C ローカルで生かす。absorb 後・登録前に GC が
+         * 走ると legacy は C struct からしか届かず無 root で回収されうるため、保守的な
+         * machine-stack mark に拾わせて回収と move を防ぐ（登録後は value_taken が守る）。 */
         volatile VALUE legacy_keep = r->sync.legacy;
 
-        /* 継承したオブジェクトへの唯一の経路は死んだ Ractor の C struct であり、
-         * 我々の local GC はそれを辿らない。トップレベルスロットを shref ビットで
-         * pin して root にする（local GC 一巡用。詳細は rb_ractor_pin_inherited_parts）。 */
-        rb_ractor_pin_inherited_parts(r);
+        /* 死んだ Ractor の local storage はこれ以降 Ruby コードから到達不能
+         * （Ractor#[] は内側からのみ動く）。値は自然に死ね、ractor_mark も
+         * ractor_free も後で stale な表を辿らない。 */
+        ractor_local_storage_free(r);
+        r->local_storage = NULL;
+        r->idkey_local_storage = NULL;
 
         /* legacy は successor の objspace に在り C struct 経由でしか到達できない。shref pin
          * は sweep からは守るが compaction では move し C slot が stale 化する。successor の
