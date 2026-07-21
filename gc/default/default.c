@@ -810,7 +810,6 @@ static rb_global_objspace_t *global_objspace = NULL;
 /* mark/sweep の述語は objspace ごとの during_global_gc を見る。これは driver が
  * barrier 下で取る反復用スナップショット。 */
 static struct {
-    bool active;
     /* compacting global GC の move 相の間 true。gc_sweep_compact は全 objspace を
      * 移動させるが、全 forwarding pointer が揃うまで参照更新（gc_compact_finish）を
      * 遅延させる 2 相方式。cross-objspace 参照を 1 度だけ書き換えるため。 */
@@ -818,11 +817,6 @@ static struct {
     struct rb_objspace **list;
     size_t count, capa;
 } rlgc_global;
-
-/* 死んだ Ractor の objspace を別へ併合中は true。併合中は VM グローバル root 表が
- * 未併合の src を指しオブジェクトも移動途中なので、verifier の cross-objspace 検査は
- * 一時的な非 heap/foreign エッジを見る。この間は抑止し、次の通常 GC が検証する。 */
-
 
 static void rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
@@ -844,13 +838,6 @@ global_objspace_init(void)
     }
 }
 
-void *
-rb_gc_impl_global_objspace_alloc(void)
-{
-    global_objspace_init();
-
-    return global_objspace;
-}
 
 #ifndef HEAP_PAGE_ALIGN_LOG
 /* default tiny heap size: 64KiB */
@@ -5968,7 +5955,6 @@ struct verify_internal_consistency_struct {
     size_t remembered_shady_count;
 };
 
-static bool verify_pointer_in_any_heap_p(const void *ptr);
 
 static void
 check_generation_i(const VALUE child, void *ptr)
@@ -6027,23 +6013,8 @@ check_children_i(const VALUE child, void *ptr)
     /* fast path: この objspace の子（エッジの 99.99%）。 */
     if (RB_LIKELY(is_pointer_to_heap(data->objspace, (void *)child))) {
         if (check_rvalue_consistency_force(data->objspace, child, FALSE) != 0) {
-            fprintf(stderr, "check_children_i: %s has error (referenced from %s)",
+            fprintf(stderr, "check_children_i: %s has error (referenced from %s)\n",
                     rb_obj_info(child), rb_obj_info(data->parent));
-            /* 追加診断: parent の shareable/pin と、edge が String の shared root か。 */
-            {
-                VALUE p = data->parent;
-                fprintf(stderr, " [diag parent=%p sh=%d pinned=%d child_os=%p verify_os=%p",
-                        (void *)p, (int)!!RB_FL_TEST_RAW(p, RUBY_FL_SHAREABLE),
-                        (int)RVALUE_PINNED(data->objspace, p),
-                        (void *)GET_HEAP_OBJSPACE(child), (void *)data->objspace);
-                if (RB_TYPE_P(p, T_STRING)) {
-                    fprintf(stderr, " str_shared=%d str_fstr=%d aux_shared_is_child=%d",
-                            (int)!!FL_TEST_RAW(p, STR_SHARED),
-                            (int)!!FL_TEST_RAW(p, RSTRING_FSTR),
-                            (int)(FL_TEST_RAW(p, STR_NOEMBED) && RSTRING(p)->as.heap.aux.shared == child));
-                }
-                fprintf(stderr, "]\n");
-            }
             data->err_count++;
         }
         return;
@@ -6056,40 +6027,12 @@ check_children_i(const VALUE child, void *ptr)
     if (!data->world_stopped) return;
 
     /* 非 heap の child がこの callback に来るのは、stale なフィールドを素の rb_gc_mark で
-     * たどった場合だけ（兄弟 struct が先に free された、生きているが到達不能な wrapper の
-     * dmark でのみ観測）。中断せず報告し継続する。対象先頭ワード（fault-safe に読む。
-     * unmap されているかも）で原因フィールドを soak をまたいで特定するため。 */
+     * たどった場合だけ（生きているが到達不能な wrapper の dmark 等）。中断せず報告し継続する。 */
     if (!verify_pointer_in_any_heap_p((void *)child)) {
         /* 併合途中はグラフが流動的で、一時的な非 heap エッジは想定内。併合後に再検査する。 */
         if (global_objspace->during_absorb) return;
-        VALUE w[2] = {0, 0};
-        bool readable = false;
-#ifndef _WIN32
-        int fd = open("/proc/self/mem", O_RDONLY);
-        if (fd >= 0) {
-            if (pread(fd, w, sizeof(w), (off_t)child) == (ssize_t)sizeof(w)) {
-                readable = true;
-            }
-            close(fd);
-        }
-#endif
-        /* parent が Thread wrapper なら、フィールドを raw ポインタ一致で特定する（stale な
-         * 対象を参照しない）。rb_obj_is_kind_of ではなく直接のクラスポインタ比較を使う。
-         * parent は stale フィールドで到達した任意のオブジェクト（class ヘッダ無しの T_IMEMO
-         * call-cache や、absorb 中で klass 自体が stale な T_DATA）でありうるため。直接比較は
-         * それらに一致しないだけで済む（本物の Thread wrapper のフィールド名を出せればよい）。 */
-        const char *field = "?";
-        if (RB_TYPE_P(data->parent, T_DATA) &&
-            RBASIC_CLASS(data->parent) == rb_cThread) {
-            const rb_thread_t *pth = rb_thread_ptr(data->parent);
-            if (child == (VALUE)pth->ractor) field = "th->ractor";
-            else if (child == (VALUE)pth->root_fiber) field = "th->root_fiber";
-            else if (child == (VALUE)pth->ec) field = "th->ec";
-            else if (child == (VALUE)pth->nt) field = "th->nt";
-        }
-        fprintf(stderr, "VERIFY-NOTE: non-heap child %p (from %s field=%s) readable=%d w0=%p w1=%p\n",
-                (void *)child, rb_obj_info(data->parent), field, (int)readable,
-                (void *)w[0], (void *)w[1]);
+        fprintf(stderr, "VERIFY-NOTE: non-heap child %p (from %s)\n",
+                (void *)child, rb_obj_info(data->parent));
         return;
     }
 
@@ -6198,7 +6141,7 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
     if (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(obj), obj)) return;
     if (MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj)) return;
     if (obj == rb_vm_top_self()) return;  /* VM-permanent (see check_children_i) */
-    /* receive が materialize 中の送信側常駐スナップショットは sync.in_flight_materializing
+    /* receive が materialize 中の送信側常駐スナップショットは sync.materializing_copies
      * で root 化される。複製の間だけ有効な foreign-unshareable root（check_children_i 参照）。 */
     if (rb_gc_current_ractor_materializing_p()) return;
 
@@ -8575,7 +8518,6 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
      * 他 Ractor の objspace の残り garbage を driver スレッドで free するが、foreign オブジェクトの
      * weak 参照 free（rb_free_generic_ivar）は「global GC 進行中」を見て、per-Ractor generic_fields
      * の削除を driver 自身の表に誤って解決せず weak-pass drain へ遅延する必要があるため。 */
-    rlgc_global.active = true;
     for (size_t i = 0; i < rlgc_global.count; i++) {
         rlgc_global.list[i]->during_global_gc = 1;
     }
@@ -8780,7 +8722,6 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
         objspace->during_global_gc = 0;
         if (objspace != driver) during_gc = FALSE;
     }
-    rlgc_global.active = false;
 
     /* garbage が消えた今、zombie ledger を測り直す。barrier 内なのでエントリは安定。これが
      * 無いと、どの pass も merge しない joinable(slotted) zombie の retire 時の stale な数値で

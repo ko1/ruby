@@ -570,14 +570,6 @@ rb_mmtk_builder_init(void)
     return builder;
 }
 
-void *
-rb_gc_impl_global_objspace_alloc(void)
-{
-    /* MMTk はまだ global objspace を使わない。boot が保存できるよう
-     * 非 NULL のダミーを返す。 */
-    static char rlgc_global_objspace_placeholder;
-    return &rlgc_global_objspace_placeholder;
-}
 
 void *
 rb_gc_impl_objspace_alloc(void)
