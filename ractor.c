@@ -353,10 +353,10 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
     rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
 }
 
-/* 終了済みで未 free の Ractor の join 用スロット（戻り値・default port・stdin 等）を mark
- * かつ pin する。global GC が zombie 台帳から呼ぶ。default port は他 Ractor が終了後も
+/* 終了済みで未 free の Ractor の join 用スロット（戻り値と default port）を mark かつ
+ * pin する。global GC が zombie 台帳から呼ぶ。default port は他 Ractor が終了後も
  * send/value で読む。zombie の C-struct 参照は compaction で更新されないので movable に
- * mark すると移動して stale 化する。pin_inherited_parts と同じスロットを固定する。 */
+ * mark すると移動して stale 化する。 */
 void
 rb_ractor_mark_terminated_join_value(rb_ractor_t *r)
 {
@@ -3228,6 +3228,21 @@ static struct freed_ractor_local_keys_struct {
     rb_ractor_local_key_t *keys;
 } freed_ractor_local_keys;
 
+/* 削除済み ractor-local key を storage 表から purge し、free フックを呼ぶ。 */
+static void
+ractor_local_keys_purge(st_table *local_storage)
+{
+    for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
+        rb_ractor_local_key_t key = freed_ractor_local_keys.keys[i];
+        st_data_t val, k = (st_data_t)key;
+        if (st_delete(local_storage, &k, &val) &&
+            (key = (rb_ractor_local_key_t)k)->type->free) {
+            (*key->type->free)((void *)val);
+        }
+    }
+}
+
+
 static int
 ractor_local_storage_mark_i(st_data_t key, st_data_t val, st_data_t dmy)
 {
@@ -3235,7 +3250,6 @@ ractor_local_storage_mark_i(st_data_t key, st_data_t val, st_data_t dmy)
     if (k->type->mark) (*k->type->mark)((void *)val);
     return ST_CONTINUE;
 }
-
 
 static enum rb_id_table_iterator_result
 idkey_local_storage_mark_i(VALUE val, void *dmy)
@@ -3254,14 +3268,7 @@ ractor_local_storage_mark(rb_ractor_t *r)
          * その struct を最後に free する。これは全 Ractor を他 marker 無しで
          * 巡る collection、つまり global GC（か single-objspace）でのみ可能。 */
         if (rb_gc_single_objspace_p() || rb_gc_during_global_gc_p()) {
-            for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
-                rb_ractor_local_key_t key = freed_ractor_local_keys.keys[i];
-                st_data_t val, k = (st_data_t)key;
-                if (st_delete(r->local_storage, &k, &val) &&
-                    (key = (rb_ractor_local_key_t)k)->type->free) {
-                    (*key->type->free)((void *)val);
-                }
-            }
+            ractor_local_keys_purge(r->local_storage);
         }
     }
 
@@ -3447,14 +3454,7 @@ rb_ractor_finish_marking(void)
     for (size_t zi = 0; zi < vm->gc.zombie_objspaces_count; zi++) {
         rb_ractor_t *owner = vm->gc.zombie_objspaces[zi].owner;
         if (owner == NULL || owner->local_storage == NULL) continue;
-        for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
-            rb_ractor_local_key_t key = freed_ractor_local_keys.keys[i];
-            st_data_t val, k = (st_data_t)key;
-            if (st_delete(owner->local_storage, &k, &val) &&
-                (key = (rb_ractor_local_key_t)k)->type->free) {
-                (*key->type->free)((void *)val);
-            }
-        }
+        ractor_local_keys_purge(owner->local_storage);
     }
 
     for (int i=0; i<freed_ractor_local_keys.cnt; i++) {
