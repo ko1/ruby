@@ -5025,46 +5025,59 @@ void
 rb_gc_critical_disable(void)
 {
     rb_gc_impl_gc_rest(rb_gc_get_objspace());
-    RUBY_ATOMIC_INC(GET_VM()->gc.disabled_critical);
+    RUBY_ATOMIC_INC(GET_VM()->gc.disable_holders);
 }
 
 void
 rb_gc_critical_enable(void)
 {
-    RUBY_ATOMIC_DEC(GET_VM()->gc.disabled_critical);
+    RUBY_ATOMIC_DEC(GET_VM()->gc.disable_holders);
 }
 
 bool
 rb_gc_gc_disabled_global_p(void)
 {
-    return RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_global) != 0 ||
-           RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_critical) != 0;
+    return RUBY_ATOMIC_LOAD(GET_VM()->gc.disable_holders) != 0;
+}
+
+/* GC.disable/enable は自 Ractor のフラグを立て下げし、フラグ遷移時だけ holder 数を
+ * 増減する。戻り値(直前状態)も自 Ractor 視点。 */
+static bool
+gc_ractor_disable_set(bool disable)
+{
+    rb_ractor_t *cr = GET_RACTOR();
+    const bool was = cr->gc_disabled;
+    if (was != disable) {
+        cr->gc_disabled = disable;
+        if (disable) {
+            RUBY_ATOMIC_INC(GET_VM()->gc.disable_holders);
+        }
+        else {
+            RUBY_ATOMIC_DEC(GET_VM()->gc.disable_holders);
+        }
+    }
+    return was;
 }
 
 VALUE
 rb_gc_enable(void)
 {
-    bool was_disabled = RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_global) != 0;
-    RUBY_ATOMIC_SET(GET_VM()->gc.disabled_global, 0);
-    return RBOOL(was_disabled);
+    return RBOOL(gc_ractor_disable_set(false));
 }
 
 VALUE
 rb_gc_disable_no_rest(void)
 {
-    bool was_disabled = RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_global) != 0;
-    RUBY_ATOMIC_SET(GET_VM()->gc.disabled_global, 1);
-    return RBOOL(was_disabled);
+    return RBOOL(gc_ractor_disable_set(true));
 }
 
 VALUE
 rb_gc_disable(void)
 {
-    bool was_disabled = RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_global) != 0;
+    const bool was_disabled = gc_ractor_disable_set(true);
     if (!was_disabled) {
         rb_gc_impl_gc_rest(rb_gc_get_objspace());
     }
-    RUBY_ATOMIC_SET(GET_VM()->gc.disabled_global, 1);
     return RBOOL(was_disabled);
 }
 
