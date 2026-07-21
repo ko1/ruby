@@ -68,8 +68,8 @@ static st_table *generic_fields_tbl_;
 
 /* shareable 用の共有 generic_fields 表を守る mutex。local GC の mark/sweep が
  * この表を引くが VM lock を待てない（barrier 合流で half-collected heap を露出する）
- * ため専用 mutex を使う。alloc しうる区間は先に GC を無効化して自己再入を防ぐ。 */
-static rb_nativethread_lock_t generic_fields_lock;
+ * ため専用 mutex(vm->ractor.generic_fields_lock)を使う。alloc しうる区間は先に GC を
+ * 無効化して自己再入を防ぐ。 */
 
 typedef int rb_ivar_foreach_callback_func(ID key, VALUE val, st_data_t arg);
 static void rb_field_foreach(VALUE obj, rb_ivar_foreach_callback_func *func, st_data_t arg, bool ivar_only);
@@ -78,7 +78,7 @@ void
 rb_generic_fields_lock_atfork(void)
 {
     /* fork 時に他スレッドが保持しているかもしれないので子には作り直す */
-    rb_native_mutex_initialize(&generic_fields_lock);
+    rb_native_mutex_initialize(&GET_VM()->ractor.generic_fields_lock);
 }
 
 void
@@ -86,7 +86,6 @@ Init_var_tables(void)
 {
     rb_global_tbl = rb_id_table_create(0);
     generic_fields_tbl_ = st_init_numtable();
-    rb_native_mutex_initialize(&generic_fields_lock);
     autoload = rb_intern_const("__autoload__");
 
     autoload_mutex = rb_mutex_new();
@@ -1288,7 +1287,7 @@ static inline void
 generic_fields_write_lock(struct st_table *tbl)
 {
     if (tbl == generic_fields_tbl_) {
-        rb_native_mutex_lock(&generic_fields_lock);
+        rb_native_mutex_lock(&GET_VM()->ractor.generic_fields_lock);
     }
 }
 
@@ -1296,7 +1295,7 @@ static inline void
 generic_fields_write_unlock(struct st_table *tbl)
 {
     if (tbl == generic_fields_tbl_) {
-        rb_native_mutex_unlock(&generic_fields_lock);
+        rb_native_mutex_unlock(&GET_VM()->ractor.generic_fields_lock);
     }
 }
 
@@ -1314,9 +1313,9 @@ rb_mark_generic_ivar(VALUE obj)
      * per-Ractor 表は owner 専有なので無ロック。shareable は共有 global 表なので lock を取る。 */
     VALUE data = 0;
     if (generic_fields_shared_p(obj)) {
-        rb_native_mutex_lock(&generic_fields_lock);
+        rb_native_mutex_lock(&GET_VM()->ractor.generic_fields_lock);
         st_lookup(generic_fields_tbl_, (st_data_t)obj, (st_data_t *)&data);
-        rb_native_mutex_unlock(&generic_fields_lock);
+        rb_native_mutex_unlock(&GET_VM()->ractor.generic_fields_lock);
     }
     else {
         struct st_table *tbl = GET_RACTOR()->generic_fields_tbl;
@@ -1339,9 +1338,9 @@ rb_obj_fields_generic_uncached(VALUE obj)
     int found = 0;
 
     if (generic_fields_shared_p(obj)) {
-        rb_native_mutex_lock(&generic_fields_lock);
+        rb_native_mutex_lock(&GET_VM()->ractor.generic_fields_lock);
         found = st_lookup(generic_fields_tbl_, (st_data_t)obj, (st_data_t *)&fields_obj);
-        rb_native_mutex_unlock(&generic_fields_lock);
+        rb_native_mutex_unlock(&GET_VM()->ractor.generic_fields_lock);
     }
     else {
         rb_ractor_t *cr = GET_RACTOR();
@@ -2345,11 +2344,11 @@ rb_copy_generic_ivar(VALUE dest, VALUE obj)
 void
 rb_generic_fields_shared_table_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg)
 {
-    rb_native_mutex_lock(&generic_fields_lock);
+    rb_native_mutex_lock(&GET_VM()->ractor.generic_fields_lock);
     if (generic_fields_tbl_ != NULL) {
         cb(generic_fields_tbl_, arg);
     }
-    rb_native_mutex_unlock(&generic_fields_lock);
+    rb_native_mutex_unlock(&GET_VM()->ractor.generic_fields_lock);
 }
 
 void
@@ -2450,13 +2449,13 @@ rb_mv_generic_ivar_to_shared(VALUE obj)
     bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
     bool has_entry = (src != NULL) && st_lookup(src, key, &val);
 
-    rb_native_mutex_lock(&generic_fields_lock);
+    rb_native_mutex_lock(&GET_VM()->ractor.generic_fields_lock);
     if (has_entry) {
         st_insert(generic_fields_tbl_, key, val);
     }
     FL_SET_RAW(obj, FL_SHAREABLE);
     rb_gc_obj_became_shareable(obj);
-    rb_native_mutex_unlock(&generic_fields_lock);
+    rb_native_mutex_unlock(&GET_VM()->ractor.generic_fields_lock);
 
     if (has_entry) {
         st_delete(src, &key, NULL);  /* owner 専有の per-Ractor 表 */
