@@ -307,6 +307,11 @@ ractor_mark(void *ptr)
      * 触らない（inter-Ractor 値の被覆は root scan 側で行う）。 */
     rb_gc_mark(r->loc);
     rb_gc_mark(r->name);
+    /* default port は shareable なのでここから辿って良い(shref 制約に抵触しない)。
+     * terminated 後も他 Ractor が wrapper 経由で send/value に使うため、wrapper が
+     * 生きる限り生かす。終了済み Ractor は set/台帳の root scan から外れうる
+     * (objspace が orphan merge された後)ので、wrapper marker が唯一の被覆になる。 */
+    rb_gc_mark(r->sync.default_port_value);
 }
 
 /* value_taken リストの直列化。add は successor の実行 thread、unlink は任意 Ractor の
