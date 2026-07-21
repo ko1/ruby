@@ -1511,6 +1511,13 @@ ractor_send_basket(rb_execution_context_t *ec, const struct ractor_port *rp, str
         else {
             b->port_id = ractor_port_id(rp);
             ractor_queue_enq(rp->r, rp->r->sync.recv_queue, b);
+            /* copy snapshot の shref pin(basket_new)からここまでの間に global GC が
+             * 挟まると、step5 の全 shref clear 後に誰も re-pin しない(repin_in_flight は
+             * queue のみ、materialize frame は dequeue 後のみを覆う)。lock 内は
+             * safepoint も malloc-GC も無いので、enqueue と同時に張り直せば窓が閉じる。 */
+            if (b->type == basket_type_copy && !RB_SPECIAL_CONST_P(b->p.v)) {
+                rb_gc_pin_in_flight_message(b->p.v);
+            }
         }
     }
     RACTOR_UNLOCK(rp->r);
