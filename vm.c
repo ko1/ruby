@@ -44,6 +44,7 @@
 #include "vm_core.h"
 #include "vm_callinfo.h"
 #include "vm_debug.h"
+#include "ruby/debug.h"
 #include "vm_exec.h"
 #include "vm_insnhelper.h"
 #include "ractor_core.h"
@@ -4775,6 +4776,7 @@ Init_BareVM(void)
     rb_native_mutex_initialize(&vm->ractor.move_courier_registry_lock);
     ccan_list_head_init(&vm->ractor.move_courier_registry);
     rb_native_mutex_initialize(&vm->gc.registered_globals.lock);
+    vm->gc.orphan_merge_pjob = POSTPONED_JOB_HANDLE_INVALID;
 
     vm_opt_method_def_table = st_init_numtable();
     vm_opt_mid_table = st_init_numtable();
