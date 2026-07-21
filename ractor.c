@@ -1005,6 +1005,11 @@ rb_ractor_stillborn_remove(rb_ractor_t *r, rb_thread_t *th)
         VM_ASSERT(vm->ractor.cnt > 1);
         ccan_list_del(&r->vmlr_node);
         vm->ractor.cnt--;
+        /* insert 時に blocking として数えた分(vm_insert_ractor)を戻す。stillborn は一度も
+         * 走らず dec の機会が無いので、戻さないと後続 insert の blocking_cnt<=cnt が破れる。 */
+        VM_ASSERT(r->status_ == ractor_blocking);
+        VM_ASSERT(vm->ractor.blocking_cnt > 0);
+        vm->ractor.blocking_cnt--;
 
         rb_gc_ractor_cache_free(r->newobj_cache);
         r->newobj_cache = NULL;
