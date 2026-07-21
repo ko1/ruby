@@ -66,10 +66,11 @@ static void setup_const_entry(rb_const_entry_t *, VALUE, VALUE, rb_const_flag_t)
 static VALUE rb_const_search(VALUE klass, ID id, int exclude, int recurse, int visibility, VALUE *found_in);
 static st_table *generic_fields_tbl_;
 
-/* shareable 用の共有 generic_fields 表を守る mutex。local GC の mark/sweep が
- * この表を引くが VM lock を待てない（barrier 合流で half-collected heap を露出する）
- * ため専用 mutex(vm->ractor.generic_fields_lock)を使う。alloc しうる区間は先に GC を
- * 無効化して自己再入を防ぐ。 */
+/* shareable 用の共有 generic_fields 表を守る mutex。local GC の mark
+ * (rb_mark_generic_ivar)がこの表を引くが VM lock を待てない（barrier 合流で
+ * half-collected heap を露出する）ため専用 mutex(vm->ractor.generic_fields_lock)を
+ * 使う。共有表の掃除は global GC の weak pass(barrier 下)なので lock 不要。
+ * alloc しうる区間は先に GC を無効化して自己再入を防ぐ。 */
 
 typedef int rb_ivar_foreach_callback_func(ID key, VALUE val, st_data_t arg);
 static void rb_field_foreach(VALUE obj, rb_ivar_foreach_callback_func *func, st_data_t arg, bool ivar_only);
