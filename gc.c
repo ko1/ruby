@@ -236,19 +236,18 @@ rb_gc_event_hook(VALUE obj, rb_event_flag_t event)
 
 /* VM destruct の free-at-exit walk は thread/ractor struct を先に free しうるので、
  * current-Ractor 経由の解決が UAF になる。walk 開始前に stash した objspace を返す。 */
-static void *ruby_vm_cleanup_objspace;
 
 void
 rb_gc_stash_cleanup_objspace(void)
 {
-    ruby_vm_cleanup_objspace = rb_gc_get_objspace();
+    GET_VM()->gc.cleanup_objspace = rb_gc_get_objspace();
 }
 
 void *
 rb_gc_get_objspace(void)
 {
-    if (RB_UNLIKELY(ruby_vm_during_cleanup) && ruby_vm_cleanup_objspace) {
-        return ruby_vm_cleanup_objspace;
+    if (RB_UNLIKELY(ruby_vm_during_cleanup) && GET_VM()->gc.cleanup_objspace) {
+        return GET_VM()->gc.cleanup_objspace;
     }
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (cr == NULL) {
@@ -3880,7 +3879,6 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
 /* 所有者を失った zombie objspace（Ractor オブジェクトが回収された）を main へ
  * マージする処理は、main を対象にした postponed job として main の次の safepoint で
  * 走る。orphan を見つけた GC サイクルの内側では走らせない。 */
-static rb_postponed_job_handle_t rlgc_orphan_merge_pjob = POSTPONED_JOB_HANDLE_INVALID;
 
 static void rlgc_orphan_merge_job(void *unused);
 
@@ -3919,9 +3917,9 @@ rb_gc_objspace_retire(void **objspace_slot)
     RB_VM_LOCKING() {
         /* 全 retire/disown 経路で共有。二重の preregister は冪等（同じ func + data で
          * 重複排除される）。 */
-        if (rlgc_orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
-            rlgc_orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
-            if (rlgc_orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+        if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+            GET_VM()->gc.orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
+            if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
                 rb_bug("Could not preregister postponed job for GC");
             }
         }
@@ -3960,13 +3958,13 @@ rb_gc_objspace_disown(void *objspace)
     /* トリガは wait-free（atomic ビット + interrupt フラグ）で sweep 内でも安全。
      * 他 Ractor が存在する前は disown 対象が無く、その頃には handle は preregister
      * 済み（最初の retire で）。一度も開始しなかった Ractor の経路も念のため覆う。 */
-    if (rlgc_orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
-        rlgc_orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
-        if (rlgc_orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+    if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
+        GET_VM()->gc.orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
+        if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
             rb_bug("Could not preregister postponed job for GC");
         }
     }
-    rb_postponed_job_trigger_for_ractor(rlgc_orphan_merge_pjob, vm->ractor.main_ractor->pub.self);
+    rb_postponed_job_trigger_for_ractor(GET_VM()->gc.orphan_merge_pjob, vm->ractor.main_ractor->pub.self);
 }
 
 /* global（stop-the-world）GC サイクルが走行中か。その間は駆動側しか実行できない
@@ -4102,7 +4100,7 @@ rb_gc_zombie_objspaces_atfork(void)
 
     for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
         if (vm->gc.zombie_objspaces[i].owner_slot == NULL) {
-            rb_postponed_job_trigger_for_ractor(rlgc_orphan_merge_pjob, vm->ractor.main_ractor->pub.self);
+            rb_postponed_job_trigger_for_ractor(GET_VM()->gc.orphan_merge_pjob, vm->ractor.main_ractor->pub.self);
             break;
         }
     }
@@ -5019,56 +5017,54 @@ rb_gc_initial_stress_set(VALUE flag)
  * disable_no_rest はこれを切り替え、全 Ractor の自動 GC を止める。現在の Ractor 自身の
  * 再入 GC だけを抑える objspace 単位の無効化は rb_objspace_gc_* と rb_gc_local_*。 */
 /* atomic。どの Ractor も切り替えてよく、各 Ractor の ready_to_gc が読む。 */
-static rb_atomic_t ruby_gc_disabled_global = 0;
 
 /* barrier 下の収集など「途中で GC が起きてはならない」内部区間のカウンタ。ユーザの
  * GC.enable は boolean フラグしか触れないので、並行する区間を破れない。 */
-static rb_atomic_t ruby_gc_disabled_critical = 0;
 
 void
 rb_gc_critical_disable(void)
 {
     rb_gc_impl_gc_rest(rb_gc_get_objspace());
-    RUBY_ATOMIC_INC(ruby_gc_disabled_critical);
+    RUBY_ATOMIC_INC(GET_VM()->gc.disabled_critical);
 }
 
 void
 rb_gc_critical_enable(void)
 {
-    RUBY_ATOMIC_DEC(ruby_gc_disabled_critical);
+    RUBY_ATOMIC_DEC(GET_VM()->gc.disabled_critical);
 }
 
 bool
 rb_gc_gc_disabled_global_p(void)
 {
-    return RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0 ||
-           RUBY_ATOMIC_LOAD(ruby_gc_disabled_critical) != 0;
+    return RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_global) != 0 ||
+           RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_critical) != 0;
 }
 
 VALUE
 rb_gc_enable(void)
 {
-    bool was_disabled = RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0;
-    RUBY_ATOMIC_SET(ruby_gc_disabled_global, 0);
+    bool was_disabled = RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_global) != 0;
+    RUBY_ATOMIC_SET(GET_VM()->gc.disabled_global, 0);
     return RBOOL(was_disabled);
 }
 
 VALUE
 rb_gc_disable_no_rest(void)
 {
-    bool was_disabled = RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0;
-    RUBY_ATOMIC_SET(ruby_gc_disabled_global, 1);
+    bool was_disabled = RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_global) != 0;
+    RUBY_ATOMIC_SET(GET_VM()->gc.disabled_global, 1);
     return RBOOL(was_disabled);
 }
 
 VALUE
 rb_gc_disable(void)
 {
-    bool was_disabled = RUBY_ATOMIC_LOAD(ruby_gc_disabled_global) != 0;
+    bool was_disabled = RUBY_ATOMIC_LOAD(GET_VM()->gc.disabled_global) != 0;
     if (!was_disabled) {
         rb_gc_impl_gc_rest(rb_gc_get_objspace());
     }
-    RUBY_ATOMIC_SET(ruby_gc_disabled_global, 1);
+    RUBY_ATOMIC_SET(GET_VM()->gc.disabled_global, 1);
     return RBOOL(was_disabled);
 }
 

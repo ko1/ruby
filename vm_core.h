@@ -853,6 +853,16 @@ typedef struct rb_vm_struct {
             VALUE **addrs;              /* rb_gc_register_address: *addr を mark_maybe */
             size_t addrs_cnt, addrs_capa;
         } registered_globals;
+
+        /* RLGC: GC.disable の process-wide 化(決定事項7)。global=GC.disable、
+         * critical=内部の短期 disable。どちらも atomic カウンタ。 */
+        rb_atomic_t disabled_global;
+        rb_atomic_t disabled_critical;
+        /* orphan objspace を main へ併合する postponed job の handle
+         * (rb_postponed_job_handle_t。未登録は POSTPONED_JOB_HANDLE_INVALID)。 */
+        unsigned int orphan_merge_pjob;
+        /* VM 終了処理中に objspace 解決へ使う(rb_gc_get_objspace の cleanup 経路)。 */
+        void *cleanup_objspace;
     } gc;
 
     rb_at_exit_list *at_exit;
