@@ -854,10 +854,11 @@ typedef struct rb_vm_struct {
             size_t addrs_cnt, addrs_capa;
         } registered_globals;
 
-        /* RLGC: GC.disable の process-wide 化(決定事項7)。global=GC.disable、
-         * critical=内部の短期 disable。どちらも atomic カウンタ。 */
-        rb_atomic_t disabled_global;
-        rb_atomic_t disabled_critical;
+        /* RLGC: GC を止めている holder の数(atomic)。GC.disable した Ractor
+         * (per-Ractor の gc_disabled フラグ、1 Ractor で高々 1)と、内部の短期
+         * critical 区間が holder になる。1 つでも居れば全 GC を止める。
+         * GC.enable は自分の hold しか外さない(他 Ractor の disable を踏み潰さない)。 */
+        rb_atomic_t disable_holders;
         /* orphan objspace を main へ併合する postponed job の handle
          * (rb_postponed_job_handle_t。未登録は POSTPONED_JOB_HANDLE_INVALID)。 */
         unsigned int orphan_merge_pjob;
