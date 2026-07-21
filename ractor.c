@@ -315,17 +315,15 @@ ractor_mark(void *ptr)
 }
 
 /* value_taken リストの直列化。add は successor の実行 thread、unlink は任意 Ractor の
- * sweep(ractor_free)、scan は owner の local GC と global GC から並行に走るので leaf lock で
- * 守る。臨界区間は純粋なポインタ操作のみで safepoint を含まない（含めると STW mark が
- * half-linked list を見る）。Init_Ractor で初期化。 */
-static rb_nativethread_lock_t value_taken_lock;
-
+ * sweep(ractor_free)、scan は owner の local GC と global GC から並行に走るので
+ * vm->ractor.value_taken_lock(leaf lock)で守る。臨界区間は純粋なポインタ操作のみで
+ * safepoint を含まない（含めると STW mark が half-linked list を見る）。 */
 static void
 rb_ractor_value_taken_add(rb_ractor_t *successor, rb_ractor_t *taken)
 {
-    rb_native_mutex_lock(&value_taken_lock);
+    rb_native_mutex_lock(&GET_VM()->ractor.value_taken_lock);
     ccan_list_add_tail(&successor->value_taken, &taken->value_held_node);
-    rb_native_mutex_unlock(&value_taken_lock);
+    rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
 }
 
 /* Ractor r の C 構造体から到達可能な GC root を mark する。local GC は heap 上の
@@ -347,12 +345,12 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
      * #value が返さず（successor は受け取らない）終了 Ractor では teardown で解放されうる。
      * 解放済みスロットを pin すると poison するのでここでは触らない。 */
     rb_ractor_t *taken;
-    rb_native_mutex_lock(&value_taken_lock);
+    rb_native_mutex_lock(&GET_VM()->ractor.value_taken_lock);
     ccan_list_for_each(&r->value_taken, taken, value_held_node) {
         VALUE slot[] = { taken->sync.legacy };
         rb_gc_mark_vm_stack_values((long)numberof(slot), slot);
     }
-    rb_native_mutex_unlock(&value_taken_lock);
+    rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
 }
 
 /* 終了済みで未 free の Ractor の join 用スロット（戻り値・default port・stdin 等）を mark
@@ -420,7 +418,7 @@ ractor_free(void *ptr)
      * 残る子を全て unlink する。これを怠ると、この struct の解放後に子の ractor_free の
      * ccan_list_del が freed head へ prev/next を書く(UAF write)。同一 sweep で successor
      * と子が共に回収される時(#value 連鎖 + global GC)に顕在化する。 */
-    rb_native_mutex_lock(&value_taken_lock);
+    rb_native_mutex_lock(&GET_VM()->ractor.value_taken_lock);
     ccan_list_del_init(&r->value_held_node);
     {
         rb_ractor_t *taken, *nxt;
@@ -428,7 +426,7 @@ ractor_free(void *ptr)
             ccan_list_del_init(&taken->value_held_node);
         }
     }
-    rb_native_mutex_unlock(&value_taken_lock);
+    rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
 
     if (!r->main_ractor) {
         /* この Ractor の generic_fields 表を main へ移送する。struct と共に失うと、
@@ -709,6 +707,11 @@ rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th)
     // initialize as a main ractor
     vm->ractor.cnt = 0;
     vm->ractor.blocking_cnt = 0;
+    /* 他スレッドが保持したまま fork した可能性があるので、子では lock を作り直す
+     * (generic_fields_lock の atfork 再初期化と同じ理由)。registry の list head は
+     * 生き残った courier の node が繋がったままなので触らない。 */
+    rb_native_mutex_initialize(&vm->ractor.value_taken_lock);
+    rb_native_mutex_initialize(&vm->ractor.move_courier_registry_lock);
     /* fork 後は main Ractor だけが生きる。生成中カバーは無効化する。set は直前の
      * rb_vm_living_threads_init が空にし、zombie 台帳は terminate_atfork が退避した
      * 非main objspace を保持したまま orphan merge に委ねる。 */
@@ -1310,18 +1313,9 @@ ractor_moved_missing(int argc, VALUE *argv, VALUE self)
  *
  */
 
-/* 転送中 move courier の VM グローバルな registry(定義は上、詳細は move_courier_registry_add
- * 付近のコメント)。Init_Ractor より前に置き、Init と registry 関数の両方から見えるようにする。 */
-static struct ccan_list_head move_courier_registry;
-static rb_nativethread_lock_t move_courier_registry_lock;
-
 void
 Init_Ractor(void)
 {
-    ccan_list_head_init(&move_courier_registry);
-    rb_native_mutex_initialize(&move_courier_registry_lock);
-    rb_native_mutex_initialize(&value_taken_lock);
-
     rb_cRactor = rb_define_class("Ractor", rb_cObject);
     rb_undef_alloc_func(rb_cRactor);
 
@@ -2447,22 +2441,22 @@ struct rb_ractor_move_courier {
  * 各 Ractor から並行に走るので lock を取るが、mark は STW なので lock 不要。lockless mark が
  * 成り立つのは add/remove が safepoint を含まない（allocation も割込み検査も無い）ため。ここに
  * それらを足すと half-linked list を barrier 越しに mark しうるので禁止。
- * (実体は move_courier_registry / move_courier_registry_lock、Init_Ractor より前で定義。) */
+ * (実体は vm->ractor.move_courier_registry / 同 _lock。) */
 
 static void
 move_courier_registry_add(struct rb_ractor_move_courier *c)
 {
-    rb_native_mutex_lock(&move_courier_registry_lock);
-    ccan_list_add(&move_courier_registry, &c->reg_node);
-    rb_native_mutex_unlock(&move_courier_registry_lock);
+    rb_native_mutex_lock(&GET_VM()->ractor.move_courier_registry_lock);
+    ccan_list_add(&GET_VM()->ractor.move_courier_registry, &c->reg_node);
+    rb_native_mutex_unlock(&GET_VM()->ractor.move_courier_registry_lock);
 }
 
 static void
 move_courier_registry_remove(struct rb_ractor_move_courier *c)
 {
-    rb_native_mutex_lock(&move_courier_registry_lock);
+    rb_native_mutex_lock(&GET_VM()->ractor.move_courier_registry_lock);
     ccan_list_del(&c->reg_node);
-    rb_native_mutex_unlock(&move_courier_registry_lock);
+    rb_native_mutex_unlock(&GET_VM()->ractor.move_courier_registry_lock);
 }
 
 void rb_ractor_move_courier_mark(struct rb_ractor_move_courier *c);
@@ -2472,7 +2466,7 @@ void
 rb_ractor_move_courier_registry_mark(void)
 {
     struct rb_ractor_move_courier *c;
-    ccan_list_for_each(&move_courier_registry, c, reg_node) {
+    ccan_list_for_each(&GET_VM()->ractor.move_courier_registry, c, reg_node) {
         rb_ractor_move_courier_mark(c);
     }
 }
