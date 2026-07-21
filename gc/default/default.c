@@ -783,6 +783,19 @@ typedef struct rb_global_objspace {
         char *arena_cursor;              /* 最新アリーナの未切り出しの先頭 body */
         char *arena_end;
     } page_pool;
+
+    /* 前回 global サイクル後に残った zombie ページ数(≒生存データ)。barrier 下で更新、
+     * 読み手(rlgc_global_wanted_p)は racy でよい。 */
+    size_t zombie_pages_survivors;
+
+    /* objspace 併合中(rlgc_objspace_absorb)。グラフが流動的な間、cross-objspace verifier
+     * 検査を抑止する。書き手は absorb スレッド、読み手は world 停止下の verify。 */
+    bool during_absorb;
+
+    /* gc_enter のロック方針が使う main の objspace。Ractor 生成中に main_ractor->objspace が
+     * 一時的に差し替わるため、GC の両端で同じ判定をするよう安定したポインタを別に持つ。
+     * 起動時に設定し、fork した子では貼り直す。 */
+    rb_objspace_t *main_objspace;
 } rb_global_objspace_t;
 
 static rb_global_objspace_t rb_global_objspace_instance;
@@ -796,9 +809,6 @@ static rb_global_objspace_t *global_objspace = NULL;
  * （小さな Ractor の objspace は約 13 ページなので大量廃棄でも越えにくく、肥えた
  * zombie は 1 つで越える）。 */
 #define RLGC_ZOMBIE_PAGES_TRIGGER 256
-/* 前回 global サイクル後に残った zombie ページ数（≒生存データ）。barrier 下で更新、
- * 読み手（rlgc_global_wanted_p）は racy でよい。 */
-static size_t rlgc_zombie_pages_survivors = 0;
 
 /* mark/sweep の述語は objspace ごとの during_global_gc を見る。これは driver が
  * barrier 下で取る反復用スナップショット。 */
@@ -815,20 +825,10 @@ static struct {
 /* 死んだ Ractor の objspace を別へ併合中は true。併合中は VM グローバル root 表が
  * 未併合の src を指しオブジェクトも移動途中なので、verifier の cross-objspace 検査は
  * 一時的な非 heap/foreign エッジを見る。この間は抑止し、次の通常 GC が検証する。 */
-static bool rlgc_during_absorb = false;
 
-/* world 停止中の verify（VM lock+barrier を取る GC.verify、または barrier を持つ
- * global GC）でのみ true。cross-objspace 検査は全 objspace のページを走査するため
- * world 停止時のみ健全で、mid-local-GC の verify では他 Ractor の
- * lock-free 割り当てと競合する（SEGV）。false 時は当該検査をスキップする。 */
-static bool rlgc_verify_world_stopped = false;
 
 static void rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
-/* gc_enter のロック方針が使う main の objspace。Ractor 生成中に
- * main_ractor->objspace が一時的に差し替わるため、GC の両端で同じ判定をするよう
- * 安定したポインタを別に持つ。起動時に設定し、fork した子では貼り直す。 */
-static rb_objspace_t *rlgc_main_objspace;
 
 static struct heap_page_body *page_pool_acquire(void);
 static void page_pool_release(struct heap_page_body *body);
@@ -4379,7 +4379,7 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
      * その表を守るので不要。compacting な local GC は GC 全体の lock を持つので無害に nest する。
      * 非 main Ractor の local GC はそれらの shareable を free しないので取らない。 */
     const bool sweep_needs_vm_lock =
-        objspace == rlgc_main_objspace && rb_multi_ractor_p() && !objspace->during_global_gc;
+        objspace == global_objspace->main_objspace && rb_multi_ractor_p() && !objspace->during_global_gc;
     unsigned int sweep_lock_lev = 0;
     if (sweep_needs_vm_lock) sweep_lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
 
@@ -5958,6 +5958,9 @@ gc_marks_check(rb_objspace_t *objspace, st_foreach_callback_func *checker_func, 
 
 struct verify_internal_consistency_struct {
     rb_objspace_t *objspace;
+    /* world 停止下の verify(VM lock+barrier の GC.verify、または barrier 持ちの global GC)で
+     * のみ true。cross-objspace 検査(全 objspace のページ走査)はこの時のみ健全。 */
+    bool world_stopped;
     int err_count;
     size_t live_object_count;
     size_t zombie_object_count;
@@ -6053,7 +6056,7 @@ check_children_i(const VALUE child, void *ptr)
      * （verify_pointer_in_any_heap_p）。これは world 停止時のみ健全で、mid-local-GC の
      * verify では他 Ractor が lock-free に割り当て・ページ構造を変更し競合する（SEGV）。
      * その場合はスキップし、次の world 停止 verify が再検査する。 */
-    if (!rlgc_verify_world_stopped) return;
+    if (!data->world_stopped) return;
 
     /* 非 heap の child がこの callback に来るのは、stale なフィールドを素の rb_gc_mark で
      * たどった場合だけ（兄弟 struct が先に free された、生きているが到達不能な wrapper の
@@ -6061,7 +6064,7 @@ check_children_i(const VALUE child, void *ptr)
      * unmap されているかも）で原因フィールドを soak をまたいで特定するため。 */
     if (!verify_pointer_in_any_heap_p((void *)child)) {
         /* 併合途中はグラフが流動的で、一時的な非 heap エッジは想定内。併合後に再検査する。 */
-        if (rlgc_during_absorb) return;
+        if (global_objspace->during_absorb) return;
         VALUE w[2] = {0, 0};
         bool readable = false;
 #ifndef _WIN32
@@ -6107,7 +6110,7 @@ check_children_i(const VALUE child, void *ptr)
             !MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(child), child) &&
             !rb_gc_impl_during_global_gc_p(data->objspace) &&
             !rb_gc_current_ractor_materializing_p() &&
-            !rlgc_during_absorb) {
+            !global_objspace->during_absorb) {
             fprintf(stderr, "check_children_i: containment violation: "
                     "unshareable %s (objspace %p) -> foreign unshareable %s (objspace %p)\n",
                     rb_obj_info(data->parent), (void *)data->objspace,
@@ -6172,10 +6175,10 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
     if (RB_SPECIAL_CONST_P(obj)) return;
     /* この検査は全 objspace を走査する（verify_pointer_in_any_heap_p）ので world 停止時のみ
      * 健全。mid-local-GC の verify は他 Ractor の lock-free 割り当てと競合する。 */
-    if (!rlgc_verify_world_stopped) return;
+    if (!data->world_stopped) return;
     /* 併合途中は VM グローバル root 表が未併合の src を指す（一時的な非 heap/foreign root）。
      * 併合後に再検査する。 */
-    if (rlgc_during_absorb) return;
+    if (global_objspace->during_absorb) return;
     if (strcmp(category, "machine_context") == 0 ||
         strcmp(category, "vm_registered_objects") == 0 ||
         strcmp(category, "end_proc") == 0 ||
@@ -6402,11 +6405,12 @@ gc_verify_heap_pages(rb_objspace_t *objspace)
 }
 
 static void
-gc_verify_internal_consistency_(rb_objspace_t *objspace)
+gc_verify_internal_consistency_(rb_objspace_t *objspace, bool world_stopped)
 {
     struct verify_internal_consistency_struct data = {0};
 
     data.objspace = objspace;
+    data.world_stopped = world_stopped;
     gc_report(5, objspace, "gc_verify_internal_consistency: start\n");
 
     /* check relations */
@@ -6512,7 +6516,7 @@ gc_during_gc_set(rb_objspace_t *objspace, unsigned int v)
  * foreign な os の per-objspace verify を走らせるため、driver 側の during_gc も消す必要がある
  * （cur == objspace のときは no-op）。 */
 static void
-gc_verify_internal_consistency_body(rb_objspace_t *objspace)
+gc_verify_internal_consistency_body(rb_objspace_t *objspace, bool world_stopped)
 {
     const unsigned int prev_during_gc = during_gc;
     during_gc = FALSE; // stop gc here
@@ -6521,7 +6525,7 @@ gc_verify_internal_consistency_body(rb_objspace_t *objspace)
     const unsigned int prev_cur_during_gc = (cur != objspace) ? gc_during_gc_get(cur) : 0;
     if (cur != objspace) gc_during_gc_set(cur, FALSE);
     {
-        gc_verify_internal_consistency_(objspace);
+        gc_verify_internal_consistency_(objspace, world_stopped);
     }
     if (cur != objspace) gc_during_gc_set(cur, prev_cur_during_gc);
     during_gc = prev_during_gc;
@@ -6541,20 +6545,14 @@ gc_verify_internal_consistency(void *objspace_ptr)
     if (during_gc) {
         /* world が止まるのは global GC の driver がこれを走らせるとき（barrier 保持）だけ。
          * 非 main の worker GC は他 Ractor を止めない。 */
-        const bool prev_ws = rlgc_verify_world_stopped;
-        rlgc_verify_world_stopped = rb_gc_impl_during_global_gc_p(objspace);
-        gc_verify_internal_consistency_body(objspace);
-        rlgc_verify_world_stopped = prev_ws;
+        gc_verify_internal_consistency_body(objspace, rb_gc_impl_during_global_gc_p(objspace));
         return;
     }
 
     unsigned int lev = RB_GC_VM_LOCK();
     {
         rb_gc_vm_barrier(); // stop other ractors
-        const bool prev_ws = rlgc_verify_world_stopped;
-        rlgc_verify_world_stopped = true;   // barrier 保持中なので全 objspace 走査は健全
-        gc_verify_internal_consistency_body(objspace);
-        rlgc_verify_world_stopped = prev_ws;
+        gc_verify_internal_consistency_body(objspace, true); // barrier 保持中なので全 objspace 走査は健全
     }
     RB_GC_VM_UNLOCK(lev);
 }
@@ -7829,7 +7827,7 @@ rlgc_global_wanted_p(rb_objspace_t *objspace)
      * 全 Ractor の GC を恒久的に STW 化するのを防ぐ。 */
     {
         size_t zp = rb_gc_vm_zombie_total_pages();
-        size_t base = rlgc_zombie_pages_survivors < zp ? rlgc_zombie_pages_survivors : zp;
+        size_t base = global_objspace->zombie_pages_survivors < zp ? global_objspace->zombie_pages_survivors : zp;
         if (zp - base >= RLGC_ZOMBIE_PAGES_TRIGGER) return true;
     }
     /* retention。自分の root から到達不能な shareable（mark 末尾の pin で数える）が、前回の
@@ -8181,7 +8179,7 @@ gc_local_gc_holds_vm_lock(const rb_objspace_t *objspace)
      * JIT 有効時に GC 全体で lock を保持する。一般 mark が shareable iseq の payload で
      * rb_yjit_iseq_mark / rb_zjit_iseq_mark に届き、他 Ractor の並行 JIT コンパイルから排他する
      * 必要があるため（rb_iseq_mark_and_move がそこで VM lock を assert する）。 */
-    return objspace == rlgc_main_objspace &&
+    return objspace == global_objspace->main_objspace &&
            (objspace->flags.during_compacting || rb_yjit_enabled_p || rb_zjit_enabled_p);
 }
 
@@ -8791,7 +8789,7 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
      * 無いと、どの pass も merge しない joinable(slotted) zombie の retire 時の stale な数値で
      * 上のページ trigger が発火し続ける。 */
     rb_gc_vm_refresh_zombie_pages();
-    rlgc_zombie_pages_survivors = rb_gc_vm_zombie_total_pages();
+    global_objspace->zombie_pages_survivors = rb_gc_vm_zombie_total_pages();
 
     /* 上の sweep が未 join の Ractor オブジェクトを回収した場合、ractor_free がその zombie ledger
      * エントリを disown し merge を main Ractor へ postponed job として投げている。objspace は
@@ -8818,9 +8816,9 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
 {
     GC_ASSERT(dst != src);
 
-    /* グラフが流動的な間は cross-objspace verifier 検査を抑止する（rlgc_during_absorb 参照）。 */
-    const bool prev_absorb = rlgc_during_absorb;
-    rlgc_during_absorb = true;
+    /* グラフが流動的な間は cross-objspace verifier 検査を抑止する（global_objspace->during_absorb 参照）。 */
+    const bool prev_absorb = global_objspace->during_absorb;
+    global_objspace->during_absorb = true;
 
     /* まず dst を落ち着かせる。lazy sweep カーソルが heap リストを歩いている最中にページを
      * 追加すると、併合ページを src の stale mark bit で sweep して生きたオブジェクトを free
@@ -9020,7 +9018,7 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
 
     if (dst_gc_was_enabled) rb_gc_impl_gc_enable(dst);
 
-    rlgc_during_absorb = prev_absorb;
+    global_objspace->during_absorb = prev_absorb;
 }
 
 void
@@ -11975,7 +11973,7 @@ rb_gc_impl_after_fork(void *objspace_ptr, rb_pid_t pid)
     if (pid == 0) { /* child process */
         heap_alloc_state_clear(objspace);
         /* fork した Ractor が子プロセスの main Ractor になる。 */
-        rlgc_main_objspace = objspace;
+        global_objspace->main_objspace = objspace;
     }
 }
 
@@ -12075,11 +12073,11 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
         ccan_list_head_init(&heap->pages);
     }
 
-    if (rlgc_main_objspace == NULL) {
+    if (global_objspace->main_objspace == NULL) {
         /* 起動時の単一スレッド。最初の objspace は main のもの。プロセス共通の定数はここで
          * 1 度だけ計算する。後の objspace_init（Ractor 生成）が同じ値でも書き直すと、他スレッドの
          * lock-free な読み取りと競合する。 */
-        rlgc_main_objspace = objspace;
+        global_objspace->main_objspace = objspace;
 
         init_size_to_heap_idx();
 
