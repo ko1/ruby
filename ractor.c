@@ -3138,8 +3138,12 @@ ractor_native_shallow_copy(VALUE obj)
         return Qundef;
     }
 
-    /* 非 T_OBJECT ホストは instance 変数を generic fields 表に持つので複製する。 */
-    if (BUILTIN_TYPE(obj) != T_OBJECT && UNLIKELY(rb_obj_gen_fields_p(obj))) {
+    /* 非 T_OBJECT ホストは instance 変数を generic fields 表に持つので複製する。
+     * T_HASH は rb_hash_dup が内部で rb_copy_generic_ivar 済み(hash.c)なので除外する。
+     * 二重に呼ぶと 1 回目で copy が ivar shape になり、2 回目の rb_shape_rebuild が
+     * SHAPE_ROOT 前提 assert で落ちる(RUBY_DEBUG build で決定論)。 */
+    if (BUILTIN_TYPE(obj) != T_OBJECT && BUILTIN_TYPE(obj) != T_HASH &&
+        UNLIKELY(rb_obj_gen_fields_p(obj))) {
         rb_copy_generic_ivar(copy, obj);
     }
 
