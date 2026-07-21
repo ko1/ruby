@@ -6149,15 +6149,22 @@ check_shareable_i(const VALUE child, void *ptr)
     }
 }
 
+/* shareable 検証 walk 中であることを示す flag。mark 側の gate(T_OBJECT の as.extended、
+ * iseq/cref/hook の unshareable 子)がこれを見て、検証 walk にだけ子の traverse を抑制する。
+ * process global にすると、検証中とは別の Ractor の lock-free local GC までもが gate を
+ * 踏み、live オブジェクトの fields imemo 等の mark を skip → sweep が回収して dangling を
+ * 作る(upstream は GC が常に VM lock 下なので global でも安全だった)。walk は同期的で
+ * switch point が無いので、thread local が検証スレッドだけを正確に覆う。 */
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+static RB_THREAD_LOCAL_SPECIFIER bool gc_checking_shareable = false;
+#else
+/* native TLS が無い環境は従来どおり process global + VM lock(検証は RUBY_DEBUG 限定)。 */
 static bool gc_checking_shareable = false;
+#endif
 
 static void
 gc_verify_shareable(void *objspace, VALUE obj, void *data)
 {
-    // while gc_checking_shareable is true,
-    // other Ractors should not run the GC, until the flag is not local.
-    // TODO: remove VM locking if the flag is Ractor local
-
     unsigned int lev = RB_GC_VM_LOCK();
     {
         gc_checking_shareable = true;
