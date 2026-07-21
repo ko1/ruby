@@ -14,7 +14,6 @@
 
 /* 転送中の move payload。off-heap にシリアライズされる（ractor.c で定義）。 */
 struct rb_ractor_move_courier;
-struct rlgc_materialize_frame;
 
 struct rb_ractor_sync {
     // ractor lock
@@ -47,10 +46,6 @@ struct rb_ractor_sync {
     VALUE legacy;
     bool legacy_exc;
 
-    /* 転送中の materialize の chain（新しい順、copy receive 1 件に 1 frame）。root scan と
-     * global GC の re-pin が再構築中も sender 側 snapshot を生かす。ネスト receive に備え
-     * chain とし、machine stack 上で TAG 保護下に push/pop するので raise でも復元される。
-     * move の courier は in-flight registry(ractor.c)が root にするので frame には載らない。 */
     /* copy を materialize 中の receive の数（owner threads のみが GVL 下で更新）。 */
     int materializing_copies;
 };
@@ -178,11 +173,6 @@ struct rb_ractor_struct {
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
 void rb_ractor_mark_terminated_join_value(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
-void rb_ractor_pin_inherited_parts(rb_ractor_t *r);
-
-/* Ractor-local 化した VM グローバル root（旧 vm->global_object_list /
- * vm->mark_object_ary）の登録・解除・移管。GC sweep（ractor_free）からも呼ばれるので
- * raw malloc/realloc/free のみを使う。 */
 
 /* src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする
  * （Ractor#value join / orphan free）。実装は variable.c。st は raw malloc なので
