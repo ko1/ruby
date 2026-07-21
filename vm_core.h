@@ -687,6 +687,9 @@ typedef const struct rb_builtin_function *RB_BUILTIN;
 struct gc_mark_func_data_struct {
     void *data;
     void (*mark_func)(VALUE v, void *data);
+    /* shareable 検証 walk 中の印(rb_gc_checking_shareable が読む)。slot 自体が
+     * per-Ractor なので、検証している Ractor の walk にだけ作用する。 */
+    bool checking_shareable;
 };
 
 typedef struct rb_vm_struct {
