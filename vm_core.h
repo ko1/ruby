@@ -722,6 +722,13 @@ typedef struct rb_vm_struct {
 #endif
         } sync;
 
+        /* RLGC: Ractor 転送/継承機構の VM-wide lock 群と in-flight move courier の
+         * registry。いずれも leaf lock(臨界区間に safepoint を含めない)。 */
+        rb_nativethread_lock_t generic_fields_lock;   /* variable.c の共有 generic-fields 表 */
+        rb_nativethread_lock_t value_taken_lock;      /* value_taken リスト(add/unlink/scan) */
+        struct ccan_list_head move_courier_registry;  /* 転送中 courier(ractor.c)。global GC が mark */
+        rb_nativethread_lock_t move_courier_registry_lock;
+
 #ifdef RUBY_THREAD_PTHREAD_H
         // ractor scheduling
         struct {
