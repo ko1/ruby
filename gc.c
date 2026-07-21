@@ -6144,41 +6144,34 @@ check_shareable_i(const VALUE child, void *ptr)
     }
 }
 
-/* shareable 検証 walk 中であることを示す flag。mark 側の gate(T_OBJECT の as.extended、
- * iseq/cref/hook の unshareable 子)がこれを見て、検証 walk にだけ子の traverse を抑制する。
- * process global にすると、検証中とは別の Ractor の lock-free local GC までもが gate を
- * 踏み、live オブジェクトの fields imemo 等の mark を skip → sweep が回収して dangling を
- * 作る(upstream は GC が常に VM lock 下なので global でも安全だった)。walk は同期的で
- * switch point が無いので、thread local が検証スレッドだけを正確に覆う。 */
-#ifdef RB_THREAD_LOCAL_SPECIFIER
-static RB_THREAD_LOCAL_SPECIFIER bool gc_checking_shareable = false;
-#else
-/* native TLS が無い環境は従来どおり process global + VM lock(検証は RUBY_DEBUG 限定)。 */
-static bool gc_checking_shareable = false;
-#endif
-
-static void
-gc_verify_shareable(void *objspace, VALUE obj, void *data)
-{
-    unsigned int lev = RB_GC_VM_LOCK();
-    {
-        gc_checking_shareable = true;
-        rb_objspace_reachable_objects_from(obj, check_shareable_i, (void *)data);
-        gc_checking_shareable = false;
-    }
-    RB_GC_VM_UNLOCK(lev);
-}
-
-// TODO: only one level (non-recursive)
+/* obj の直接の子を 1 段だけ traversal API で列挙し、shareable 制約
+ * (shareable の子は shareable か shref 記録付き unshareable)を検査する。
+ * 「検証 walk 中」の印は per-Ractor の mark_func_data slot に載せる。process global な
+ * flag だと、検証中とは別の Ractor の lock-free local GC までもが mark gate を踏んで
+ * live オブジェクトの子(fields imemo 等)の mark を skip し、sweep が回収して dangling を
+ * 作る(upstream は GC が常に VM lock 下なので global でも安全だった)。slot は自 Ractor
+ * 専有で walk は同期的なので、lock は不要。 */
 void
 rb_gc_verify_shareable(VALUE obj)
 {
-    rb_objspace_t *objspace = rb_gc_get_objspace();
     struct check_shareable_data data = {
         .parent = obj,
         .err_count = 0,
     };
-    gc_verify_shareable(objspace, obj, &data);
+
+    if (!RB_SPECIAL_CONST_P(obj)) {
+        struct gc_mark_func_data_struct **mfdp = GC_MARK_FUNC_DATA_SLOTP();
+        struct gc_mark_func_data_struct *prev_mfd = *mfdp;
+        struct gc_mark_func_data_struct mfd = {
+            .mark_func = check_shareable_i,
+            .data = &data,
+            .checking_shareable = true,
+        };
+
+        *mfdp = &mfd;
+        rb_gc_mark_children(rb_gc_get_objspace(), obj);
+        *mfdp = prev_mfd;
+    }
 
     if (data.err_count > 0) {
         rb_bug("rb_gc_verify_shareable");
@@ -6188,7 +6181,8 @@ rb_gc_verify_shareable(VALUE obj)
 bool
 rb_gc_checking_shareable(void)
 {
-    return gc_checking_shareable;
+    const struct gc_mark_func_data_struct *mfd = *GC_MARK_FUNC_DATA_SLOTP();
+    return mfd && mfd->checking_shareable;
 }
 
 /*
