@@ -2962,21 +2962,11 @@ rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
                 rb_ary_push(shell, RARRAY_AREF(shells, n->u.ary.elems[j]));
             }
             break;
-          case MOVE_K_HASH: {
-            for (long j = 0; j < n->u.hash.size; j++) {
-                rb_hash_aset(shell, RARRAY_AREF(shells, n->u.hash.kv[2 * j]),
-                             RARRAY_AREF(shells, n->u.hash.kv[2 * j + 1]));
-            }
-            /* default 値 / default proc を復元（freeze 前に設定） */
-            VALUE ifnone = RARRAY_AREF(shells, n->u.hash.ifnone_id);
-            if (n->u.hash.proc_default) {
-                rb_hash_set_default_proc(shell, ifnone);
-            }
-            else if (ifnone != Qnil) {
-                rb_hash_set_default(shell, ifnone);
-            }
+          case MOVE_K_HASH:
+            /* entry の挿入は第 3 パスへ遅延する(下記)。挿入は key の #hash/#eql? を
+             * 呼ぶため、graph の中身が埋まる前に挿すと content ベースの custom #hash が
+             * 全 key で衝突し、entry が潰れて値が混ざる(データ喪失)。 */
             break;
-          }
           case MOVE_K_STRUCT:
             for (long j = 0; j < n->u.strct.len; j++) {
                 RSTRUCT_SET(shell, (int)j, RARRAY_AREF(shells, n->u.strct.elems[j]));
@@ -3004,6 +2994,27 @@ rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
         /* instance/generic ivar を復元（全 non-REF node が持ちうる） */
         for (uint32_t j = 0; j < n->niv; j++) {
             rb_ivar_set(shell, n->iv_ids[j], RARRAY_AREF(shells, n->iv_vals[j]));
+        }
+    }
+
+    /* hash の entry 挿入は全 shell の中身が確定した後に行う。node id は DFS で
+     * 子が親より大きいので、逆順に挿せば hash-key 自身が hash のネストでも
+     * 内側から確定する(自分自身を経由する病的な #hash 循環は対象外)。 */
+    for (uint32_t i = c->count; i > 0; i--) {
+        struct move_node *n = &c->nodes[i - 1];
+        if (n->kind != MOVE_K_HASH) continue;
+        VALUE shell = RARRAY_AREF(shells, i - 1);
+        for (long j = 0; j < n->u.hash.size; j++) {
+            rb_hash_aset(shell, RARRAY_AREF(shells, n->u.hash.kv[2 * j]),
+                         RARRAY_AREF(shells, n->u.hash.kv[2 * j + 1]));
+        }
+        /* default 値 / default proc を復元（freeze 前に設定） */
+        VALUE ifnone = RARRAY_AREF(shells, n->u.hash.ifnone_id);
+        if (n->u.hash.proc_default) {
+            rb_hash_set_default_proc(shell, ifnone);
+        }
+        else if (ifnone != Qnil) {
+            rb_hash_set_default(shell, ifnone);
         }
     }
 
