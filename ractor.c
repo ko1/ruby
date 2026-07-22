@@ -1457,11 +1457,9 @@ static inline bool
 ractor_obj_using_gen_fields_table_p(VALUE obj)
 {
     switch (BUILTIN_TYPE(obj)) {
+      case T_STRUCT:
       case T_DATA:
         return false;
-      case T_STRUCT:
-        if (!FL_TEST_RAW(obj, RSTRUCT_GEN_FIELDS)) return false;
-        break;
       default:
         break;
     }
