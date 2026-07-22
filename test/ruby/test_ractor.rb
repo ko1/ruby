@@ -418,6 +418,9 @@ class TestRactor < Test::Unit::TestCase
       end.value
       assert_include(message, "timess")
       assert_include(message, "Did you mean?")
+    RUBY
+  end
+
   # per-Ractor GC では finalizer の登録・テーブル・実行はすべてオブジェクトの
   # Ractor に属する。他 Ractor のオブジェクト（shareable も含む）への定義は拒否する
   def test_define_finalizer_on_foreign_object
