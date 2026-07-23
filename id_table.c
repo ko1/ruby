@@ -395,8 +395,9 @@ rb_managed_id_table_dup(VALUE old_table)
      * shareable. */
     RB_OBJ_SET_SHAREABLE(obj);
     struct rb_id_table *old_tbl = managed_id_table_ptr(old_table);
-    rb_id_table_init(new_tbl, old_tbl->num + 1);
+    rb_id_table_init(new_tbl, old_tbl->num + 1);   /* xmalloc: GC 点 */
     rb_id_table_foreach(old_tbl, managed_id_table_dup_i, new_tbl);
+    RB_GC_GUARD(old_table);
     return obj;
 }
 
@@ -422,12 +423,16 @@ void
 rb_managed_id_table_foreach(VALUE table, rb_id_table_foreach_func_t *func, void *data)
 {
     rb_id_table_foreach(managed_id_table_ptr(table), func, data);
+    /* 実体は EMBEDDABLE(interior pointer)。callback が確保で GC を起こしても
+     * 表本体が conservative scan から漏れないよう VALUE を生かす。 */
+    RB_GC_GUARD(table);
 }
 
 void
 rb_managed_id_table_foreach_values(VALUE table, rb_id_table_foreach_values_func_t *func, void *data)
 {
     rb_id_table_foreach_values(managed_id_table_ptr(table), func, data);
+    RB_GC_GUARD(table);
 }
 
 int
