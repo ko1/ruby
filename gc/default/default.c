@@ -1965,6 +1965,9 @@ void
 rb_gc_impl_set_event_hook(void *objspace_ptr, const rb_event_flag_t event)
 {
     rb_objspace_t *objspace = objspace_ptr;
+    /* FREEOBJ は main objspace のみ（design §3、caller が mask する）。 */
+    GC_ASSERT(!(event & RUBY_INTERNAL_EVENT_FREEOBJ) ||
+              objspace == global_objspace->main_objspace);
     objspace->hook_events = event & RUBY_INTERNAL_EVENT_OBJSPACE_MASK;
 }
 
@@ -4637,6 +4640,9 @@ gc_sweep_start(rb_objspace_t *objspace)
     objspace->rincgc.pooled_slots = 0;
 
     if (RB_UNLIKELY(objspace->hook_events & RUBY_INTERNAL_EVENT_FREEOBJ)) {
+        /* main objspace 以外に FREEOBJ は立たない＝worker の lock-free local
+         * sweep で hook が走ることはない（design §3 の安全前提）。 */
+        GC_ASSERT(objspace == global_objspace->main_objspace);
         gc_sweep_freeobj_hooks(objspace);
     }
 
