@@ -865,6 +865,10 @@ freelist が尽きたときの補充も全部「自分の物」で進む:
 - NEWOBJ / FREEOBJ の tracepoint: NEWOBJ は従来どおり(フック有効時のみ VM ロック下)。
   FREEOBJ のフックは worker の objspace には立てない(worker の local sweep 中に任意の
   Ruby / C コードが走ることを防ぐ。これが立たないことは安全性の前提)。
+  **仕様(2026-07-23 決定): FREEOBJ は main objspace 限定**。`rb_objspace_set_event_hook`
+  が非 main で FREEOBJ bit を mask し、impl の set と sweep 開始が CHECK assert で担保する。
+  per-Ractor 購読は実益なし(帳簿掃除は NEWOBJ の付随・profiler は process 全体を望む)。
+  process 全体への拡張(全 objspace の free イベント収集)は将来課題。
 
 ### 3.1 GC.disable / GC.enable — process-wide と per-objspace の 2 枚のフラグ
 
