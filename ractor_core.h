@@ -50,9 +50,13 @@ struct rb_ractor_sync {
     int materializing_copies;
 };
 
+struct ractor_basket;
+
 /* 転送中の copy payload 再構築 1 件（受信側の machine stack 上に置かれる） */
 struct rlgc_materialize_frame {
     VALUE snapshot;                          /* sender 側 snapshot */
+    const VALUE *pinned;                     /* snapshot 全 node の pin list（basket 所有） */
+    size_t pinned_cnt;
     struct rlgc_materialize_frame *prev;
 };
 
@@ -167,6 +171,13 @@ struct rb_ractor_struct {
     bool gen_fields_capturing;
     struct st_table *gen_fields_capture;
     struct st_table *gen_fields_materialize;
+
+    /* copy snapshot 構築中に全 node を収集する pin list（basket_new が basket へ移送）。
+     * global GC は全 shref を消すため、re-pin は root だけでなく全 node に要る。 */
+    VALUE *pin_capture;
+    size_t pin_capture_cnt, pin_capture_capa;
+    /* basket_new 完了から enqueue 完了までの in-flight copy basket（re-pin の被覆用） */
+    struct ractor_basket *sending_basket;
 }; // rb_ractor_t is defined in vm_core.h
 
 /* Ractor r の C 構造体から GC root を mark する（gc.c の root scan）。 */
