@@ -469,6 +469,10 @@ ractor_free(void *ptr)
     r->registered_marks = NULL;
     r->registered_marks_cnt = r->registered_marks_capa = 0;
 
+    free(r->pin_capture);
+    r->pin_capture = NULL;
+    r->pin_capture_cnt = r->pin_capture_capa = 0;
+
     if (!r->main_ractor) {
         SIZED_FREE(r);
     }
@@ -762,6 +766,9 @@ ractor_init(rb_ractor_t *r, VALUE name, VALUE loc)
     r->gen_fields_capturing = false;
     r->gen_fields_capture = NULL;
     r->gen_fields_materialize = NULL;
+    r->pin_capture = NULL;
+    r->pin_capture_cnt = r->pin_capture_capa = 0;
+    r->sending_basket = NULL;
     st_init_existing_numtable_with_size(&r->pub.targeted_hooks, 0);
     r->pub.hooks.type = hook_list_type_ractor_local;
 
@@ -3163,6 +3170,21 @@ ractor_native_shallow_copy(VALUE obj)
     return copy;
 }
 
+/* copy snapshot 構築中の node を pin list へ追加し、即 pin する。 */
+static void
+ractor_pin_capture_push(rb_ractor_t *cr, VALUE v)
+{
+    if (cr->pin_capture_cnt == cr->pin_capture_capa) {
+        size_t nc = cr->pin_capture_capa ? cr->pin_capture_capa * 2 : 16;
+        VALUE *p = realloc(cr->pin_capture, nc * sizeof(VALUE));
+        if (!p) rb_bug("ractor_pin_capture_push: out of memory");
+        cr->pin_capture = p;
+        cr->pin_capture_capa = nc;
+    }
+    cr->pin_capture[cr->pin_capture_cnt++] = v;
+    rb_gc_pin_in_flight_message(v);
+}
+
 static enum obj_traverse_iterator_result
 copy_enter(VALUE obj, struct obj_traverse_replace_data *data)
 {
@@ -3174,17 +3196,26 @@ copy_enter(VALUE obj, struct obj_traverse_replace_data *data)
         VALUE copy = ractor_native_shallow_copy(obj);
         if (UNDEF_P(copy)) return traverse_stop; /* native copy 不可 */
         data->replacement = copy;
-        /* snapshot 作成中に copy が generic-ivar host なら、その fields_obj を対応表に
-         * 記録する。こうすると受信側 materialize が送信側の per-Ractor 表を跨いで
-         * 読まずに済む。表は host が出て初めて遅延確保する。 */
+        /* snapshot 作成中は全 node を pin list に収集する（basket が保持し、global GC の
+         * re-pin が root だけでなく全 node を再 pin できるように。compaction が snapshot
+         * node を動かすとアドレスキーの対応表や dedup 表が壊れる）。加えて copy が
+         * generic-ivar host なら fields_obj を対応表に記録する（受信側 materialize が
+         * 送信側の per-Ractor 表を跨がないため。表は host が出て初めて遅延確保）。 */
         rb_ractor_t *cr = GET_RACTOR();
-        if (cr->gen_fields_capturing &&
-            BUILTIN_TYPE(copy) != T_OBJECT && rb_obj_gen_fields_p(copy)) {
-            if (cr->gen_fields_capture == NULL) {
-                cr->gen_fields_capture = st_init_numtable();
+        if (cr->gen_fields_capturing) {
+            /* 誕生した瞬間から pin する（shref bit + global compaction 中なら pin bit）。
+             * 構築中の list は rb_ractor_repin_in_flight が cr->pin_capture 経由で
+             * re-pin するので、構築〜enqueue〜materialize まで被覆が途切れない。 */
+            ractor_pin_capture_push(cr, copy);
+            if (BUILTIN_TYPE(copy) != T_OBJECT && rb_obj_gen_fields_p(copy)) {
+                if (cr->gen_fields_capture == NULL) {
+                    cr->gen_fields_capture = st_init_numtable();
+                }
+                VALUE fields_obj = rb_obj_fields_no_ractor_check(copy);
+                st_insert(cr->gen_fields_capture, (st_data_t)copy, (st_data_t)fields_obj);
+                /* 対応表はアドレスで引かれるので fields_obj も動いてはならない。 */
+                ractor_pin_capture_push(cr, fields_obj);
             }
-            st_insert(cr->gen_fields_capture, (st_data_t)copy,
-                      (st_data_t)rb_obj_fields_no_ractor_check(copy));
         }
         return traverse_cont;
     }
