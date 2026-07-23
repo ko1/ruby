@@ -353,20 +353,14 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
     rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
 }
 
-/* 終了済みで未 free の Ractor の join 用スロット（戻り値と default port）を mark かつ
- * pin する。global GC が zombie 台帳から呼ぶ。default port は他 Ractor が終了後も
- * send/value で読む。zombie の C-struct 参照は compaction で更新されないので movable に
- * mark すると移動して stale 化する。 */
+/* 終了済みで未 free の Ractor の戻り値(legacy)を mark+pin する。global GC が
+ * zombie 台帳から呼ぶ。C-struct 参照は compaction で更新されないので pin 必須。
+ * default port は wrapper↔port の相互 mark で被覆済み(両方無到達なら誰も読まない)。 */
 void
 rb_ractor_mark_terminated_join_value(rb_ractor_t *r)
 {
-    /* 他 Ractor が終了後も読む値のみ。戻り値(legacy)と default port。stdin/stdout/
-     * stderr と verbose/debug は終了 Ractor の local 環境で、終了後は誰も読まない
-     * (rb_ractor_stdin 等は現在の Ractor 用)。pin すると freed slot 再 pin で poison
-     * するので、ここでは持たず自然に回収させる。 */
     VALUE slots[] = {
         r->sync.legacy,
-        r->sync.default_port_value,
     };
     rb_gc_mark_vm_stack_values((long)numberof(slots), slots);
 }
