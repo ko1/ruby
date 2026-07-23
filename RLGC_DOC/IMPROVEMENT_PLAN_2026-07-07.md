@@ -173,3 +173,22 @@ bootstraptest/test_ractor.rb:1252 が新仕様(自 objspace は全列挙)で fai
 4. P3 の設計判断を ko1 と確定(B-2 は S-2 案、B-9 は doc 改訂、B-5 は実装時期)
 5. P4 doc 反映(判断確定分から)
 6. 長時間 soak(rebase 後の全構成)で 4.4 の安定性を確定
+
+## 6. 完了状況の追記(2026-07-23 監査)
+
+P1/P2 は全て完了(多くは後続キャンペーンで治癒済みだったことを実装確認):
+- B-13(pjob flush 例外パス→自 Ractor mask 再投入): 実装済み(vm_trace.c 末尾)。
+- 改善5(rb_replace_generic_ivar): 削除済み(無駄削除 8e5cb31ab4 系)。
+- 改善6(newobj_init 誕生時 assert): 実装済み(born-shareable ⇒ GC_ASSERT(wb_protected)
+  + writebarrier_unprotect 側の対 assert)。
+- 改善3(他 objspace zombie finalizer): rb_gc_trigger_finalize_deferred が owner 宛て
+  rb_postponed_job_trigger_for_ractor を発射。absorb 側は dst の pjob 予約。
+- 改善4(objspace 殻の解放漏れ): rlgc_objspace_absorb 末尾で profile.records /
+  mark_stack / weak_references darray を free、malloc 圧は dst へ移送。
+- B-8(move のサブクラス落ち)・改善8(singleton): courier 書き直しで治癒。実挙動で
+  サブクラス保持・特異メソッド保持とも stock 一致を確認。
+- 改善9(恒久テスト昇格): **77af7d33bc** で test_ractor.rb に 5 本追加
+  (stillborn / shared-root move / Port×GC.stress / hash-key move / subclass move)。
+
+未了で残るのは P3(設計判断: 改善1/2/7、B-5=当面無視、B-12=modular GC 後回し)と
+P4(doc 反映)のみ。
