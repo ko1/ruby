@@ -1799,7 +1799,14 @@ rb_gc_obj_free(void *objspace, VALUE obj)
 void
 rb_objspace_set_event_hook(const rb_event_flag_t event)
 {
-    rb_gc_impl_set_event_hook(rb_gc_get_objspace(), event);
+    /* FREEOBJ hook は main objspace 限定（design §3）。worker の lock-free local
+     * sweep 中に hook を走らせない。process 全体への拡張は将来課題。 */
+    rb_event_flag_t e = event;
+    const rb_ractor_t *const cr = rb_current_ractor_raw(false);
+    if (cr != NULL && cr != GET_VM()->ractor.main_ractor) {
+        e &= ~RUBY_INTERNAL_EVENT_FREEOBJ;
+    }
+    rb_gc_impl_set_event_hook(rb_gc_get_objspace(), e);
 }
 
 static int
