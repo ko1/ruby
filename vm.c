@@ -3888,7 +3888,12 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     for (const struct rlgc_materialize_frame *f = ec->materialize_frames; f != NULL; f = f->prev) {
         rb_gc_mark(f->snapshot);
         if (f->snapshot && !RB_SPECIAL_CONST_P(f->snapshot) && rb_gc_during_global_gc_p()) {
+            /* root だけでなく全 node（+ fields_obj 群）。compaction が snapshot node を
+             * 動かすとアドレスキーの対応表や dedup 表が壊れる。 */
             rb_gc_pin_in_flight_message(f->snapshot);
+            for (size_t i = 0; i < f->pinned_cnt; i++) {
+                rb_gc_pin_in_flight_message(f->pinned[i]);
+            }
         }
     }
 

@@ -218,9 +218,14 @@ struct ractor_basket {
         struct rb_ractor_move_courier *move_courier;
         /* native copy snapshot の generic-ivar 対応表 {snapshot host -> fields_obj}。
          * 送信時に構築し受信側 materialize が引く（sender の per-Ractor 表を跨がないため）。
-         * 値は snapshot と共に sender objspace で pin され生きるので別途 mark 不要。
+         * 値は下の pinned list に含めて pin する。
          * 対応表が無い（generic ivar 無し / marshaled / move）ときは NULL。 */
         struct st_table *gen_fields;
+        /* native copy snapshot の全 node + fields_obj 群（構築時に収集、raw malloc）。
+         * global GC の re-pin はこれを舐める（GC 中の graph traverse は generic-ivar の
+         * 表 lookup が要るため不可）。NULL なら root（p.v）のみ pin。 */
+        VALUE *pinned;
+        size_t pinned_cnt;
     } p; // payload
 
     struct ccan_list_node node;
@@ -253,6 +258,15 @@ ractor_basket_mark(const struct ractor_basket *b)
 static void
 ractor_basket_free(struct ractor_basket *b)
 {
+    /* 未 enqueue の basket が raise 等で死ぬ場合、sender の re-pin 用 slot を掃除する。
+     * 他 Ractor（queue 破棄側）の free では一致せず no-op。 */
+    rb_ractor_t *cr = rb_current_ractor_raw(false);
+    if (cr != NULL && cr->sending_basket == b) {
+        cr->sending_basket = NULL;
+    }
+    free(b->p.pinned);
+    b->p.pinned = NULL;
+    b->p.pinned_cnt = 0;
     if (b->type == basket_type_move && b->p.move_courier) {
         /* 未消費の move courier（例: queue の破棄途中）。 */
         rb_ractor_move_courier_free(b->p.move_courier);
@@ -727,6 +741,17 @@ ractor_sync_mark(rb_ractor_t *r)
     }
 }
 
+/* copy basket の payload（root + 収集済み全 node）を re-pin する。 */
+static void
+ractor_basket_repin_in_flight(const struct ractor_basket *b)
+{
+    if (b->type != basket_type_copy) return;
+    rb_gc_pin_in_flight_message(b->p.v);
+    for (size_t i = 0; i < b->p.pinned_cnt; i++) {
+        rb_gc_pin_in_flight_message(b->p.pinned[i]);
+    }
+}
+
 static void
 ractor_queue_repin_in_flight(const struct ractor_queue *rq)
 {
@@ -734,9 +759,7 @@ ractor_queue_repin_in_flight(const struct ractor_queue *rq)
     ccan_list_for_each(&rq->set, b, node) {
         /* move basket は off-heap courier を運ぶ（re-pin する shref は無い）。運ぶ
          * shareable な VALUE は代わりに ractor_basket_mark で mark される。 */
-        if (b->type == basket_type_copy) {
-            rb_gc_pin_in_flight_message(b->p.v);
-        }
+        ractor_basket_repin_in_flight(b);
     }
 }
 
@@ -756,6 +779,14 @@ rb_ractor_repin_in_flight(rb_ractor_t *r)
     if (r->sync.ports) {
         ractor_queue_repin_in_flight(r->sync.recv_queue);
         st_foreach(r->sync.ports, ractor_repin_ports_i, 0);
+    }
+    /* basket_new 済み・未 enqueue の basket（送信路上）。 */
+    if (r->sending_basket != NULL) {
+        ractor_basket_repin_in_flight(r->sending_basket);
+    }
+    /* 構築中の snapshot（prepare_payload の走査中〜basket への移送前）。 */
+    for (size_t i = 0; i < r->pin_capture_cnt; i++) {
+        rb_gc_pin_in_flight_message(r->pin_capture[i]);
     }
     /* materialize 中の snapshot の再 pin は EC の frame 鎖から行う
      * （rb_execution_context_mark。suspend 中の fiber の EC も traversal が拾う）。 */
@@ -983,6 +1014,7 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
                     st_free_table(cr->gen_fields_capture);
                     cr->gen_fields_capture = NULL;
                 }
+                cr->pin_capture_cnt = 0;
                 EC_JUMP_TAG(ec, state);
             }
             if (UNDEF_P(snapshot)) {
@@ -990,6 +1022,7 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
                     st_free_table(cr->gen_fields_capture);
                     cr->gen_fields_capture = NULL;
                 }
+                cr->pin_capture_cnt = 0;
                 snapshot = rb_rescue2(ractor_marshal_dump_body, obj,
                                       ractor_marshal_dump_rescue, obj,
                                       rb_eTypeError, (VALUE)0);
@@ -1009,6 +1042,7 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     bool marshaled = false;
     struct rb_ractor_move_courier *courier = NULL;
     st_table *gen_fields = NULL;
+    (void)gen_fields;
 
     if (type == basket_type_move) {
         /* グラフを off-heap courier へ直列化する。元オブジェクトは RactorMovedObject に
@@ -1018,15 +1052,11 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     }
     else {
         v = ractor_prepare_payload(ec, obj, &type, &marshaled);
-        if (type == basket_type_copy) {
-            /* copy snapshot（native グラフまたは Marshal 文字列）は受信側が
-             * materialize するまで送信側の objspace に在る。shref で pin し、
-             * 送信側の local GC に維持させる。 */
+        /* copy の全 node は構築時（copy_enter）に pin 済みで、cr->pin_capture が
+         * re-pin の被覆源。basket への移送は basket_alloc（malloc→GC 可）の後に行い、
+         * 被覆を途切れさせない。marshal 文字列は走査に載らないのでここで root を pin。 */
+        if (type == basket_type_copy && marshaled) {
             rb_gc_pin_in_flight_message(v);
-            /* native copy の generic-ivar 対応表を basket へ移す（prepare_payload が
-             * cr->gen_fields_capture に構築、marshaled/generic-ivar 無しなら空/NULL）。 */
-            gen_fields = rb_ec_ractor_ptr(ec)->gen_fields_capture;
-            rb_ec_ractor_ptr(ec)->gen_fields_capture = NULL;
         }
     }
 
@@ -1036,7 +1066,22 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     b->p.v = v;
     b->p.marshaled = marshaled;
     b->p.move_courier = courier;
-    b->p.gen_fields = gen_fields;
+    b->p.gen_fields = NULL;
+    b->p.pinned = NULL;
+    b->p.pinned_cnt = 0;
+    if (type == basket_type_copy) {
+        /* pin list と対応表を basket へ移し、enqueue までの re-pin 被覆を
+         * cr->pin_capture から cr->sending_basket へ引き継ぐ（この間に safepoint 無し）。 */
+        rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
+        b->p.gen_fields = cr->gen_fields_capture;
+        cr->gen_fields_capture = NULL;
+        b->p.pinned = cr->pin_capture;
+        b->p.pinned_cnt = cr->pin_capture_cnt;
+        VM_ASSERT(cr->sending_basket == NULL);
+        cr->sending_basket = b;
+        cr->pin_capture = NULL;
+        cr->pin_capture_cnt = cr->pin_capture_capa = 0;
+    }
     return b;
 }
 
@@ -1077,7 +1122,8 @@ ractor_basket_value(struct ractor_basket *b)
         rb_execution_context_t *ec = rb_current_ec_noinline();
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         struct rlgc_materialize_frame frame = {
-            .snapshot = b->p.v, .prev = ec->materialize_frames,
+            .snapshot = b->p.v, .pinned = b->p.pinned, .pinned_cnt = b->p.pinned_cnt,
+            .prev = ec->materialize_frames,
         };
         ec->materialize_frames = &frame;
         cr->sync.materializing_copies++;
@@ -1511,12 +1557,14 @@ ractor_send_basket(rb_execution_context_t *ec, const struct ractor_port *rp, str
         else {
             b->port_id = ractor_port_id(rp);
             ractor_queue_enq(rp->r, rp->r->sync.recv_queue, b);
-            /* copy snapshot の shref pin(basket_new)からここまでの間に global GC が
-             * 挟まると、step5 の全 shref clear 後に誰も re-pin しない(repin_in_flight は
-             * queue のみ、materialize frame は dequeue 後のみを覆う)。lock 内は
-             * safepoint も malloc-GC も無いので、enqueue と同時に張り直せば窓が閉じる。 */
-            if (b->type == basket_type_copy && !RB_SPECIAL_CONST_P(b->p.v)) {
-                rb_gc_pin_in_flight_message(b->p.v);
+            /* basket_new から enqueue までは sender の sending_basket slot が re-pin を
+             * 被覆する。ここからは queue 走査が被覆するので slot を外す（lock 内は
+             * safepoint も malloc-GC も無く、被覆は途切れない）。 */
+            if (b->type == basket_type_copy) {
+                rb_ractor_t *scr = rb_current_ractor_raw(false);
+                if (scr != NULL && scr->sending_basket == b) {
+                    scr->sending_basket = NULL;
+                }
             }
         }
     }

@@ -552,6 +552,32 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  # copy send の in-flight snapshot は GC.compact で動いてはならない
+  # （generic-ivar 同梱表と dedup 表はアドレスキーのため。YJIT で決定論再現した形）
+  def test_copy_genivar_snapshot_survives_compact
+    assert_ractor(<<~'RUBY', timeout: 60, args: [{ "RUBY_YJIT_ENABLE" => "1" }])
+      port = Ractor::Port.new
+      w = Ractor.new(port) do |po|
+        mm = Ractor.receive
+        res = mm.map { |ss| [ss, ss.frozen?, ss.instance_variable_get(:@sku)] }
+        po.send(res)
+      end
+      items = 4.times.map do |i|
+        s = +"item-#{i}"
+        s.instance_variable_set(:@sku, "SKU#{1000 + i}")
+        s.freeze
+      end
+      w.send(items)
+      GC.compact
+      res = port.receive
+      res.each_with_index do |(txt, fz, sku), i|
+        assert_equal "item-#{i}", txt
+        assert fz
+        assert_equal "SKU#{1000 + i}", sku
+      end
+    RUBY
+  end
+
   # move が String/Array/Hash のサブクラスの class を保持すること
   def test_move_preserves_subclass
     assert_ractor(<<~'RUBY', timeout: 60)
