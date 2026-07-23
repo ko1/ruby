@@ -7494,6 +7494,13 @@ rb_gc_impl_pin_in_flight_message(void *objspace_ptr, VALUE obj)
         _MARK_IN_BITMAP(page->shref_bits, page, obj);
         page->has_shref_objects = TRUE;
     }
+    /* shref bit は次の local GC の root になるだけで、進行中の global compaction の
+     * move 判定（pinned_bits）には効かない。payload node が動くとアドレスキーの
+     * 対応表・dedup 表・pin list が壊れるので、barrier 下の re-pin では pin も立てる。 */
+    rb_objspace_t *objspace = objspace_ptr;
+    if (objspace->during_global_gc) {
+        gc_pin(objspace, obj);
+    }
 }
 
 void
