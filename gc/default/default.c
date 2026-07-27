@@ -622,12 +622,11 @@ typedef struct rb_objspace {
     size_t incremental_mark_step_allocated_slots;
 
     /* global GC 起動判定の入力。すべてこの objspace のスレッドが所有する。
-     * shareable_objects は shareable の生存数。stalled_shareables は前回の local GC が
-     * pin だけで生かした（global GC のみが回収できる）オブジェクト数の上限。 */
+     * shareable_objects は shareable の生存数（population）で、これが limit を超えたら
+     * global GC を要求する。 */
     struct {
         size_t shareable_objects;
         size_t shareable_objects_limit;
-        size_t stalled_shareables;
         /* 直近の mark が pinned walk を実行したか。sweep の assert が参照する。 */
         unsigned char last_cycle_pinned;
     } rlgc;
@@ -6676,14 +6675,12 @@ gc_marks_finish(rb_objspace_t *objspace)
     objspace->rlgc.last_cycle_pinned = 0;
     if (!rb_gc_single_objspace_p() && !objspace->during_global_gc) {
         objspace->rlgc.last_cycle_pinned = 1;
-        size_t marked_before = objspace->marked_slots;
         gc_mark_set_parent_raw(objspace, Qundef, false);
         for (int i = 0; i < HEAP_COUNT; i++) {
             rlgc_pinned_roots_mark(objspace, &heaps[i]);
         }
         /* そしてそれらが生かすもの全て。 */
         gc_mark_stacked_objects_all(objspace);
-        objspace->rlgc.stalled_shareables = objspace->marked_slots - marked_before;
     }
 
     gc_update_weak_references(objspace);
@@ -7789,10 +7786,6 @@ rlgc_global_wanted_p(rb_objspace_t *objspace)
         size_t base = global_objspace->zombie_pages_survivors < zp ? global_objspace->zombie_pages_survivors : zp;
         if (zp - base >= RLGC_ZOMBIE_PAGES_TRIGGER) return true;
     }
-    /* retention。自分の root から到達不能な shareable（mark 末尾の pin で数える）が、前回の
-     * global サイクルの survivor 数（shareable_objects_limit = survivors x 2, floor 付き）の
-     * 規模まで溜まった。 */
-    if (objspace->rlgc.stalled_shareables > objspace->rlgc.shareable_objects_limit / 2) return true;
     return false;
 }
 
@@ -8566,12 +8559,6 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
         /* unified mark は正確で pin しない。下の per-objspace sweep は stale な local サイクルに
          * 対して再チェックしてはならない。 */
         objspace->rlgc.last_cycle_pinned = 0;
-        /* stalled_shareables は local サイクルの pinned-roots pass（gc_marks_finish）だけが書く。
-         * 一度 retention trigger を踏むと gc_start が全入口を global サイクルへ短絡し、これを下げ
-         * うる local pass は二度と走らない。survivor が limit を縮め、stale なカウントが勝ち続け、
-         * objspace は永久に STW global GC を回し続ける。この global サイクルが滞留 shareable を
-         * 回収/pin するのでカウントを 0 から再開する。 */
-        objspace->rlgc.stalled_shareables = 0;
         objspace->rgengc.uncollectible_wb_unprotected_objects = 0;
         objspace->rgengc.old_objects = 0;
         objspace->rgengc.last_major_gc = objspace->profile.count;
