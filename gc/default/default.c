@@ -984,22 +984,16 @@ struct heap_page {
     unsigned short free_slots;
     unsigned short final_slots;
     unsigned short pinned_slots;
-    /* bitfield ではなく 1 バイトずつ持つ。has_remembered_objects は lock-free な
-     * write barrier が任意の Ractor スレッドから立てるため、bitfield の read-modify-write
-     * だと隣のフラグへの並行 store を失いうる。バイト単位なら各 store は独立。
-     * 順序: write barrier は bit を立ててからこのフラグを立て、rgengc_rememberset_mark は
-     * フラグを消してから bit を drain するので、競合しても再走査に漏れない。 */
+    /* ページ状態フラグ。writer は所有 Ractor(GVL) か global GC の driver(STW) のみで
+     * 並行しないため bitfield でよい。has_shref/shareable は shref / shareable bit が
+     * このページに 1 つでもある再走査ヒント。 */
     struct {
-        unsigned char before_sweep;
-        unsigned char has_remembered_objects;
-        unsigned char has_uncollectible_wb_unprotected_objects;
+        unsigned int before_sweep : 1;
+        unsigned int has_remembered_objects : 1;
+        unsigned int has_uncollectible_wb_unprotected_objects : 1;
+        unsigned int has_shref_objects : 1;
+        unsigned int has_shareable_objects : 1;
     } flags;
-
-    /* このページのいずれかのオブジェクトに shref / shareable bit が立つと立てる。
-     * バイトにする理由は上のフラグと同じ。bit 自体は所有者スレッドのみが書くので
-     * atomic 不要。 */
-    unsigned char has_shref_objects;
-    unsigned char has_shareable_objects;
 
     rb_heap_t *heap;
 
@@ -2390,8 +2384,8 @@ heap_page_resurrect(rb_objspace_t *objspace)
         objspace->empty_pages = page->free_next;
         /* 空にした際の flag 残留を再利用時に払う。残すと shareable/shref の各走査が
          * 空 bitmap を恒久的に舐め続ける。 */
-        page->has_shareable_objects = FALSE;
-        page->has_shref_objects = FALSE;
+        page->flags.has_shareable_objects = FALSE;
+        page->flags.has_shref_objects = FALSE;
     }
 
     return page;
@@ -2668,7 +2662,7 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
          * ここから shareable を root にする（rlgc_pinned_roots_mark）。 */
         struct heap_page *page = GET_HEAP_PAGE(obj);
         _MARK_IN_BITMAP(page->shareable_bits, page, obj);
-        page->has_shareable_objects = TRUE;
+        page->flags.has_shareable_objects = TRUE;
         objspace->rlgc.shareable_objects++;
     }
 
@@ -3238,7 +3232,7 @@ objspace_each_objects_try(VALUE arg)
                  * foreign な Ractor の objspace の walk は、その Ractor の unshareable を
                  * 決して露出してはならない。呼び出し側は自分の Ractor の構造で走っており
                  * 安全に検査できないため。 */
-                if (page->has_shareable_objects) {
+                if (page->flags.has_shareable_objects) {
                     /* この walk は foreign な objspace 上（barrier 下）で走り、所有者の停止中
                      * lazy sweep を落ち着かせてはならない。落ち着かせると所有者の
                      * obj_free/dfree がこのスレッド・この Ractor の identity で走る
@@ -4355,7 +4349,7 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
      * 継いではならないが、生きた shareable は GC をまたいで pin を保つ必要がある。free slot は
      * ちょうど unmarked なので `bits &= mark_bits` で生きた shareable を残し free slot を消す。
      * freelist 公開前に走るので再利用 slot は常に clean。shareable/shref を持たないページは省略。 */
-    if (sweep_page->has_shareable_objects || sweep_page->has_shref_objects) {
+    if (sweep_page->flags.has_shareable_objects || sweep_page->flags.has_shref_objects) {
         bits_t *shareable_bits = sweep_page->shareable_bits;
         bits_t *shref_bits = sweep_page->shref_bits;
         for (int i = 0; i < bitmap_plane_count; i++) {
@@ -5389,7 +5383,7 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
             !RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE)) {
             struct heap_page *page = GET_HEAP_PAGE(obj);
             _MARK_IN_BITMAP(page->shref_bits, page, obj);
-            page->has_shref_objects = TRUE;
+            page->flags.has_shref_objects = TRUE;
         }
     }
 
@@ -6997,7 +6991,7 @@ rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
      *     old->young 対象と同様で、これが無いと参照元の shareable が歩かれず到達不能に見える。
      * GC 間でオブジェクトが shareable になりうるので、前回の sweep でなく mark 開始時に走る。 */
     ccan_list_for_each(&heap->pages, page, page_node) {
-        if (!(page->has_shareable_objects | page->has_shref_objects)) continue;
+        if (!(page->flags.has_shareable_objects | page->flags.has_shref_objects)) continue;
 
         uintptr_t p = page->start;
         short slot_size = page->slot_size;
@@ -7398,7 +7392,7 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
         struct heap_page *bpage = GET_HEAP_PAGE(b);
         if (!_MARKED_IN_BITMAP(bpage->shref_bits, bpage, b)) {
             _MARK_IN_BITMAP(bpage->shref_bits, bpage, b);
-            bpage->has_shref_objects = TRUE;
+            bpage->flags.has_shref_objects = TRUE;
         }
     }
 
@@ -7438,7 +7432,7 @@ rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
     struct heap_page *page = GET_HEAP_PAGE(obj);
     if (_MARKED_IN_BITMAP(page->shareable_bits, page, obj)) return;
     _MARK_IN_BITMAP(page->shareable_bits, page, obj);
-    page->has_shareable_objects = TRUE;
+    page->flags.has_shareable_objects = TRUE;
     page->objspace->rlgc.shareable_objects++;
 
     /* unshareable だった頃の shref 記録はもう不要（shareable pin が覆う）。shref は
@@ -7457,7 +7451,7 @@ rb_gc_impl_pin_in_flight_message(void *objspace_ptr, VALUE obj)
     struct heap_page *page = GET_HEAP_PAGE(obj);
     if (!_MARKED_IN_BITMAP(page->shref_bits, page, obj)) {
         _MARK_IN_BITMAP(page->shref_bits, page, obj);
-        page->has_shref_objects = TRUE;
+        page->flags.has_shref_objects = TRUE;
     }
     /* shref bit は次の local GC の root になるだけで、進行中の global compaction の
      * move 判定（pinned_bits）には効かない。payload node が動くとアドレスキーの
@@ -8413,7 +8407,7 @@ rlgc_clear_shref_bits(rb_objspace_t *objspace)
         struct heap_page *page = NULL;
         ccan_list_for_each(&heaps[i].pages, page, page_node) {
             memset(&page->shref_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
-            page->has_shref_objects = FALSE;
+            page->flags.has_shref_objects = FALSE;
         }
     }
 }
@@ -8675,7 +8669,7 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
         for (int h = 0; h < HEAP_COUNT; h++) {
             struct heap_page *page = NULL;
             ccan_list_for_each(&heaps[h].pages, page, page_node) {
-                if (!page->has_shareable_objects) continue;
+                if (!page->flags.has_shareable_objects) continue;
                 for (int j = 0; j < HEAP_PAGE_BITMAP_LIMIT; j++) {
                     survivors += rb_popcount_intptr(page->shareable_bits[j]);
                 }
@@ -9154,7 +9148,7 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
 
     if (shareable) {
         MARK_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(dest), dest);
-        GET_HEAP_PAGE(dest)->has_shareable_objects = TRUE;
+        GET_HEAP_PAGE(dest)->flags.has_shareable_objects = TRUE;
     }
     else {
         CLEAR_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(dest), dest);
@@ -9162,7 +9156,7 @@ gc_move(rb_objspace_t *objspace, VALUE src, VALUE dest, struct heap_page *src_pa
 
     if (shref) {
         MARK_IN_BITMAP(GET_HEAP_SHREF_BITS(dest), dest);
-        GET_HEAP_PAGE(dest)->has_shref_objects = TRUE;
+        GET_HEAP_PAGE(dest)->flags.has_shref_objects = TRUE;
     }
     else {
         CLEAR_IN_BITMAP(GET_HEAP_SHREF_BITS(dest), dest);
