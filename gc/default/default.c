@@ -1095,36 +1095,6 @@ slot_index_for_offset(size_t offset, uint64_t reciprocal)
 #define MARK_IN_BITMAP(bits, p)      _MARK_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
 #define CLEAR_IN_BITMAP(bits, p)     _CLEAR_IN_BITMAP(bits, GET_HEAP_PAGE(p), p)
 
-/* remembered_bits は他 Ractor のスレッドから lock-free write barrier で書かれる唯一の
- * bitmap。素の |= だと同じ word の別オブジェクトの bit を並行 writer が失いうるので、
- * word 全体を size_t CAS で更新する。bit を立てたとき true を返す。 */
-static inline bool
-gc_bitmap_atomic_set(bits_t *bits, const struct heap_page *page, VALUE obj)
-{
-    volatile size_t *const word = (volatile size_t *)&bits[SLOT_BITMAP_INDEX(page, obj)];
-    const size_t mask = (size_t)SLOT_BITMAP_BIT(page, obj);
-    size_t old = 0;
-    while ((old & mask) != mask) {
-        const size_t prev = RUBY_ATOMIC_SIZE_CAS(*word, old, old | mask);
-        if (prev == old) return true;
-        old = prev;
-    }
-    return false;
-}
-
-static inline void
-gc_bitmap_atomic_clear(bits_t *bits, const struct heap_page *page, VALUE obj)
-{
-    volatile size_t *const word = (volatile size_t *)&bits[SLOT_BITMAP_INDEX(page, obj)];
-    const size_t mask = (size_t)SLOT_BITMAP_BIT(page, obj);
-    size_t old = mask;
-    while ((old & mask) != 0) {
-        const size_t prev = RUBY_ATOMIC_SIZE_CAS(*word, old, old & ~mask);
-        if (prev == old) return;
-        old = prev;
-    }
-}
-
 #define GET_HEAP_MARK_BITS(x)           (&GET_HEAP_PAGE(x)->mark_bits[0])
 #define GET_HEAP_PINNED_BITS(x)         (&GET_HEAP_PAGE(x)->pinned_bits[0])
 #define GET_HEAP_UNCOLLECTIBLE_BITS(x)  (&GET_HEAP_PAGE(x)->uncollectible_bits[0])
@@ -1886,10 +1856,8 @@ RVALUE_DEMOTE(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(RVALUE_OLD_P(objspace, obj));
 
     if (!is_incremental_marking(objspace) && RVALUE_REMEMBERED(objspace, obj)) {
-        /* atomic。素の &= ~mask だと、並行する write barrier による同じ word 内の別オブジェクトの
-         * bit セットを失いうる。 */
         struct heap_page *page = GET_HEAP_PAGE(obj);
-        gc_bitmap_atomic_clear(page->remembered_bits, page, obj);
+        _CLEAR_IN_BITMAP(page->remembered_bits, page, obj);
     }
 
     CLEAR_IN_BITMAP(GET_HEAP_UNCOLLECTIBLE_BITS(obj), obj);
@@ -7199,11 +7167,11 @@ rgengc_remembersetbits_set(rb_objspace_t *objspace, VALUE obj)
     struct heap_page *page = GET_HEAP_PAGE(obj);
     bits_t *bits = &page->remembered_bits[0];
 
-    /* atomic。lock-free write barrier は任意の Ractor スレッドから、所有者の GC や同じ word の
-     * 他 writer と並行して shareable を remember する。bit を先に立ててからページフラグを立てる。
-     * これにより、bit を drain する前にフラグを消す並行 rgengc_rememberset_mark は、remember
-     * 直後のオブジェクトを飛ばさずページを再走査対象として残す。 */
-    const bool newly = gc_bitmap_atomic_set(bits, page, obj);
+    /* remembered_bits の writer は常に直列。mutator の write barrier は locality gate で local な
+     * a のみを所有 Ractor の GVL 下で remember し、global GC は STW 下で driver 単独が書く。
+     * bit を先に立ててからページフラグを立てる（rememberset_mark へのページ再走査を残す）。 */
+    const bool newly = !_MARKED_IN_BITMAP(bits, page, obj);
+    _MARK_IN_BITMAP(bits, page, obj);
     page->flags.has_remembered_objects = TRUE;
     return newly ? TRUE : FALSE;
 }
