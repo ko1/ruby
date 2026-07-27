@@ -517,10 +517,12 @@ typedef struct rb_heap_struct {
     size_t empty_slots;
 
     /* bump-pointer 割り当ての状態。この objspace の所有者スレッドだけが書き込む。 */
-    uintptr_t alloc_cursor;
-    uintptr_t alloc_cursor_end;
-    struct free_region *alloc_next_region;
-    struct heap_page *alloc_using_page;
+    struct {
+        uintptr_t alloc_cursor;
+        uintptr_t alloc_cursor_end;
+        struct free_region *alloc_next_region;
+        struct heap_page *alloc_using_page;
+    } newobj;
 
     struct heap_page *free_pages;
     struct ccan_list_head pages;
@@ -2779,16 +2781,16 @@ rb_gc_impl_size_allocatable_p(size_t size)
 static inline bool
 heap_advance_region(rb_heap_t *heap)
 {
-    struct free_region *region = heap->alloc_next_region;
+    struct free_region *region = heap->newobj.alloc_next_region;
     if (region == NULL) {
         return false;
     }
 
     rb_asan_unpoison_object((VALUE)region, false);
     GC_ASSERT(RB_TYPE_P((VALUE)region, T_NONE));
-    heap->alloc_cursor = (uintptr_t)region;
-    heap->alloc_cursor_end = region->end;
-    heap->alloc_next_region = region->next;
+    heap->newobj.alloc_cursor = (uintptr_t)region;
+    heap->newobj.alloc_cursor_end = region->end;
+    heap->newobj.alloc_next_region = region->next;
     rb_asan_poison_object((VALUE)region);
 
     return true;
@@ -2799,12 +2801,12 @@ heap_alloc_slot(rb_objspace_t *objspace, size_t heap_idx)
 {
     rb_heap_t *heap = &heaps[heap_idx];
 
-    uintptr_t cursor = heap->alloc_cursor;
-    if (RB_UNLIKELY(cursor >= heap->alloc_cursor_end)) {
+    uintptr_t cursor = heap->newobj.alloc_cursor;
+    if (RB_UNLIKELY(cursor >= heap->newobj.alloc_cursor_end)) {
         if (heap_advance_region(heap) == false) {
             return Qfalse;
         }
-        cursor = heap->alloc_cursor;
+        cursor = heap->newobj.alloc_cursor;
     }
 
     if (RB_UNLIKELY(is_incremental_marking(objspace))) {
@@ -2818,7 +2820,7 @@ heap_alloc_slot(rb_objspace_t *objspace, size_t heap_idx)
 
     VALUE obj = (VALUE)cursor;
     rb_asan_unpoison_object(obj, true);
-    heap->alloc_cursor = cursor + pool_slot_sizes[heap_idx];
+    heap->newobj.alloc_cursor = cursor + pool_slot_sizes[heap_idx];
 
     /* single-writer（所有 Ractor の GVL）なので素のインクリメントで足りる。 */
     heap->total_allocated_objects++;
@@ -2857,19 +2859,19 @@ heap_set_alloc_page(rb_objspace_t *objspace, size_t heap_idx, struct heap_page *
 
     rb_heap_t *heap = &heaps[heap_idx];
 
-    GC_ASSERT(heap->alloc_cursor >= heap->alloc_cursor_end);
-    GC_ASSERT(heap->alloc_next_region == NULL);
+    GC_ASSERT(heap->newobj.alloc_cursor >= heap->newobj.alloc_cursor_end);
+    GC_ASSERT(heap->newobj.alloc_next_region == NULL);
     GC_ASSERT(page->free_slots != 0);
     GC_ASSERT(page->free_region != NULL);
 
-    heap->alloc_using_page = page;
+    heap->newobj.alloc_using_page = page;
 
     struct free_region *region = page->free_region;
     rb_asan_unpoison_object((VALUE)region, false);
     GC_ASSERT(RB_TYPE_P((VALUE)region, T_NONE));
-    heap->alloc_cursor = (uintptr_t)region;
-    heap->alloc_cursor_end = region->end;
-    heap->alloc_next_region = region->next;
+    heap->newobj.alloc_cursor = (uintptr_t)region;
+    heap->newobj.alloc_cursor_end = region->end;
+    heap->newobj.alloc_next_region = region->next;
     rb_asan_poison_object((VALUE)region);
 
     page->free_slots = 0;
@@ -4488,14 +4490,14 @@ gc_mode_transition(rb_objspace_t *objspace, enum gc_mode mode)
 static void
 heap_page_flush_alloc_regions(struct heap_page *page, rb_heap_t *heap)
 {
-    struct free_region *chain = heap->alloc_next_region;
+    struct free_region *chain = heap->newobj.alloc_next_region;
 
-    if (heap->alloc_cursor < heap->alloc_cursor_end) {
-        VALUE start = (VALUE)heap->alloc_cursor;
+    if (heap->newobj.alloc_cursor < heap->newobj.alloc_cursor_end) {
+        VALUE start = (VALUE)heap->newobj.alloc_cursor;
         rb_asan_unpoison_object(start, false);
         struct free_region *remnant = (struct free_region *)start;
         remnant->flags = 0;
-        remnant->end = heap->alloc_cursor_end;
+        remnant->end = heap->newobj.alloc_cursor_end;
         remnant->next = chain;
         rb_asan_poison_object(start);
         chain = remnant;
@@ -4554,17 +4556,17 @@ heap_alloc_state_clear(rb_objspace_t *objspace)
     for (size_t heap_idx = 0; heap_idx < HEAP_COUNT; heap_idx++) {
         rb_heap_t *heap = &heaps[heap_idx];
 
-        struct heap_page *page = heap->alloc_using_page;
-        RUBY_DEBUG_LOG("heap alloc_using_page:%p cursor:%p", (void *)page, (void *)heap->alloc_cursor);
+        struct heap_page *page = heap->newobj.alloc_using_page;
+        RUBY_DEBUG_LOG("heap alloc_using_page:%p cursor:%p", (void *)page, (void *)heap->newobj.alloc_cursor);
 
         if (page) {
             heap_page_flush_alloc_regions(page, heap);
         }
 
-        heap->alloc_using_page = NULL;
-        heap->alloc_cursor = 0;
-        heap->alloc_cursor_end = 0;
-        heap->alloc_next_region = NULL;
+        heap->newobj.alloc_using_page = NULL;
+        heap->newobj.alloc_cursor = 0;
+        heap->newobj.alloc_cursor_end = 0;
+        heap->newobj.alloc_next_region = NULL;
     }
 }
 
