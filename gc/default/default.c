@@ -801,8 +801,14 @@ typedef struct rb_global_objspace {
      * 方式(cross-objspace 参照を 1 度だけ書き換えるため)。list は対象 objspace の snapshot。 */
     struct {
         bool compacting;
-        struct rb_objspace **list;
-        size_t count, capa;
+        struct rb_objspace **objspaces;
+        size_t n_objspaces, objspaces_capa;
+        /* 全 objspace の heap_pages.sorted を 1 本に併合した索引。保守的 mark と
+         * rb_gc_impl_location の所属判定を objspace 数に依らず 1 回の bsearch にする。
+         * snapshot 時(barrier 下)に作り直す。 */
+        struct heap_page **pages;
+        size_t n_pages, pages_capa;
+        uintptr_t lomem, himem;
     } global_gc;
 } rb_global_objspace_t;
 
@@ -5492,10 +5498,22 @@ rb_gc_impl_mark_and_pin(void *objspace_ptr, VALUE obj)
 static bool
 gc_global_pointer_to_heap_p(const void *ptr)
 {
-    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-        if (is_pointer_to_heap(global_objspace->global_gc.list[i], ptr)) return true;
-    }
-    return false;
+    const rb_global_objspace_t *g = global_objspace;
+    uintptr_t p = (uintptr_t)ptr;
+
+    if (p < g->global_gc.lomem || p > g->global_gc.himem) return false;
+    if (p % sizeof(VALUE) != 0) return false;
+
+    struct heap_page **res = bsearch(ptr, g->global_gc.pages, g->global_gc.n_pages,
+                                     sizeof(struct heap_page *), ptr_in_page_body_p);
+    if (res == NULL) return false;
+
+    struct heap_page *page = *res;
+    if (heap_page_in_global_empty_pages_pool(page->objspace, page)) return false;
+    if (p < page->start) return false;
+    if (p >= page->start + (page->total_slots * page->slot_size)) return false;
+    if ((p - page->start) % page->slot_size != 0) return false;
+    return true;
 }
 
 void
@@ -5572,8 +5590,8 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
         /* 全 objspace の finalizer 表（zombie も含む）を pin する。
          * （finalizer_table はローカルの "objspace" に対するマクロ。） */
         rb_objspace_t *const driver = objspace;
-        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-            rb_objspace_t *objspace = global_objspace->global_gc.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+            rb_objspace_t *objspace = global_objspace->global_gc.objspaces[i];
             if (finalizer_table != NULL) {
                 st_foreach(finalizer_table, pin_value, (st_data_t)driver);
             }
@@ -8396,23 +8414,58 @@ rb_gc_impl_heap_page_count(void *objspace_ptr)
 static void
 gc_global_objspaces_i(void *os, void *data)
 {
-    if (global_objspace->global_gc.count == global_objspace->global_gc.capa) {
-        size_t new_capa = global_objspace->global_gc.capa ? global_objspace->global_gc.capa * 2 : 16;
-        struct rb_objspace **new_list = realloc(global_objspace->global_gc.list, new_capa * sizeof(*new_list));
+    if (global_objspace->global_gc.n_objspaces == global_objspace->global_gc.objspaces_capa) {
+        size_t new_capa = global_objspace->global_gc.objspaces_capa ? global_objspace->global_gc.objspaces_capa * 2 : 16;
+        struct rb_objspace **new_list = realloc(global_objspace->global_gc.objspaces, new_capa * sizeof(*new_list));
         if (new_list == NULL) rb_bug("gc_global_objspaces_i: realloc failed");
-        global_objspace->global_gc.list = new_list;
-        global_objspace->global_gc.capa = new_capa;
+        global_objspace->global_gc.objspaces = new_list;
+        global_objspace->global_gc.objspaces_capa = new_capa;
     }
-    global_objspace->global_gc.list[global_objspace->global_gc.count++] = os;
+    global_objspace->global_gc.objspaces[global_objspace->global_gc.n_objspaces++] = os;
 }
 
-/* このサイクルが対象とする全 objspace(zombie 含む)の snapshot を取り直す。
- * list/capa のバッファは前サイクルから使い回す。 */
+static int
+gc_global_page_cmp(const void *a, const void *b)
+{
+    uintptr_t pa = (uintptr_t)(*(const struct heap_page *const *)a)->body;
+    uintptr_t pb = (uintptr_t)(*(const struct heap_page *const *)b)->body;
+    return pa < pb ? -1 : pa > pb ? 1 : 0;
+}
+
+/* このサイクルが対象とする全 objspace(zombie 含む)の snapshot と併合ページ索引を
+ * 取り直す。バッファは前サイクルから使い回す。barrier 下なので各 sorted は安定。 */
 static void
 gc_global_snapshot_objspaces(void)
 {
-    global_objspace->global_gc.count = 0;
+    rb_global_objspace_t *g = global_objspace;
+
+    g->global_gc.n_objspaces = 0;
     rb_gc_vm_each_objspace(gc_global_objspaces_i, NULL);
+
+    size_t total = 0;
+    for (size_t i = 0; i < g->global_gc.n_objspaces; i++) {
+        total += rb_darray_size(g->global_gc.objspaces[i]->heap_pages.sorted);
+    }
+    if (g->global_gc.pages_capa < total) {
+        struct heap_page **grown = realloc(g->global_gc.pages, total * sizeof(*grown));
+        if (grown == NULL) rb_bug("gc_global_snapshot_objspaces: realloc failed");
+        g->global_gc.pages = grown;
+        g->global_gc.pages_capa = total;
+    }
+    g->global_gc.n_pages = 0;
+    g->global_gc.lomem = UINTPTR_MAX;
+    g->global_gc.himem = 0;
+    for (size_t i = 0; i < g->global_gc.n_objspaces; i++) {
+        rb_objspace_t *os = g->global_gc.objspaces[i];
+        size_t n = rb_darray_size(os->heap_pages.sorted);
+        if (n == 0) continue;
+        MEMCPY(g->global_gc.pages + g->global_gc.n_pages,
+               rb_darray_ref(os->heap_pages.sorted, 0), struct heap_page *, n);
+        g->global_gc.n_pages += n;
+        if (os->heap_pages.range[0] < g->global_gc.lomem) g->global_gc.lomem = os->heap_pages.range[0];
+        if (os->heap_pages.range[1] > g->global_gc.himem) g->global_gc.himem = os->heap_pages.range[1];
+    }
+    qsort(g->global_gc.pages, g->global_gc.n_pages, sizeof(struct heap_page *), gc_global_page_cmp);
 }
 
 /* global GC: すべての Ractor を停止させ、全 objspace を 1 つの heap として clear/mark/sweep
@@ -8493,16 +8546,16 @@ gc_start_global(rb_objspace_t *driver, bool compact)
      * 他 Ractor の objspace の残り garbage を driver スレッドで free するが、foreign オブジェクトの
      * weak 参照 free（rb_free_generic_ivar）は「global GC 進行中」を見て、per-Ractor generic_fields
      * の削除を driver 自身の表に誤って解決せず weak-pass drain へ遅延する必要があるため。 */
-    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-        global_objspace->global_gc.list[i]->flags.during_global_gc = TRUE;
+    for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+        global_objspace->global_gc.objspaces[i]->flags.during_global_gc = TRUE;
     }
 
     /* step 3: 全 objspace の lazy sweep を落ち着かせ、下の clear より前に mark bit の意味を
      * 確定させる。（during_gc はローカルの "objspace" に対するマクロ。）objspace が GC 中は
      * rb_gc_get_ec() が objspace->vm_context 経由で解決するので、全員分を初期化する
      * （driver スレッドが全員の phase を走らせる）。 */
-    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.objspaces[i];
         /* ここではどの objspace も incremental mark の途中ではありえない。incremental mark は
          * 単一 objspace でしか走らず、単一→複数遷移（vm_insert_ractor0）が落ち着かせる。gray
          * stack がスナップショットを保持したまま step 5 で flag を消すと所有者の GC 状態機械を壊す。 */
@@ -8515,8 +8568,8 @@ gc_start_global(rb_objspace_t *driver, bool compact)
 
     /* step 5: 全 objspace の mark / remembered set / 世代カウンタ / shref をクリアする
      * （1 つでも漏らすと stale な mark bit で UAF）。（heaps はローカルの "objspace" のマクロ。） */
-    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.objspaces[i];
         objspace->flags.during_minor_gc = FALSE;
         objspace->flags.during_incremental_marking = FALSE;
         /* unified mark は正確で pin しない。下の per-objspace sweep は stale な local サイクルに
@@ -8540,8 +8593,8 @@ gc_start_global(rb_objspace_t *driver, bool compact)
      * 走り、global_objspace->global_gc.compacting が参照更新相を下の phase 2 へ遅延する（2 相、cross-objspace 安全）。 */
     global_objspace->global_gc.compacting = compact;
     if (compact) {
-        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-            rb_objspace_t *objspace = global_objspace->global_gc.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+            rb_objspace_t *objspace = global_objspace->global_gc.objspaces[i];
             objspace->flags.during_compacting = TRUE;
             /* gc_marks_start は compacting な local GC 用に各ページの pinned_slots をリセットするが、
              * global GC は gc_marks_start を飛ばすのでここでリセットする。step 5 で pinned_bits は
@@ -8584,8 +8637,8 @@ gc_start_global(rb_objspace_t *driver, bool compact)
     /* step 9: barrier 内で全 objspace を lazy でなく sweep する。dead な shareable はここで回収し、
      * 空きページは pool に戻る。 */
     if (!compact) {
-        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-            rb_objspace_t *os = global_objspace->global_gc.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+            rb_objspace_t *os = global_objspace->global_gc.objspaces[i];
             unsigned int prev_immediate = os->flags.immediate_sweep;
             os->flags.immediate_sweep = TRUE;
             gc_sweep(os);
@@ -8602,8 +8655,8 @@ gc_start_global(rb_objspace_t *driver, bool compact)
         install_handlers();
 
         /* pass 1 (move): 全 objspace を再配置し T_MOVED forwarding を残す。 */
-        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-            rb_objspace_t *os = global_objspace->global_gc.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+            rb_objspace_t *os = global_objspace->global_gc.objspaces[i];
             gc_sweeping_enter(os);
             gc_sweep_start(os);        /* mode を sweeping へ、compaction 用に heap を整列 */
             gc_compact_relocate(os);   /* mode を compacting へ、move */
@@ -8613,20 +8666,20 @@ gc_start_global(rb_objspace_t *driver, bool compact)
          * （cross-objspace 参照も解決する）。gc_compact_finish はページの unprotect と
          * during_compacting のクリアも行う。move か mark かの判定は rb_gc_get_objspace() の
          * during_reference_updating を読むので、pass 用に全 objspace に立てる。 */
-        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-            global_objspace->global_gc.list[i]->flags.during_reference_updating = TRUE;
+        for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+            global_objspace->global_gc.objspaces[i]->flags.during_reference_updating = TRUE;
         }
         rb_gc_before_updating_jit_code();
-        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-            gc_compact_finish(global_objspace->global_gc.list[i]);
+        for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+            gc_compact_finish(global_objspace->global_gc.objspaces[i]);
         }
         /* 参照更新の VM グローバル / weak-table 側は 1 度だけ走る（各 objspace の heap 側は
          * 上の gc_compact_finish で既に走った）。 */
         gc_update_references_global(driver);
         rb_gc_after_updating_jit_code();
-        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-            global_objspace->global_gc.list[i]->flags.during_reference_updating = FALSE;
-            global_objspace->global_gc.list[i]->flags.during_compacting = FALSE;
+        for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+            global_objspace->global_gc.objspaces[i]->flags.during_reference_updating = FALSE;
+            global_objspace->global_gc.objspaces[i]->flags.during_compacting = FALSE;
         }
         global_objspace->global_gc.compacting = false;
         uninstall_handlers();
@@ -8634,8 +8687,8 @@ gc_start_global(rb_objspace_t *driver, bool compact)
         /* pass 3 (free): 全 objspace を page-sweep し、dead オブジェクトと空になった移動元
          * ページを free する。during_compacting はクリア済みなので sweep は T_MOVED を通常通り
          * 扱う。 */
-        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-            rb_objspace_t *os = global_objspace->global_gc.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+            rb_objspace_t *os = global_objspace->global_gc.objspaces[i];
             gc_sweep_rest(os);
             gc_sweeping_exit(os);
         }
@@ -8648,8 +8701,8 @@ gc_start_global(rb_objspace_t *driver, bool compact)
      * 回収できない）は free ページも empty ページも無く allocatable_bytes == 0 になり、次の割り当てで
      * newobj_refill の「major GC 後に新ページを作れない」に当たる。ここで詰まった objspace 全てに
      * gc_marks_finish と同様に成長予算を与える。 */
-    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.objspaces[i];
         if (objspace->heap_pages.allocatable_bytes != 0 || objspace->empty_pages_count != 0) {
             continue;
         }
@@ -8665,8 +8718,8 @@ gc_start_global(rb_objspace_t *driver, bool compact)
 
     /* 生き残った shareable を数え直し（sweep が既に dead を shareable_bits から畳んだ）、
      * 各 trigger limit をリセットする。 */
-    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.objspaces[i];
         size_t survivors = 0;
         for (int h = 0; h < HEAP_COUNT; h++) {
             struct heap_page *page = NULL;
@@ -8685,8 +8738,8 @@ gc_start_global(rb_objspace_t *driver, bool compact)
     driver->profile.count++;
 
     /* step 10 */
-    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
-        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.objspaces[i];
         objspace->flags.during_global_gc = FALSE;
         if (objspace != driver) during_gc = FALSE;
     }
