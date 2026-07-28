@@ -803,13 +803,17 @@ typedef struct rb_global_objspace {
         bool compacting;
         struct rb_objspace **objspaces;
         size_t n_objspaces, objspaces_capa;
-        /* 全 objspace の heap_pages.sorted を 1 本に併合した索引。保守的 mark と
-         * rb_gc_impl_location の所属判定を objspace 数に依らず 1 回の bsearch にする。
-         * snapshot 時(barrier 下)に作り直す。 */
-        struct heap_page **pages;
-        size_t n_pages, pages_capa;
-        uintptr_t lomem, himem;
     } global_gc;
+
+    /* 全 objspace の heap page を body アドレス順で持つ索引。writer は page の
+     * allocate/free(page_pool.lock で直列化)。reader は STW の global GC のみ
+     * (保守的 mark と rb_gc_impl_location の所属判定)なので読み手の lock は不要。
+     * local GC は自 objspace の heap_pages.sorted を使う。 */
+    struct {
+        struct heap_page **pages;
+        size_t n_pages, capa;
+        uintptr_t lomem, himem;
+    } page_index;
 } rb_global_objspace_t;
 
 static rb_global_objspace_t rb_global_objspace_instance;
@@ -2178,9 +2182,64 @@ heap_page_body_free(struct heap_page_body *page_body)
     page_pool_release(page_body);
 }
 
+/* page_index への挿入。writer 同士は page_pool.lock で直列化。lomem/himem は
+ * 単調拡大の過大近似(quick reject 用)でよい。 */
+static void
+global_page_index_insert(struct heap_page *page)
+{
+    rb_global_objspace_t *g = global_objspace;
+    uintptr_t body = (uintptr_t)page->body;
+
+    rb_native_mutex_lock(&g->page_pool.lock);
+    if (g->page_index.n_pages == g->page_index.capa) {
+        size_t new_capa = g->page_index.capa ? g->page_index.capa * 2 : 128;
+        struct heap_page **grown = realloc(g->page_index.pages, new_capa * sizeof(*grown));
+        if (grown == NULL) rb_bug("global_page_index_insert: realloc failed");
+        g->page_index.pages = grown;
+        g->page_index.capa = new_capa;
+    }
+    size_t lo = 0, hi = g->page_index.n_pages;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if ((uintptr_t)g->page_index.pages[mid]->body < body) lo = mid + 1;
+        else hi = mid;
+    }
+    memmove(&g->page_index.pages[lo + 1], &g->page_index.pages[lo],
+            (g->page_index.n_pages - lo) * sizeof(struct heap_page *));
+    g->page_index.pages[lo] = page;
+    g->page_index.n_pages++;
+
+    uintptr_t start = body + sizeof(struct heap_page_header);
+    uintptr_t end = body + HEAP_PAGE_SIZE;
+    if (g->page_index.lomem == 0 || g->page_index.lomem > start) g->page_index.lomem = start;
+    if (g->page_index.himem < end) g->page_index.himem = end;
+    rb_native_mutex_unlock(&g->page_pool.lock);
+}
+
+static void
+global_page_index_remove(const struct heap_page *page)
+{
+    rb_global_objspace_t *g = global_objspace;
+    uintptr_t body = (uintptr_t)page->body;
+
+    rb_native_mutex_lock(&g->page_pool.lock);
+    size_t lo = 0, hi = g->page_index.n_pages;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if ((uintptr_t)g->page_index.pages[mid]->body < body) lo = mid + 1;
+        else hi = mid;
+    }
+    GC_ASSERT(lo < g->page_index.n_pages && g->page_index.pages[lo] == page);
+    memmove(&g->page_index.pages[lo], &g->page_index.pages[lo + 1],
+            (g->page_index.n_pages - lo - 1) * sizeof(struct heap_page *));
+    g->page_index.n_pages--;
+    rb_native_mutex_unlock(&g->page_pool.lock);
+}
+
 static void
 heap_page_free(rb_objspace_t *objspace, struct heap_page *page)
 {
+    global_page_index_remove(page);
     objspace->heap_pages.freed_pages++;
     heap_page_body_free(page->body);
     free(page);
@@ -2469,6 +2528,8 @@ heap_page_allocate(rb_objspace_t *objspace)
     page->objspace = objspace;
 
     objspace->heap_pages.allocated_pages++;
+
+    global_page_index_insert(page);
 
     return page;
 }
@@ -5501,10 +5562,10 @@ gc_global_pointer_to_heap_p(const void *ptr)
     const rb_global_objspace_t *g = global_objspace;
     uintptr_t p = (uintptr_t)ptr;
 
-    if (p < g->global_gc.lomem || p > g->global_gc.himem) return false;
+    if (p < g->page_index.lomem || p > g->page_index.himem) return false;
     if (p % sizeof(VALUE) != 0) return false;
 
-    struct heap_page **res = bsearch(ptr, g->global_gc.pages, g->global_gc.n_pages,
+    struct heap_page **res = bsearch(ptr, g->page_index.pages, g->page_index.n_pages,
                                      sizeof(struct heap_page *), ptr_in_page_body_p);
     if (res == NULL) return false;
 
@@ -8424,48 +8485,22 @@ gc_global_objspaces_i(void *os, void *data)
     global_objspace->global_gc.objspaces[global_objspace->global_gc.n_objspaces++] = os;
 }
 
-static int
-gc_global_page_cmp(const void *a, const void *b)
-{
-    uintptr_t pa = (uintptr_t)(*(const struct heap_page *const *)a)->body;
-    uintptr_t pb = (uintptr_t)(*(const struct heap_page *const *)b)->body;
-    return pa < pb ? -1 : pa > pb ? 1 : 0;
-}
-
-/* このサイクルが対象とする全 objspace(zombie 含む)の snapshot と併合ページ索引を
- * 取り直す。バッファは前サイクルから使い回す。barrier 下なので各 sorted は安定。 */
+/* このサイクルが対象とする全 objspace(zombie 含む)の snapshot を取り直す。
+ * objspaces/capa のバッファは前サイクルから使い回す。 */
 static void
 gc_global_snapshot_objspaces(void)
 {
-    rb_global_objspace_t *g = global_objspace;
-
-    g->global_gc.n_objspaces = 0;
+    global_objspace->global_gc.n_objspaces = 0;
     rb_gc_vm_each_objspace(gc_global_objspaces_i, NULL);
 
+#if RGENGC_CHECK_MODE
+    /* page_index の増分維持が per-objspace sorted と一致しているか検証する。 */
     size_t total = 0;
-    for (size_t i = 0; i < g->global_gc.n_objspaces; i++) {
-        total += rb_darray_size(g->global_gc.objspaces[i]->heap_pages.sorted);
+    for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
+        total += rb_darray_size(global_objspace->global_gc.objspaces[i]->heap_pages.sorted);
     }
-    if (g->global_gc.pages_capa < total) {
-        struct heap_page **grown = realloc(g->global_gc.pages, total * sizeof(*grown));
-        if (grown == NULL) rb_bug("gc_global_snapshot_objspaces: realloc failed");
-        g->global_gc.pages = grown;
-        g->global_gc.pages_capa = total;
-    }
-    g->global_gc.n_pages = 0;
-    g->global_gc.lomem = UINTPTR_MAX;
-    g->global_gc.himem = 0;
-    for (size_t i = 0; i < g->global_gc.n_objspaces; i++) {
-        rb_objspace_t *os = g->global_gc.objspaces[i];
-        size_t n = rb_darray_size(os->heap_pages.sorted);
-        if (n == 0) continue;
-        MEMCPY(g->global_gc.pages + g->global_gc.n_pages,
-               rb_darray_ref(os->heap_pages.sorted, 0), struct heap_page *, n);
-        g->global_gc.n_pages += n;
-        if (os->heap_pages.range[0] < g->global_gc.lomem) g->global_gc.lomem = os->heap_pages.range[0];
-        if (os->heap_pages.range[1] > g->global_gc.himem) g->global_gc.himem = os->heap_pages.range[1];
-    }
-    qsort(g->global_gc.pages, g->global_gc.n_pages, sizeof(struct heap_page *), gc_global_page_cmp);
+    GC_ASSERT(total == global_objspace->page_index.n_pages);
+#endif
 }
 
 /* global GC: すべての Ractor を停止させ、全 objspace を 1 つの heap として clear/mark/sweep
