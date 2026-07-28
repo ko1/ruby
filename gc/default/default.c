@@ -8379,7 +8379,7 @@ rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
     return MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj) != 0;
 }
 
-/* 現在の heap ページ数（zombie ledger のページ計上に使う）。 */
+/* 現在の heap ページ数（zombie_objspaces 表 のページ計上に使う）。 */
 size_t
 rb_gc_impl_heap_page_count(void *objspace_ptr)
 {
@@ -8691,15 +8691,15 @@ gc_start_global(rb_objspace_t *driver, bool compact)
         if (objspace != driver) during_gc = FALSE;
     }
 
-    /* garbage が消えた今、zombie ledger を測り直す。barrier 内なのでエントリは安定。これが
+    /* garbage が消えた今、zombie_objspaces 表 を測り直す。barrier 内なのでエントリは安定。これが
      * 無いと、どの pass も merge しない joinable(slotted) zombie の retire 時の stale な数値で
      * 上のページ trigger が発火し続ける。 */
     rb_gc_vm_refresh_zombie_pages();
     global_objspace->zombie_pages_survivors = rb_gc_vm_zombie_total_pages();
 
-    /* 上の sweep が未 join の Ractor オブジェクトを回収した場合、ractor_free がその zombie ledger
+    /* 上の sweep が未 join の Ractor オブジェクトを回収した場合、ractor_free がその zombie_objspaces 表
      * エントリを disown し merge を main Ractor へ postponed job として投げている。objspace は
-     * main が次の safepoint で absorb するまで ledger に列挙可能なまま残る。 */
+     * main が次の safepoint で absorb するまで zombie_objspaces に列挙可能なまま残る。 */
 
     gc_exit(driver, gc_enter_event_global, &lock_lev);
 }

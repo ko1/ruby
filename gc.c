@@ -3872,7 +3872,7 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
 static void gc_orphan_merge_job(void *unused);
 
 /* 素の realloc で伸ばす。rb_gc_objspace_disown は global GC の sweep 内から push し、
- * そこでは会計付きアロケータが禁止のため。この台帳は VM 寿命のメタデータで、
+ * そこでは会計付きアロケータが禁止のため。この表は VM 寿命のメタデータで、
  * 多くても数十エントリ。 */
 static void
 zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot, struct rb_ractor_struct *owner)
@@ -3928,8 +3928,8 @@ rb_gc_objspace_retire(void **objspace_slot)
 }
 
 /* この objspace を所有する Ractor オブジェクトが回収された。もう誰も join できない。
- * 台帳の owner スロットを落とし、マージを main Ractor へ投げる。ractor_free つまり sweep
- * 内から呼ばれ会計付きアロケータは使えないが、台帳は安定である。 */
+ * zombie_objspaces の owner スロットを落とし、マージを main Ractor へ投げる。ractor_free つまり sweep
+ * 内から呼ばれ会計付きアロケータは使えないが、表は安定である。 */
 void
 rb_gc_objspace_disown(void *objspace)
 {
