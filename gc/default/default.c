@@ -598,7 +598,6 @@ typedef struct rb_objspace {
         unsigned int during_compacting : 1;
         unsigned int gc_lock_barrier : 1;
         unsigned int during_reference_updating : 1;
-        unsigned int gc_stressful: 1;
         unsigned int during_minor_gc : 1;
         unsigned int during_incremental_marking : 1;
         unsigned int measure_gc : 1;
@@ -710,7 +709,6 @@ typedef struct rb_objspace {
         size_t weak_references_count;
     } profile;
 
-    VALUE gc_stress_mode;
 
     struct {
         bool parent_object_old_p;
@@ -795,6 +793,11 @@ typedef struct rb_global_objspace {
      * 一時的に差し替わるため、GC の両端で同じ判定をするよう安定したポインタを別に持つ。
      * 起動時に設定し、fork した子では貼り直す。 */
     rb_objspace_t *main_objspace;
+
+    /* GC.stress は process-global(upstream 意味論)。書き手は任意 Ractor の GC.stress=(稀)、
+     * 読み手は全 Ractor の alloc/GC path。診断用なので素の store/load(last-writer-wins)。 */
+    bool gc_stressful;
+    VALUE gc_stress_mode;
 } rb_global_objspace_t;
 
 static rb_global_objspace_t rb_global_objspace_instance;
@@ -1268,8 +1271,8 @@ gc_malloc_counters_snapshot(rb_objspace_t *objspace, struct gc_malloc_bytes *c)
 #define during_gc		objspace->flags.during_gc
 #define finalizing		objspace->atomic_flags.finalizing
 #define finalizer_table 	objspace->finalizer_table
-#define ruby_gc_stressful	objspace->flags.gc_stressful
-#define ruby_gc_stress_mode     objspace->gc_stress_mode
+#define ruby_gc_stressful       global_objspace->gc_stressful
+#define ruby_gc_stress_mode     global_objspace->gc_stress_mode
 #if GC_DEBUG_STRESS_TO_CLASS
 #define stress_to_class         objspace->stress_to_class
 #define set_stress_to_class(c)  (stress_to_class = (c))
@@ -10011,17 +10014,14 @@ rb_gc_impl_config_set(void *objspace_ptr, VALUE hash)
 VALUE
 rb_gc_impl_stress_get(void *objspace_ptr)
 {
-    rb_objspace_t *objspace = objspace_ptr;
     return ruby_gc_stress_mode;
 }
 
 void
 rb_gc_impl_stress_set(void *objspace_ptr, VALUE flag)
 {
-    rb_objspace_t *objspace = objspace_ptr;
-
-    objspace->flags.gc_stressful = RTEST(flag);
-    objspace->gc_stress_mode = flag;
+    global_objspace->gc_stressful = RTEST(flag);
+    global_objspace->gc_stress_mode = flag;
 }
 
 static int
