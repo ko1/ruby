@@ -1687,7 +1687,7 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
             if (!world_stopped) {
                 /* local GC 中の verify は no-barrier VM lock しか持たず barrier は持たない。
                  * 他 Ractor が 自 objspace への割り当てで heap_pages.sorted を realloc しており、
-                 * verify_pointer_in_any_heap_p の全 objspace bsearch はそれと競合して SEGV する。
+                 * verify_pointer_in_any_heap_p の page_index 読みはその更新と競合する。
                  * barrier 無しでは foreign ポインタを確認できないのでここでは許容し、
                  * global GC の verify（world 停止）が完全な存在検査を行う。 */
             }
@@ -6136,20 +6136,6 @@ check_children_i(const VALUE child, void *ptr)
     }
 }
 
-struct verify_any_heap_query {
-    const void *ptr;
-    bool found;
-};
-
-static void
-verify_pointer_in_any_heap_i(void *os, void *data)
-{
-    struct verify_any_heap_query *q = data;
-    if (!q->found && is_pointer_to_heap((rb_objspace_t *)os, q->ptr)) {
-        q->found = true;
-    }
-}
-
 /* Whether a heap slot currently holds a live object. Returns false for empty
  * (T_NONE), moved (T_MOVED), and zombie (T_ZOMBIE) slots, and for garbage
  * objects about to be swept. */
@@ -6167,13 +6153,11 @@ gc_slot_live_object_p(rb_objspace_t *objspace, VALUE obj)
 }
 
 /* verifier 専用: ptr がいずれかの objspace の生きた slot を指すか。呼び出し元は VM lock と
- * barrier を持つので列挙は安定。 */
+ * barrier を持つので page_index は安定。 */
 static bool
 verify_pointer_in_any_heap_p(const void *ptr)
 {
-    struct verify_any_heap_query q = { .ptr = ptr, .found = false };
-    rb_gc_vm_each_objspace(verify_pointer_in_any_heap_i, &q);
-    return q.found;
+    return gc_global_pointer_to_heap_p(ptr);
 }
 
 /* 呼び出し元 Ractor の exact root は、shareable・自 objspace のオブジェクト・shref 記録された
