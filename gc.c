@@ -4028,14 +4028,19 @@ rb_gc_finish_in_flight_gc(void)
     rb_gc_impl_gc_rest(rb_gc_get_objspace());
 }
 
+/* zombie 吸収中は真。zombie の count-- は merge 前に済む（下の absorb 参照）ので、
+ * その窓では zombie の生きたオブジェクトがまだ在るのに single に見えてしまう。 */
+static int gc_absorbing_zombie = 0;
+
 /* プロセス内に objspace が 1 つだけ（live Ractor 1、zombie 0）のとき真。このときだけ
- * local GC が全世界となり multi-objspace 用ガードを省ける。最初の子生成の窓（子 objspace は
- * 既に在り cnt はまだ 1）は multi として数える。single 扱いだと窓中の GC がガードを飛ばす。 */
+ * local GC が全世界となり multi-objspace 用ガードを省ける。子生成の窓（子 objspace は
+ * 既に在り cnt はまだ 1）と zombie 吸収の窓（count-- 済みだが merge 未了）は multi 扱い。
+ * single 扱いだと窓中の GC が shareable pin 等のガードを飛ばし live cc 等を回収する。 */
 bool
 rb_gc_single_objspace_p(void)
 {
     rb_vm_t *vm = GET_VM();
-    return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0 &&
+    return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0 && gc_absorbing_zombie == 0 &&
            (vm->ractor.main_ractor == NULL ||
             vm->ractor.main_ractor->creating_child_objspace == NULL);
 }
@@ -4057,8 +4062,10 @@ rb_gc_objspace_absorb_into_current(void **objspace_slot)
         void *objspace = *objspace_slot;
         if (objspace != NULL) {
             *objspace_slot = NULL;
+            gc_absorbing_zombie++;
             rb_gc_vm_forget_zombie(objspace);
             objspace_absorb_merge(rb_gc_get_objspace(), objspace);
+            gc_absorbing_zombie--;
         }
     }
 }
@@ -4079,8 +4086,10 @@ objspace_absorb_disowned_zombies(void)
                 /* forget で外す。エントリのページ数を zombie_total_pages からも
                  * 引く。自前の swap-remove だとページが数えられたまま残り、幻の
                  * 総数が余計な STW global サイクルを起こし続けてしまう。 */
+                gc_absorbing_zombie++;
                 rb_gc_vm_forget_zombie(zombie);
                 objspace_absorb_merge(rb_gc_get_objspace(), zombie);
+                gc_absorbing_zombie--;
             }
             else {
                 i++;
