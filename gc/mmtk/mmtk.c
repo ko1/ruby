@@ -632,6 +632,12 @@ rb_gc_impl_ractor_cache_alloc(void *objspace_ptr, void *ractor)
 }
 
 void
+rb_gc_impl_objspace_retire_gc(void *objspace_ptr)
+{
+    /* objspace が単一なので終了時の per-Ractor GC は不要 */
+}
+
+void
 rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache_ptr)
 {
     struct objspace *objspace = objspace_ptr;

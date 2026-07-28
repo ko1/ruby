@@ -662,6 +662,13 @@ ractor_notify_exit(rb_execution_context_t *ec, rb_ractor_t *cr, VALUE legacy, bo
     VM_ASSERT(!UNDEF_P(legacy));
     VM_ASSERT(cr->sync.legacy == Qundef);
 
+    /* 終了前の最後の local GC。ここは通常実行文脈(block 末尾の GC.start と等価)で、
+     * 生き残る root は legacy(C 引数=stack root) 等のみ。join 側へ継承されるはずだった
+     * ゴミを自スレッドで回収し、空ページは pool へ返す。 */
+    if (cr != GET_VM()->ractor.main_ractor) {
+        rb_gc_objspace_retire_gc();
+    }
+
     RACTOR_LOCK_SELF(cr);
     {
         ractor_free_all_ports(cr);
