@@ -722,7 +722,7 @@ typedef struct rb_vm_struct {
 #endif
         } sync;
 
-        /* RLGC: Ractor 転送/継承機構の VM-wide lock 群と in-flight move courier の
+        /* Ractor 転送/継承機構の VM-wide lock 群と in-flight move courier の
          * registry。いずれも leaf lock(臨界区間に safepoint を含めない)。 */
         rb_nativethread_lock_t generic_fields_lock;   /* variable.c の共有 generic-fields 表 */
         rb_nativethread_lock_t value_taken_lock;      /* value_taken リスト(add/unlink/scan) */
@@ -854,7 +854,7 @@ typedef struct rb_vm_struct {
             size_t addrs_cnt, addrs_capa;
         } registered_globals;
 
-        /* RLGC: GC を止めている holder の数(atomic)。GC.disable した Ractor
+        /* GC を止めている holder の数(atomic)。GC.disable した Ractor
          * (per-Ractor の gc_disabled フラグ、1 Ractor で高々 1)と、内部の短期
          * critical 区間が holder になる。1 つでも居れば全 GC を止める。
          * GC.enable は自分の hold しか外さない(他 Ractor の disable を踏み潰さない)。 */
@@ -1108,7 +1108,7 @@ struct rb_waiting_list {
     struct rb_fiber_struct *fiber;
 };
 
-struct rlgc_materialize_frame;
+struct ractor_materialize_frame;
 
 struct rb_execution_context_struct {
     /* execution information */
@@ -1163,7 +1163,7 @@ struct rb_execution_context_struct {
 
     /* この EC 上で materialize 中の receive の frame 鎖（LIFO、実体は C スタック）。
      * thread/fiber 切替があっても各 EC の鎖はその EC の入れ子だけなので崩れない。 */
-    struct rlgc_materialize_frame *materialize_frames;
+    struct ractor_materialize_frame *materialize_frames;
 
     /* for GC */
     struct {
