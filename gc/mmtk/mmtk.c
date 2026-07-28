@@ -1760,7 +1760,7 @@ rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
 size_t
 rb_gc_impl_heap_page_count(void *objspace_ptr)
 {
-    /* objspace が単一なので zombie 台帳は常に空 */
+    /* objspace が単一なので zombie_objspacesは常に空 */
     return 0;
 }
 
