@@ -8966,14 +8966,12 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
      * cross-objspace の garbage を回収できる唯一の collector だから。 */
     if (!rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK)) {
         gc_start_global(objspace, compact);
-        gc_finalize_deferred(objspace);
-        gc_config_full_mark_set(full_marking_p);
-        return;
+    }
+    else {
+        garbage_collect(objspace, reason);
     }
 
-    garbage_collect(objspace, reason);
     gc_finalize_deferred(objspace);
-
     gc_config_full_mark_set(full_marking_p);
 }
 
