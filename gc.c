@@ -619,6 +619,7 @@ typedef struct gc_function_map {
     void *(*objspace_alloc)(void);
     void (*objspace_init)(void *objspace_ptr);
     void *(*ractor_cache_alloc)(void *objspace_ptr, void *ractor);
+    void (*objspace_retire_gc)(void *objspace_ptr);
     void (*set_params)(void *objspace_ptr);
     void (*init)(void);
     // Shutdown
@@ -804,6 +805,7 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(objspace_alloc);
     load_modular_gc_func(objspace_init);
     load_modular_gc_func(ractor_cache_alloc);
+    load_modular_gc_func(objspace_retire_gc);
     load_modular_gc_func(set_params);
     load_modular_gc_func(init);
     // Shutdown
@@ -898,6 +900,7 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_objspace_alloc rb_gc_functions.objspace_alloc
 # define rb_gc_impl_objspace_init rb_gc_functions.objspace_init
 # define rb_gc_impl_ractor_cache_alloc rb_gc_functions.ractor_cache_alloc
+# define rb_gc_impl_objspace_retire_gc rb_gc_functions.objspace_retire_gc
 # define rb_gc_impl_set_params rb_gc_functions.set_params
 # define rb_gc_impl_init rb_gc_functions.init
 // Shutdown
@@ -3909,6 +3912,13 @@ gc_orphan_merge_pjob_ensure(void)
             rb_bug("Could not preregister postponed job for GC");
         }
     }
+}
+
+/* 終了する Ractor が自 objspace の最後の local GC を行う。own thread 専用。 */
+void
+rb_gc_objspace_retire_gc(void)
+{
+    rb_gc_impl_objspace_retire_gc(rb_gc_get_objspace());
 }
 
 void
