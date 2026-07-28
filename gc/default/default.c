@@ -1098,6 +1098,21 @@ slot_index_for_offset(size_t offset, uint64_t reciprocal)
 #define GET_HEAP_SHREF_BITS(x)          (&GET_HEAP_PAGE(x)->shref_bits[0])
 #define GET_HEAP_OBJSPACE(x)            (GET_HEAP_PAGE(x)->objspace)
 
+/* obj が現在の objspace ではなく別 objspace のページに属する(= foreign)。 */
+static inline bool
+gc_foreign_object_p(const rb_objspace_t *objspace, VALUE obj)
+{
+    return RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace);
+}
+
+/* foreign かつ global GC(STW) 中でない。true の間は local GC が obj の per-object な GC 状態
+ * (mark/pin/remember 等)に触れてはならない — 所有者、または全員停止の global GC が扱う。 */
+static inline bool
+gc_skip_foreign_object_p(const rb_objspace_t *objspace, VALUE obj)
+{
+    return gc_foreign_object_p(objspace, obj) && !objspace->flags.during_global_gc;
+}
+
 static int
 RVALUE_AGE_GET(VALUE obj)
 {
@@ -1970,7 +1985,7 @@ rb_gc_impl_garbage_object_p(void *objspace_ptr, VALUE ptr)
      * barrier 外では garbage と報告しない。fstring / symbol の weak-set 検索は
      * cross-objspace にこれを引くが、それらは born-shareable で global STW でしか回収
      * されないため「garbage でない」が正しい。 */
-    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(ptr) != objspace) && !objspace->flags.during_global_gc) {
+    if (gc_skip_foreign_object_p(objspace, ptr)) {
         return false;
     }
 
@@ -5370,7 +5385,7 @@ gc_mark(rb_objspace_t *objspace, VALUE obj)
      * その生死は所有者（または global GC）の担当。この GC からその bitmap を触るのは不健全。
      * global GC ではこの制限を外す。全員停止しており、bit はオブジェクト自身のページにある
      * ので cross-objspace の書き込みも正しい場所に着く。 */
-    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace) && !objspace->flags.during_global_gc) {
+    if (gc_skip_foreign_object_p(objspace, obj)) {
         return;
     }
 
@@ -5408,7 +5423,7 @@ gc_pin(rb_objspace_t *objspace, VALUE obj)
     GC_ASSERT(!SPECIAL_CONST_P(obj));
 
     /* foreign なページの pinned bit は決して書かない（global GC は可: 全員停止中）。 */
-    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace) && !objspace->flags.during_global_gc) return;
+    if (gc_skip_foreign_object_p(objspace, obj)) return;
 
     if (RB_UNLIKELY(objspace->flags.during_compacting)) {
         if (RB_LIKELY(during_gc)) {
@@ -6566,7 +6581,7 @@ rb_gc_impl_handle_weak_references_alive_p(void *objspace_ptr, VALUE obj)
 
     /* local GC は foreign なオブジェクトの生死を判定できないので生存扱いにする（所有者
      * または global GC が判定する。global GC の unified mark は正確で全てを判定できる）。 */
-    if (RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace) && !objspace->flags.during_global_gc) return true;
+    if (gc_skip_foreign_object_p(objspace, obj)) return true;
 
     bool marked = RVALUE_MARKED(objspace, obj);
 
