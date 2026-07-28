@@ -1012,15 +1012,12 @@ rb_gc_init_objspaces(void)
 }
 
 /* 新しい非main Ractor の objspace を確保する。生成側 Ractor のスレッド上で、
- * 新 Ractor が動き出す前に呼ばれる。GC 設定は生成側から引き継ぐ。 */
+ * 新 Ractor が動き出す前に呼ばれる。 */
 void *
 rb_gc_objspace_alloc(void)
 {
-    void *parent_objspace = rb_gc_get_objspace();
-
     void *objspace = rb_gc_impl_objspace_alloc();
     rb_gc_impl_objspace_init(objspace);
-    rb_gc_impl_stress_set(objspace, rb_gc_impl_stress_get(parent_objspace));
 
     return objspace;
 }
