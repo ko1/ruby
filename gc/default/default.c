@@ -1113,6 +1113,18 @@ gc_skip_foreign_object_p(const rb_objspace_t *objspace, VALUE obj)
     return gc_foreign_object_p(objspace, obj) && !objspace->flags.during_global_gc;
 }
 
+/* obj を所有ページの shareable として記録する(bit + ページフラグ + 個体数カウンタ)。誕生時の
+ * born-shareable と make_shareable の共通処理。writer は所有者スレッドなので素の bit op でよい。 */
+static inline void
+gc_page_add_shareable(struct heap_page *page, VALUE obj)
+{
+    GC_ASSERT(page == GET_HEAP_PAGE(obj));
+    GC_ASSERT(RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE));
+    _MARK_IN_BITMAP(page->shareable_bits, page, obj);
+    page->flags.has_shareable_objects = TRUE;
+    page->objspace->rlgc.shareable_objects++;
+}
+
 static int
 RVALUE_AGE_GET(VALUE obj)
 {
@@ -2671,14 +2683,10 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
 
     if (RB_UNLIKELY(flags & RUBY_FL_SHAREABLE)) {
         /* born-shareable は WB protected でなければならない
-         * (shareable の shref/remset 規律は WB 前提)。 */
+         * (shareable の shref/remset 規律は WB 前提)。local GC はこの bit から
+         * shareable を root にする（rlgc_pinned_roots_mark）。 */
         GC_ASSERT(wb_protected);
-        /* born-shareable をページの bitmap にも反映する。local GC は
-         * ここから shareable を root にする（rlgc_pinned_roots_mark）。 */
-        struct heap_page *page = GET_HEAP_PAGE(obj);
-        _MARK_IN_BITMAP(page->shareable_bits, page, obj);
-        page->flags.has_shareable_objects = TRUE;
-        objspace->rlgc.shareable_objects++;
+        gc_page_add_shareable(GET_HEAP_PAGE(obj), obj);
     }
 
 #if RGENGC_CHECK_MODE
@@ -7446,9 +7454,7 @@ rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
      * single-writer。 */
     struct heap_page *page = GET_HEAP_PAGE(obj);
     if (_MARKED_IN_BITMAP(page->shareable_bits, page, obj)) return;
-    _MARK_IN_BITMAP(page->shareable_bits, page, obj);
-    page->flags.has_shareable_objects = TRUE;
-    page->objspace->rlgc.shareable_objects++;
+    gc_page_add_shareable(page, obj);
 
     /* unshareable だった頃の shref 記録はもう不要（shareable pin が覆う）。shref は
      * unshareable しか指さない。shref の writer も所有者スレッドなので素の clear でよい。 */
