@@ -1642,7 +1642,7 @@ RVALUE_UNCOLLECTIBLE(rb_objspace_t *objspace, VALUE obj)
 #define RVALUE_PAGE_MARKING(page, obj)        MARKED_IN_BITMAP((page)->marking_bits, (obj))
 
 static int rgengc_remember(rb_objspace_t *objspace, VALUE obj);
-static void rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap);
+static void rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref);
 static void rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap);
 static bool verify_pointer_in_any_heap_p(const void *ptr); /* cross-objspace の所属判定 */
 
@@ -3647,7 +3647,7 @@ gc_abort(void *objspace_ptr)
 
     for (int i = 0; i < HEAP_COUNT; i++) {
         rb_heap_t *heap = &heaps[i];
-        rgengc_mark_and_rememberset_clear(objspace, heap);
+        rgengc_mark_and_rememberset_clear(objspace, heap, false);
     }
 
     gc_mode_set(objspace, gc_mode_none);
@@ -7089,7 +7089,7 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
 
         for (int i = 0; i < HEAP_COUNT; i++) {
             rb_heap_t *heap = &heaps[i];
-            rgengc_mark_and_rememberset_clear(objspace, heap);
+            rgengc_mark_and_rememberset_clear(objspace, heap, false);
             heap_move_pooled_pages_to_free_pages(heap);
 
             if (objspace->flags.during_compacting) {
@@ -7306,7 +7306,7 @@ rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
 }
 
 static void
-rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
+rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref)
 {
     struct heap_page *page = 0;
 
@@ -7322,6 +7322,12 @@ rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
         memset(&page->pinned_bits[0],     0, HEAP_PAGE_BITMAP_SIZE);
         page->flags.has_uncollectible_wb_unprotected_objects = FALSE;
         page->flags.has_remembered_objects = FALSE;
+        /* shref は local GC の root なので、消してよいのは unified mark が全
+         * shareable->unshareable エッジから再導出する global GC(STW) だけ。 */
+        if (clear_shref) {
+            memset(&page->shref_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
+            page->flags.has_shref_objects = FALSE;
+        }
     }
 }
 
@@ -8400,18 +8406,6 @@ gc_global_objspaces_i(void *os, void *data)
     global_objspace->global_gc.list[global_objspace->global_gc.count++] = os;
 }
 
-static void
-clear_shref_bits(rb_objspace_t *objspace)
-{
-    for (int i = 0; i < HEAP_COUNT; i++) {
-        struct heap_page *page = NULL;
-        ccan_list_for_each(&heaps[i].pages, page, page_node) {
-            memset(&page->shref_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
-            page->flags.has_shref_objects = FALSE;
-        }
-    }
-}
-
 /* global GC: すべての Ractor を停止させ、全 objspace を 1 つの heap として clear/mark/sweep
  * する。shareable を free でき、cross-objspace な到達可能性を正確に判定できる唯一の collector。 */
 /* global GC の generic_fields weak pass。
@@ -8527,10 +8521,9 @@ gc_start_global(rb_objspace_t *driver, bool compact)
         objspace->marked_slots = 0;
         for (int h = 0; h < HEAP_COUNT; h++) {
             rb_heap_t *heap = &heaps[h];
-            rgengc_mark_and_rememberset_clear(objspace, heap);
+            rgengc_mark_and_rememberset_clear(objspace, heap, true);
             heap_move_pooled_pages_to_free_pages(heap);
         }
-        clear_shref_bits(objspace);
     }
     driver->profile.major_gc_count++;
 
