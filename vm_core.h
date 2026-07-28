@@ -838,7 +838,7 @@ typedef struct rb_vm_struct {
         } *zombie_objspaces;
         size_t zombie_objspaces_count;
         size_t zombie_objspaces_capa;
-        /* ledger 全体の .pages の合計。global cycle 間では上限値
+        /* zombie_objspaces 全体の .pages の合計。global cycle 間では上限値
          * (zombie のヒープは増えず、global cycle でのみ縮む)。 */
         size_t zombie_total_pages;
 

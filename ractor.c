@@ -255,7 +255,7 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
 
     /* 以下は owner が実行中に変更する構造（thread/EC/fiber は並行に free もされる）。
      * 呼び出しは root scan のみ: local GC は自分自身、global GC は barrier 下で set の
-     * 全員。終了済みは set を離れ zombie 台帳が担うので、ここには来ない。 */
+     * 全員。終了済みは set を離れ zombie_objspacesが担うので、ここには来ない。 */
     VM_ASSERT(r == rb_current_ractor_raw(false) || rb_gc_during_global_gc_p());
     VM_ASSERT(!rb_ractor_status_p(r, ractor_terminated));
 
@@ -302,14 +302,14 @@ ractor_mark(void *ptr)
     rb_ractor_t *r = (rb_ractor_t *)ptr;
 
     /* wrapper 直参照のみ。unshareable な root は owner の local GC と global GC の
-     * root scan（rb_ractor_mark_local_roots）が mark する。終了済みは zombie 台帳。
+     * root scan（rb_ractor_mark_local_roots）が mark する。終了済みは zombie_objspaces。
      * shareable な wrapper から unshareable を辿ると shref 制約に反するので、ここでは
      * 触らない（inter-Ractor 値の被覆は root scan 側で行う）。 */
     rb_gc_mark(r->loc);
     rb_gc_mark(r->name);
     /* default port は shareable なのでここから辿って良い(shref 制約に抵触しない)。
      * terminated 後も他 Ractor が wrapper 経由で send/value に使うため、wrapper が
-     * 生きる限り生かす。終了済み Ractor は set/台帳の root scan から外れうる
+     * 生きる限り生かす。終了済み Ractor は set/zombie_objspaces の root scan から外れうる
      * (objspace が orphan merge された後)ので、wrapper marker が唯一の被覆になる。 */
     rb_gc_mark(r->sync.default_port_value);
 }
@@ -354,7 +354,7 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
 }
 
 /* 終了済みで未 free の Ractor の戻り値(legacy)を mark+pin する。global GC が
- * zombie 台帳から呼ぶ。C-struct 参照は compaction で更新されないので pin 必須。
+ * zombie_objspacesから呼ぶ。C-struct 参照は compaction で更新されないので pin 必須。
  * default port は wrapper↔port の相互 mark で被覆済み(両方無到達なら誰も読まない)。 */
 void
 rb_ractor_mark_terminated_join_value(rb_ractor_t *r)
@@ -446,7 +446,7 @@ ractor_free(void *ptr)
     }
 
     /* unjoin で死んだ Ractor（handle も消え誰も継げない）。ここは global GC barrier 下の
-     * sweep なので zombie ledger を放し objspace merge を main に postponed job で渡す。
+     * sweep なので zombie_objspaces 表 を放し objspace merge を main に postponed job で渡す。
      * main は free-at-exit walk で来るので触らず、objspace も残す（VM destruct が最後に free）。 */
     if (r->objspace && !r->main_ractor) {
         rb_gc_objspace_disown(r->objspace);
@@ -721,7 +721,7 @@ rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th)
      * main 自身の disable だけが残る。 */
     RUBY_ATOMIC_SET(vm->gc.disable_holders, th->ractor->gc_disabled ? 1 : 0);
     /* fork 後は main Ractor だけが生きる。生成中カバーは無効化する。set は直前の
-     * rb_vm_living_threads_init が空にし、zombie 台帳は terminate_atfork が退避した
+     * rb_vm_living_threads_init が空にし、zombie_objspacesは terminate_atfork が退避した
      * 非main objspace を保持したまま orphan merge に委ねる。 */
     th->ractor->creating_child_objspace = NULL;
     ruby_single_main_ractor = th->ractor;
@@ -1007,7 +1007,7 @@ ractor_check_blocking(rb_ractor_t *cr, unsigned int remained_thread_cnt, const c
 
 /* 生成中に send_parameters が失敗した stillborn 子を set から外す。creator が呼ぶ
  * (rb_ractor_living_threads_remove は自 Ractor 前提)。objspace の disown まで同一
- * VM lock 内で行い、set 離脱〜台帳の間に列挙漏れの窓を作らない。 */
+ * VM lock 内で行い、set 離脱〜zombie_objspaces 登録の間に列挙漏れの窓を作らない。 */
 void
 rb_ractor_stillborn_remove(rb_ractor_t *r, rb_thread_t *th)
 {
@@ -2725,7 +2725,7 @@ move_capture(struct move_build *b, VALUE obj)
       case T_FILE:
       {
         /* fptr（と fd）を丸ごとポインタで持ち越し、source は close しない shell になる。
-         * fptr の VALUE メンバは送信側 object で husk 後は無 root になるので、通常の
+         * fptr の VALUE メンバは送信側 object で、T_MOVED 化後は無 root になるので、通常の
          * child node として capture し fptr から切り離す。rebuild が受信側 shell を書き戻す。 */
         struct rb_io *fptr = RFILE(obj)->fptr;
         VM_ASSERT(!RTEST(fptr->tied_io_for_writing) && !RTEST(fptr->wakeup_mutex));
@@ -2734,7 +2734,7 @@ move_capture(struct move_build *b, VALUE obj)
         uint32_t wc_pre_id  = move_capture(b, fptr->writeconv_pre_ecopts);
         uint32_t wc_ac_id   = move_capture(b, fptr->writeconv_asciicompat);
         uint32_t timeout_id = move_capture(b, fptr->timeout);
-        fptr->self = Qnil;   /* husk を指すため; attach 時に再構築 */
+        fptr->self = Qnil;   /* 移動元(T_MOVED)を指すため; attach 時に再構築 */
         fptr->pathv = Qnil;
         fptr->encs.ecopts = Qnil;
         fptr->writeconv_pre_ecopts = Qnil;
@@ -2781,7 +2781,7 @@ move_preflight_hash_i(st_data_t key, st_data_t val, st_data_t arg)
 }
 
 /* move_capture の判定木を変更なしで辿る事前walk。capture は各 object を
- * husk しながら進むので、途中で move 不可に当たると graph が壊れ回復不能になる。
+ * 移動元を T_MOVED 化しながら進むので、途中で move 不可に当たると graph が壊れ回復不能になる。
  * 「can not move」系のエラーは最初の変更前にここで全て raise する。 */
 static void
 move_preflight(VALUE obj, st_table *seen)
@@ -2864,7 +2864,7 @@ rb_ractor_move_courier_build(VALUE obj)
 
     /* off-heap courier の shareable REF は、送信〜受信 materialize の間、queue や materialize
      * frame に載らない transient(stack-local messages 等)を通る窓で無 root になり、その間の
-     * global GC に回収されうる。生存期間を通じ registry の root で mark+pin して守る。husk 前に
+     * global GC に回収されうる。生存期間を通じ registry の root で mark+pin して守る。T_MOVED 化前に
      * 登録するので、mark 安全に初期化した partial node を mark しても無害。 */
     move_courier_registry_add(c);
 
@@ -3482,7 +3482,7 @@ rb_ractor_finish_marking(void)
     }
 
     /* zombie（終了済み・未 merge）の storage には root scan の purge が届かない
-     * （set に居らず、台帳は join スロットしか mark しない）。struct を解放する前に
+     * （set に居らず、zombie_objspaces は join スロットしか mark しない）。struct を解放する前に
      * ここで purge しないと、後の ractor_free が解放済み key を読む。barrier 下。 */
     rb_vm_t *vm = GET_VM();
     for (size_t zi = 0; zi < vm->gc.zombie_objspaces_count; zi++) {
