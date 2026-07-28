@@ -1429,7 +1429,7 @@ static void gc_rest(rb_objspace_t *objspace);
 /* GC サイクルのイベント（ENTER/EXIT/START/END_MARK/END_SWEEP）は、その objspace の
  * Ractor が有効化した場合だけ発火する。並行する local GC が、他 Ractor が変更中の
  * VM グローバル hook リストを走査しないため。NEWOBJ/FREEOBJ は元から同様に絞る。 */
-#define gc_event_hook_objspace(objspace, event) do { \
+#define gc_event_hook(objspace, event) do { \
     if (RB_UNLIKELY((objspace)->hook_events & (event))) { \
         rb_gc_event_hook(0, (event)); \
     } \
@@ -4741,7 +4741,7 @@ gc_sweep_finish(rb_objspace_t *objspace)
         }
     }
 
-    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_END_SWEEP);
+    gc_event_hook(objspace, RUBY_INTERNAL_EVENT_GC_END_SWEEP);
     gc_mode_transition(objspace, gc_mode_none);
 }
 
@@ -6754,7 +6754,7 @@ gc_marks_finish(rb_objspace_t *objspace)
     // TODO: refactor so we don't need to call this
     rb_ractor_finish_marking();
 
-    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_END_MARK);
+    gc_event_hook(objspace, RUBY_INTERNAL_EVENT_GC_END_MARK);
 }
 
 static bool
@@ -7920,7 +7920,7 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     gc_prof_setup_new_record(objspace, reason);
     gc_reset_malloc_info(objspace, do_full_mark);
 
-    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_START);
+    gc_event_hook(objspace, RUBY_INTERNAL_EVENT_GC_START);
 
     GC_ASSERT(during_gc);
 
@@ -8197,7 +8197,7 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
     gc_report(1, objspace, "gc_enter: %s [%s]\n", gc_enter_event_cstr(event), gc_current_status(objspace));
     gc_record(objspace, 0, gc_enter_event_cstr(event));
 
-    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_ENTER);
+    gc_event_hook(objspace, RUBY_INTERNAL_EVENT_GC_ENTER);
 }
 
 static inline void
@@ -8207,7 +8207,7 @@ gc_exit(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_l
 
     RUBY_DTRACE_GC_HOOK(EXIT, event);
 
-    gc_event_hook_objspace(objspace, RUBY_INTERNAL_EVENT_GC_EXIT);
+    gc_event_hook(objspace, RUBY_INTERNAL_EVENT_GC_EXIT);
 
     if (objspace->profile.gc_pause_start_time) {
         if (gc_prof_enabled(objspace)) {
