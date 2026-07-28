@@ -89,6 +89,7 @@ MODULAR_GC_FN void rb_gc_vm_unlock_no_barrier(unsigned int lev, const char *file
 MODULAR_GC_FN void rb_gc_vm_barrier(void);
 MODULAR_GC_FN void rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data);
 MODULAR_GC_FN size_t rb_gc_vm_zombie_total_pages(void);
+MODULAR_GC_FN unsigned int rb_gc_vm_ractor_count(void);
 MODULAR_GC_FN void rb_gc_vm_refresh_zombie_pages(void);
 /* MODULAR_GC_FN を付けない: VM 側（ractor.c）からも呼ぶので、非モジュラービルドでも
  * 外部リンケージが要る（internal/gc.h 参照）。 */
