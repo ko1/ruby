@@ -725,7 +725,7 @@ ractor_sync_mark(rb_ractor_t *r)
      * が辿ると壊れて読める。しかも containment によりその中身はどれもこの marker に
      * とって foreign（payload snapshot は sender の in-flight pin で、port は
      * shareable pin で生存）。並行する所有者が居ない場合のみ辿る: 自 Ractor か
-     * global GC の barrier 下（終了済み Ractor は set/台帳経由でここへ来ない）。 */
+     * global GC の barrier 下（終了済み Ractor は set/zombie_objspaces 経由でここへ来ない）。 */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (r == cr || rb_gc_during_global_gc_p()) {
         /* materialize 中の copy snapshot の root は各 EC の frame 鎖
