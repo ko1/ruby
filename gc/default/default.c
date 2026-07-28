@@ -622,12 +622,10 @@ typedef struct rb_objspace {
     /* global GC 起動判定の入力。すべてこの objspace のスレッドが所有する。
      * shareable_objects は shareable の生存数（population）で、これが limit を超えたら
      * global GC を要求する。 */
-    struct {
-        size_t shareable_objects;
-        size_t shareable_objects_limit;
-        /* 直近の mark が pinned walk を実行したか。sweep の assert が参照する。 */
-        unsigned char last_cycle_pinned;
-    } rlgc;
+    size_t shareable_objects;
+    size_t shareable_objects_limit;
+    /* 直近の mark が pinned walk を実行したか。sweep の assert が参照する。 */
+    unsigned char last_cycle_pinned;
 
     struct {
         rb_darray(struct heap_page *) sorted;
@@ -782,10 +780,10 @@ typedef struct rb_global_objspace {
     } page_pool;
 
     /* 前回 global サイクル後に残った zombie ページ数(≒生存データ)。barrier 下で更新、
-     * 読み手(rlgc_global_wanted_p)は racy でよい。 */
+     * 読み手(gc_need_global_p)は racy でよい。 */
     size_t zombie_pages_survivors;
 
-    /* objspace 併合中(rlgc_objspace_absorb)。グラフが流動的な間、cross-objspace verifier
+    /* objspace 併合中(objspace_absorb)。グラフが流動的な間、cross-objspace verifier
      * 検査を抑止する。書き手は absorb スレッド、読み手は world 停止下の verify。 */
     bool during_absorb;
 
@@ -798,6 +796,15 @@ typedef struct rb_global_objspace {
      * 読み手は全 Ractor の alloc/GC path。診断用なので素の store/load(last-writer-wins)。 */
     bool gc_stressful;
     VALUE gc_stress_mode;
+
+    /* global GC driver の状態。compacting は move 相の間 true。gc_sweep_compact は全
+     * objspace を移動させるが、全 forwarding pointer が揃うまで参照更新を遅延する 2 相
+     * 方式(cross-objspace 参照を 1 度だけ書き換えるため)。list は対象 objspace の snapshot。 */
+    struct {
+        bool compacting;
+        struct rb_objspace **list;
+        size_t count, capa;
+    } global_gc;
 } rb_global_objspace_t;
 
 static rb_global_objspace_t rb_global_objspace_instance;
@@ -805,25 +812,16 @@ static rb_global_objspace_t *global_objspace = NULL;
 
 /* floor は shareable が少し出来ただけで global GC が走るのを防ぐ。factor は
  * old 世代 limit の規則に倣う。 */
-#define RLGC_SHAREABLE_LIMIT_MIN (1 << 16)
-#define RLGC_SHAREABLE_LIMIT_FACTOR 2.0
+#define SHAREABLE_OBJECTS_LIMIT_MIN (1 << 16)
+#define SHAREABLE_OBJECTS_LIMIT_FACTOR 2.0
 /* 終了して未継承の Ractor がこれだけの heap page を保持したら global GC を起動する
  * （小さな Ractor の objspace は約 13 ページなので大量廃棄でも越えにくく、肥えた
  * zombie は 1 つで越える）。 */
-#define RLGC_ZOMBIE_PAGES_TRIGGER 256
+#define ZOMBIE_PAGES_TRIGGER 256
 
 /* mark/sweep の述語は objspace ごとの during_global_gc を見る。これは driver が
  * barrier 下で取る反復用スナップショット。 */
-static struct {
-    /* compacting global GC の move 相の間 true。gc_sweep_compact は全 objspace を
-     * 移動させるが、全 forwarding pointer が揃うまで参照更新（gc_compact_finish）を
-     * 遅延させる 2 相方式。cross-objspace 参照を 1 度だけ書き換えるため。 */
-    bool compacting;
-    struct rb_objspace **list;
-    size_t count, capa;
-} rlgc_global;
-
-static void rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
+static void objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
 
 static struct heap_page_body *page_pool_acquire(void);
@@ -1125,7 +1123,7 @@ gc_page_add_shareable(struct heap_page *page, VALUE obj)
     GC_ASSERT(RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE));
     _MARK_IN_BITMAP(page->shareable_bits, page, obj);
     page->flags.has_shareable_objects = TRUE;
-    page->objspace->rlgc.shareable_objects++;
+    page->objspace->shareable_objects++;
 }
 
 static int
@@ -2687,7 +2685,7 @@ newobj_init(VALUE klass, VALUE flags, int wb_protected, rb_objspace_t *objspace,
     if (RB_UNLIKELY(flags & RUBY_FL_SHAREABLE)) {
         /* born-shareable は WB protected でなければならない
          * (shareable の shref/remset 規律は WB 前提)。local GC はこの bit から
-         * shareable を root にする（rlgc_pinned_roots_mark）。 */
+         * shareable を root にする（pinned_roots_mark）。 */
         GC_ASSERT(wb_protected);
         gc_page_add_shareable(GET_HEAP_PAGE(obj), obj);
     }
@@ -4142,14 +4140,14 @@ gc_compact_finish(rb_objspace_t *objspace)
         gc_unprotect_pages(objspace, heap);
     }
 
-    if (!rlgc_global.compacting) uninstall_handlers();
+    if (!global_objspace->global_gc.compacting) uninstall_handlers();
 
-    if (rlgc_global.compacting) {
+    if (global_objspace->global_gc.compacting) {
         /* compacting global GC ではここでこの objspace の heap 参照だけを更新する。
          * move か mark かの判定（RB_GC_MARK_OR_TRAVERSE）は rb_gc_get_objspace()（driver）の
-         * during_reference_updating を読むため、rlgc_global_gc がパス全体で全 objspace に
+         * during_reference_updating を読むため、gc_start_global がパス全体で全 objspace に
          * その flag を立てる。VM グローバル側（gc_update_references_global）は冪等でないので、
-         * rlgc_global_gc が全 objspace の heap 更新後に 1 度だけ実行する。 */
+         * gc_start_global が全 objspace の heap 更新後に 1 度だけ実行する。 */
         gc_update_references_heap(objspace);
     }
     else {
@@ -4168,7 +4166,7 @@ gc_compact_finish(rb_objspace_t *objspace)
         gc_profile_record *record = gc_prof_record(objspace);
         record->moved_objects = objspace->rcompactor.total_moved - record->moved_objects;
     }
-    if (!rlgc_global.compacting) objspace->flags.during_compacting = FALSE;
+    if (!global_objspace->global_gc.compacting) objspace->flags.during_compacting = FALSE;
 }
 
 struct gc_sweep_context {
@@ -4635,7 +4633,7 @@ gc_sweep_start(rb_objspace_t *objspace)
 
     /* VM グローバル表の掃除。global GC では全 objspace の sweep がここを通るが、
      * 表は VM に 1 つで判定は mark bit（ページ相対）なので反復は冪等な無駄。
-     * rlgc_global_gc が sweep 前に 1 回だけ実施する。 */
+     * gc_start_global が sweep 前に 1 回だけ実施する。 */
     if (!objspace->flags.during_global_gc) {
         for (int table = 0; table < RB_GC_VM_WEAK_TABLE_COUNT; table++) {
             if (!rb_gc_vm_weak_table_essential_p(table)) continue;
@@ -4768,7 +4766,7 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
      * single-world サイクルは死んだ shareable を正当に unmarked のまま残し、その sweep が
      * 途中で multi-objspace に切り替わりうるため。global GC の正確な mark は pin しないので
      * 自動的に対象外。 */
-    const unsigned char check_pinned_free = objspace->rlgc.last_cycle_pinned;
+    const unsigned char check_pinned_free = objspace->last_cycle_pinned;
 
     do {
         RUBY_DEBUG_LOG("sweep_page:%p", (void *)sweep_page);
@@ -4925,7 +4923,7 @@ gc_sweep_step_for_malloc(rb_objspace_t *objspace)
     gc_exit(objspace, gc_enter_event_continue, &lock_lev);
 }
 
-static bool rlgc_global_pointer_to_heap_p(const void *ptr);
+static bool gc_global_pointer_to_heap_p(const void *ptr);
 
 VALUE
 rb_gc_impl_location(void *objspace_ptr, VALUE value)
@@ -4938,7 +4936,7 @@ rb_gc_impl_location(void *objspace_ptr, VALUE value)
      * compacting global GC は barrier 下で全 objspace を動かすので cross-objspace 参照も動く。
      * その場合は全 objspace の heap を調べて forwarding を辿る。 */
     if (RB_UNLIKELY(objspace->flags.during_global_gc)
-            ? !rlgc_global_pointer_to_heap_p((void *)value)
+            ? !gc_global_pointer_to_heap_p((void *)value)
             : !is_pointer_to_heap(objspace_ptr, (void *)value)) {
         return value;
     }
@@ -5046,7 +5044,7 @@ gc_compact_start(rb_objspace_t *objspace)
 
     /* Set up read barrier for pages containing MOVED objects */
     /* compacting global GC は read barrier を全 objspace 分まとめて 1 度だけ設置する。 */
-    if (!rlgc_global.compacting) install_handlers();
+    if (!global_objspace->global_gc.compacting) install_handlers();
 }
 
 static void gc_sweep_compact(rb_objspace_t *objspace);
@@ -5493,10 +5491,10 @@ rb_gc_impl_mark_and_pin(void *objspace_ptr, VALUE obj)
  * 全 objspace のスナップショットに対して所属を判定する（bit は gc_mark/gc_pin 経由で
  * 所有者のページに着く）。 */
 static bool
-rlgc_global_pointer_to_heap_p(const void *ptr)
+gc_global_pointer_to_heap_p(const void *ptr)
 {
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        if (is_pointer_to_heap(rlgc_global.list[i], ptr)) return true;
+    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+        if (is_pointer_to_heap(global_objspace->global_gc.list[i], ptr)) return true;
     }
     return false;
 }
@@ -5509,7 +5507,7 @@ rb_gc_impl_mark_maybe(void *objspace_ptr, VALUE obj)
     (void)VALGRIND_MAKE_MEM_DEFINED(&obj, sizeof(obj));
 
     if (RB_UNLIKELY(objspace->flags.during_global_gc)
-            ? rlgc_global_pointer_to_heap_p((void *)obj)
+            ? gc_global_pointer_to_heap_p((void *)obj)
             : is_pointer_to_heap(objspace, (void *)obj)) {
         asan_unpoisoning_object(obj) {
             /* Garbage can live on the stack, so do not mark or pin */
@@ -5555,7 +5553,7 @@ gc_mark_set_parent_invalid(rb_objspace_t *objspace)
     asan_poison_memory_region(&objspace->rgengc.parent_object_old_p, sizeof(objspace->rgengc.parent_object_old_p));
 }
 
-static void rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap);
+static void pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap);
 
 static void
 mark_roots(rb_objspace_t *objspace, const char **categoryp)
@@ -5575,8 +5573,8 @@ mark_roots(rb_objspace_t *objspace, const char **categoryp)
         /* 全 objspace の finalizer 表（zombie も含む）を pin する。
          * （finalizer_table はローカルの "objspace" に対するマクロ。） */
         rb_objspace_t *const driver = objspace;
-        for (size_t i = 0; i < rlgc_global.count; i++) {
-            rb_objspace_t *objspace = rlgc_global.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+            rb_objspace_t *objspace = global_objspace->global_gc.list[i];
             if (finalizer_table != NULL) {
                 st_foreach(finalizer_table, pin_value, (st_data_t)driver);
             }
@@ -6658,12 +6656,12 @@ gc_marks_finish(rb_objspace_t *objspace)
      * ならない。全走査後に走るので pin 数は retention 指標（global GC だけが回収できる
      * garbage の上限）になる。global GC は pin しない（unified mark が正確な到達可能性）。
      * （RGENGC_CHECK_MODE >= 4 の allrefs 比較はこの pin を模さず誤検出するので注意。） */
-    objspace->rlgc.last_cycle_pinned = 0;
+    objspace->last_cycle_pinned = 0;
     if (!rb_gc_single_objspace_p() && !objspace->flags.during_global_gc) {
-        objspace->rlgc.last_cycle_pinned = 1;
+        objspace->last_cycle_pinned = 1;
         gc_mark_set_parent_raw(objspace, Qundef, false);
         for (int i = 0; i < HEAP_COUNT; i++) {
-            rlgc_pinned_roots_mark(objspace, &heaps[i]);
+            pinned_roots_mark(objspace, &heaps[i]);
         }
         /* そしてそれらが生かすもの全て。 */
         gc_mark_stacked_objects_all(objspace);
@@ -6929,7 +6927,7 @@ gc_sweep_compact(rb_objspace_t *objspace)
 {
     gc_compact_relocate(objspace);
     /* compacting global GC は finish（参照更新）を、全 objspace の再配置後の第 2 相へ遅延する。 */
-    if (!rlgc_global.compacting) {
+    if (!global_objspace->global_gc.compacting) {
         gc_compact_finish(objspace);
     }
 }
@@ -7001,7 +6999,7 @@ gc_marks_continue(rb_objspace_t *objspace, rb_heap_t *heap)
  *   in-flight のメッセージキューにありうる。write barrier が維持する。
  * VM が単一 Ractor の間はスキップ。local GC が全世界 GC となり shareable も通常通り死ねる。 */
 static void
-rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
+pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
 {
     struct heap_page *page = NULL;
 
@@ -7041,7 +7039,7 @@ rlgc_pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
                             /* dead な slot（finalizer 待ちの zombie など）は root でない。 */
                             break;
                           default:
-                            gc_report(2, objspace, "rlgc_pinned_roots_mark: mark %s\n", rb_obj_info(obj));
+                            gc_report(2, objspace, "pinned_roots_mark: mark %s\n", rb_obj_info(obj));
                             if (sr_bits & 1) {
                                 gc_mark(objspace, obj);          /* shref: root + traverse */
                             }
@@ -7318,7 +7316,7 @@ rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap)
         memset(&page->marking_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
         /* 素の memset は並行 write barrier の remember を失いうるが、他 Ractor のスレッドから
          * remember されうるのは shareable だけで、shareable は remembered bit に関係なく毎回の
-         * local mark（rlgc_pinned_roots_mark）で再 mark される。かつこの clear が先立つ major は
+         * local mark（pinned_roots_mark）で再 mark される。かつこの clear が先立つ major は
          * どのみち全体を再走査する。 */
         memset(&page->remembered_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->pinned_bits[0],     0, HEAP_PAGE_BITMAP_SIZE);
@@ -7751,16 +7749,16 @@ gc_reset_malloc_info(rb_objspace_t *objspace, bool full_mark)
 #endif
 }
 
-static void rlgc_global_gc(rb_objspace_t *driver, bool compact);
+static void gc_start_global(rb_objspace_t *driver, bool compact);
 
 /* この回収は global でなければならないか。local GC は shareable も zombie objspace も回収
  * できないので、それらが限界を超えたら global GC だけが前進する。入力はすべてこの objspace
  * 自身のもの。 */
 static bool
-rlgc_global_wanted_p(rb_objspace_t *objspace)
+gc_need_global_p(rb_objspace_t *objspace)
 {
     if (rb_gc_single_objspace_p()) return false;
-    if (objspace->rlgc.shareable_objects > objspace->rlgc.shareable_objects_limit) return true;
+    if (objspace->shareable_objects > objspace->shareable_objects_limit) return true;
     /* zombie は heap ページを保持し、その garbage は global サイクルしか回収できない。
      * ただし前回 global の残存分は生きているデータなので、それを基準に「新たに」
      * TRIGGER ぶん増えた時だけ再トリガする。生存ページの多い未 join zombie が
@@ -7768,7 +7766,7 @@ rlgc_global_wanted_p(rb_objspace_t *objspace)
     {
         size_t zp = rb_gc_vm_zombie_total_pages();
         size_t base = global_objspace->zombie_pages_survivors < zp ? global_objspace->zombie_pages_survivors : zp;
-        if (zp - base >= RLGC_ZOMBIE_PAGES_TRIGGER) return true;
+        if (zp - base >= ZOMBIE_PAGES_TRIGGER) return true;
     }
     return false;
 }
@@ -7810,8 +7808,8 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
      * 通らず直接 gc_start に来る割り当て slow path も含む。dead shareable / 滞留 retention /
      * zombie ページを回収できるのは global サイクルだけで、明示・malloc 起因の GC だけで
      * 判定すると割り当て駆動のワークロードが全閾値をすり抜けてしまう。 */
-    if (rlgc_global_wanted_p(objspace)) {
-        rlgc_global_gc(objspace, false);
+    if (gc_need_global_p(objspace)) {
+        gc_start_global(objspace, false);
         return TRUE;
     }
 
@@ -8412,20 +8410,20 @@ rb_gc_impl_heap_page_count(void *objspace_ptr)
 }
 
 static void
-rlgc_global_objspaces_i(void *os, void *data)
+gc_global_objspaces_i(void *os, void *data)
 {
-    if (rlgc_global.count == rlgc_global.capa) {
-        size_t new_capa = rlgc_global.capa ? rlgc_global.capa * 2 : 16;
-        struct rb_objspace **new_list = realloc(rlgc_global.list, new_capa * sizeof(*new_list));
-        if (new_list == NULL) rb_bug("rlgc_global_objspaces_i: realloc failed");
-        rlgc_global.list = new_list;
-        rlgc_global.capa = new_capa;
+    if (global_objspace->global_gc.count == global_objspace->global_gc.capa) {
+        size_t new_capa = global_objspace->global_gc.capa ? global_objspace->global_gc.capa * 2 : 16;
+        struct rb_objspace **new_list = realloc(global_objspace->global_gc.list, new_capa * sizeof(*new_list));
+        if (new_list == NULL) rb_bug("gc_global_objspaces_i: realloc failed");
+        global_objspace->global_gc.list = new_list;
+        global_objspace->global_gc.capa = new_capa;
     }
-    rlgc_global.list[rlgc_global.count++] = os;
+    global_objspace->global_gc.list[global_objspace->global_gc.count++] = os;
 }
 
 static void
-rlgc_clear_shref_bits(rb_objspace_t *objspace)
+clear_shref_bits(rb_objspace_t *objspace)
 {
     for (int i = 0; i < HEAP_COUNT; i++) {
         struct heap_page *page = NULL;
@@ -8447,15 +8445,15 @@ rlgc_clear_shref_bits(rb_objspace_t *objspace)
  * weak-KEY: live(marked) な key の val（fields_obj = strong child）だけを mark し、
  * dead な key の entry は drain する。val の mark が新たな key を live 化しうるので
  * fixpoint まで繰り返す。 */
-struct rlgc_genfields_mark_arg {
+struct genfields_mark_arg {
     rb_objspace_t *objspace;
     bool progress;
 };
 
 static int
-rlgc_genfields_mark_i(VALUE key, VALUE val, void *arg)
+genfields_mark_i(VALUE key, VALUE val, void *arg)
 {
-    struct rlgc_genfields_mark_arg *a = (struct rlgc_genfields_mark_arg *)arg;
+    struct genfields_mark_arg *a = (struct genfields_mark_arg *)arg;
     if (RB_SPECIAL_CONST_P(val) || !RVALUE_MARKED_BITMAP(key)) {
         return ST_CONTINUE;
     }
@@ -8474,32 +8472,32 @@ rlgc_genfields_mark_i(VALUE key, VALUE val, void *arg)
 }
 
 static bool
-rlgc_genfields_dead_p(VALUE key)
+genfields_dead_p(VALUE key)
 {
     return RVALUE_MARKED_BITMAP(key) == 0;
 }
 
 static void
-rlgc_global_mark_generic_fields(rb_objspace_t *driver)
+gc_global_mark_generic_fields(rb_objspace_t *driver)
 {
-    struct rlgc_genfields_mark_arg arg = { driver, false };
+    struct genfields_mark_arg arg = { driver, false };
     do {
         arg.progress = false;
-        /* 各エントリの mark で parent=key を張る（rlgc_genfields_mark_i）。世代間 WB を
+        /* 各エントリの mark で parent=key を張る（genfields_mark_i）。世代間 WB を
          * 正しく記録するため。foreach 後は gc_mark_stacked_objects_all が自分で per-obj の
          * parent を張るので、その前に parent を invalid に戻しておく（poison 契約）。 */
-        rb_gc_vm_generic_fields_mark_foreach(rlgc_genfields_mark_i, &arg);
+        rb_gc_vm_generic_fields_mark_foreach(genfields_mark_i, &arg);
         gc_mark_set_parent_invalid(driver);
         if (arg.progress) {
             gc_mark_stacked_objects_all(driver);
         }
     } while (arg.progress);
 
-    rb_gc_vm_generic_fields_drain_dead(rlgc_genfields_dead_p);
+    rb_gc_vm_generic_fields_drain_dead(genfields_dead_p);
 }
 
 static void
-rlgc_global_gc(rb_objspace_t *driver, bool compact)
+gc_start_global(rb_objspace_t *driver, bool compact)
 {
     unsigned int lock_lev;
     gc_enter(driver, gc_enter_event_global, &lock_lev);
@@ -8507,23 +8505,23 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
     GC_ASSERT(is_mark_stack_empty(&driver->mark_stack));
 
     /* driver が持つ全 objspace（zombie 含む）のスナップショット。 */
-    rlgc_global.count = 0;
-    rb_gc_vm_each_objspace(rlgc_global_objspaces_i, NULL);
+    global_objspace->global_gc.count = 0;
+    rb_gc_vm_each_objspace(gc_global_objspaces_i, NULL);
 
     /* step 3 で lazy sweep を落ち着かせる前に、全 objspace を global GC 中と印す。その settle は
      * 他 Ractor の objspace の残り garbage を driver スレッドで free するが、foreign オブジェクトの
      * weak 参照 free（rb_free_generic_ivar）は「global GC 進行中」を見て、per-Ractor generic_fields
      * の削除を driver 自身の表に誤って解決せず weak-pass drain へ遅延する必要があるため。 */
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        rlgc_global.list[i]->flags.during_global_gc = TRUE;
+    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+        global_objspace->global_gc.list[i]->flags.during_global_gc = TRUE;
     }
 
     /* step 3: 全 objspace の lazy sweep を落ち着かせ、下の clear より前に mark bit の意味を
      * 確定させる。（during_gc はローカルの "objspace" に対するマクロ。）objspace が GC 中は
      * rb_gc_get_ec() が objspace->vm_context 経由で解決するので、全員分を初期化する
      * （driver スレッドが全員の phase を走らせる）。 */
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        rb_objspace_t *objspace = rlgc_global.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
         /* ここではどの objspace も incremental mark の途中ではありえない。incremental mark は
          * 単一 objspace でしか走らず、単一→複数遷移（vm_insert_ractor0）が落ち着かせる。gray
          * stack がスナップショットを保持したまま step 5 で flag を消すと所有者の GC 状態機械を壊す。 */
@@ -8536,13 +8534,13 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
 
     /* step 5: 全 objspace の mark / remembered set / 世代カウンタ / shref をクリアする
      * （1 つでも漏らすと stale な mark bit で UAF）。（heaps はローカルの "objspace" のマクロ。） */
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        rb_objspace_t *objspace = rlgc_global.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
         objspace->flags.during_minor_gc = FALSE;
         objspace->flags.during_incremental_marking = FALSE;
         /* unified mark は正確で pin しない。下の per-objspace sweep は stale な local サイクルに
          * 対して再チェックしてはならない。 */
-        objspace->rlgc.last_cycle_pinned = 0;
+        objspace->last_cycle_pinned = 0;
         objspace->rgengc.uncollectible_wb_unprotected_objects = 0;
         objspace->rgengc.old_objects = 0;
         objspace->rgengc.last_major_gc = objspace->profile.count;
@@ -8552,18 +8550,18 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
             rgengc_mark_and_rememberset_clear(objspace, heap);
             heap_move_pooled_pages_to_free_pages(heap);
         }
-        rlgc_clear_shref_bits(objspace);
+        clear_shref_bits(objspace);
     }
     driver->profile.major_gc_count++;
 
     /* compacting global GC: mark の前に全 objspace で compaction を有効にする。unified な保守的
      * root 走査が各 Ractor のマシンスタック参照先を pin し（gc_pin は during_compacting の間だけ
      * pinned bit を立てる）、step 9 の per-objspace sweep が再配置するように。move 相はそこで
-     * 走り、rlgc_global.compacting が参照更新相を下の phase 2 へ遅延する（2 相、cross-objspace 安全）。 */
-    rlgc_global.compacting = compact;
+     * 走り、global_objspace->global_gc.compacting が参照更新相を下の phase 2 へ遅延する（2 相、cross-objspace 安全）。 */
+    global_objspace->global_gc.compacting = compact;
     if (compact) {
-        for (size_t i = 0; i < rlgc_global.count; i++) {
-            rb_objspace_t *objspace = rlgc_global.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+            rb_objspace_t *objspace = global_objspace->global_gc.list[i];
             objspace->flags.during_compacting = TRUE;
             /* gc_marks_start は compacting な local GC 用に各ページの pinned_slots をリセットするが、
              * global GC は gc_marks_start を飛ばすのでここでリセットする。step 5 で pinned_bits は
@@ -8586,7 +8584,7 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
      * live key の val（fields_obj）を mark（＋その先を drain）し、dead key の entry を
      * drain する。per-object の rb_mark_generic_ivar は global GC 中は no-op なので、
      * ここが唯一の generic_fields の mark 経路である。 */
-    rlgc_global_mark_generic_fields(driver);
+    gc_global_mark_generic_fields(driver);
 
     /* step 8 */
     gc_update_weak_references(driver);
@@ -8606,8 +8604,8 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
     /* step 9: barrier 内で全 objspace を lazy でなく sweep する。dead な shareable はここで回収し、
      * 空きページは pool に戻る。 */
     if (!compact) {
-        for (size_t i = 0; i < rlgc_global.count; i++) {
-            rb_objspace_t *os = rlgc_global.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+            rb_objspace_t *os = global_objspace->global_gc.list[i];
             unsigned int prev_immediate = os->flags.immediate_sweep;
             os->flags.immediate_sweep = TRUE;
             gc_sweep(os);
@@ -8624,8 +8622,8 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
         install_handlers();
 
         /* pass 1 (move): 全 objspace を再配置し T_MOVED forwarding を残す。 */
-        for (size_t i = 0; i < rlgc_global.count; i++) {
-            rb_objspace_t *os = rlgc_global.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+            rb_objspace_t *os = global_objspace->global_gc.list[i];
             gc_sweeping_enter(os);
             gc_sweep_start(os);        /* mode を sweeping へ、compaction 用に heap を整列 */
             gc_compact_relocate(os);   /* mode を compacting へ、move */
@@ -8635,34 +8633,34 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
          * （cross-objspace 参照も解決する）。gc_compact_finish はページの unprotect と
          * during_compacting のクリアも行う。move か mark かの判定は rb_gc_get_objspace() の
          * during_reference_updating を読むので、pass 用に全 objspace に立てる。 */
-        for (size_t i = 0; i < rlgc_global.count; i++) {
-            rlgc_global.list[i]->flags.during_reference_updating = TRUE;
+        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+            global_objspace->global_gc.list[i]->flags.during_reference_updating = TRUE;
         }
         rb_gc_before_updating_jit_code();
-        for (size_t i = 0; i < rlgc_global.count; i++) {
-            gc_compact_finish(rlgc_global.list[i]);
+        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+            gc_compact_finish(global_objspace->global_gc.list[i]);
         }
         /* 参照更新の VM グローバル / weak-table 側は 1 度だけ走る（各 objspace の heap 側は
          * 上の gc_compact_finish で既に走った）。 */
         gc_update_references_global(driver);
         rb_gc_after_updating_jit_code();
-        for (size_t i = 0; i < rlgc_global.count; i++) {
-            rlgc_global.list[i]->flags.during_reference_updating = FALSE;
-            rlgc_global.list[i]->flags.during_compacting = FALSE;
+        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+            global_objspace->global_gc.list[i]->flags.during_reference_updating = FALSE;
+            global_objspace->global_gc.list[i]->flags.during_compacting = FALSE;
         }
-        rlgc_global.compacting = false;
+        global_objspace->global_gc.compacting = false;
         uninstall_handlers();
 
         /* pass 3 (free): 全 objspace を page-sweep し、dead オブジェクトと空になった移動元
          * ページを free する。during_compacting はクリア済みなので sweep は T_MOVED を通常通り
          * 扱う。 */
-        for (size_t i = 0; i < rlgc_global.count; i++) {
-            rb_objspace_t *os = rlgc_global.list[i];
+        for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+            rb_objspace_t *os = global_objspace->global_gc.list[i];
             gc_sweep_rest(os);
             gc_sweeping_exit(os);
         }
     }
-    rlgc_global.compacting = false;
+    global_objspace->global_gc.compacting = false;
 
     /* global GC は独自の unified mark+sweep を走らせ、次サイクルの heap 成長予算
      * （allocatable_bytes）を用意する gc_marks_finish を呼ばない。global sweep 後も heap が満杯の
@@ -8670,8 +8668,8 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
      * 回収できない）は free ページも empty ページも無く allocatable_bytes == 0 になり、次の割り当てで
      * newobj_refill の「major GC 後に新ページを作れない」に当たる。ここで詰まった objspace 全てに
      * gc_marks_finish と同様に成長予算を与える。 */
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        rb_objspace_t *objspace = rlgc_global.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
         if (objspace->heap_pages.allocatable_bytes != 0 || objspace->empty_pages_count != 0) {
             continue;
         }
@@ -8687,8 +8685,8 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
 
     /* 生き残った shareable を数え直し（sweep が既に dead を shareable_bits から畳んだ）、
      * 各 trigger limit をリセットする。 */
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        rb_objspace_t *objspace = rlgc_global.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
         size_t survivors = 0;
         for (int h = 0; h < HEAP_COUNT; h++) {
             struct heap_page *page = NULL;
@@ -8699,16 +8697,16 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
                 }
             }
         }
-        objspace->rlgc.shareable_objects = survivors;
-        size_t new_limit = (size_t)(survivors * RLGC_SHAREABLE_LIMIT_FACTOR);
-        if (new_limit < RLGC_SHAREABLE_LIMIT_MIN) new_limit = RLGC_SHAREABLE_LIMIT_MIN;
-        objspace->rlgc.shareable_objects_limit = new_limit;
+        objspace->shareable_objects = survivors;
+        size_t new_limit = (size_t)(survivors * SHAREABLE_OBJECTS_LIMIT_FACTOR);
+        if (new_limit < SHAREABLE_OBJECTS_LIMIT_MIN) new_limit = SHAREABLE_OBJECTS_LIMIT_MIN;
+        objspace->shareable_objects_limit = new_limit;
     }
     driver->profile.count++;
 
     /* step 10 */
-    for (size_t i = 0; i < rlgc_global.count; i++) {
-        rb_objspace_t *objspace = rlgc_global.list[i];
+    for (size_t i = 0; i < global_objspace->global_gc.count; i++) {
+        rb_objspace_t *objspace = global_objspace->global_gc.list[i];
         objspace->flags.during_global_gc = FALSE;
         if (objspace != driver) during_gc = FALSE;
     }
@@ -8727,7 +8725,7 @@ rlgc_global_gc(rb_objspace_t *driver, bool compact)
 }
 
 static int
-rlgc_absorb_finalizer_i(st_data_t key, st_data_t val, st_data_t data)
+absorb_finalizer_i(st_data_t key, st_data_t val, st_data_t data)
 {
     rb_objspace_t *objspace = (rb_objspace_t *)data;
     st_insert(finalizer_table, key, val);
@@ -8740,7 +8738,7 @@ rlgc_absorb_finalizer_i(st_data_t key, st_data_t val, st_data_t data)
  * オブジェクト bit はオブジェクトを表し objspace を表さないのでそのまま残り、dst の次回回収は
  * full mark を強制して併合後の世代状態を作り直す。 */
 static void
-rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
+objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
 {
     GC_ASSERT(dst != src);
 
@@ -8766,7 +8764,7 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         /* gc_sweep_finish は sweep 済みページを来るべき incremental mark 用に "pooled" のまま残す
          * （will_be_incremental_marking）。src は incremental mark を走らせない（併合寸前で dst の
          * 次回回収は full 強制）ので、今 src の free リストへ返す。global GC の settle
-         * （rlgc_global_gc step 3）と同様で、下のページ併合が前提とする pooled_pages == NULL を
+         * （gc_start_global step 3）と同様で、下のページ併合が前提とする pooled_pages == NULL を
          * 回復する。 */
         for (int h = 0; h < HEAP_COUNT; h++) {
             heap_move_pooled_pages_to_free_pages(&heaps[h]);
@@ -8887,7 +8885,7 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
                 finalizer_table = src_finalizers;
             }
             else {
-                st_foreach(src_finalizers, rlgc_absorb_finalizer_i, (st_data_t)dst);
+                st_foreach(src_finalizers, absorb_finalizer_i, (st_data_t)dst);
                 st_free_table(src_finalizers);
             }
         }
@@ -8912,7 +8910,7 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     /* dst に引き継ぐカウンタ。 */
     dst->rgengc.old_objects += src->rgengc.old_objects;
     dst->rgengc.uncollectible_wb_unprotected_objects += src->rgengc.uncollectible_wb_unprotected_objects;
-    dst->rlgc.shareable_objects += src->rlgc.shareable_objects;
+    dst->shareable_objects += src->shareable_objects;
 
     /* 併合ページは src 基準の mark/age 状態を持つので、dst の世界観は次回回収で作り直す。 */
     dst->rgengc.need_major_gc |= GPR_FLAG_MAJOR_BY_FORCE;
@@ -8952,7 +8950,7 @@ rlgc_objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
 void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
-    rlgc_objspace_absorb(dst_ptr, src_ptr);
+    objspace_absorb(dst_ptr, src_ptr);
 }
 
 void
@@ -8969,7 +8967,7 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
 
     /* compaction はオブジェクトを動かす。複数 objspace では global GC の barrier が全 Ractor を
      * 止めるので、全 objspace をまたいで再配置と 2 相の参照更新を安全に行える（下で compact=true
-     * で呼ぶ rlgc_global_gc）。単一 objspace の compaction は通常の local 経路
+     * で呼ぶ gc_start_global）。単一 objspace の compaction は通常の local 経路
      * （garbage_collect -> during_compacting 付き gc_start）を通る。 */
 
     /* For now, compact implies full mark / sweep, so ignore other flags */
@@ -8987,7 +8985,7 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
     /* 複数 objspace での明示的な full な GC.start は global GC を走らせる。shareable と
      * cross-objspace の garbage を回収できる唯一の collector だから。 */
     if (!rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK)) {
-        rlgc_global_gc(objspace, compact);
+        gc_start_global(objspace, compact);
         gc_finalize_deferred(objspace);
         gc_config_full_mark_set(full_marking_p);
         return;
@@ -11973,7 +11971,7 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
 
     objspace->flags.measure_gc = true;
     malloc_limit = gc_params.malloc_limit_min;
-    objspace->rlgc.shareable_objects_limit = RLGC_SHAREABLE_LIMIT_MIN;
+    objspace->shareable_objects_limit = SHAREABLE_OBJECTS_LIMIT_MIN;
 #ifdef MALLOC_COUNTERS_NEED_LOCK
     rb_native_mutex_initialize(&objspace->malloc_counters.lock);
 #endif
