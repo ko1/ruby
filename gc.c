@@ -3988,6 +3988,13 @@ rb_gc_vm_zombie_total_pages(void)
     return GET_VM()->gc.zombie_total_pages;
 }
 
+/* 生存 Ractor 数。ヒープ成長ヒューリスティック(r_mul)用で racy read でよい。 */
+unsigned int
+rb_gc_vm_ractor_count(void)
+{
+    return GET_VM()->ractor.cnt;
+}
+
 /* global サイクルが barrier 内で呼ぶ。 */
 void
 rb_gc_vm_refresh_zombie_pages(void)
