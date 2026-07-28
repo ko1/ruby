@@ -1121,7 +1121,7 @@ ractor_basket_value(struct ractor_basket *b)
          * 死んだ materialization を漏らしたり外側を落としたりしない。 */
         rb_execution_context_t *ec = rb_current_ec_noinline();
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
-        struct rlgc_materialize_frame frame = {
+        struct ractor_materialize_frame frame = {
             .snapshot = b->p.v, .pinned = b->p.pinned, .pinned_cnt = b->p.pinned_cnt,
             .prev = ec->materialize_frames,
         };

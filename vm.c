@@ -3885,7 +3885,7 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
      * snapshot は送信側常駐なので自 local GC では containment が skip し、global GC が
      * mark + shref 再 pin する（step5 が全 shref を消すため）。move courier は in-flight
      * registry が global GC の root として mark+pin する(ractor.c)のでここでは扱わない。 */
-    for (const struct rlgc_materialize_frame *f = ec->materialize_frames; f != NULL; f = f->prev) {
+    for (const struct ractor_materialize_frame *f = ec->materialize_frames; f != NULL; f = f->prev) {
         rb_gc_mark(f->snapshot);
         if (f->snapshot && !RB_SPECIAL_CONST_P(f->snapshot) && rb_gc_during_global_gc_p()) {
             /* root だけでなく全 node（+ fields_obj 群）。compaction が snapshot node を

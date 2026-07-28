@@ -3869,7 +3869,7 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
  * マージする処理は、main を対象にした postponed job として main の次の safepoint で
  * 走る。orphan を見つけた GC サイクルの内側では走らせない。 */
 
-static void rlgc_orphan_merge_job(void *unused);
+static void gc_orphan_merge_job(void *unused);
 
 /* 素の realloc で伸ばす。rb_gc_objspace_disown は global GC の sweep 内から push し、
  * そこでは会計付きアロケータが禁止のため。この台帳は VM 寿命のメタデータで、
@@ -3901,10 +3901,10 @@ zombie_objspaces_push(rb_vm_t *vm, void *objspace, void **owner_slot, struct rb_
 /* orphan objspace 併合 job の handle を（未登録なら）確保する。全 retire/disown 経路で
  * 共有。二重の preregister は冪等（同じ func + data で重複排除される）。 */
 static void
-rlgc_orphan_merge_pjob_ensure(void)
+gc_orphan_merge_pjob_ensure(void)
 {
     if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
-        GET_VM()->gc.orphan_merge_pjob = rb_postponed_job_preregister(0, rlgc_orphan_merge_job, NULL);
+        GET_VM()->gc.orphan_merge_pjob = rb_postponed_job_preregister(0, gc_orphan_merge_job, NULL);
         if (GET_VM()->gc.orphan_merge_pjob == POSTPONED_JOB_HANDLE_INVALID) {
             rb_bug("Could not preregister postponed job for GC");
         }
@@ -3917,7 +3917,7 @@ rb_gc_objspace_retire(void **objspace_slot)
     rb_vm_t *vm = GET_VM();
 
     RB_VM_LOCKING() {
-        rlgc_orphan_merge_pjob_ensure();
+        gc_orphan_merge_pjob_ensure();
         /* owner_slot は常に retire 対象 Ractor の &r->objspace。owner は global GC の
          * generic_fields weak pass がこの zombie の per-Ractor 表を舐めるために記録する。
          * orphan 化すると rb_gc_objspace_disown が owner を NULL にする。 */
@@ -3952,7 +3952,7 @@ rb_gc_objspace_disown(void *objspace)
 
     /* トリガは wait-free（atomic ビット + interrupt フラグ）で sweep 内でも安全。
      * 一度も開始しなかった Ractor の経路も覆う。 */
-    rlgc_orphan_merge_pjob_ensure();
+    gc_orphan_merge_pjob_ensure();
     rb_postponed_job_trigger_for_ractor(GET_VM()->gc.orphan_merge_pjob, vm->ractor.main_ractor->pub.self);
 }
 
@@ -4073,7 +4073,7 @@ objspace_absorb_disowned_zombies(void)
 }
 
 static void
-rlgc_orphan_merge_job(void *unused)
+gc_orphan_merge_job(void *unused)
 {
     (void)unused;
     objspace_absorb_disowned_zombies();

@@ -53,11 +53,11 @@ struct rb_ractor_sync {
 struct ractor_basket;
 
 /* 転送中の copy payload 再構築 1 件（受信側の machine stack 上に置かれる） */
-struct rlgc_materialize_frame {
+struct ractor_materialize_frame {
     VALUE snapshot;                          /* sender 側 snapshot */
     const VALUE *pinned;                     /* snapshot 全 node の pin list（basket 所有） */
     size_t pinned_cnt;
-    struct rlgc_materialize_frame *prev;
+    struct ractor_materialize_frame *prev;
 };
 
 // created
