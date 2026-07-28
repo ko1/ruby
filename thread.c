@@ -1122,7 +1122,7 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
 
     /* vm_insert_ractor までに生成は失敗し得る(IsolationError 等)。cover を残すと
      * 死んだ子の objspace が二重列挙され merge 後に dangle する。失敗時は VM lock
-     * 下で objspace を zombie ledger へ渡し cover を落とし r->objspace=NULL にする。 */
+     * 下で objspace を zombie_objspaces 表 へ渡し cover を落とし r->objspace=NULL にする。 */
     enum ruby_tag_type state;
     VALUE thret = Qundef;
     rb_execution_context_t *ec = GET_EC();

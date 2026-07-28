@@ -3960,7 +3960,7 @@ thread_mark(void *ptr)
     }
 
     /* 生きた thread wrapper はその Ractor オブジェクト(dfree 経由で rb_ractor_t)
-     * を生かす。これにより zombie ledger は wrapper を mark するだけで終了中の
+     * を生かす。これにより zombie_objspaces 表 は wrapper を mark するだけで終了中の
      * Ractor を保持でき、継承された Thread も死んだ Ractor を upstream 同様に保つ。 */
     if (th->ractor) rb_gc_mark(rb_ractor_self(th->ractor));
     if (th->root_fiber) rb_fiber_mark_self(th->root_fiber);
