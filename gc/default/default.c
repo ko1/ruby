@@ -1652,7 +1652,7 @@ RVALUE_UNCOLLECTIBLE(rb_objspace_t *objspace, VALUE obj)
 #define RVALUE_PAGE_MARKING(page, obj)        MARKED_IN_BITMAP((page)->marking_bits, (obj))
 
 static int rgengc_remember(rb_objspace_t *objspace, VALUE obj);
-static void rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref);
+static void gc_bitmaps_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref);
 static void rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap);
 static bool verify_pointer_in_any_heap_p(const void *ptr); /* cross-objspace の所属判定 */
 
@@ -3714,7 +3714,7 @@ gc_abort(void *objspace_ptr)
 
     for (int i = 0; i < HEAP_COUNT; i++) {
         rb_heap_t *heap = &heaps[i];
-        rgengc_mark_and_rememberset_clear(objspace, heap, false);
+        gc_bitmaps_clear(objspace, heap, false);
     }
 
     gc_mode_set(objspace, gc_mode_none);
@@ -7152,7 +7152,7 @@ gc_marks_start(rb_objspace_t *objspace, int full_mark)
 
         for (int i = 0; i < HEAP_COUNT; i++) {
             rb_heap_t *heap = &heaps[i];
-            rgengc_mark_and_rememberset_clear(objspace, heap, false);
+            gc_bitmaps_clear(objspace, heap, false);
             heap_move_pooled_pages_to_free_pages(heap);
 
             if (objspace->flags.during_compacting) {
@@ -7369,7 +7369,7 @@ rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap)
 }
 
 static void
-rgengc_mark_and_rememberset_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref)
+gc_bitmaps_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref)
 {
     struct heap_page *page = 0;
 
@@ -8600,7 +8600,7 @@ gc_start_global(rb_objspace_t *driver, bool compact)
         objspace->marked_slots = 0;
         for (int h = 0; h < HEAP_COUNT; h++) {
             rb_heap_t *heap = &heaps[h];
-            rgengc_mark_and_rememberset_clear(objspace, heap, true);
+            gc_bitmaps_clear(objspace, heap, true);
             heap_move_pooled_pages_to_free_pages(heap);
         }
     }
