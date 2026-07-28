@@ -55,6 +55,7 @@ struct rb_gc_object_metadata_entry {
 GC_IMPL_FN void *rb_gc_impl_objspace_alloc(void);
 GC_IMPL_FN void rb_gc_impl_objspace_init(void *objspace_ptr);
 GC_IMPL_FN void *rb_gc_impl_ractor_cache_alloc(void *objspace_ptr, void *ractor);
+GC_IMPL_FN void rb_gc_impl_objspace_retire_gc(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_set_params(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_init(void);
 // Shutdown
