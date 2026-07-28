@@ -752,7 +752,6 @@ typedef struct rb_objspace {
     rb_darray(VALUE) weak_references;
     rb_postponed_job_handle_t finalize_deferred_pjob;
 
-    unsigned long live_ractor_cache_count;
 
     int sweeping_heap_count;
 
@@ -6676,7 +6675,8 @@ gc_marks_finish(rb_objspace_t *objspace)
 #endif
 
     {
-        const unsigned long r_mul = objspace->live_ractor_cache_count > 8 ? 8 : objspace->live_ractor_cache_count; // upto 8
+        const unsigned long ractor_cnt = rb_gc_vm_ractor_count();
+        const unsigned long r_mul = ractor_cnt > 8 ? 8 : ractor_cnt; // upto 8
 
         size_t total_slots = objspace_available_slots(objspace);
         size_t sweep_slots = total_slots - objspace->marked_slots; /* will be swept slots */
@@ -7621,31 +7621,14 @@ rb_gc_impl_object_metadata(void *objspace_ptr, VALUE obj)
 void *
 rb_gc_impl_ractor_cache_alloc(void *objspace_ptr, void *ractor)
 {
-    rb_objspace_t *objspace = objspace_ptr;
-
-    /* per-Ractor cache は無い。heap 成長ヒューリスティック用に Ractor 数だけ数え、NULL を返す
-     * （gc.c は保持するだけ）。NULL cache の一部 teardown が free 呼び出しを飛ばすためカウントは
-     * 過大方向へずれうるが、上限付き r_mul ヒューリスティックにしか使われない。 */
-    objspace->live_ractor_cache_count++;
-
+    /* 割り当ては per-Ractor objspace で行うので cache 不要。 */
     return NULL;
 }
 
 void
 rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache)
 {
-    rb_objspace_t *objspace = objspace_ptr;
-
     GC_ASSERT(cache == NULL);
-
-    /* cache_alloc は生成側 Ractor の objspace（Ractor.new 時の rb_gc_get_objspace()）で走り、
-     * cache_free は終了する Ractor 自身の objspace で走る。別 objspace なのでこの per-objspace
-     * カウンタは一方でインクリメント、他方でデクリメントされ、ここで underflow しうる
-     * （cache_alloc の過大ずれの裏）。
-     * 上限付き r_mul ヒューリスティックにしか使わないので assert せず clamp する。 */
-    if (objspace->live_ractor_cache_count > 0) {
-        objspace->live_ractor_cache_count--;
-    }
 }
 
 static void
