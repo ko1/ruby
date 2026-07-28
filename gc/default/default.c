@@ -7776,9 +7776,6 @@ garbage_collect(rb_objspace_t *objspace, unsigned int reason)
 {
     int ret;
 
-    /* 外側の VM lock は取らない。gc_enter が各経路に必要なものを取る（非 main の local GC は
-     * 無し、main は no-barrier VM lock、global サイクルは lock + barrier）。2 つの Ractor が同時に
-     * global GC を選んでも 2 サイクルが連続で走るだけで、2 回目は無駄仕事であって誤りではない。 */
 #if GC_PROFILE_MORE_DETAIL
     objspace->profile.prepare_time = getrusage_time();
 #endif
@@ -7789,8 +7786,6 @@ garbage_collect(rb_objspace_t *objspace, unsigned int reason)
     objspace->profile.prepare_time = getrusage_time() - objspace->profile.prepare_time;
 #endif
 
-    /* global か local かの判定は、全入口（割り当て slow path も含む）が通る唯一の地点である
-     * gc_start の先頭に置く。 */
     ret = gc_start(objspace, reason);
 
     return ret;
@@ -8121,7 +8116,7 @@ static inline void
 gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_lev)
 {
     /* local GC は所有者スレッドで走り、VM lock も barrier も取らない。containment により heap は
-     * single-writer で、cross-objspace の bitmap 書き込みは atomic。例外は 2 つ。
+     * single-writer（cross-objspace のページ書き込みは STW の global GC のみが行う）。例外は 2 つ。
      *
      * - global GC は world を止める（VM lock + barrier）。GC には safepoint が無く、スレッドは
      *   gc_exit 後にしか合流しないので、barrier は暗黙に全 in-flight local GC を待つ。
@@ -8496,6 +8491,8 @@ gc_global_mark_generic_fields(rb_objspace_t *driver)
     rb_gc_vm_generic_fields_drain_dead(genfields_dead_p);
 }
 
+/* 2 つの Ractor が同時に global GC を選んでも gc_enter の barrier で直列化され
+ * 2 サイクルが連続で走るだけ。2 回目は無駄仕事であって誤りではない。 */
 static void
 gc_start_global(rb_objspace_t *driver, bool compact)
 {
