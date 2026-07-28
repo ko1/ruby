@@ -8406,6 +8406,15 @@ gc_global_objspaces_i(void *os, void *data)
     global_objspace->global_gc.list[global_objspace->global_gc.count++] = os;
 }
 
+/* このサイクルが対象とする全 objspace(zombie 含む)の snapshot を取り直す。
+ * list/capa のバッファは前サイクルから使い回す。 */
+static void
+gc_global_snapshot_objspaces(void)
+{
+    global_objspace->global_gc.count = 0;
+    rb_gc_vm_each_objspace(gc_global_objspaces_i, NULL);
+}
+
 /* global GC: すべての Ractor を停止させ、全 objspace を 1 つの heap として clear/mark/sweep
  * する。shareable を free でき、cross-objspace な到達可能性を正確に判定できる唯一の collector。 */
 /* global GC の generic_fields weak pass。
@@ -8478,9 +8487,7 @@ gc_start_global(rb_objspace_t *driver, bool compact)
 
     GC_ASSERT(is_mark_stack_empty(&driver->mark_stack));
 
-    /* driver が持つ全 objspace（zombie 含む）のスナップショット。 */
-    global_objspace->global_gc.count = 0;
-    rb_gc_vm_each_objspace(gc_global_objspaces_i, NULL);
+    gc_global_snapshot_objspaces();
 
     /* step 3 で lazy sweep を落ち着かせる前に、全 objspace を global GC 中と印す。その settle は
      * 他 Ractor の objspace の残り garbage を driver スレッドで free するが、foreign オブジェクトの
