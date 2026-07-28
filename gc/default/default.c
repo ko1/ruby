@@ -1434,6 +1434,7 @@ static void init_mark_stack(mark_stack_t *stack);
 static int garbage_collect(rb_objspace_t *, unsigned int reason);
 
 static int  gc_start(rb_objspace_t *objspace, unsigned int reason);
+static int  gc_start_body(rb_objspace_t *objspace, unsigned int reason, bool allow_global);
 static void gc_rest(rb_objspace_t *objspace);
 
 /* GC サイクルのイベント（ENTER/EXIT/START/END_MARK/END_SWEEP）は、その objspace の
@@ -2278,15 +2279,22 @@ heap_pages_free_unused_pages(rb_objspace_t *objspace)
         rb_darray_pop(objspace->heap_pages.sorted, i - j);
         GC_ASSERT(rb_darray_size(objspace->heap_pages.sorted) == j);
 
-        struct heap_page *hipage = rb_darray_get(objspace->heap_pages.sorted, rb_darray_size(objspace->heap_pages.sorted) - 1);
-        uintptr_t himem = (uintptr_t)hipage->body + HEAP_PAGE_SIZE;
-        GC_ASSERT(himem <= heap_pages_himem);
-        heap_pages_himem = himem;
+        /* retire GC は全ページを解放しうる(空 objspace は正当)。 */
+        if (j > 0) {
+            struct heap_page *hipage = rb_darray_get(objspace->heap_pages.sorted, rb_darray_size(objspace->heap_pages.sorted) - 1);
+            uintptr_t himem = (uintptr_t)hipage->body + HEAP_PAGE_SIZE;
+            GC_ASSERT(himem <= heap_pages_himem);
+            heap_pages_himem = himem;
 
-        struct heap_page *lopage = rb_darray_get(objspace->heap_pages.sorted, 0);
-        uintptr_t lomem = (uintptr_t)lopage->body + sizeof(struct heap_page_header);
-        GC_ASSERT(lomem >= heap_pages_lomem);
-        heap_pages_lomem = lomem;
+            struct heap_page *lopage = rb_darray_get(objspace->heap_pages.sorted, 0);
+            uintptr_t lomem = (uintptr_t)lopage->body + sizeof(struct heap_page_header);
+            GC_ASSERT(lomem >= heap_pages_lomem);
+            heap_pages_lomem = lomem;
+        }
+        else {
+            heap_pages_lomem = 0;
+            heap_pages_himem = 0;
+        }
     }
 }
 
@@ -7700,6 +7708,22 @@ rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache)
     GC_ASSERT(cache == NULL);
 }
 
+/* 終了する Ractor 自身による最後の local GC(own thread 専用)。root は既に最小なので
+ * mark は極小で、join 側へ継承されるはずだったゴミを自スレッドで回収する。global へは
+ * 昇格しない(Ractor 死亡毎の STW を避ける)。空ページは即 page_pool へ返す。 */
+void
+rb_gc_impl_objspace_retire_gc(void *objspace_ptr)
+{
+    rb_objspace_t *objspace = objspace_ptr;
+
+    gc_rest(objspace);
+    gc_start_body(objspace, GPR_FLAG_FULL_MARK | GPR_FLAG_IMMEDIATE_MARK | GPR_FLAG_IMMEDIATE_SWEEP,
+                  false);
+
+    heap_pages_freeable_pages = objspace->empty_pages_count;
+    heap_pages_free_unused_pages(objspace);
+}
+
 static void
 heap_ready_to_gc(rb_objspace_t *objspace, rb_heap_t *heap)
 {
@@ -7844,7 +7868,7 @@ garbage_collect(rb_objspace_t *objspace, unsigned int reason)
 }
 
 static int
-gc_start(rb_objspace_t *objspace, unsigned int reason)
+gc_start_body(rb_objspace_t *objspace, unsigned int reason, bool allow_global)
 {
     unsigned int do_full_mark = !!(reason & GPR_FLAG_FULL_MARK);
 
@@ -7854,8 +7878,9 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     /* すべての local GC 入口が、代わりに global サイクルが要るかを問う。garbage_collect を
      * 通らず直接 gc_start に来る割り当て slow path も含む。dead shareable / 滞留 retention /
      * zombie ページを回収できるのは global サイクルだけで、明示・malloc 起因の GC だけで
-     * 判定すると割り当て駆動のワークロードが全閾値をすり抜けてしまう。 */
-    if (gc_need_global_p(objspace)) {
+     * 判定すると割り当て駆動のワークロードが全閾値をすり抜けてしまう。
+     * 例外は retire GC(rb_gc_impl_objspace_retire_gc): Ractor 死亡毎の STW を避け昇格しない。 */
+    if (allow_global && gc_need_global_p(objspace)) {
         gc_start_global(objspace, false);
         return TRUE;
     }
@@ -7990,6 +8015,12 @@ gc_start(rb_objspace_t *objspace, unsigned int reason)
     gc_verify_internal_consistency(objspace);
 #endif
     return TRUE;
+}
+
+static int
+gc_start(rb_objspace_t *objspace, unsigned int reason)
+{
+    return gc_start_body(objspace, reason, true);
 }
 
 static void
@@ -8875,19 +8906,6 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         dheap->final_slots_count += sheap->final_slots_count;
     }
 
-    /* empty ページを再所有して連結する。 */
-    for (struct heap_page *page = src->empty_pages; page; page = page->free_next) {
-        page->objspace = dst;
-    }
-    if (src->empty_pages) {
-        struct heap_page **tail = &dst->empty_pages;
-        while (*tail) tail = &(*tail)->free_next;
-        *tail = src->empty_pages;
-        dst->empty_pages_count += src->empty_pages_count;
-        src->empty_pages = NULL;
-        src->empty_pages_count = 0;
-    }
-
     /* objspace 全体のページ管理情報。 */
     {
         rb_objspace_t *objspace = dst; /* for the heap_pages_* macros */
@@ -8895,6 +8913,12 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         size_t srcn = rb_darray_size(src->heap_pages.sorted);
         for (size_t i = 0; i < srcn; i++) {
             page = rb_darray_get(src->heap_pages.sorted, i);
+            /* empty pool の住人(生存オブジェクト無し)は引き継がず page_pool へ返す。
+             * dst の割り当て需要は共有 pool の freelist から安価に賄える。 */
+            if (heap_page_in_global_empty_pages_pool(src, page)) {
+                heap_page_free(src, page);
+                continue;
+            }
             uintptr_t body = (uintptr_t)page->body;
             uintptr_t start = body + sizeof(struct heap_page_header);
             uintptr_t end = body + HEAP_PAGE_SIZE;
@@ -8920,6 +8944,9 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
         objspace->heap_pages.freed_pages += src->heap_pages.freed_pages;
         rb_darray_free_without_gc(src->heap_pages.sorted);
         src->heap_pages.sorted = NULL;
+        /* empty_pages チェーンの構造体は上のループで解放済み。 */
+        src->empty_pages = NULL;
+        src->empty_pages_count = 0;
     }
 
     /* finalizer: 表のエントリを移し、死んだ Ractor の deferred zombie は今後 dst の
@@ -8995,6 +9022,14 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     free(src);
 
     if (dst_gc_was_enabled) rb_gc_impl_gc_enable(dst);
+
+    /* 継承で dst に溜まった empty ページ(死んだ Ractor の teardown 資材由来が主)を
+     * 無予算で pool へ返す。empty は定義上安全に解放でき、再取得は pool から安価。 */
+    {
+        rb_objspace_t *objspace = dst;
+        heap_pages_freeable_pages = objspace->empty_pages_count;
+        heap_pages_free_unused_pages(objspace);
+    }
 
     global_objspace->during_absorb = prev_absorb;
 }
