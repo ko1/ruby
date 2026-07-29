@@ -957,7 +957,7 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         EC_POP_TAG();
         if (state != TAG_NONE) {
             th->status = THREAD_KILLED;
-            rb_ractor_stillborn_remove(params->g, th);
+            rb_ractor_cancel_creation(params->g, th);
             EC_JUMP_TAG(ec, state);
         }
     }
