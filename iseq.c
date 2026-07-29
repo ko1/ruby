@@ -378,9 +378,14 @@ rb_iseq_mark_and_move(rb_iseq_t *iseq, bool reference_updating)
         rb_gc_mark_and_move(&body->location.label);
         rb_gc_mark_and_move(&body->location.base_label);
         rb_gc_mark_and_move(&body->location.pathobj);
-        if (body->local_iseq) rb_gc_mark_and_move_ptr(&body->local_iseq);
-        if (body->parent_iseq) rb_gc_mark_and_move_ptr(&body->parent_iseq);
-        if (body->mandatory_only_iseq) rb_gc_mark_and_move_ptr(&body->mandatory_only_iseq);
+        /* shareable な複製 iseq（Proc#refined memo）では local_iseq/parent_iseq が不変な
+         * source（多くは main）を上向きに指す。所有者の root なので生存は保証され、
+         * shareable 検査からは除外する（cref の klass_or_self と同じ扱い）。 */
+        if (!rb_gc_checking_shareable()) {
+            if (body->local_iseq) rb_gc_mark_and_move_ptr(&body->local_iseq);
+            if (body->parent_iseq) rb_gc_mark_and_move_ptr(&body->parent_iseq);
+            if (body->mandatory_only_iseq) rb_gc_mark_and_move_ptr(&body->mandatory_only_iseq);
+        }
 
         if (body->call_data) {
             for (unsigned int i = 0; i < body->ci_size; i++) {
