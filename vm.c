@@ -338,7 +338,17 @@ vm_cref_new0(VALUE klass, rb_method_visibility_t visi, int module_func, rb_cref_
     VM_ASSERT(singleton || klass);
 
     rb_cref_t *cref = SHAREABLE_IMEMO_NEW(rb_cref_t, imemo_cref, refinements);
-    cref->klass_or_self = klass;
+    /* cref は生まれつき shareable なので、unshareable になりうる子(singleton cref の self、
+     * using の refinements hash)は WB を通して shref を植える。素 store だと owner の
+     * local GC が子を回収し、pin で生き残った cref が dangling になる。next は常に
+     * cref(shareable)なので素 store でよい。 */
+    if (!SPECIAL_CONST_P(refinements)) RB_OBJ_WRITTEN(cref, Qundef, refinements);
+    if (klass) {
+        RB_OBJ_WRITE(cref, &cref->klass_or_self, klass);
+    }
+    else {
+        cref->klass_or_self = 0;
+    }
     cref->next = use_prev_prev ? CREF_NEXT(prev_cref) : prev_cref;
     *((rb_scope_visibility_t *)&cref->scope_visi) = scope_visi;
 
