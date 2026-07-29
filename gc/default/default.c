@@ -4429,7 +4429,7 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
      * その表を守るので不要。compacting な local GC は GC 全体の lock を持つので無害に nest する。
      * 非 main Ractor の local GC はそれらの shareable を free しないので取らない。 */
     const bool sweep_needs_vm_lock =
-        objspace == global_objspace->main_objspace && rb_multi_ractor_p() && !objspace->flags.during_global_gc;
+        objspace == global_objspace->main_objspace && rb_gc_multi_ractor_p() && !objspace->flags.during_global_gc;
     unsigned int sweep_lock_lev = 0;
     if (sweep_needs_vm_lock) sweep_lock_lev = RB_GC_VM_LOCK_NO_BARRIER();
 
@@ -6054,10 +6054,10 @@ check_generation_i(const VALUE child, void *ptr)
      * された子）を再 mark し、global GC は世代状態を作り直す。よって端点のどちらかが
      * shareable なら世代間 O->Y 不変条件は成り立たない。これは old な constcache / cc_table /
      * interned string が young(global GC 後)な core class を指す典型的な偽陽性。判定は
-     * 瞬間的な単一 objspace 数ではなく rb_multi_ractor_p()（一度 multi 化すると恒久）で行い、
+     * 瞬間的な単一 objspace 数ではなく rb_gc_multi_ractor_p()（一度 multi 化すると恒久）で行い、
      * multi-Ractor プログラムの一時的な ractor.cnt==1 の窓も被覆する。multi 化しない
      * プログラムは従来の厳密検査のまま。残余リスクは ASAN が拾う。 */
-    if (rb_multi_ractor_p() &&
+    if (rb_gc_multi_ractor_p() &&
         (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(parent), parent) ||
          MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child))) {
         return;
@@ -7502,7 +7502,7 @@ rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b)
         /* 世代間 barrier は同一 objspace の old->young エッジだけが対象。foreign な a/b の old bit は
          * 他 objspace 所有で並行変更され読むのが危険なので、multi-Ractor 時のみ locality を先に検査する
          * (foreign な a は shareable で shref が既に b を生かすため remember は不要)。単一 Ractor は foreign 無し。 */
-        if ((rb_multi_ractor_p() &&
+        if ((rb_gc_multi_ractor_p() &&
                 (GET_HEAP_OBJSPACE(a) != objspace || GET_HEAP_OBJSPACE(b) != objspace)) ||
                 !RVALUE_OLD_P(objspace, a) || RVALUE_OLD_P(objspace, b)) {
             // do nothing
