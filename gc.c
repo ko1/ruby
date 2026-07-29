@@ -633,6 +633,8 @@ typedef struct gc_function_map {
     void (*gc_enable)(void *objspace_ptr);
     void (*gc_disable)(void *objspace_ptr, bool finish_current_gc);
     bool (*gc_enabled_p)(void *objspace_ptr);
+    bool (*user_gc_disabled_set)(void *objspace_ptr, bool disable);
+    bool (*user_gc_disabled_p)(void *objspace_ptr);
     void (*gc_rest)(void *objspace_ptr);
     VALUE (*config_get)(void *objpace_ptr);
     void (*config_set)(void *objspace_ptr, VALUE hash);
@@ -819,6 +821,8 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(gc_enable);
     load_modular_gc_func(gc_disable);
     load_modular_gc_func(gc_enabled_p);
+    load_modular_gc_func(user_gc_disabled_set);
+    load_modular_gc_func(user_gc_disabled_p);
     load_modular_gc_func(gc_rest);
     load_modular_gc_func(config_set);
     load_modular_gc_func(config_get);
@@ -914,6 +918,8 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_gc_enable rb_gc_functions.gc_enable
 # define rb_gc_impl_gc_disable rb_gc_functions.gc_disable
 # define rb_gc_impl_gc_enabled_p rb_gc_functions.gc_enabled_p
+# define rb_gc_impl_user_gc_disabled_set rb_gc_functions.user_gc_disabled_set
+# define rb_gc_impl_user_gc_disabled_p rb_gc_functions.user_gc_disabled_p
 # define rb_gc_impl_gc_rest rb_gc_functions.gc_rest
 # define rb_gc_impl_config_get rb_gc_functions.config_get
 # define rb_gc_impl_config_set rb_gc_functions.config_set
@@ -3938,6 +3944,11 @@ rb_gc_objspace_retire(void **objspace_slot)
 {
     rb_vm_t *vm = GET_VM();
 
+    /* GC.disable したまま終了したら hold を返す。残すと誰も enable できず GC が止まる。 */
+    if (rb_gc_impl_user_gc_disabled_set(*objspace_slot, false)) {
+        RUBY_ATOMIC_DEC(vm->gc.disable_holders);
+    }
+
     RB_VM_LOCKING() {
         gc_orphan_merge_pjob_ensure();
         /* owner_slot は常に retire 対象 Ractor の &r->objspace。owner は global GC の
@@ -4134,6 +4145,14 @@ gc_orphan_merge_job(void *unused)
 /* fork 後に保留中の orphan マージを狙い直す。job が親の main Ractor を対象にして
  * いる場合があり、その per-Ractor トリガマスクは fork した Ractor でない限り
  * 引き継がれない。子側で呼ばれる。 */
+/* fork 後は main だけが生きる。main 自身の hold だけで counter を作り直す。 */
+void
+rb_gc_disable_holders_atfork(void)
+{
+    RUBY_ATOMIC_SET(GET_VM()->gc.disable_holders,
+                    rb_gc_impl_user_gc_disabled_p(rb_gc_get_objspace()) ? 1 : 0);
+}
+
 void
 rb_gc_zombie_objspaces_atfork(void)
 {
@@ -5076,15 +5095,13 @@ rb_gc_gc_disabled_global_p(void)
     return RUBY_ATOMIC_LOAD(GET_VM()->gc.disable_holders) != 0;
 }
 
-/* GC.disable/enable は自 Ractor のフラグを立て下げし、フラグ遷移時だけ holder 数を
- * 増減する。戻り値(直前状態)も自 Ractor 視点。 */
+/* GC.disable/enable は自 objspace のフラグを立て下げし、フラグ遷移時だけ holder 数を
+ * 増減する。戻り値(直前状態)も自 objspace 視点。 */
 static bool
 gc_ractor_disable_set(bool disable)
 {
-    rb_ractor_t *cr = GET_RACTOR();
-    const bool was = cr->gc_disabled;
+    const bool was = rb_gc_impl_user_gc_disabled_set(rb_gc_get_objspace(), disable);
     if (was != disable) {
-        cr->gc_disabled = disable;
         if (disable) {
             RUBY_ATOMIC_INC(GET_VM()->gc.disable_holders);
         }

@@ -649,13 +649,6 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         }
         vm->ractor.cnt--;
 
-        /* GC.disable したまま終了したら hold を返す。残すと誰も enable できず
-         * GC が永久に止まる。 */
-        if (cr->gc_disabled) {
-            cr->gc_disabled = false;
-            RUBY_ATOMIC_DEC(vm->gc.disable_holders);
-        }
-
         rb_gc_ractor_cache_free(cr->newobj_cache);
         cr->newobj_cache = NULL;
 
@@ -719,7 +712,7 @@ rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th)
     rb_native_mutex_initialize(&vm->ractor.move_courier_registry_lock);
     /* fork 後は main だけが生きる。死んだ Ractor や critical 区間の hold は消え、
      * main 自身の disable だけが残る。 */
-    RUBY_ATOMIC_SET(vm->gc.disable_holders, th->ractor->gc_disabled ? 1 : 0);
+    rb_gc_disable_holders_atfork();
     /* fork 後は main Ractor だけが生きる。生成中カバーは無効化する。set は直前の
      * rb_vm_living_threads_init が空にし、zombie_objspacesは terminate_atfork が退避した
      * 非main objspace を保持したまま orphan merge に委ねる。 */
@@ -1029,7 +1022,6 @@ rb_ractor_cancel_creation(rb_ractor_t *r, rb_thread_t *th)
         VM_ASSERT(r->status_ == ractor_blocking);
         VM_ASSERT(vm->ractor.blocking_cnt > 0);
         vm->ractor.blocking_cnt--;
-        VM_ASSERT(!r->gc_disabled); /* 一度も走っていないので disable し得ない */
 
         rb_gc_ractor_cache_free(r->newobj_cache);
         r->newobj_cache = NULL;
