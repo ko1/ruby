@@ -8794,6 +8794,10 @@ gc_start_global(rb_objspace_t *driver, bool compact)
         if (objspace != driver) during_gc = FALSE;
     }
 
+    /* unified mark で吸収 shareable の到達可能性を張り直したので、single objspace の
+     * local mark を再び信頼してよい（次の吸収まで pin を省ける）。 */
+    rb_gc_reset_absorbed_since_global_gc();
+
     /* garbage が消えた今、zombie_objspaces 表 を測り直す。barrier 内なのでエントリは安定。これが
      * 無いと、どの pass も merge しない joinable(slotted) zombie の retire 時の stale な数値で
      * 上のページ trigger が発火し続ける。 */
