@@ -144,9 +144,6 @@ struct rb_ractor_struct {
     VALUE debug;
 
     bool malloc_gc_disabled;
-    /* この Ractor が GC.disable 中か(自 Ractor の thread だけが触る)。1 つでも disable 中の
-     * Ractor がいる間は全 GC を止める(実体は vm->gc.disable_holders カウンタ)。 */
-    bool gc_disabled;
     bool main_ractor;
     void *newobj_cache;
 
