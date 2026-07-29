@@ -119,6 +119,7 @@ MODULAR_GC_FN bool rb_gc_obj_free(void *objspace, VALUE obj);
 MODULAR_GC_FN void rb_gc_save_machine_context(void);
 MODULAR_GC_FN void rb_gc_mark_roots(void *objspace, const char **categoryp);
 MODULAR_GC_FN bool rb_gc_multi_ractor_p(void);
+MODULAR_GC_FN bool rb_gc_ever_multi_ractor_p(void);
 /* プロセス全体の GC 無効フラグ（GC.disable / rb_gc_disable）。impl の各 GC trigger が
  * これを見るので、無効化すると全 Ractor の自動 GC が止まる。
  * per-objspace の無効化は objspace->flags.dont_gc。 */
