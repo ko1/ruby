@@ -4032,15 +4032,28 @@ rb_gc_finish_in_flight_gc(void)
  * その窓では zombie の生きたオブジェクトがまだ在るのに single に見えてしまう。 */
 static int gc_absorbing_zombie = 0;
 
-/* プロセス内に objspace が 1 つだけ（live Ractor 1、zombie 0）のとき真。このときだけ
- * local GC が全世界となり multi-objspace 用ガードを省ける。子生成の窓（子 objspace は
- * 既に在り cnt はまだ 1）と zombie 吸収の窓（count-- 済みだが merge 未了）は multi 扱い。
- * single 扱いだと窓中の GC が shareable pin 等のガードを飛ばし live cc 等を回収する。 */
+/* 前回 global GC 以降に zombie objspace を吸収したら真。吸収した shareable は unified mark を
+ * 経るまで単一 objspace の local mark が取りこぼしうる（class の cc_table 経由の cc 等）ので、
+ * その間は single 扱いをやめる。global GC 完了で false に戻す。 */
+static bool gc_absorbed_since_global_gc = false;
+
+void
+rb_gc_reset_absorbed_since_global_gc(void)
+{
+    gc_absorbed_since_global_gc = false;
+}
+
+/* プロセス内に objspace が 1 つだけ（live Ractor 1、zombie 0）で、かつ前回 global GC 以降に
+ * 吸収が無いとき真。このときだけ local GC が全世界となり multi-objspace 用ガードを省ける。
+ * 子生成の窓（子 objspace は既に在り cnt はまだ 1）と zombie 吸収の during（count-- 済みだが
+ * merge 未了）／after（merge 済だが次の global GC 未了）の窓は multi 扱い。single 扱いだと
+ * 窓中の GC が shareable pin 等のガードを飛ばし live cc 等を回収する。 */
 bool
 rb_gc_single_objspace_p(void)
 {
     rb_vm_t *vm = GET_VM();
     return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0 && gc_absorbing_zombie == 0 &&
+           !gc_absorbed_since_global_gc &&
            (vm->ractor.main_ractor == NULL ||
             vm->ractor.main_ractor->creating_child_objspace == NULL);
 }
@@ -4053,6 +4066,7 @@ objspace_absorb_merge(void *dst, void *src)
 {
     ASSERT_vm_locking();
     rb_gc_impl_objspace_absorb(dst, src);
+    gc_absorbed_since_global_gc = true;
 }
 
 void
