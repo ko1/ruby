@@ -6064,9 +6064,13 @@ check_generation_i(const VALUE child, void *ptr)
     }
 
     if (!RVALUE_OLD_P(data->objspace, child)) {
+        /* shareable な young child は local GC が pin して生かす（回収は global GC のみ）ので、
+         * old parent が remember していなくても回収されない。世代 rememberset の対象外なので
+         * O->Y 検査から除外する。 */
         if (!RVALUE_REMEMBERED(data->objspace, parent) &&
             !RVALUE_REMEMBERED(data->objspace, child) &&
-            !RVALUE_UNCOLLECTIBLE(data->objspace, child)) {
+            !RVALUE_UNCOLLECTIBLE(data->objspace, child) &&
+            !RB_FL_TEST_RAW(child, RUBY_FL_SHAREABLE)) {
             fprintf(stderr, "verify_internal_consistency_reachable_i: WB miss (O->Y) %s -> %s\n", rb_obj_info(parent), rb_obj_info(child));
             data->err_count++;
         }
