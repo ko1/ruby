@@ -15227,6 +15227,10 @@ rb_iseq_dup_with_independent_caches(const rb_iseq_t *src_root)
             RB_OBJ_WRITE(copy, &cb->parent_iseq, sb->parent_iseq);
             result = copy;
         }
+
+        /* Proc#refined の memo で Ractor 間共有される複製。部分木は自己完結
+         * （nested block も複製済み）なので各 copy を shareable にする。 */
+        RB_OBJ_SET_SHAREABLE((VALUE)copy);
     }
 
     if (ISEQ_PC2BRANCHINDEX(src_root) != Qnil) {
