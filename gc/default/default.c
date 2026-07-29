@@ -592,6 +592,8 @@ typedef struct rb_objspace {
         unsigned int mode : 2;
         unsigned int immediate_sweep : 1;
         unsigned int dont_gc : 1;
+        /* GC.disable による user hold(実体は vm->gc.disable_holders)。owner thread だけが書く。 */
+        unsigned int user_gc_disabled : 1;
         unsigned int dont_incremental : 1;
         unsigned int during_gc : 1;
         unsigned int during_global_gc : 1;
@@ -1913,6 +1915,22 @@ static inline int
 RVALUE_WHITE_P(rb_objspace_t *objspace, VALUE obj)
 {
     return !RVALUE_MARKED(objspace, obj);
+}
+
+bool
+rb_gc_impl_user_gc_disabled_set(void *objspace_ptr, bool disable)
+{
+    rb_objspace_t *objspace = objspace_ptr;
+    const bool was = objspace->flags.user_gc_disabled;
+    objspace->flags.user_gc_disabled = disable;
+    return was;
+}
+
+bool
+rb_gc_impl_user_gc_disabled_p(void *objspace_ptr)
+{
+    rb_objspace_t *objspace = objspace_ptr;
+    return objspace->flags.user_gc_disabled;
 }
 
 bool

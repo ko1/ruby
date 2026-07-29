@@ -69,6 +69,8 @@ GC_IMPL_FN void rb_gc_impl_prepare_heap(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_gc_enable(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_gc_disable(void *objspace_ptr, bool finish_current_gc);
 GC_IMPL_FN bool rb_gc_impl_gc_enabled_p(void *objspace_ptr);
+GC_IMPL_FN bool rb_gc_impl_user_gc_disabled_set(void *objspace_ptr, bool disable);
+GC_IMPL_FN bool rb_gc_impl_user_gc_disabled_p(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_gc_rest(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_stress_set(void *objspace_ptr, VALUE flag);
 GC_IMPL_FN VALUE rb_gc_impl_stress_get(void *objspace_ptr);
