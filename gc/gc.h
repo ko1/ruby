@@ -94,6 +94,9 @@ MODULAR_GC_FN void rb_gc_vm_refresh_zombie_pages(void);
 /* MODULAR_GC_FN を付けない: VM 側（ractor.c）からも呼ぶので、非モジュラービルドでも
  * 外部リンケージが要る（internal/gc.h 参照）。 */
 bool rb_gc_single_objspace_p(void);
+/* global GC 完了で「吸収済みフラグ」を戻す（rb_gc_single_objspace_p 参照）。上と同じ理由で
+ * MODULAR_GC_FN を付けない。 */
+void rb_gc_reset_absorbed_since_global_gc(void);
 MODULAR_GC_FN size_t rb_gc_obj_optimal_size(VALUE obj);
 MODULAR_GC_FN void rb_gc_mark_children(void *objspace, VALUE obj);
 MODULAR_GC_FN bool rb_gc_vm_weak_table_essential_p(enum rb_gc_vm_weak_tables table);
