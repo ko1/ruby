@@ -6053,11 +6053,11 @@ check_generation_i(const VALUE child, void *ptr)
      * 管理される。mark 末尾の pinned walk が local サイクルごとに全 shareable（とその shref
      * された子）を再 mark し、global GC は世代状態を作り直す。よって端点のどちらかが
      * shareable なら世代間 O->Y 不変条件は成り立たない。これは old な constcache / cc_table /
-     * interned string が young(global GC 後)な core class を指す典型的な偽陽性。判定は
-     * 瞬間的な単一 objspace 数ではなく rb_gc_multi_ractor_p()（一度 multi 化すると恒久）で行い、
-     * multi-Ractor プログラムの一時的な ractor.cnt==1 の窓も被覆する。multi 化しない
-     * プログラムは従来の厳密検査のまま。残余リスクは ASAN が拾う。 */
-    if (rb_gc_multi_ractor_p() &&
+     * interned string が young(global GC 後)な core class を指す典型的な偽陽性。この状態は
+     * 全 worker 終了で single に戻った後も次の major まで残る（例: old な shareable singleton
+     * class → young attached_object）ので、判定は rb_gc_ever_multi_ractor_p()（一度 multi 化
+     * すると恒久）で行う。multi 化しないプログラムは従来の厳密検査のまま。残余は ASAN が拾う。 */
+    if (rb_gc_ever_multi_ractor_p() &&
         (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(parent), parent) ||
          MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child))) {
         return;

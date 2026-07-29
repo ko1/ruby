@@ -1014,11 +1014,23 @@ rb_gc_init_objspaces(void)
 #endif
 }
 
+/* 一度でも multi-Ractor 化したら true のまま（rb_multi_ractor_p は全 worker 終了で
+ * false に戻る）。multi 期間に作られた世代状態を跨いで参照する verify が使う。 */
+static bool gc_ever_multi_ractor = false;
+
+bool
+rb_gc_ever_multi_ractor_p(void)
+{
+    if (!gc_ever_multi_ractor && rb_multi_ractor_p()) gc_ever_multi_ractor = true;
+    return gc_ever_multi_ractor;
+}
+
 /* 新しい非main Ractor の objspace を確保する。生成側 Ractor のスレッド上で、
  * 新 Ractor が動き出す前に呼ばれる。 */
 void *
 rb_gc_objspace_alloc(void)
 {
+    gc_ever_multi_ractor = true;
     void *objspace = rb_gc_impl_objspace_alloc();
     rb_gc_impl_objspace_init(objspace);
 
