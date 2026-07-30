@@ -6149,7 +6149,7 @@ check_children_i(const VALUE child, void *ptr)
          * global GC 中はスキップ。全 shref bit を消し in-flight payload は再 pin で生かすので
          * shref 免除は発火せず、unified な正確 STW mark でこの不変条件自体が無意味になる。 */
         if (!data->parent_shareable &&
-            child != rb_vm_top_self() &&
+            child != rb_gc_vm_top_self() &&
             !MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(child), child) &&
             !MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(child), child) &&
             !rb_gc_impl_during_global_gc_p(data->objspace) &&
@@ -6228,7 +6228,7 @@ root_scope_check_i(const char *category, VALUE obj, void *ptr)
     if (GET_HEAP_OBJSPACE(obj) == data->objspace) return;
     if (MARKED_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(obj), obj)) return;
     if (MARKED_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj)) return;
-    if (obj == rb_vm_top_self()) return;  /* VM-permanent (see check_children_i) */
+    if (obj == rb_gc_vm_top_self()) return;  /* VM-permanent (see check_children_i) */
     /* receive が materialize 中の送信側常駐スナップショットは sync.materializing_copies
      * で root 化される。複製の間だけ有効な foreign-unshareable root（check_children_i 参照）。 */
     if (rb_gc_current_ractor_materializing_p()) return;
