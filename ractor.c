@@ -682,6 +682,12 @@ rb_ractor_main_alloc(void)
      * Init_BareVM（rb_gc_init_objspaces が r->objspace を設定した後）で作る。 */
     ruby_single_main_ractor = r;
 
+    /* gc_stress では ractor_init (rb_ractor_main_setup) より前の boot 中にも GC が走り、
+     * rb_ractor_mark_local_roots が value_taken を歩く。zero 埋めの ccan list head は
+     * 空 list ではないので、ここで初期化しておく (ractor_init の再初期化は空のまま)。 */
+    ccan_list_head_init(&r->value_taken);
+    ccan_list_node_init(&r->value_held_node);
+
     return r;
 }
 
