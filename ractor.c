@@ -1465,13 +1465,8 @@ rb_obj_set_shareable_no_assert(VALUE obj)
     /* FL_SHAREABLE を立てる。generic fields が per-Ractor 表にある object は、
      * flag 反転を generic_fields_lock 下の共有表への移送と交錯させるので、
      * ここでは flag を立てない。それ以外は直接立てる。 */
-    if (rb_obj_gen_fields_p(obj) && ractor_obj_using_gen_fields_table_p(obj)) {
-        rb_mv_generic_ivar_to_shared(obj); /* sets FL_SHAREABLE + pin, in order */
-    }
-    else {
-        FL_SET_RAW(obj, FL_SHAREABLE);
-        rb_gc_obj_became_shareable(obj);
-    }
+    FL_SET_RAW(obj, FL_SHAREABLE);
+    rb_gc_obj_became_shareable(obj);
 
     if (BUILTIN_TYPE(obj) == T_FILE && RFILE(obj)->fptr) {
         /* fptr の VALUE メンバは make_shareable の traversal で到達されず（C struct 内、

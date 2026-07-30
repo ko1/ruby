@@ -69,7 +69,6 @@ void rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key));
 void rb_generic_fields_tables_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg);
 void rb_generic_fields_shared_table_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg);
 /* obj の generic_fields entry を owner の per-Ractor 表から shared global 表へ移送。 */
-void rb_mv_generic_ivar_to_shared(VALUE obj);
 
 RUBY_SYMBOL_EXPORT_BEGIN
 /* variable.c (export) */
