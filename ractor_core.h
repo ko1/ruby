@@ -161,13 +161,10 @@ struct rb_ractor_struct {
      * shareable 分は variable.c の global 表）。weak-key で host obj が死ねば entry も消える。
      * local GC は rb_mark_generic_ivar で引き、global GC は mark 後に全表を drain する。
      * lazy に生成（NULL = まだ空）。 */
-    struct st_table *generic_fields_tbl;
     /* Ractor#send の native copy 中の generic-ivar 対応表。capturing=送信側 snapshot 作成中
      * だけ true で、host が出たら capture を遅延確保しその fields_obj を記録。materialize=
      * 受信側で snapshot host の fields_obj を引く。これで受信側が sender の表を跨がない。 */
     bool gen_fields_capturing;
-    struct st_table *gen_fields_capture;
-    struct st_table *gen_fields_materialize;
 
     /* copy snapshot 構築中に全 node を収集する pin list（basket_new が basket へ移送）。
      * global GC は全 shref を消すため、re-pin は root だけでなく全 node に要る。 */
@@ -182,13 +179,9 @@ void rb_ractor_mark_local_roots(rb_ractor_t *r);
 void rb_ractor_mark_terminated_join_value(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
 
-/* src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする
- * （Ractor#value join / orphan free）。実装は variable.c。st は raw malloc なので
- * sweep 中の呼び出しも安全。 */
-void rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src);
+/* src の registered_marks を dst へ移送して src を空にする（join / orphan absorb）。
+ * absorb は GC sweep 中に走りうるので実装は生 realloc（ractor.c）。 */
 void rb_ractor_absorb_registered_marks(rb_ractor_t *dst, rb_ractor_t *src);
-/* この Ractor の per-Ractor generic_fields 表を解放（ractor_free）。 */
-void rb_ractor_free_generic_fields(rb_ractor_t *r);
 
 enum ractor_wakeup_status {
     wakeup_none,
