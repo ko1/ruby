@@ -1807,3 +1807,40 @@ rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
     /* objspace が単一 */
 }
+
+void
+rb_gc_impl_gc_rest(void *objspace_ptr)
+{
+    /* mmtk の GC は STW で完結し、incremental mark / lazy sweep の途中状態を持たない */
+}
+
+struct each_objects_shareable_data {
+    int (*func)(void *, void *, size_t, void *);
+    void *data;
+};
+
+static int
+each_objects_shareable_i(void *start, void *end, size_t stride, void *d)
+{
+    struct each_objects_shareable_data *data = d;
+    for (VALUE obj = (VALUE)start; obj < (VALUE)end; obj += stride) {
+        if (RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE)) {
+            int ret = data->func((void *)obj, (void *)(obj + stride), stride, data->data);
+            if (ret) return ret;
+        }
+    }
+    return 0;
+}
+
+void
+rb_gc_impl_each_objects_shareable(void *objspace_ptr, int (*func)(void *, void *, size_t, void *), void *data)
+{
+    struct each_objects_shareable_data d = { func, data };
+    rb_gc_impl_each_objects(objspace_ptr, each_objects_shareable_i, &d);
+}
+
+void
+rb_gc_impl_each_objects_foreign(void *objspace_ptr, int (*func)(void *, void *, size_t, void *), void *data)
+{
+    /* objspace が単一なので foreign な objspace 在住オブジェクトは無い */
+}
