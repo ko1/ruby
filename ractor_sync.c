@@ -233,7 +233,6 @@ struct ractor_basket {
          * 送信時に構築し受信側 materialize が引く（sender の per-Ractor 表を跨がないため）。
          * 値は下の pinned list に含めて pin する。
          * 対応表が無い（generic ivar 無し / marshaled / move）ときは NULL。 */
-        struct st_table *gen_fields;
         /* native copy snapshot の全 node + fields_obj 群（構築時に収集、raw malloc）。
          * global GC の re-pin はこれを舐める（GC 中の graph traverse は generic-ivar の
          * 表 lookup が要るため不可）。NULL なら root（p.v）のみ pin。 */
@@ -284,11 +283,6 @@ ractor_basket_free(struct ractor_basket *b)
         /* 未消費の move courier（例: queue の破棄途中）。 */
         rb_ractor_move_courier_free(b->p.move_courier);
         b->p.move_courier = NULL;
-    }
-    else if (b->type != basket_type_move && b->p.gen_fields) {
-        /* native copy の generic-ivar 対応表（st は raw malloc）。 */
-        st_free_table(b->p.gen_fields);
-        b->p.gen_fields = NULL;
     }
     SIZED_FREE(b);
 }
@@ -932,14 +926,7 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
             rb_thread_schedule();
         }
 
-        /* r の per-Ractor generic_fields 表を joiner へ移送する。objspace merge より
-         * 前に行う必要がある: 下の absorb は内部で r の objspace を sweep し、その最中に
-         * r の dead host が obj_free 経由で rb_free_generic_ivar を呼ぶが、その時点の
-         * GET_RACTOR() は joiner なので entry を joiner 表に引きに行く。先に移送しないと
-         * 「objspace は移ったが登録情報は未移送」の窓で miss する。移送から merge の間に
-         * GC safepoint は無く、移送先 key はまだ r の objspace だが誰も引かないので安全。 */
-        rb_ractor_absorb_generic_fields(GET_RACTOR(), r);
-        /* rb_gc_register_mark_object の pin も同じ窓。下の merge が r の objspace を
+        /* rb_gc_register_mark_object の pin: 下の merge が r の objspace を
          * sweep するので、先に r の per-Ractor 登録を joiner へ移さないと、r の objspace
          * に残った pin 済みオブジェクトが root を失う。 */
         rb_ractor_absorb_registered_marks(GET_RACTOR(), r);
@@ -1012,11 +999,10 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
              * native に deep copy し、それ以外は snapshot を Marshal バイト列にする
              * （その利用者フックはここ、送信側で走る）。 */
             *ptype = basket_type_copy;
-            /* native copy 中、copy_enter が snapshot の generic-ivar host の fields_obj を
-             * cr->gen_fields_capture に記録する（host が出て初めて遅延確保）。
-             * ractor_basket_new が basket へ移して回収し、Marshal fallback 時は破棄する。 */
+            /* native copy 中、copy_enter が snapshot の全 node を pin list に集める
+             * （construction〜enqueue〜materialize の re-pin 被覆）。 */
             rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
-            VM_ASSERT(!cr->gen_fields_capturing && cr->gen_fields_capture == NULL);
+            VM_ASSERT(!cr->gen_fields_capturing);
             cr->gen_fields_capturing = true;
             VALUE snapshot = Qundef;
             /* native copy は raise しうる（確保・非同期割り込み）。capturing フラグが
@@ -1030,18 +1016,10 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
             EC_POP_TAG();
             cr->gen_fields_capturing = false;
             if (state != TAG_NONE) {
-                if (cr->gen_fields_capture) {
-                    st_free_table(cr->gen_fields_capture);
-                    cr->gen_fields_capture = NULL;
-                }
                 cr->pin_capture_cnt = 0;
                 EC_JUMP_TAG(ec, state);
             }
             if (UNDEF_P(snapshot)) {
-                if (cr->gen_fields_capture) {
-                    st_free_table(cr->gen_fields_capture);
-                    cr->gen_fields_capture = NULL;
-                }
                 cr->pin_capture_cnt = 0;
                 snapshot = rb_rescue2(ractor_marshal_dump_body, obj,
                                       ractor_marshal_dump_rescue, obj,
@@ -1086,15 +1064,12 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     b->p.v = v;
     b->p.marshaled = marshaled;
     b->p.move_courier = courier;
-    b->p.gen_fields = NULL;
     b->p.pinned = NULL;
     b->p.pinned_cnt = 0;
     if (type == basket_type_copy) {
         /* pin list と対応表を basket へ移し、enqueue までの re-pin 被覆を
          * cr->pin_capture から cr->sending_basket へ引き継ぐ（この間に safepoint 無し）。 */
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
-        b->p.gen_fields = cr->gen_fields_capture;
-        cr->gen_fields_capture = NULL;
         b->p.pinned = cr->pin_capture;
         b->p.pinned_cnt = cr->pin_capture_cnt;
         VM_ASSERT(cr->sending_basket == NULL);
@@ -1147,7 +1122,6 @@ ractor_basket_value(struct ractor_basket *b)
         };
         ec->materialize_frames = &frame;
         cr->sync.materializing_copies++;
-        struct st_table *prev_gf = cr->gen_fields_materialize;
         VALUE result = Qundef;
         enum ruby_tag_type state;
         EC_PUSH_TAG(ec);
@@ -1156,17 +1130,11 @@ ractor_basket_value(struct ractor_basket *b)
                 result = rb_marshal_load(b->p.v);
             }
             else {
-                /* materialize 中、snapshot host の generic-ivar を読む際（native copy の
-                 * rb_copy_generic_ivar）、送信側の per-Ractor 表を跨がずこの対応表から
-                 * fields_obj を引く（rb_obj_fields_generic_uncached が
-                 * gen_fields_materialize を参照）。 */
-                cr->gen_fields_materialize = b->p.gen_fields;
                 result = ractor_copy_native_try(b->p.v);
                 if (UNDEF_P(result)) rb_bug("ractor_basket_value: native snapshot not natively copyable");
             }
         }
         EC_POP_TAG();
-        cr->gen_fields_materialize = prev_gf;
         ec->materialize_frames = frame.prev;
         cr->sync.materializing_copies--;
         /* rb_copy_generic_ivar はこの EC の gen_fields_cache に送信側の snapshot host と
