@@ -8487,6 +8487,12 @@ gc_set_candidate_object_i(void *vstart, void *vend, size_t stride, void *data)
 }
 
 bool
+rb_gc_impl_multi_objspace_p(void)
+{
+    return true;
+}
+
+bool
 rb_gc_impl_during_global_gc_p(void *objspace_ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
