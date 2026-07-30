@@ -19,6 +19,7 @@
 
 #ifdef BUILDING_MODULAR_GC
 # define nlz_int64(x) (x == 0 ? 64 : (unsigned int)__builtin_clzll((unsigned long long)x))
+# define rb_popcount_intptr(x) ((unsigned int)__builtin_popcountll((unsigned long long)(x)))
 #else
 # include "internal/bits.h"
 #endif
@@ -6259,7 +6260,7 @@ verify_internal_consistency_i(void *page_start, void *page_end, size_t stride,
 
                 /* bitmap 不変条件: ページの shareable bit は FL_SHAREABLE と正確に一致し、
                  * shref 記録は unshareable しか指さない。 */
-                if (sh_bit != !!RB_OBJ_SHAREABLE_P(obj)) {
+                if (sh_bit != !!RB_FL_TEST_RAW(obj, RUBY_FL_SHAREABLE)) {
                     fprintf(stderr, "verify_internal_consistency_i: shareable bit %d "
                             "disagrees with FL_SHAREABLE on %s\n", (int)sh_bit, rb_obj_info(obj));
                     data->err_count++;
