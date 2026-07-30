@@ -635,6 +635,10 @@ typedef struct gc_function_map {
     bool (*gc_enabled_p)(void *objspace_ptr);
     bool (*user_gc_disabled_set)(void *objspace_ptr, bool disable);
     bool (*user_gc_disabled_p)(void *objspace_ptr);
+    bool (*during_global_gc_p)(void *objspace_ptr);
+    bool (*shref_marked_p)(void *objspace_ptr, VALUE obj);
+    size_t (*heap_page_count)(void *objspace_ptr);
+    void (*objspace_absorb)(void *dst_ptr, void *src_ptr);
     void (*gc_rest)(void *objspace_ptr);
     VALUE (*config_get)(void *objpace_ptr);
     void (*config_set)(void *objspace_ptr, VALUE hash);
@@ -823,6 +827,10 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(gc_enabled_p);
     load_modular_gc_func(user_gc_disabled_set);
     load_modular_gc_func(user_gc_disabled_p);
+    load_modular_gc_func(during_global_gc_p);
+    load_modular_gc_func(shref_marked_p);
+    load_modular_gc_func(heap_page_count);
+    load_modular_gc_func(objspace_absorb);
     load_modular_gc_func(gc_rest);
     load_modular_gc_func(config_set);
     load_modular_gc_func(config_get);
@@ -920,6 +928,10 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_gc_enabled_p rb_gc_functions.gc_enabled_p
 # define rb_gc_impl_user_gc_disabled_set rb_gc_functions.user_gc_disabled_set
 # define rb_gc_impl_user_gc_disabled_p rb_gc_functions.user_gc_disabled_p
+# define rb_gc_impl_during_global_gc_p rb_gc_functions.during_global_gc_p
+# define rb_gc_impl_shref_marked_p rb_gc_functions.shref_marked_p
+# define rb_gc_impl_heap_page_count rb_gc_functions.heap_page_count
+# define rb_gc_impl_objspace_absorb rb_gc_functions.objspace_absorb
 # define rb_gc_impl_gc_rest rb_gc_functions.gc_rest
 # define rb_gc_impl_config_get rb_gc_functions.config_get
 # define rb_gc_impl_config_set rb_gc_functions.config_set
