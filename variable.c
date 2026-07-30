@@ -2295,8 +2295,7 @@ rb_generic_fields_shared_table_foreach(void (*cb)(struct st_table *tbl, void *ar
     rb_native_mutex_unlock(&GET_VM()->ractor.generic_fields_lock);
 }
 
-/* すべての generic_fields 表（shareable 用の global 表 + 全 Ractor の per-Ractor 表 +
- * 未 merge の zombie owner の表）について cb(tbl, arg) を呼ぶ。global GC の weak pass と
+/* 単一の global generic_fields 表について cb(tbl, arg) を呼ぶ。global GC の weak pass と
  * compaction の参照更新から使う。いずれも barrier 下なので走査にロックは要らない。 */
 void
 rb_generic_fields_tables_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg)
@@ -2305,62 +2304,6 @@ rb_generic_fields_tables_foreach(void (*cb)(struct st_table *tbl, void *arg), vo
         cb(generic_fields_tbl_, arg);
     }
 }
-
-struct gf_mark_foreach_ctx {
-    int (*cb)(VALUE key, VALUE val, void *arg);
-    void *arg;
-};
-
-static int
-gf_mark_foreach_i(st_data_t key, st_data_t val, st_data_t data)
-{
-    struct gf_mark_foreach_ctx *ctx = (struct gf_mark_foreach_ctx *)data;
-    return ctx->cb((VALUE)key, (VALUE)val, ctx->arg);
-}
-
-static void
-gf_mark_foreach_table_cb(struct st_table *tbl, void *arg)
-{
-    st_foreach(tbl, gf_mark_foreach_i, (st_data_t)arg);
-}
-
-void
-rb_gc_vm_generic_fields_mark_foreach(int (*cb)(VALUE key, VALUE val, void *arg), void *arg)
-{
-    struct gf_mark_foreach_ctx ctx = { cb, arg };
-    rb_generic_fields_tables_foreach(gf_mark_foreach_table_cb, &ctx);
-}
-
-struct gf_drain_ctx {
-    bool (*is_dead)(VALUE key);
-};
-
-static int
-gf_drain_i(st_data_t key, st_data_t val, st_data_t data)
-{
-    struct gf_drain_ctx *ctx = (struct gf_drain_ctx *)data;
-    if (ctx->is_dead((VALUE)key)) {
-        /* weak pass の drain: dead key の entry を消すだけで key 本体には触らない。
-         * global GC が他 objspace の lazy sweep を settle した時点で key は既に free
-         * （slot poison）済みかもしれず、shape を書くと use-after-poison になるため。 */
-        return ST_DELETE;
-    }
-    return ST_CONTINUE;
-}
-
-static void
-gf_drain_table_cb(struct st_table *tbl, void *arg)
-{
-    st_foreach(tbl, gf_drain_i, (st_data_t)arg);
-}
-
-void
-rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key))
-{
-    struct gf_drain_ctx ctx = { is_dead };
-    rb_generic_fields_tables_foreach(gf_drain_table_cb, &ctx);
-}
-
 
 void
 rb_field_foreach(VALUE obj, rb_ivar_foreach_callback_func *func, st_data_t arg, bool ivar_only)
