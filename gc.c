@@ -635,6 +635,7 @@ typedef struct gc_function_map {
     bool (*gc_enabled_p)(void *objspace_ptr);
     bool (*user_gc_disabled_set)(void *objspace_ptr, bool disable);
     bool (*user_gc_disabled_p)(void *objspace_ptr);
+    bool (*multi_objspace_p)(void);
     bool (*during_global_gc_p)(void *objspace_ptr);
     bool (*shref_marked_p)(void *objspace_ptr, VALUE obj);
     size_t (*heap_page_count)(void *objspace_ptr);
@@ -827,6 +828,7 @@ ruby_modular_gc_init(void)
     load_modular_gc_func(gc_enabled_p);
     load_modular_gc_func(user_gc_disabled_set);
     load_modular_gc_func(user_gc_disabled_p);
+    load_modular_gc_func(multi_objspace_p);
     load_modular_gc_func(during_global_gc_p);
     load_modular_gc_func(shref_marked_p);
     load_modular_gc_func(heap_page_count);
@@ -928,6 +930,7 @@ ruby_modular_gc_init(void)
 # define rb_gc_impl_gc_enabled_p rb_gc_functions.gc_enabled_p
 # define rb_gc_impl_user_gc_disabled_set rb_gc_functions.user_gc_disabled_set
 # define rb_gc_impl_user_gc_disabled_p rb_gc_functions.user_gc_disabled_p
+# define rb_gc_impl_multi_objspace_p rb_gc_functions.multi_objspace_p
 # define rb_gc_impl_during_global_gc_p rb_gc_functions.during_global_gc_p
 # define rb_gc_impl_shref_marked_p rb_gc_functions.shref_marked_p
 # define rb_gc_impl_heap_page_count rb_gc_functions.heap_page_count
@@ -1049,6 +1052,10 @@ void *
 rb_gc_objspace_alloc(void)
 {
     gc_ever_multi_ractor = true;
+    if (!rb_gc_impl_multi_objspace_p()) {
+        /* objspace は 1 つを全 Ractor で共有する。 */
+        return rb_gc_get_objspace();
+    }
     void *objspace = rb_gc_impl_objspace_alloc();
     rb_gc_impl_objspace_init(objspace);
 
@@ -3961,6 +3968,12 @@ rb_gc_objspace_retire(void **objspace_slot)
 {
     rb_vm_t *vm = GET_VM();
 
+    if (!rb_gc_impl_multi_objspace_p()) {
+        /* 共有 objspace の別名を持っていただけなので手放す。 */
+        *objspace_slot = NULL;
+        return;
+    }
+
     /* GC.disable したまま終了したら hold を返す。残すと誰も enable できず GC が止まる。 */
     if (rb_gc_impl_user_gc_disabled_set(*objspace_slot, false)) {
         RUBY_ATOMIC_DEC(vm->gc.disable_holders);
@@ -3983,6 +3996,7 @@ rb_gc_objspace_retire(void **objspace_slot)
 void
 rb_gc_objspace_disown(void *objspace)
 {
+    if (!rb_gc_impl_multi_objspace_p()) return;
     rb_vm_t *vm = GET_VM();
     bool found = false;
 
@@ -4088,9 +4102,18 @@ rb_gc_reset_absorbed_since_global_gc(void)
  * 子生成の窓（子 objspace は既に在り cnt はまだ 1）と zombie 吸収の during（count-- 済みだが
  * merge 未了）／after（merge 済だが次の global GC 未了）の窓は multi 扱い。single 扱いだと
  * 窓中の GC が shareable pin 等のガードを飛ばし live cc 等を回収する。 */
+/* impl が objspace を 1 つしか扱えない (mmtk 等) とき false。VM は per-Ractor
+ * objspace 機構 (retire/absorb/creation cover) を素通しにする。 */
+bool
+rb_gc_multi_objspace_p(void)
+{
+    return rb_gc_impl_multi_objspace_p();
+}
+
 bool
 rb_gc_single_objspace_p(void)
 {
+    if (!rb_gc_impl_multi_objspace_p()) return true;
     rb_vm_t *vm = GET_VM();
     return vm->ractor.cnt == 1 && vm->gc.zombie_objspaces_count == 0 && gc_absorbing_zombie == 0 &&
            !gc_absorbed_since_global_gc &&
@@ -4112,6 +4135,10 @@ objspace_absorb_merge(void *dst, void *src)
 void
 rb_gc_objspace_absorb_into_current(void **objspace_slot)
 {
+    if (!rb_gc_impl_multi_objspace_p()) {
+        *objspace_slot = NULL;
+        return;
+    }
     RB_VM_LOCKING() {
         void *objspace = *objspace_slot;
         if (objspace != NULL) {

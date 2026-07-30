@@ -577,13 +577,25 @@ rb_mmtk_builder_init(void)
 void *
 rb_gc_impl_objspace_alloc(void)
 {
-    MMTk_Builder *builder = rb_mmtk_builder_init();
-    MMTk_RubyBindingOptions binding_options = {
-        .suffix_size = RB_GC_OBJ_SUFFIX_SIZE,
-    };
-    mmtk_init_binding(builder, &binding_options, &ruby_upcalls);
+    /* heap・binding・objspace はプロセスに 1 つ (multi_objspace_p=false)。VM は
+     * 全 Ractor で同じ objspace を共有するので、再入しても同じ実体を返す。 */
+    static struct objspace *the_objspace = NULL;
+    if (the_objspace == NULL) {
+        MMTk_Builder *builder = rb_mmtk_builder_init();
+        MMTk_RubyBindingOptions binding_options = {
+            .suffix_size = RB_GC_OBJ_SUFFIX_SIZE,
+        };
+        mmtk_init_binding(builder, &binding_options, &ruby_upcalls);
+        the_objspace = calloc(1, sizeof(struct objspace));
+    }
 
-    return calloc(1, sizeof(struct objspace));
+    return the_objspace;
+}
+
+bool
+rb_gc_impl_multi_objspace_p(void)
+{
+    return false;
 }
 
 static void gc_run_finalizers(void *data);
@@ -592,6 +604,10 @@ void
 rb_gc_impl_objspace_init(void *objspace_ptr)
 {
     struct objspace *objspace = objspace_ptr;
+
+    /* objspace は singleton (rb_gc_impl_objspace_alloc 参照)。再 init で
+     * finalizer_table や ractor_caches を潰さない。 */
+    if (objspace->finalizer_table != NULL) return;
 
     objspace->measure_gc_time = true;
 
@@ -614,7 +630,7 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
 void
 rb_gc_impl_objspace_free(void *objspace_ptr)
 {
-    free(objspace_ptr);
+    /* objspace は process-lifetime の singleton。 */
 }
 
 void *
