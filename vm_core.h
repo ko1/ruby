@@ -682,8 +682,8 @@ typedef const struct rb_builtin_function *RB_BUILTIN;
 /* The mark redirect used by the object-traversal APIs
  * (rb_objspace_reachable_objects_from etc.).  It is installed while a traversal
  * runs and is NULL during a real GC.  Storage is per-Ractor
- * (rb_ractor_t.mark_func_data), except on a modular GC where it lives in the VM
- * (rb_vm_struct's gc sub-struct; see gc.c). */
+ * (rb_ractor_t.mark_func_data); on a modular GC, threads without a current
+ * Ractor fall back to rb_vm_struct's gc sub-struct (see gc.c). */
 struct gc_mark_func_data_struct {
     void *data;
     void (*mark_func)(VALUE v, void *data);
