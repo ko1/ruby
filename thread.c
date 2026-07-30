@@ -1101,23 +1101,26 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
      * walk が参照するので、入れ替えは VM lock 下で他から不可視に行う。 */
     VALUE thval;
     rb_ractor_t *cr = GET_RACTOR();
+    const bool multi_objspace = rb_gc_multi_objspace_p();
     RB_VM_LOCKING() {
         void *const parent_objspace = cr->objspace;
-        cr->objspace = r->objspace;
+        if (multi_objspace) cr->objspace = r->objspace;
         /* 下の wrapper 割り当てで GC を再入させない。cr->objspace が子を指す間は
          * creator 自身の objspace がどの walk からも漏れ、global GC が飛ばして stale
          * mark bits = UAF になる。単一オブジェクトなので抑止しても増えるだけ。 */
         VALUE gc_was_disabled = rb_gc_local_disable_no_rest();
         thval = rb_thread_alloc(rb_cThread);
         if (gc_was_disabled == Qfalse) rb_gc_local_enable();
-        cr->objspace = parent_objspace;
+        if (multi_objspace) cr->objspace = parent_objspace;
         /* 子の objspace は wrapper を持つがまだ vm->ractor.set に無い。列挙可能に
          * 保つ(ここと vm_insert_ractor の間に走る global GC が取りこぼし mark で
          * ループするのを防ぐ)。vm_insert_ractor が set 参加時に VM lock 下でクリア。
          * 単一スロット。set〜clear の間に GVL 解放は無く同 Ractor の生成は直列なので
          * 上書き衝突は起きない(将来 GVL を手放す変更が入ると破れるので assert)。 */
-        RUBY_ASSERT(cr->creating_child_objspace == NULL);
-        cr->creating_child_objspace = r->objspace;
+        if (multi_objspace) {
+            RUBY_ASSERT(cr->creating_child_objspace == NULL);
+            cr->creating_child_objspace = r->objspace;
+        }
     }
 
     /* vm_insert_ractor までに生成は失敗し得る(IsolationError 等)。cover を残すと
