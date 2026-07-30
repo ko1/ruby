@@ -1086,7 +1086,7 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
  * それを containment 違反と誤検出してはならない（copy 自身の確保がその GC を途中で
  * 起こしうる）。 */
 bool
-rb_gc_current_ractor_materializing_p(void)
+rb_ractor_materializing_p(void)
 {
     const rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (cr == NULL) return false;
