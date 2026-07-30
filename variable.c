@@ -2301,27 +2301,8 @@ rb_generic_fields_shared_table_foreach(void (*cb)(struct st_table *tbl, void *ar
 void
 rb_generic_fields_tables_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg)
 {
-    rb_vm_t *vm = GET_VM();
-
     if (generic_fields_tbl_ != NULL) {
         cb(generic_fields_tbl_, arg);
-    }
-
-    rb_ractor_t *r;
-    ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
-        if (r->generic_fields_tbl != NULL) {
-            cb(r->generic_fields_tbl, arg);
-        }
-    }
-
-    /* 終了して vm->ractor.set から外れたが未 merge の zombie owner の表も舐める
-     * （残る entry は weak pass の対象）。orphan（owner==NULL）は ractor_free が表を
-     * main へ移送済みなので main 側で拾われる。 */
-    for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
-        rb_ractor_t *zr = vm->gc.zombie_objspaces[i].owner;
-        if (zr != NULL && zr->generic_fields_tbl != NULL) {
-            cb(zr->generic_fields_tbl, arg);
-        }
     }
 }
 
@@ -2380,49 +2361,6 @@ rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key))
     rb_generic_fields_tables_foreach(gf_drain_table_cb, &ctx);
 }
 
-struct gf_absorb_ctx {
-    struct st_table *dst;
-};
-
-static int
-gf_absorb_i(st_data_t key, st_data_t val, st_data_t data)
-{
-    struct gf_absorb_ctx *ctx = (struct gf_absorb_ctx *)data;
-    st_insert(ctx->dst, key, val);
-    return ST_CONTINUE;
-}
-
-/* src Ractor の per-Ractor generic_fields 表を dst へ移送して src を空にする（Ractor#value
- * join / orphan free）。dst が空なら表ごと引き渡す。要素移送では st_insert の resize が
- * dst の GC を誘発しうるので、移送ループは dst の GC を disable した窓の中で行う。 */
-void
-rb_ractor_absorb_generic_fields(rb_ractor_t *dst, rb_ractor_t *src)
-{
-    if (dst == src) return;
-    if (src->generic_fields_tbl == NULL) return;
-
-    if (dst->generic_fields_tbl == NULL) {
-        dst->generic_fields_tbl = src->generic_fields_tbl;
-        src->generic_fields_tbl = NULL;
-        return;
-    }
-
-    VALUE gc_was_disabled = rb_gc_local_disable_no_rest();
-    struct gf_absorb_ctx ctx = { dst->generic_fields_tbl };
-    st_foreach(src->generic_fields_tbl, gf_absorb_i, (st_data_t)&ctx);
-    st_free_table(src->generic_fields_tbl);
-    src->generic_fields_tbl = NULL;
-    if (gc_was_disabled == Qfalse) rb_gc_local_enable();
-}
-
-void
-rb_ractor_free_generic_fields(rb_ractor_t *r)
-{
-    if (r->generic_fields_tbl != NULL) {
-        st_free_table(r->generic_fields_tbl);
-        r->generic_fields_tbl = NULL;
-    }
-}
 
 void
 rb_field_foreach(VALUE obj, rb_ivar_foreach_callback_func *func, st_data_t arg, bool ivar_only)

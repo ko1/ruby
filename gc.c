@@ -4181,12 +4181,10 @@ rb_gc_objspace_absorb_all_zombies(void)
     while (vm->gc.zombie_objspaces_count > 0) {
         size_t before = vm->gc.zombie_objspaces_count;
         GC_ASSERT(vm->gc.zombie_objspaces[0].owner_slot != NULL);
-        /* join と同じ順序で表と pin を merge より先に移送する。merge 内の sweep が
-         * owner の dead host を obj_free し、現 Ractor の generic_fields 表を引くため
-         * (ractor_value 参照)。未移送だと表 miss の rb_bug / pin の root 喪失になる。 */
+        /* pin (rb_gc_register_mark_object) を merge より先に移送する。merge 内の sweep で
+         * owner の objspace に残る pin 済みオブジェクトが root を失わないため。 */
         rb_ractor_t *owner = vm->gc.zombie_objspaces[0].owner;
         if (owner) {
-            rb_ractor_absorb_generic_fields(GET_RACTOR(), owner);
             rb_ractor_absorb_registered_marks(GET_RACTOR(), owner);
         }
         rb_gc_objspace_absorb_into_current(vm->gc.zombie_objspaces[0].owner_slot);
@@ -4696,22 +4694,14 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
         break;
       }
       case RB_GC_VM_GENERIC_FIELDS_TABLE: {
-        /* global GC は STW なので shared 表 + 全 Ractor 表を安全に舐められる。ローカル GC は
-         * 自分の Ractor の表だけを見る。他 Ractor 表は foreign な住人しか持たず並行変更中なので触れない。 */
+        /* 表は 1 本。global GC は STW barrier 下で lock なしに舐める。local compaction は
+         * GC 全体の lock で他 GC と排他済みなので、foreign key は動かず moved 判定を素通り
+         * する。mutator の insert とは表の mutex で排他（shared_table_foreach が取る）。 */
         if (rb_gc_during_global_gc_p()) {
             rb_generic_fields_tables_foreach(vm_weak_table_gen_fields_tbl_cb, (void *)&foreach_data);
         }
-        else {
-            rb_ractor_t *cr = rb_current_ractor_raw(false);
-            if (cr && cr->generic_fields_tbl != NULL) {
-                vm_weak_table_gen_fields_tbl_cb(cr->generic_fields_tbl, (void *)&foreach_data);
-            }
-            /* compaction の参照更新では自 objspace の shareable host が動くと共有表の
-             * キー/値が stale になるので共有表も更新する（lock 下）。掃除(weak_only)は
-             * shareable の生死を local GC が判定できないので触らない。 */
-            if (!weak_only) {
-                rb_generic_fields_shared_table_foreach(vm_weak_table_gen_fields_tbl_cb, (void *)&foreach_data);
-            }
+        else if (!weak_only) {
+            rb_generic_fields_shared_table_foreach(vm_weak_table_gen_fields_tbl_cb, (void *)&foreach_data);
         }
         break;
       }
