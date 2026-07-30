@@ -4731,6 +4731,75 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
     }
 }
 
+/* generic_fields 表の global GC 用 weak pass。barrier 下なので走査にロックは要らない。 */
+struct gf_mark_foreach_ctx {
+    int (*cb)(VALUE key, VALUE val, void *arg);
+    void *arg;
+};
+
+static int
+gf_mark_foreach_i(st_data_t key, st_data_t val, st_data_t data)
+{
+    struct gf_mark_foreach_ctx *ctx = (struct gf_mark_foreach_ctx *)data;
+    return ctx->cb((VALUE)key, (VALUE)val, ctx->arg);
+}
+
+static void
+gf_mark_foreach_table_cb(struct st_table *tbl, void *arg)
+{
+    st_foreach(tbl, gf_mark_foreach_i, (st_data_t)arg);
+}
+
+void
+rb_gc_vm_generic_fields_mark_foreach(int (*cb)(VALUE key, VALUE val, void *arg), void *arg)
+{
+    struct gf_mark_foreach_ctx ctx = { cb, arg };
+    rb_generic_fields_tables_foreach(gf_mark_foreach_table_cb, &ctx);
+}
+
+struct gf_drain_ctx {
+    bool (*is_dead)(VALUE key);
+};
+
+static int
+gf_drain_i(st_data_t key, st_data_t val, st_data_t data)
+{
+    struct gf_drain_ctx *ctx = (struct gf_drain_ctx *)data;
+    if (ctx->is_dead((VALUE)key)) {
+        /* weak pass の drain: dead key の entry を消すだけで key 本体には触らない。
+         * global GC が他 objspace の lazy sweep を settle した時点で key は既に free
+         * （slot poison）済みかもしれず、shape を書くと use-after-poison になるため。 */
+        return ST_DELETE;
+    }
+    return ST_CONTINUE;
+}
+
+static void
+gf_drain_table_cb(struct st_table *tbl, void *arg)
+{
+    st_foreach(tbl, gf_drain_i, (st_data_t)arg);
+}
+
+void
+rb_gc_vm_generic_fields_drain_dead(bool (*is_dead)(VALUE key))
+{
+    struct gf_drain_ctx ctx = { is_dead };
+    rb_generic_fields_tables_foreach(gf_drain_table_cb, &ctx);
+}
+
+/* modular build の gc-impl から呼べるよう gc.c で export する wrapper。 */
+bool
+rb_gc_current_ractor_materializing_p(void)
+{
+    return rb_ractor_materializing_p();
+}
+
+VALUE
+rb_gc_vm_top_self(void)
+{
+    return rb_vm_top_self();
+}
+
 void
 rb_gc_update_vm_references(void *objspace)
 {
