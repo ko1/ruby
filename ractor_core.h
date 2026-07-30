@@ -91,12 +91,10 @@ struct rb_ractor_struct {
     VALUE *registered_marks;
     size_t registered_marks_cnt, registered_marks_capa;
 
-#if !USE_MODULAR_GC
     /* traversal-API mark redirect (NULL outside a traversal).  Per Ractor so a
-     * concurrent traversal on another Ractor is never observed.  A modular GC
-     * keeps this in the VM instead (vm->gc.mark_func_data). */
+     * concurrent traversal on another Ractor is never observed.  A modular GC's
+     * Ractor-less marking worker threads read vm->gc.mark_func_data instead. */
     struct gc_mark_func_data_struct *mark_func_data;
-#endif
 
     // thread management
     struct {
