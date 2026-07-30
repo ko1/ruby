@@ -422,13 +422,6 @@ ractor_free(void *ptr)
     }
     rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
 
-    if (!r->main_ractor) {
-        /* この Ractor の generic_fields 表を main へ移送する。struct と共に失うと、
-         * objspace が後で main に merge された後、host の obj_free が entry を見つけられず
-         * rb_bug になる。st は raw malloc なので sweep 中でも安全。 */
-        rb_ractor_absorb_generic_fields(GET_VM()->ractor.main_ractor, r);
-    }
-
     free_targeted_hooks(&r->pub.targeted_hooks);
     rb_native_mutex_destroy(&r->sync.lock);
 #ifdef RUBY_THREAD_WIN32_H
@@ -454,10 +447,6 @@ ractor_free(void *ptr)
     }
 
     ractor_sync_free(r);
-
-    /* generic_fields 表を解放。非 main は上で main へ移送済み（NULL）だが、
-     * main は shutdown 時に非 NULL のことがある。NULL は no-op。 */
-    rb_ractor_free_generic_fields(r);
 
     /* orphan Ractor（未 join）は objspace を main に吸収される前に
      * rb_gc_register_mark_object pin を main へ渡す。join 側も同様に、
@@ -757,8 +746,6 @@ ractor_init(rb_ractor_t *r, VALUE name, VALUE loc)
 {
     ractor_sync_init(r);
     r->gen_fields_capturing = false;
-    r->gen_fields_capture = NULL;
-    r->gen_fields_materialize = NULL;
     r->pin_capture = NULL;
     r->pin_capture_cnt = r->pin_capture_capa = 0;
     r->sending_basket = NULL;
@@ -1442,21 +1429,6 @@ st_table *
 rb_ractor_targeted_hooks(rb_ractor_t *cr)
 {
     return &cr->pub.targeted_hooks;
-}
-
-/* upstream が gc.c 内の static inline に移したので、ここで同じ判定を持つ。
- * generic fields 表を使う object かどうかの純粋な型/フラグ検査。 */
-static inline bool
-ractor_obj_using_gen_fields_table_p(VALUE obj)
-{
-    switch (BUILTIN_TYPE(obj)) {
-      case T_STRUCT:
-      case T_DATA:
-        return false;
-      default:
-        break;
-    }
-    return rb_obj_gen_fields_p(obj);
 }
 
 static void
@@ -3185,24 +3157,14 @@ copy_enter(VALUE obj, struct obj_traverse_replace_data *data)
         data->replacement = copy;
         /* snapshot 作成中は全 node を pin list に収集する（basket が保持し、global GC の
          * re-pin が root だけでなく全 node を再 pin できるように。compaction が snapshot
-         * node を動かすとアドレスキーの対応表や dedup 表が壊れる）。加えて copy が
-         * generic-ivar host なら fields_obj を対応表に記録する（受信側 materialize が
-         * 送信側の per-Ractor 表を跨がないため。表は host が出て初めて遅延確保）。 */
+         * node を動かすとアドレスキーの dedup 表が壊れる）。generic-ivar の fields_obj は
+         * global 表経由で引け、compaction の参照更新も表が受けるので同梱不要。 */
         rb_ractor_t *cr = GET_RACTOR();
         if (cr->gen_fields_capturing) {
             /* 誕生した瞬間から pin する（shref bit + global compaction 中なら pin bit）。
              * 構築中の list は rb_ractor_repin_in_flight が cr->pin_capture 経由で
              * re-pin するので、構築〜enqueue〜materialize まで被覆が途切れない。 */
             ractor_pin_capture_push(cr, copy);
-            if (BUILTIN_TYPE(copy) != T_OBJECT && rb_obj_gen_fields_p(copy)) {
-                if (cr->gen_fields_capture == NULL) {
-                    cr->gen_fields_capture = st_init_numtable();
-                }
-                VALUE fields_obj = rb_obj_fields_no_ractor_check(copy);
-                st_insert(cr->gen_fields_capture, (st_data_t)copy, (st_data_t)fields_obj);
-                /* 対応表はアドレスで引かれるので fields_obj も動いてはならない。 */
-                ractor_pin_capture_push(cr, fields_obj);
-            }
         }
         return traverse_cont;
     }
