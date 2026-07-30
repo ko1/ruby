@@ -636,16 +636,19 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         if (vm->ractor.cnt <= 2 && vm->ractor.sync.terminate_waiting) {
             rb_native_cond_signal(&vm->ractor.sync.terminate_cond);
         }
-        vm->ractor.cnt--;
 
         rb_gc_ractor_cache_free(cr->newobj_cache);
         cr->newobj_cache = NULL;
 
         /* ここで objspace は owner thread を失う。継承で merge されるまで
-         * global GC から列挙可能に保つ。 */
+         * global GC から列挙可能に保つ。rb_gc_single_objspace_p は他 Ractor の
+         * local GC が lock-free に読むので、zombie_objspacesへの登録を cnt-- より
+         * 先に行う。逆順だと cnt==1 かつ zombie 0 の窓ができ、その間の GC が
+         * shareable pin を省き、この objspace 経由でだけ届く cc 等を回収する。 */
         if (cr->objspace) {
             rb_gc_objspace_retire(&cr->objspace);
         }
+        vm->ractor.cnt--;
 
         ractor_status_set(cr, ractor_terminated);
     }
