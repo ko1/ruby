@@ -19,10 +19,9 @@ end
 def spawn_fat_zombies(n)
   rs = n.times.map do
     Ractor.new do
-      retain = Array.new(8_000) { +"x" * 512 }
-      Ractor.yield nil if false   # keep the local visible to the end
-      retain.size
-      :done
+      # 戻り値 (value 未取得の legacy) として保持する。retire GC はローカルの
+      # garbage を死亡時に回収するので、pages を保たせるには live value が要る。
+      Array.new(8_000) { +"x" * 512 }
     end
   end
   wait_terminated(rs)
