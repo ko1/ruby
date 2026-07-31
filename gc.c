@@ -4537,6 +4537,10 @@ struct global_vm_table_foreach_data {
      * compaction の参照更新は表ごとに走る。移動した key の再挿入先がその entry の属する
      * 表になるよう、現在走査中の表をここに持つ。 */
     struct st_table *gen_fields_current_tbl;
+    /* 移動した key の再挿入は entry 追加で rehash を起こし、走査中の iterator を壊す。
+     * 走査後にまとめて挿入する（GC 中なので raw realloc）。 */
+    struct gen_fields_deferred_insert { st_data_t k, v; struct st_table *tbl; } *gf_deferred;
+    size_t gf_deferred_cnt, gf_deferred_capa;
 };
 
 static int
@@ -4645,12 +4649,26 @@ vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
         }
     }
 
-    if (key != new_key || value != new_value) {
+    if (key != new_key) {
+        /* 新 key の挿入は entry 追加＝rehash になり得るので走査後に回す。 */
+        if (iter_data->gf_deferred_cnt == iter_data->gf_deferred_capa) {
+            size_t nc = iter_data->gf_deferred_capa ? iter_data->gf_deferred_capa * 2 : 64;
+            struct gen_fields_deferred_insert *p =
+                realloc(iter_data->gf_deferred, nc * sizeof(*p));
+            if (!p) rb_bug("vm_weak_table_gen_fields_foreach: out of memory");
+            iter_data->gf_deferred = p;
+            iter_data->gf_deferred_capa = nc;
+        }
+        iter_data->gf_deferred[iter_data->gf_deferred_cnt++] =
+            (struct gen_fields_deferred_insert){
+                .k = (st_data_t)new_key, .v = (st_data_t)new_value,
+                .tbl = iter_data->gen_fields_current_tbl,
+            };
+    }
+    else if (value != new_value) {
         DURING_GC_COULD_MALLOC_REGION_START();
         {
-            /* entry が属する表（global 用 shared か、いずれかの per-Ractor か）に
-             * 再挿入する。single-objspace でのみ compaction が走るので、per-Ractor は
-             * 実質 main の 1 本だけである。 */
+            /* 既存 key の値更新は entry を増やさず rehash しない。 */
             st_insert(iter_data->gen_fields_current_tbl, (st_data_t)new_key, new_value);
         }
         DURING_GC_COULD_MALLOC_REGION_END();
@@ -4755,6 +4773,17 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
         }
         else if (!weak_only) {
             rb_generic_fields_shared_table_foreach(vm_weak_table_gen_fields_tbl_cb, (void *)&foreach_data);
+        }
+        if (foreach_data.gf_deferred != NULL) {
+            DURING_GC_COULD_MALLOC_REGION_START();
+            {
+                for (size_t i = 0; i < foreach_data.gf_deferred_cnt; i++) {
+                    struct gen_fields_deferred_insert *const d = &foreach_data.gf_deferred[i];
+                    st_insert(d->tbl, d->k, d->v);
+                }
+            }
+            DURING_GC_COULD_MALLOC_REGION_END();
+            free(foreach_data.gf_deferred);
         }
         break;
       }
