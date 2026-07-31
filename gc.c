@@ -4634,6 +4634,12 @@ vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
             iter_data->update_callback(&new_value, iter_data->data);
             break;
 
+          case ST_DELETE:
+            /* move 済み host の残骸 entry。host(key) が生きていても fields_obj が
+             * 無到達ならこの fields は誰も読めない。key 側の削除と同じ後始末をする。 */
+            RBASIC_SET_SHAPE_ID((VALUE)key, ROOT_SHAPE_ID);
+            return ST_DELETE;
+
           default:
             rb_bug("vm_weak_table_gen_fields_foreach: return value %d not supported", ivar_ret);
         }
