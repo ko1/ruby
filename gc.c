@@ -3222,7 +3222,10 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     if (categoryp) *categoryp = category; \
 } while (0)
 
-    bool global_gc = rb_gc_impl_during_global_gc_p(objspace);
+    /* 単一 objspace の impl (mmtk) は STW の global GC しか持たず、mutator ごとの
+     * root scan も無いので、常に全 Ractor の local root をここで歩く。 */
+    const bool global_gc = rb_gc_impl_during_global_gc_p(objspace) ||
+                           !rb_gc_impl_multi_objspace_p();
 
     /* 現在の Ractor 自身の root は C 構造体から mark する。local GC は他 objspace に
      * あり得るヒープ上の Ractor/Thread ラッパに頼れないため。global GC は同じ root 一覧を
