@@ -1801,7 +1801,10 @@ rb_gc_impl_active_gc_name(void)
 bool
 rb_gc_impl_during_global_gc_p(void *objspace_ptr)
 {
-    return false;
+    /* mmtk の GC は常に STW の global GC。mark 中の helper (ractor_sync_mark 等)が
+     * 「全 mutator 停止済みか」の判定にこれを読む。 */
+    struct objspace *objspace = objspace_ptr;
+    return objspace->world_stopped;
 }
 
 bool

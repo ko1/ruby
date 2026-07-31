@@ -176,6 +176,7 @@ struct rb_ractor_struct {
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
 void rb_ractor_mark_terminated_join_value(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
+void rb_ractor_mark_in_flight_for_single_objspace(rb_ractor_t *r);
 /* 現 Ractor が到着 copy を materialize 中なら true（詳細は ractor_sync.c の定義）。 */
 bool rb_ractor_materializing_p(void);
 
