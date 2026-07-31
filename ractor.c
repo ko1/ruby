@@ -312,6 +312,13 @@ ractor_mark(void *ptr)
      * 生きる限り生かす。終了済み Ractor は set/zombie_objspaces の root scan から外れうる
      * (objspace が orphan merge された後)ので、wrapper marker が唯一の被覆になる。 */
     rb_gc_mark(r->sync.default_port_value);
+    /* 単一 objspace の impl (mmtk) には zombie_objspaces も pin/shref bit も無く、
+     * 終了済み Ractor の legacy 値・queue・in-flight payload を root scan が拾えない。
+     * shref 制約も無いので wrapper から辿って生かす。 */
+    if (!rb_gc_multi_objspace_p()) {
+        ractor_mark_unshareable_parts(r);
+        rb_ractor_mark_in_flight_for_single_objspace(r);
+    }
 }
 
 /* value_taken リストの直列化。add は successor の実行 thread、unlink は任意 Ractor の

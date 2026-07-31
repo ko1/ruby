@@ -806,6 +806,21 @@ rb_ractor_repin_in_flight(rb_ractor_t *r)
      * （rb_execution_context_mark。suspend 中の fiber の EC も traversal が拾う）。 */
 }
 
+/* 単一 objspace の impl (mmtk) には pin/shref bit が無く zombie_objspacesも無い。
+ * legacy 値・送信路上の basket・構築中 snapshot を wrapper marker から素の mark で
+ * 生かす（default GC では pin 機構と zombie scan が同じ範囲を被覆する）。 */
+void
+rb_ractor_mark_in_flight_for_single_objspace(rb_ractor_t *r)
+{
+    rb_gc_mark(r->sync.legacy);
+    if (r->sending_basket != NULL) {
+        ractor_basket_mark(r->sending_basket);
+    }
+    for (size_t i = 0; i < r->pin_capture_cnt; i++) {
+        rb_gc_mark(r->pin_capture[i]);
+    }
+}
+
 static int
 ractor_sync_free_ports_i(st_data_t _key, st_data_t val, st_data_t _args)
 {
