@@ -752,17 +752,20 @@ end
 # timeout した子の hang 地点を CI ログへ残す。ABRT で ruby の crash report
 # (control frame / C backtrace / threading) を吐かせてから KILL する。
 def kill_after_dump(pid)
-  begin
-    Process.kill :ABRT, pid
-    10.times do
-      break if Process.waitpid(pid, Process::WNOHANG)
-      sleep 0.3
+  # Windows は子への ABRT 配送に対応しない。POSIX でのみ dump を試みる
+  if Signal.list.key?("ABRT") && !RUBY_PLATFORM.match?(/mswin|mingw/)
+    begin
+      Process.kill :ABRT, pid
+      10.times do
+        break if Process.waitpid(pid, Process::WNOHANG)
+        sleep 0.3
+      end
+    rescue StandardError
     end
-  rescue Errno::ESRCH, Errno::ECHILD
   end
   begin
     Process.kill :KILL, pid
-  rescue Errno::ESRCH
+  rescue StandardError
   end
 end
 
