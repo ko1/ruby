@@ -9103,9 +9103,10 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
     }
 
     /* 複数 objspace での明示的な full な GC.start は global GC を走らせる。shareable と
-     * cross-objspace の garbage を回収できる唯一の collector だから。 */
+     * cross-objspace の garbage を回収できる唯一の collector だから。global GC は STW
+     * なので auto_compact もここで実施する（local 経路の full mark×autocompact と対）。 */
     if (!rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK)) {
-        gc_start_global(objspace, compact);
+        gc_start_global(objspace, compact || ruby_enable_autocompact);
     }
     else {
         garbage_collect(objspace, reason);
