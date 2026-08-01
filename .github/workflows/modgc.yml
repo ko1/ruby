@@ -129,6 +129,56 @@ jobs:
 
       - run: ${SETARCH} make hello
 
+      # TEMPORARY forensics: mmtk btest hits glibc "double free or corruption"
+      # (test_ractor.rb:2148/2189) only on CI. Keep SIGABRT at SIG_DFL via
+      # LD_PRELOAD so the abort dumps core instead of entering the crash
+      # reporter (deadlocks on corrupted heap), then upload the core.
+      - name: mmtk heap corruption forensics (temporary)
+        run: |
+          set -x
+          nproc; free -m; ldd --version | head -1; uname -a
+          mkdir -p coredumps
+          sudo sysctl -w kernel.core_pattern="$PWD/coredumps/core.%e.%p"
+          cat > abort_core.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <signal.h>
+          #include <dlfcn.h>
+          #include <stddef.h>
+          int sigaction(int sig, const struct sigaction *restrict act, struct sigaction *restrict oldact)
+          {
+              static int (*real)(int, const struct sigaction *, struct sigaction *);
+              if (real == NULL) real = dlsym(RTLD_NEXT, "sigaction");
+              if (sig == SIGABRT && act != NULL) {
+                  if (oldact != NULL) real(sig, NULL, oldact);
+                  return 0;
+              }
+              return real(sig, act, oldact);
+          }
+          EOF
+          cc -shared -fPIC -O2 -o abort_core.so abort_core.c -ldl
+          ulimit -c unlimited
+          LD_PRELOAD="$PWD/abort_core.so" make -s btest
+        timeout-minutes: 30
+        if: ${{ matrix.gc.name == 'mmtk' && !contains(matrix.os, 'macos') }}
+
+      - name: Package mmtk forensics cores
+        run: |
+          if ls coredumps/core.* >/dev/null 2>&1; then
+            cp -v ruby abort_core.so coredumps/
+            cp -v modgc-lib/librubygc.mmtk.so coredumps/ || true
+            cp -v /lib/x86_64-linux-gnu/libc.so.6 /lib64/ld-linux-x86-64.so.2 coredumps/
+          fi
+          ls -la coredumps/ || true
+        if: ${{ always() && matrix.gc.name == 'mmtk' && !contains(matrix.os, 'macos') }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mmtk-forensics-${{ matrix.os }}
+          path: build/coredumps/
+          if-no-files-found: ignore
+          retention-days: 7
+        if: ${{ always() && matrix.gc.name == 'mmtk' && !contains(matrix.os, 'macos') }}
+
       - name: Set test options for skipped tests
         run: |
           set -x
