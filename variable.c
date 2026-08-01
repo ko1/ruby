@@ -1278,10 +1278,10 @@ gf_unlock(void)
 void
 rb_mark_generic_ivar(VALUE obj)
 {
-    /* global GC（STW）では per-object 引きをしない。driver の GET_RACTOR() は owner と
-     * 一致せず per-Ractor 表を引けないため。代わりに mark 後、全 Ractor の表を舐める
-     * weak pass（rb_gc_vm_generic_fields_mark_foreach）で live key の val を mark する。 */
-    if (rb_gc_during_global_gc_p()) {
+    /* multi-objspace の global GC（STW）では per-object 引きをせず、mark 後の
+     * rb_gc_vm_generic_fields_mark_foreach が live key の val を mark する。
+     * 単一 objspace impl (mmtk) はその pass を持たないのでここで mark する。 */
+    if (rb_gc_during_global_gc_p() && rb_gc_multi_objspace_p()) {
         return;
     }
 
