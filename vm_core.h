@@ -657,7 +657,7 @@ typedef struct rb_at_exit_list {
     struct rb_at_exit_list *next;
 } rb_at_exit_list;
 
-void *rb_objspace_alloc(void);
+void rb_gc_init_objspaces(void);
 void rb_objspace_free(void *objspace);
 void rb_objspace_call_finalizer(void);
 
@@ -682,11 +682,15 @@ typedef const struct rb_builtin_function *RB_BUILTIN;
 /* The mark redirect used by the object-traversal APIs
  * (rb_objspace_reachable_objects_from etc.).  It is installed while a traversal
  * runs and is NULL during a real GC.  Storage is per-Ractor
- * (rb_ractor_t.mark_func_data), except on a modular GC where it lives in the VM
- * (rb_vm_struct's gc sub-struct; see gc.c). */
+ * (rb_ractor_t.mark_func_data); on a modular GC, threads without a current
+ * Ractor fall back to rb_vm_struct's gc sub-struct (see gc.c). */
 struct gc_mark_func_data_struct {
     void *data;
     void (*mark_func)(VALUE v, void *data);
+    /* Marker set while a shareable-verification walk runs (read by
+     * rb_gc_checking_shareable).  The slot is per-Ractor, so it only affects the
+     * walk of the Ractor doing the verification. */
+    bool checking_shareable;
 };
 
 typedef struct rb_vm_struct {
@@ -694,6 +698,10 @@ typedef struct rb_vm_struct {
 
     struct {
         struct ccan_list_head set;
+        /* For a single-objspace impl (mmtk): Ractors between termination and
+         * ractor_free.  The global root scan keeps marking their
+         * registered_marks. */
+        struct ccan_list_head terminated_set;
         unsigned int cnt;
         unsigned int blocking_cnt;
 
@@ -718,6 +726,14 @@ typedef struct rb_vm_struct {
             rb_nativethread_cond_t barrier_release_cond;
 #endif
         } sync;
+
+        /* VM-wide locks for the Ractor transfer/inheritance machinery, plus the
+         * registry of in-flight move couriers.  All of them are leaf locks: no
+         * safepoint inside a critical section. */
+        rb_nativethread_lock_t generic_fields_lock;   /* the shared generic-fields table in variable.c */
+        rb_nativethread_lock_t value_taken_lock;      /* the value_taken list (add/unlink/scan) */
+        struct ccan_list_head move_courier_registry;  /* couriers in flight (ractor.c); the global GC marks them */
+        rb_nativethread_lock_t move_courier_registry_lock;
 
 #ifdef RUBY_THREAD_PTHREAD_H
         // ractor scheduling
@@ -773,9 +789,6 @@ typedef struct rb_vm_struct {
     unsigned int thread_ignore_deadlock: 1;
 
     /* object management */
-    VALUE **global_object_list;
-    size_t global_object_list_size;
-    size_t global_object_list_capa;
     const VALUE special_exceptions[ruby_special_error_count];
 
     /* Ruby Box */
@@ -811,14 +824,60 @@ typedef struct rb_vm_struct {
     int coverage_mode;
 
     struct {
-        struct rb_objspace *objspace;
+        /* The VM only points at rb_global_objspace, the process-wide GC data such as
+         * the page pool.  Each Ractor owns its own rb_objspace through r->objspace,
+         * and the boot objspace belongs to the main Ractor. */
+        struct rb_global_objspace *global_objspace;
+        /* Objspaces of Ractors that terminated but have not been inherited yet.
+         * Nobody mutates them, but every global GC has to enumerate them: missing one
+         * leaves stale mark bits, i.e. a use-after-free.  owner_slot is the dead
+         * Ractor's r->objspace, cleared under the VM lock when it is inherited. */
+        struct rb_objspace_zombie {
+            void *objspace;
+            void **owner_slot;
+            /* The Ractor that owns this zombie: it has terminated and left
+             * vm->ractor.set but has not been merged yet.  The global GC's
+             * generic_fields weak pass uses it to walk the owner's per-Ractor table.
+             * NULL for an orphan (its Ractor object was collected), whose table has
+             * already been moved to the main Ractor. */
+            struct rb_ractor_struct *owner;
+            /* Heap pages this zombie holds: measured when it retires and refreshed
+             * under the barrier of each global cycle.  The total below stays exactly
+             * in sync, entry by entry. */
+            size_t pages;
+        } *zombie_objspaces;
+        size_t zombie_objspaces_count;
+        size_t zombie_objspaces_capa;
+        /* Sum of .pages over zombie_objspaces.  Between global cycles it is an upper
+         * bound: a zombie's heap never grows and only shrinks at a global cycle. */
+        size_t zombie_total_pages;
+
 #if USE_MODULAR_GC
-        /* A modular GC (e.g. MMTk) may mark on worker threads that have no
-         * current EC, so the traversal mark redirect must be reachable without
-         * a Ractor and lives here.  Otherwise it is per-Ractor
-         * (rb_ractor_t.mark_func_data). */
         struct gc_mark_func_data_struct *mark_func_data;
 #endif
+        /* One VM-wide list for rb_gc_register_address.  A registered slot can later
+         * hold a value from another objspace, so it is not split per Ractor: every
+         * Ractor's GC scans it conservatively in its root walk.  The lock is a leaf
+         * lock and register/unregister are cold paths. */
+        struct {
+            rb_nativethread_lock_t lock;
+            VALUE **addrs;              /* rb_gc_register_address: mark_maybe on *addr */
+            size_t addrs_cnt, addrs_capa;
+        } registered_globals;
+
+        /* Number of holders keeping GC disabled (atomic).  A holder is either a
+         * Ractor that called GC.disable (its per-Ractor gc_disabled flag, at most one
+         * per Ractor) or a short internal critical section.  A single holder stops GC
+         * everywhere.  GC.enable only releases the caller's own hold, so it never
+         * overrides another Ractor's disable. */
+        rb_atomic_t disable_holders;
+        /* Handle of the postponed job that merges an orphan objspace into the main
+         * one (rb_postponed_job_handle_t; POSTPONED_JOB_HANDLE_INVALID when not
+         * registered). */
+        unsigned int orphan_merge_pjob;
+        /* Used to resolve the objspace during VM teardown (the cleanup path of
+         * rb_gc_get_objspace). */
+        void *cleanup_objspace;
     } gc;
 
     rb_at_exit_list *at_exit;
@@ -1063,6 +1122,8 @@ struct rb_waiting_list {
     struct rb_fiber_struct *fiber;
 };
 
+struct ractor_materialize_frame;
+
 struct rb_execution_context_struct {
     /* execution information */
     VALUE *vm_stack;		/* must free, must mark */
@@ -1113,6 +1174,11 @@ struct rb_execution_context_struct {
         VALUE obj;
         VALUE fields_obj;
     } gen_fields_cache;
+
+    /* Chain of receive frames being materialized on this EC (LIFO; the frames live
+     * on the C stack).  A thread or fiber switch cannot corrupt it, since each EC's
+     * chain only contains that EC's own nesting. */
+    struct ractor_materialize_frame *materialize_frames;
 
     /* for GC */
     struct {
@@ -2034,6 +2100,7 @@ rb_vm_living_threads_init(rb_vm_t *vm)
 {
     ccan_list_head_init(&vm->workqueue);
     ccan_list_head_init(&vm->ractor.set);
+    ccan_list_head_init(&vm->ractor.terminated_set);
 }
 
 typedef int rb_backtrace_iter_func(void *, VALUE, int, VALUE);
