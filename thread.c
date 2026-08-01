@@ -700,10 +700,10 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
             r->r_stdout = rb_io_prep_stdout();
             r->r_stderr = rb_io_prep_stderr();
 
-            /* Build the interrupt queue and mask stack here, on the new Ractor's
-             * own main thread, instead of carrying over the ones the creating
-             * thread made. The mask stack starts empty so a new Ractor does not
-             * inherit the creating thread's Thread.handle_interrupt state. */
+            /* The interrupt queue and mask stack were built in the parent's
+             * objspace, so rebuild them out of objects this Ractor owns.  The mask
+             * stack starts empty because inheriting it would reference the parent's
+             * unshareable mask Hash. */
             th->pending_interrupt_queue = rb_ary_hidden_new(0);
             th->pending_interrupt_mask_stack = rb_ary_hidden_new(0);
         }
@@ -907,7 +907,6 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         th->invoke_arg.proc.proc = rb_proc_isolate_bang(params->proc, Qnil);
         th->invoke_arg.proc.args = INT2FIX(RARRAY_LENINT(params->args));
         th->invoke_arg.proc.kw_splat = rb_keyword_given_p();
-        rb_ractor_send_parameters(ec, params->g, params->args);
         break;
 
       case thread_invoke_type_func:
@@ -924,11 +923,19 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     th->thgroup = current_th->thgroup;
 
     if (th->invoke_type == thread_invoke_type_ractor_proc) {
-        /* A new Ractor's main thread builds these on start
-         * (thread_start_func_2); leave them unset until then. */
+        /* The child Ractor's main thread rebuilds this in its own objspace when it
+         * starts (thread_start_func_2).  Building it here would leave it in the
+         * parent's objspace with no root, so the parent's local GC could free it
+         * before the child starts and a later mark would touch freed memory.  Leave
+         * it 0 (uninitialized). */
         th->pending_interrupt_queue = 0;
         th->pending_interrupt_mask_stack = 0;
         th->pending_interrupt_queue_checked = 0;
+        /* Same for the thread group: it lives in the parent Ractor's objspace, and
+         * keeping it here would make the child's Thread wrapper point at a foreign
+         * unshareable object with no shref, which violates containment.  Leave it 0
+         * (uninitialized) until thread_do_start_proc rebuilds it. */
+        th->thgroup = 0;
     }
     else {
         th->pending_interrupt_queue = rb_ary_hidden_new(0);
@@ -940,6 +947,26 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     RUBY_DEBUG_LOG("r:%u th:%u", rb_ractor_id(th->ractor), rb_th_serial(th));
 
     rb_ractor_living_threads_insert(th->ractor, th);
+
+    if (th->invoke_type == thread_invoke_type_ractor_proc) {
+        /* Create the default port and send the arguments only after the child has
+         * joined vm->ractor.set, so that a global GC running between creation and
+         * use still marks the child's default_port in its root scan.  If the send
+         * fails (an uncopyable argument, say), undo the set membership: leaving it
+         * there would make terminate_all wait forever. */
+        rb_ractor_setup_default_port(params->g);
+        enum ruby_tag_type state;
+        EC_PUSH_TAG(ec);
+        if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+            rb_ractor_send_parameters(ec, params->g, params->args);
+        }
+        EC_POP_TAG();
+        if (state != TAG_NONE) {
+            th->status = THREAD_KILLED;
+            rb_ractor_cancel_creation(params->g, th);
+            EC_JUMP_TAG(ec, state);
+        }
+    }
 
     /* kick thread */
     err = native_thread_create(th);
@@ -1074,7 +1101,65 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
         .args = args,
         .proc = proc,
     };
-    return thread_create_core(rb_thread_alloc(rb_cThread), &params);
+
+    /* Allocate the wrappers for the child Ractor's main thread and root Fiber
+     * directly in the child's objspace, so the thread is built out of objects it
+     * owns.  A whole-VM walk reads cr->objspace, so swap it under the VM lock where
+     * no one else can observe the swap. */
+    VALUE thval;
+    rb_ractor_t *cr = GET_RACTOR();
+    const bool multi_objspace = rb_gc_multi_objspace_p();
+    RB_VM_LOCKING() {
+        void *const parent_objspace = cr->objspace;
+        if (multi_objspace) cr->objspace = r->objspace;
+        /* Do not let the wrapper allocations below re-enter GC.  While cr->objspace
+         * points at the child, the creator's own objspace is invisible to every
+         * walk, so a global GC would skip it and leave stale mark bits, i.e. a
+         * use-after-free.  These are single allocations, so suppressing GC only
+         * costs a little growth. */
+        VALUE gc_was_disabled = rb_gc_local_disable_no_rest();
+        thval = rb_thread_alloc(rb_cThread);
+        if (gc_was_disabled == Qfalse) rb_gc_local_enable();
+        if (multi_objspace) cr->objspace = parent_objspace;
+        /* The child's objspace already holds the wrappers but is not in
+         * vm->ractor.set yet.  Keep it enumerable so a global GC running between
+         * here and vm_insert_ractor does not loop on a missed mark.  vm_insert_ractor
+         * clears this under the VM lock when the child joins the set.  One slot is
+         * enough: the GVL is never released between the set and the clear and one
+         * Ractor creates children serially, so there is no overwrite (asserted, since
+         * a future change that releases the GVL would break it). */
+        if (multi_objspace) {
+            RUBY_ASSERT(cr->creating_child_objspace == NULL);
+            cr->creating_child_objspace = r->objspace;
+        }
+    }
+
+    /* Creation can still fail before vm_insert_ractor (an IsolationError, say).
+     * Leaving the cover in place would enumerate the dead child's objspace twice and
+     * dangle after the merge, so on failure hand the objspace to the
+     * zombie_objspaces table under the VM lock, drop the cover and set
+     * r->objspace = NULL. */
+    enum ruby_tag_type state;
+    VALUE thret = Qundef;
+    rb_execution_context_t *ec = GET_EC();
+    EC_PUSH_TAG(ec);
+    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+        thret = thread_create_core(thval, &params);
+    }
+    EC_POP_TAG();
+    if (state != TAG_NONE) {
+        RB_VM_LOCKING() {
+            if (cr->creating_child_objspace == r->objspace) {
+                cr->creating_child_objspace = NULL;
+            }
+            if (r->objspace) {
+                rb_gc_objspace_disown(r->objspace);
+                r->objspace = NULL;
+            }
+        }
+        EC_JUMP_TAG(ec, state);
+    }
+    return thret;
 }
 
 
@@ -5083,8 +5168,9 @@ rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const r
 
     /* may be held by any thread in parent */
     rb_native_mutex_initialize(&th->interrupt_lock);
-    rb_native_mutex_initialize(&vm->once_lock);
-    rb_native_cond_initialize(&vm->once_cond);
+    rb_gc_zombie_objspaces_atfork();
+    rb_gc_atfork_global_locks();
+    rb_generic_fields_lock_atfork();
     ccan_list_head_init(&th->interrupt_exec_tasks);
 
     vm->fork_gen++;
