@@ -3237,6 +3237,12 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
             rb_ractor_mark_local_roots(r);
             rb_ractor_repin_in_flight(r);
         }
+
+        /* boot 早期 (rb_ractor_main_setup 前) は main が vm->ractor.set 未参加。
+         * 単一 objspace impl の boot GC でも main の registered_marks 等を落とさない。 */
+        if (vm->ractor.cnt == 0 && vm->ractor.main_ractor) {
+            rb_ractor_mark_local_roots(vm->ractor.main_ractor);
+        }
         /* 終了済み（vm->ractor.set から外れた）だが struct 未 free の Ractor はまだ
          * rb_gc_register_mark_object の pin を所有する。ractor_free が main へ渡すまで生かす
          * （owner==NULL の orphan は上で移送済み。main 以外の登録はほぼ無く通常は空）。 */
