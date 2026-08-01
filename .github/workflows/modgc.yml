@@ -158,7 +158,7 @@ jobs:
           cc -shared -fPIC -O2 -o abort_core.so abort_core.c -ldl
           ulimit -c unlimited
           for round in 1 2 3 4; do
-            LD_PRELOAD="$PWD/abort_core.so" make -s btest RUBYOPT=-w || true
+            LD_PRELOAD="$PWD/abort_core.so" make -s btest-ruby RUBYOPT=-w || true
             if ls coredumps/core.* >/dev/null 2>&1; then
               echo "core dumped in round $round"
               exit 1
