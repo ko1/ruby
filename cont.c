@@ -889,6 +889,15 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
 
     if (DEBUG) fprintf(stderr, "fiber_pool_stack_release: %p used=%"PRIuSIZE"\n", stack->base, stack->pool->used);
 
+    /* Serialize pool access against other Ractors' acquires: a per-Ractor GC sweep can
+     * free a fiber without the VM lock.  Releases are rare, so take it NO_BARRIER,
+     * never joining a forming global barrier.  VM destruct's free-at-exit walk takes no
+     * lock: single-threaded, and the thread structs are already freed (vm_locked would
+     * deref the current Ractor = freed memory). */
+    unsigned int lev = 0;
+    const bool lock_here = !ruby_vm_during_cleanup;
+    if (lock_here) RB_VM_LOCK_ENTER_LEV_NB(&lev);
+
     // Copy the stack details into the vacancy area:
     vacancy->stack = *stack;
     // After this point, be careful about updating/using state in stack, since it's copied to the vacancy area.
@@ -919,6 +928,8 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
         fiber_pool_stack_free(&vacancy->stack);
     }
 #endif
+
+    if (lock_here) RB_VM_LOCK_LEAVE_LEV_NB(&lev);
 }
 
 static inline void
@@ -1034,11 +1045,9 @@ fiber_stack_release(rb_fiber_t * fiber)
 static void
 fiber_stack_release_locked(rb_fiber_t *fiber)
 {
-    if (!ruby_vm_during_cleanup) {
-        // We can't try to acquire the VM lock here because MMTK calls free in its own native thread which has no ec.
-        // This assertion will fail on MMTK but we currently don't have CI for debug releases of MMTK, so we can assert for now.
-        ASSERT_vm_locking_with_barrier();
-    }
+    /* Called from GC finalization.  With per-Ractor objspaces the sweep runs with
+     * no barrier and no VM lock, so the side that returns stacks to the pool
+     * (fiber_pool_stack_release) takes the lock.  Do not assert the VM lock here. */
     fiber_stack_release(fiber);
 }
 
@@ -1307,12 +1316,11 @@ fiber_memsize(const void *ptr)
     const rb_fiber_t *fiber = ptr;
     size_t size = sizeof(*fiber);
     const rb_execution_context_t *saved_ec = &fiber->cont.saved_ec;
-    const rb_thread_t *th = rb_ec_thread_ptr(saved_ec);
 
-    /*
-     * vm.c::thread_memsize already counts th->ec->local_storage
-     */
-    if (saved_ec->local_storage && fiber != th->root_fiber) {
+    /* thread_memsize in vm.c already accounts for a root fiber's local_storage.
+     * first_proc != 0 picks the non-root fibers without dereferencing the thread
+     * (equivalent to fiber != th->root_fiber). */
+    if (saved_ec->local_storage && fiber->first_proc != 0) {
         size += rb_id_table_memsize(saved_ec->local_storage);
         size += rb_obj_memsize_of(saved_ec->storage);
     }
