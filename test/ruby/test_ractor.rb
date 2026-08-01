@@ -424,6 +424,7 @@ class TestRactor < Test::Unit::TestCase
   # per-Ractor GC では finalizer の登録・テーブル・実行はすべてオブジェクトの
   # Ractor に属する。他 Ractor のオブジェクト（shareable も含む）への定義は拒否する
   def test_define_finalizer_on_foreign_object
+    omit 'per-Ractor objspace semantics of the default GC' unless GC.config[:implementation] == 'default'
     assert_separately([], __FILE__, __LINE__, <<-'RUBY')
       Warning[:experimental] = false
       r = Ractor.new do
@@ -453,6 +454,7 @@ class TestRactor < Test::Unit::TestCase
   # ObjectSpace.each_object は呼び出し元 Ractor 自身の objspace の全オブジェクトと、
   # 他の生存 Ractor が持つ shareable を列挙する（他 Ractor の unshareable は列挙しない）
   def test_each_object_own_all_and_foreign_shareables
+    omit 'per-Ractor objspace semantics of the default GC' unless GC.config[:implementation] == 'default'
     assert_separately([], __FILE__, __LINE__, <<-'RUBY')
       Warning[:experimental] = false
       class Marker; end
@@ -555,6 +557,7 @@ class TestRactor < Test::Unit::TestCase
   # copy send の in-flight snapshot は GC.compact で動いてはならない
   # （generic-ivar 同梱表と dedup 表はアドレスキーのため。YJIT で決定論再現した形）
   def test_copy_genivar_snapshot_survives_compact
+    omit 'GC.compact is unimplemented' unless GC.config[:implementation] == 'default'
     assert_ractor(<<~'RUBY', timeout: 60, args: [{ "RUBY_YJIT_ENABLE" => "1" }])
       port = Ractor::Port.new
       w = Ractor.new(port) do |po|
