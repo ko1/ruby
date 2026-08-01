@@ -697,6 +697,9 @@ typedef struct rb_vm_struct {
 
     struct {
         struct ccan_list_head set;
+        /* 単一 objspace impl (mmtk) 用: terminated 後 ractor_free までの Ractor。
+         * global root scan が registered_marks を mark し続ける。 */
+        struct ccan_list_head terminated_set;
         unsigned int cnt;
         unsigned int blocking_cnt;
 
@@ -2085,6 +2088,7 @@ rb_vm_living_threads_init(rb_vm_t *vm)
 {
     ccan_list_head_init(&vm->workqueue);
     ccan_list_head_init(&vm->ractor.set);
+    ccan_list_head_init(&vm->ractor.terminated_set);
 }
 
 typedef int rb_backtrace_iter_func(void *, VALUE, int, VALUE);

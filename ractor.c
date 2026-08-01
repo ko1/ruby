@@ -455,6 +455,13 @@ ractor_free(void *ptr)
 
     ractor_sync_free(r);
 
+    if (r->in_terminated_set) {
+        rb_native_mutex_lock(&GET_VM()->gc.registered_globals.lock);
+        ccan_list_del(&r->vmlr_node);
+        r->in_terminated_set = false;
+        rb_native_mutex_unlock(&GET_VM()->gc.registered_globals.lock);
+    }
+
     /* orphan Ractor（未 join）は objspace を main に吸収される前に
      * rb_gc_register_mark_object pin を main へ渡す。join 側も同様に、
      * objspace merge の前に joiner へ渡す（registration 未移送の窓を防ぐ）。 */
@@ -639,6 +646,15 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
 
         VM_ASSERT(vm->ractor.cnt > 0);
         ccan_list_del(&cr->vmlr_node);
+
+        /* 単一 objspace impl は zombie_objspaces を持たず、set から外れた Ractor の
+         * registered_marks を mark する root が無い。ractor_free まで別リストで追う。 */
+        if (!rb_gc_multi_objspace_p()) {
+            rb_native_mutex_lock(&vm->gc.registered_globals.lock);
+            ccan_list_add(&vm->ractor.terminated_set, &cr->vmlr_node);
+            cr->in_terminated_set = true;
+            rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
+        }
 
         if (vm->ractor.cnt <= 2 && vm->ractor.sync.terminate_waiting) {
             rb_native_cond_signal(&vm->ractor.sync.terminate_cond);

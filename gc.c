@@ -3250,6 +3250,19 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
                 rb_ractor_mark_terminated_join_value(owner);
             }
         }
+
+        /* 単一 objspace impl: terminated 済みで ractor_free 前の Ractor の
+         * rb_gc_register_mark_object 登録を wrapper 到達性に依存せず生かす
+         * （multi では上の zombie_objspaces が同じ役を担い、このリストは常に空）。 */
+        if (!rb_gc_impl_multi_objspace_p()) {
+            rb_ractor_t *tr;
+            rb_native_mutex_lock(&vm->gc.registered_globals.lock);
+            ccan_list_for_each(&vm->ractor.terminated_set, tr, vmlr_node) {
+                rb_gc_mark_vm_stack_values((long)tr->registered_marks_cnt,
+                                           tr->registered_marks);
+            }
+            rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
+        }
     }
     else {
         rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
