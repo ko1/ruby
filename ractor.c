@@ -2987,9 +2987,14 @@ rb_ractor_move_courier_free(struct rb_ractor_move_courier *c)
             rb_match_move_free(n->u.match.regs);
             break;
           case MOVE_KIND_IO:
-            /* A consumed IO has fptr == NULL; an unconsumed one (the queue was torn down
-             * before the receive) still holds its fd/fptr.  Only discarding an undelivered IO
-             * leaks. */
+            /* A delivered IO left fptr == NULL: the rebuilt IO owns it.  One that was
+             * never delivered (the send failed, or the queue was torn down) still owns
+             * the fd, and the source IO is already a RactorMovedObject, so nobody else
+             * can close it.  Close it here instead of leaking the descriptor. */
+            if (n->u.io.fptr) {
+                rb_io_fptr_finalize(n->u.io.fptr);
+                n->u.io.fptr = NULL;
+            }
             break;
           default:
             break;
