@@ -16,11 +16,8 @@
 #include "internal/object.h"
 #include "internal/array.h"
 #include "internal/string.h"
-#include "internal/struct.h"
-#include "internal/re.h"
 #include "internal/variable.h"
 #include "eval_intern.h"
-#include "ruby/encoding.h"
 #include "internal/io.h"
 #include "internal/ractor.h"
 #include "internal/rational.h"
@@ -2298,14 +2295,14 @@ rb_obj_traverse_replace(VALUE obj,
  * node 配列＋id 参照で共有・循環を扱い、受信側が自 objspace で 2 パス再構築する。 */
 
 enum move_node_kind {
-    MOVE_K_REF,       /* immediate か shareable: 値で運ぶ */
-    MOVE_K_STRING,
-    MOVE_K_ARRAY,
-    MOVE_K_HASH,
-    MOVE_K_OBJECT,
-    MOVE_K_STRUCT,
-    MOVE_K_MATCH,
-    MOVE_K_IO,
+    MOVE_KIND_REF,       /* immediate か shareable: 値で運ぶ */
+    MOVE_KIND_STRING,
+    MOVE_KIND_ARRAY,
+    MOVE_KIND_HASH,
+    MOVE_KIND_OBJECT,
+    MOVE_KIND_STRUCT,
+    MOVE_KIND_MATCH,
+    MOVE_KIND_IO,
 };
 
 struct move_node {
@@ -2398,7 +2395,7 @@ move_alloc_node(struct rb_ractor_move_courier *c)
     uint32_t id = c->count++;
     /* 構築途中でも courier mark（送信中 GC root）が安全に走れるよう、mark 無害な
      * REF/Qnil に初期化する。捕捉が確定した node を後で上書きする。 */
-    c->nodes[id].kind = MOVE_K_REF;
+    c->nodes[id].kind = MOVE_KIND_REF;
     c->nodes[id].frozen = false;
     c->nodes[id].niv = 0;
     c->nodes[id].iv_ids = NULL;
@@ -2497,7 +2494,7 @@ move_capture(struct move_build *b, VALUE obj)
     st_insert(b->seen, (st_data_t)obj, (st_data_t)(uintptr_t)(id + 1));
 
     if (RB_SPECIAL_CONST_P(obj) || rb_ractor_shareable_p(obj)) {
-        b->c->nodes[id].kind = MOVE_K_REF;
+        b->c->nodes[id].kind = MOVE_KIND_REF;
         b->c->nodes[id].frozen = false;
         b->c->nodes[id].niv = 0;
         b->c->nodes[id].iv_ids = NULL;
@@ -2537,7 +2534,7 @@ move_capture(struct move_build *b, VALUE obj)
             if (len) memcpy(ptr, RSTRING_PTR(obj), len);
             ptr[len] = '\0';
         }
-        b->c->nodes[id].kind = MOVE_K_STRING;
+        b->c->nodes[id].kind = MOVE_KIND_STRING;
         b->c->nodes[id].u.str.klass = RBASIC_CLASS(obj);
         b->c->nodes[id].u.str.ptr = ptr;
         b->c->nodes[id].u.str.len = len;
@@ -2551,7 +2548,7 @@ move_capture(struct move_build *b, VALUE obj)
         for (long i = 0; i < len; i++) {
             elems[i] = move_capture(b, RARRAY_AREF(obj, i));
         }
-        b->c->nodes[id].kind = MOVE_K_ARRAY;
+        b->c->nodes[id].kind = MOVE_KIND_ARRAY;
         b->c->nodes[id].u.ary.klass = RBASIC_CLASS(obj);
         b->c->nodes[id].u.ary.len = len;
         b->c->nodes[id].u.ary.elems = elems;
@@ -2569,7 +2566,7 @@ move_capture(struct move_build *b, VALUE obj)
         uint32_t *kv = size ? ALLOC_N(uint32_t, size * 2) : NULL;
         struct move_hash_ctx hc = { b, kv, 0 };
         rb_hash_stlike_foreach(obj, move_capture_hash_i, (st_data_t)&hc);
-        b->c->nodes[id].kind = MOVE_K_HASH;
+        b->c->nodes[id].kind = MOVE_KIND_HASH;
         b->c->nodes[id].u.hash.klass = RBASIC_CLASS(obj);
         b->c->nodes[id].u.hash.size = size;
         b->c->nodes[id].u.hash.kv = kv;
@@ -2582,7 +2579,7 @@ move_capture(struct move_build *b, VALUE obj)
       }
 
       case T_OBJECT:
-        b->c->nodes[id].kind = MOVE_K_OBJECT;
+        b->c->nodes[id].kind = MOVE_KIND_OBJECT;
         /* 本来の class を保持（singleton でも shareable なので cross-objspace 参照は安全）。
          * rebuild が非 singleton class で確保した後で付け直す。 */
         b->c->nodes[id].u.obj.klass = RBASIC_CLASS(obj);
@@ -2594,7 +2591,7 @@ move_capture(struct move_build *b, VALUE obj)
         for (long i = 0; i < len; i++) {
             elems[i] = move_capture(b, RSTRUCT_GET(obj, (int)i));
         }
-        b->c->nodes[id].kind = MOVE_K_STRUCT;
+        b->c->nodes[id].kind = MOVE_KIND_STRUCT;
         b->c->nodes[id].u.strct.len = len;
         b->c->nodes[id].u.strct.elems = elems;
         b->c->nodes[id].u.strct.klass = RBASIC_CLASS(obj);
@@ -2613,7 +2610,7 @@ move_capture(struct move_build *b, VALUE obj)
         void *regs = rb_match_move_dump(obj, &re, &st, &nregs);
         uint32_t rid = move_capture(b, re);
         uint32_t sid = move_capture(b, st);
-        b->c->nodes[id].kind = MOVE_K_MATCH;
+        b->c->nodes[id].kind = MOVE_KIND_MATCH;
         b->c->nodes[id].u.match.regexp_id = rid;
         b->c->nodes[id].u.match.str_id = sid;
         b->c->nodes[id].u.match.num_regs = nregs;
@@ -2643,7 +2640,7 @@ move_capture(struct move_build *b, VALUE obj)
         fptr->write_lock = Qnil;
         fptr->wakeup_mutex = Qnil;
         fptr->tied_io_for_writing = 0;  /* io.c は C 真偽で判定するので Qnil でなく 0 */
-        b->c->nodes[id].kind = MOVE_K_IO;
+        b->c->nodes[id].kind = MOVE_KIND_IO;
         b->c->nodes[id].u.io.fptr = fptr;
         b->c->nodes[id].u.io.klass = RBASIC_CLASS(obj);
         b->c->nodes[id].u.io.pathv_id = pathv_id;
@@ -2812,36 +2809,36 @@ rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
         struct move_node *n = &c->nodes[i];
         VALUE shell;
         switch (n->kind) {
-          case MOVE_K_REF:
+          case MOVE_KIND_REF:
             shell = n->u.ref;
             break;
-          case MOVE_K_STRING:
+          case MOVE_KIND_STRING:
             shell = rb_enc_str_new(n->u.str.ptr, n->u.str.len, rb_enc_from_index(n->u.str.encidx));
             move_apply_moved_klass(shell, n->u.str.klass);
             break;
-          case MOVE_K_ARRAY:
+          case MOVE_KIND_ARRAY:
             shell = rb_ary_new_capa(n->u.ary.len);
             move_apply_moved_klass(shell, n->u.ary.klass);
             break;
-          case MOVE_K_HASH:
+          case MOVE_KIND_HASH:
             shell = n->u.hash.compare_by_id ? rb_ident_hash_new() : rb_hash_new();
             move_apply_moved_klass(shell, n->u.hash.klass);
             break;
-          case MOVE_K_OBJECT:
+          case MOVE_KIND_OBJECT:
             /* singleton class では確保できないので real class の instance を作り、
              * 後で付け直す */
             shell = rb_obj_alloc(rb_class_real(n->u.obj.klass));
             move_apply_moved_klass(shell, n->u.obj.klass);
             break;
-          case MOVE_K_STRUCT:
+          case MOVE_KIND_STRUCT:
             shell = rb_obj_alloc(rb_class_real(n->u.strct.klass));
             move_apply_moved_klass(shell, n->u.strct.klass);
             break;
-          case MOVE_K_MATCH:
+          case MOVE_KIND_MATCH:
             shell = rb_match_move_alloc(rb_class_real(n->u.match.klass), n->u.match.num_regs);
             move_apply_moved_klass(shell, n->u.match.klass);
             break;
-          case MOVE_K_IO:
+          case MOVE_KIND_IO:
             shell = rb_obj_alloc(rb_class_real(n->u.io.klass));
             move_apply_moved_klass(shell, n->u.io.klass);
             RFILE(shell)->fptr = n->u.io.fptr;
@@ -2858,27 +2855,27 @@ rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
         struct move_node *n = &c->nodes[i];
         VALUE shell = RARRAY_AREF(shells, i);
         switch (n->kind) {
-          case MOVE_K_ARRAY:
+          case MOVE_KIND_ARRAY:
             for (long j = 0; j < n->u.ary.len; j++) {
                 rb_ary_push(shell, RARRAY_AREF(shells, n->u.ary.elems[j]));
             }
             break;
-          case MOVE_K_HASH:
+          case MOVE_KIND_HASH:
             /* entry の挿入は第 3 パスへ遅延する(下記)。挿入は key の #hash/#eql? を
              * 呼ぶため、graph の中身が埋まる前に挿すと content ベースの custom #hash が
              * 全 key で衝突し、entry が潰れて値が混ざる(データ喪失)。 */
             break;
-          case MOVE_K_STRUCT:
+          case MOVE_KIND_STRUCT:
             for (long j = 0; j < n->u.strct.len; j++) {
                 RSTRUCT_SET(shell, (int)j, RARRAY_AREF(shells, n->u.strct.elems[j]));
             }
             break;
-          case MOVE_K_MATCH:
+          case MOVE_KIND_MATCH:
             rb_match_move_load(shell, RARRAY_AREF(shells, n->u.match.regexp_id),
                                RARRAY_AREF(shells, n->u.match.str_id),
                                n->u.match.num_regs, n->u.match.regs);
             break;
-          case MOVE_K_IO: {
+          case MOVE_KIND_IO: {
             /* 再構築した VALUE メンバを fptr に書き戻す（capture で切り離した）。
              * write_lock / wakeup_mutex は nil のままで io.c が遅延再生成する。 */
             struct rb_io *fptr = RFILE(shell)->fptr;
@@ -2903,7 +2900,7 @@ rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
      * 内側から確定する(自分自身を経由する病的な #hash 循環は対象外)。 */
     for (uint32_t i = c->count; i > 0; i--) {
         struct move_node *n = &c->nodes[i - 1];
-        if (n->kind != MOVE_K_HASH) continue;
+        if (n->kind != MOVE_KIND_HASH) continue;
         VALUE shell = RARRAY_AREF(shells, i - 1);
         for (long j = 0; j < n->u.hash.size; j++) {
             rb_hash_aset(shell, RARRAY_AREF(shells, n->u.hash.kv[2 * j]),
@@ -2940,22 +2937,22 @@ rb_ractor_move_courier_free(struct rb_ractor_move_courier *c)
         ruby_xfree(n->iv_ids);
         ruby_xfree(n->iv_vals);
         switch (n->kind) {
-          case MOVE_K_STRING:
+          case MOVE_KIND_STRING:
             ruby_xfree(n->u.str.ptr);
             break;
-          case MOVE_K_ARRAY:
+          case MOVE_KIND_ARRAY:
             ruby_xfree(n->u.ary.elems);
             break;
-          case MOVE_K_HASH:
+          case MOVE_KIND_HASH:
             ruby_xfree(n->u.hash.kv);
             break;
-          case MOVE_K_STRUCT:
+          case MOVE_KIND_STRUCT:
             ruby_xfree(n->u.strct.elems);
             break;
-          case MOVE_K_MATCH:
+          case MOVE_KIND_MATCH:
             rb_match_move_free(n->u.match.regs);
             break;
-          case MOVE_K_IO:
+          case MOVE_KIND_IO:
             /* 消費済み IO は fptr==NULL。未消費（受信前に queue が壊れた）は
              * fd/fptr を保持したままになる。未配送 IO を捨てた時だけの leak。 */
             break;
@@ -2977,28 +2974,28 @@ rb_ractor_move_courier_mark(struct rb_ractor_move_courier *c)
     if (!c) return;
     for (uint32_t i = 0; i < c->count; i++) {
         struct move_node *n = &c->nodes[i];
-        if (n->kind == MOVE_K_REF) {
+        if (n->kind == MOVE_KIND_REF) {
             rb_gc_mark(n->u.ref);
         }
-        else if (n->kind == MOVE_K_OBJECT) {
+        else if (n->kind == MOVE_KIND_OBJECT) {
             rb_gc_mark(n->u.obj.klass);
         }
-        else if (n->kind == MOVE_K_STRUCT) {
+        else if (n->kind == MOVE_KIND_STRUCT) {
             rb_gc_mark(n->u.strct.klass);
         }
-        else if (n->kind == MOVE_K_MATCH) {
+        else if (n->kind == MOVE_KIND_MATCH) {
             rb_gc_mark(n->u.match.klass);
         }
-        else if (n->kind == MOVE_K_IO) {
+        else if (n->kind == MOVE_KIND_IO) {
             rb_gc_mark(n->u.io.klass);
         }
-        else if (n->kind == MOVE_K_STRING) {
+        else if (n->kind == MOVE_KIND_STRING) {
             rb_gc_mark(n->u.str.klass);
         }
-        else if (n->kind == MOVE_K_ARRAY) {
+        else if (n->kind == MOVE_KIND_ARRAY) {
             rb_gc_mark(n->u.ary.klass);
         }
-        else if (n->kind == MOVE_K_HASH) {
+        else if (n->kind == MOVE_KIND_HASH) {
             rb_gc_mark(n->u.hash.klass);
         }
     }
