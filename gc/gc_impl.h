@@ -137,6 +137,8 @@ GC_IMPL_FN void rb_gc_impl_each_objects_foreign(void *objspace_ptr, int (*callba
  * 共有し、retire/absorb 等の per-Ractor objspace 機構を素通しにする。 */
 GC_IMPL_FN bool rb_gc_impl_multi_objspace_p(void);
 GC_IMPL_FN bool rb_gc_impl_during_global_gc_p(void *objspace_ptr);
+/* obj が objspace_ptr ではない別 objspace の所有か。単一 objspace の impl は常に false。 */
+GC_IMPL_FN bool rb_gc_impl_obj_foreign_p(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN bool rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN size_t rb_gc_impl_heap_page_count(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr);
