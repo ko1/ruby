@@ -45,6 +45,7 @@ struct rb_ractor_sync {
     rb_ractor_t *successor;
     VALUE legacy;
     bool legacy_exc;
+    bool legacy_taken; /* Ractor#value already returned the value */
 
     /* copy を materialize 中の receive の数（owner threads のみが GVL 下で更新）。 */
     int materializing_copies;
@@ -122,11 +123,6 @@ struct rb_ractor_struct {
 
     struct ccan_list_node vmlr_node;
     bool in_terminated_set;  /* vmlr_node が vm->ractor.terminated_set 上にある */
-    /* #value で吸収した終了 Ractor を successor(この Ractor)が繋ぐリスト。継承した
-     * join value(legacy/default port)は C struct 経由でしか到達できず compaction で
-     * C slot が更新されないので、successor の root scan がここから mark+pin する。 */
-    struct ccan_list_head value_taken;
-    struct ccan_list_node value_held_node; /* value_taken に繋ぐ node（吸収された側） */
 
     // ractor local data
 

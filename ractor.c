@@ -321,18 +321,6 @@ ractor_mark(void *ptr)
     }
 }
 
-/* value_taken リストの直列化。add は successor の実行 thread、unlink は任意 Ractor の
- * sweep(ractor_free)、scan は owner の local GC と global GC から並行に走るので
- * vm->ractor.value_taken_lock(leaf lock)で守る。臨界区間は純粋なポインタ操作のみで
- * safepoint を含まない（含めると STW mark が half-linked list を見る）。 */
-static void
-rb_ractor_value_taken_add(rb_ractor_t *successor, rb_ractor_t *taken)
-{
-    rb_native_mutex_lock(&GET_VM()->ractor.value_taken_lock);
-    ccan_list_add_tail(&successor->value_taken, &taken->value_held_node);
-    rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
-}
-
 /* Ractor r の C 構造体から到達可能な GC root を mark する。local GC は heap 上の
  * Ractor/Thread wrapper object に頼れない（別 objspace にある場合がある）ため、
  * この Ractor の所有物はここから直接 root にする。 */
@@ -347,17 +335,6 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
      * 自分の住人だけ mark する。foreign/shareable entry は owner か global GC が拾う。 */
     rb_gc_mark_vm_stack_values((long)r->registered_marks_cnt, r->registered_marks);
 
-    /* #value で吸収した終了 Ractor の戻り値(legacy)を mark+pin。この Ractor の objspace
-     * 在住で C struct 経由のみ到達可能なため compaction で move させない。default port は
-     * #value が返さず（successor は受け取らない）終了 Ractor では teardown で解放されうる。
-     * 解放済みスロットを pin すると poison するのでここでは触らない。 */
-    rb_ractor_t *taken;
-    rb_native_mutex_lock(&GET_VM()->ractor.value_taken_lock);
-    ccan_list_for_each(&r->value_taken, taken, value_held_node) {
-        VALUE slot[] = { taken->sync.legacy };
-        rb_gc_mark_vm_stack_values((long)numberof(slot), slot);
-    }
-    rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
 }
 
 /* 終了済みで未 free の Ractor の戻り値(legacy)を mark+pin する。global GC が
@@ -413,21 +390,6 @@ ractor_free(void *ptr)
 {
     rb_ractor_t *r = (rb_ractor_t *)ptr;
     RUBY_DEBUG_LOG("free r:%d", rb_ractor_id(r));
-
-    /* successor の value_taken に載っていれば外す(#value 済み・未 free だった Ractor)。
-     * node は ractor_init で初期化済みなので未登録でも安全。加えて自分の value_taken に
-     * 残る子を全て unlink する。これを怠ると、この struct の解放後に子の ractor_free の
-     * ccan_list_del が freed head へ prev/next を書く(UAF write)。同一 sweep で successor
-     * と子が共に回収される時(#value 連鎖 + global GC)に顕在化する。 */
-    rb_native_mutex_lock(&GET_VM()->ractor.value_taken_lock);
-    ccan_list_del_init(&r->value_held_node);
-    {
-        rb_ractor_t *taken, *nxt;
-        ccan_list_for_each_safe(&r->value_taken, taken, nxt, value_held_node) {
-            ccan_list_del_init(&taken->value_held_node);
-        }
-    }
-    rb_native_mutex_unlock(&GET_VM()->ractor.value_taken_lock);
 
     free_targeted_hooks(&r->pub.targeted_hooks);
     rb_native_mutex_destroy(&r->sync.lock);
@@ -708,12 +670,6 @@ rb_ractor_main_alloc(void)
      * Init_BareVM（rb_gc_init_objspaces が r->objspace を設定した後）で作る。 */
     ruby_single_main_ractor = r;
 
-    /* gc_stress では ractor_init (rb_ractor_main_setup) より前の boot 中にも GC が走り、
-     * rb_ractor_mark_local_roots が value_taken を歩く。zero 埋めの ccan list head は
-     * 空 list ではないので、ここで初期化しておく (ractor_init の再初期化は空のまま)。 */
-    ccan_list_head_init(&r->value_taken);
-    ccan_list_node_init(&r->value_held_node);
-
     return r;
 }
 
@@ -729,7 +685,6 @@ rb_ractor_atfork(rb_vm_t *vm, rb_thread_t *th)
     /* 他スレッドが保持したまま fork した可能性があるので、子では lock を作り直す
      * (generic_fields_lock の atfork 再初期化と同じ理由)。registry の list head は
      * 生き残った courier の node が繋がったままなので触らない。 */
-    rb_native_mutex_initialize(&vm->ractor.value_taken_lock);
     rb_native_mutex_initialize(&vm->ractor.move_courier_registry_lock);
     /* fork 後は main だけが生きる。死んだ Ractor や critical 区間の hold は消え、
      * main 自身の disable だけが残る。 */
@@ -787,8 +742,6 @@ ractor_init(rb_ractor_t *r, VALUE name, VALUE loc)
     // thread management
     rb_thread_sched_init(&r->threads.sched, false);
     rb_ractor_living_threads_init(r);
-    ccan_list_head_init(&r->value_taken);
-    ccan_list_node_init(&r->value_held_node);
 
     // naming
     if (!NIL_P(name)) {
