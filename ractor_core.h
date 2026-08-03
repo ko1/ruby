@@ -361,8 +361,6 @@ rb_ractor_targeted_hooks_cnt(rb_ractor_t *cr)
 
 #if RACTOR_CHECK_MODE > 0
 
-uint32_t rb_ractor_current_id(void);
-
 extern bool rb_ractor_ignore_belonging_flag;
 
 /* obj の所有 Ractor は obj のページが属する objspace で決まる(rb_gc_obj_foreign_p)。
