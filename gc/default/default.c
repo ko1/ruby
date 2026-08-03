@@ -517,7 +517,7 @@ typedef struct rb_heap_struct {
     size_t freed_slots;
     size_t empty_slots;
 
-    /* bump-pointer 割り当ての状態。この objspace の所有者スレッドだけが書き込む。 */
+    /* Bump-pointer allocation state; only this objspace's owner thread writes it. */
     struct {
         uintptr_t alloc_cursor;
         uintptr_t alloc_cursor_end;
@@ -593,7 +593,7 @@ typedef struct rb_objspace {
         unsigned int mode : 2;
         unsigned int immediate_sweep : 1;
         unsigned int dont_gc : 1;
-        /* GC.disable による user hold(実体は vm->gc.disable_holders)。owner thread だけが書く。 */
+        /* A user hold from GC.disable (kept in vm->gc.disable_holders); owner thread only. */
         unsigned int user_gc_disabled : 1;
         unsigned int dont_incremental : 1;
         unsigned int during_gc : 1;
@@ -619,15 +619,15 @@ typedef struct rb_objspace {
     mark_stack_t mark_stack;
     size_t marked_slots;
 
-    /* 割り当ては objspace ごとに 1 つ。 */
+    /* One allocator per objspace. */
     size_t incremental_mark_step_allocated_slots;
 
-    /* global GC 起動判定の入力。すべてこの objspace のスレッドが所有する。
-     * shareable_objects は shareable の生存数（population）で、これが limit を超えたら
-     * global GC を要求する。 */
+    /* Inputs of the global GC trigger, all owned by this objspace's thread.
+     * shareable_objects is the live population of shareable objects; exceeding the
+     * limit requests a global GC. */
     size_t shareable_objects;
     size_t shareable_objects_limit;
-    /* 直近の mark が pinned walk を実行したか。sweep の assert が参照する。 */
+    /* Whether the last mark ran the pinned walk; the sweep asserts on it. */
     unsigned char last_cycle_pinned;
 
     struct {
@@ -763,55 +763,59 @@ typedef struct rb_objspace {
     struct rb_gc_vm_context vm_context;
 } rb_objspace_t;
 
-/* 唯一の VM グローバル GC 構造。今は page pool のみを持つ。heap page body を大きな
- * mmap アリーナから切り出しプロセス共通の freelist で再利用し、ページ単位の
- * mmap/munmap（カーネルの mmap_lock を全スレッドで直列化する）を避ける。
- * lock は leaf lock で、保持中は割り当ても GC もしない。 */
+/* The one VM-global GC structure; for now it only holds the page pool.  Heap page
+ * bodies are carved out of large mmap arenas and reused through a process-wide
+ * freelist, avoiding per-page mmap/munmap, which serializes every thread on the
+ * kernel's mmap_lock.  Its lock is a leaf lock: no allocation and no GC while held. */
 typedef struct rb_global_objspace {
     struct {
         rb_nativethread_lock_t lock;
-        struct heap_page_body *freelist; /* 再利用する body。next ポインタは body 内に置く */
-        /* mmap で確保したページ用メモリ領域（arena）のリスト。 */
+        struct heap_page_body *freelist; /* bodies to reuse; the next pointer lives in the body */
+        /* List of mmap'd memory regions (arenas) for page bodies. */
         struct page_arena {
             struct page_arena *next;
-            char *start;                 /* HEAP_PAGE_ALIGN 整列の使用可能領域 */
-            size_t size;                 /* 使用可能バイト数（HEAP_PAGE_SIZE の倍数） */
-        } *arenas;                       /* 全アリーナ。新しい順 */
-        char *arena_cursor;              /* 最新アリーナの未切り出しの先頭 body */
+            char *start;                 /* usable area, HEAP_PAGE_ALIGN aligned */
+            size_t size;                 /* usable bytes (a multiple of HEAP_PAGE_SIZE) */
+        } *arenas;                       /* every arena, newest first */
+        char *arena_cursor;              /* first body not yet carved out of the newest arena */
         char *arena_end;
     } page_pool;
 
-    /* 前回 global サイクル後に残った zombie ページ数(≒生存データ)。barrier 下で更新、
-     * 読み手(gc_need_global_p)は racy でよい。 */
+    /* Zombie pages left after the last global cycle (roughly the live data).  Updated
+     * under the barrier; readers (gc_need_global_p) may be racy. */
     size_t zombie_pages_survivors;
 
-    /* objspace 併合中(objspace_absorb)。グラフが流動的な間、cross-objspace verifier
-     * 検査を抑止する。書き手は absorb スレッド、読み手は world 停止下の verify。 */
+    /* An objspace merge (objspace_absorb) is running: suppress the cross-objspace
+     * verifier while the graph is in flux.  Written by the absorbing thread, read by
+     * verification with the world stopped. */
     bool during_absorb;
 
-    /* gc_enter のロック方針が使う main の objspace。Ractor 生成中に main_ractor->objspace が
-     * 一時的に差し替わるため、GC の両端で同じ判定をするよう安定したポインタを別に持つ。
-     * 起動時に設定し、fork した子では貼り直す。 */
+    /* main's objspace, used by gc_enter's locking policy.  main_ractor->objspace is
+     * swapped temporarily while a Ractor is created, so keep a stable pointer here to
+     * decide the same way at both ends of a GC.  Set at boot and re-pointed in a forked
+     * child. */
     rb_objspace_t *main_objspace;
 
-    /* GC.stress は process-global(upstream 意味論)。書き手は任意 Ractor の GC.stress=(稀)、
-     * 読み手は全 Ractor の alloc/GC path。診断用なので素の store/load(last-writer-wins)。 */
+    /* GC.stress is process-global (upstream semantics).  Written by GC.stress= in any
+     * Ractor (rare) and read on every Ractor's alloc and GC path; it is diagnostic, so
+     * plain store/load with last-writer-wins is fine. */
     bool gc_stressful;
     VALUE gc_stress_mode;
 
-    /* global GC driver の状態。compacting は move 相の間 true。gc_sweep_compact は全
-     * objspace を移動させるが、全 forwarding pointer が揃うまで参照更新を遅延する 2 相
-     * 方式(cross-objspace 参照を 1 度だけ書き換えるため)。list は対象 objspace の snapshot。 */
+    /* State of the global GC driver.  compacting is true during the move phase.
+     * gc_sweep_compact moves objects in every objspace but defers reference updates
+     * until all forwarding pointers exist, so a cross-objspace reference is rewritten
+     * exactly once.  list is the snapshot of objspaces being collected. */
     struct {
         bool compacting;
         struct rb_objspace **objspaces;
         size_t n_objspaces, objspaces_capa;
     } global_gc;
 
-    /* 全 objspace の heap page を body アドレス順で持つ索引。writer は page の
-     * allocate/free(page_pool.lock で直列化)。reader は STW の global GC のみ
-     * (保守的 mark と rb_gc_impl_location の所属判定)なので読み手の lock は不要。
-     * local GC は自 objspace の heap_pages.sorted を使う。 */
+    /* Index of every objspace's heap pages, ordered by body address.  Writers allocate
+     * and free pages (serialized by page_pool.lock); the only reader is a
+     * stop-the-world global GC (conservative marking and rb_gc_impl_location's ownership
+     * test), so readers need no lock.  A local GC uses its own heap_pages.sorted. */
     struct {
         struct heap_page **pages;
         size_t n_pages, capa;
@@ -822,17 +826,17 @@ typedef struct rb_global_objspace {
 static rb_global_objspace_t rb_global_objspace_instance;
 static rb_global_objspace_t *global_objspace = NULL;
 
-/* floor は shareable が少し出来ただけで global GC が走るのを防ぐ。factor は
- * old 世代 limit の規則に倣う。 */
+/* The floor keeps a global GC from running as soon as a few shareable objects appear;
+ * the factor follows the rule used for the old-generation limit. */
 #define SHAREABLE_OBJECTS_LIMIT_MIN (1 << 16)
 #define SHAREABLE_OBJECTS_LIMIT_FACTOR 2.0
-/* 終了して未継承の Ractor がこれだけの heap page を保持したら global GC を起動する
- * （小さな Ractor の objspace は約 13 ページなので大量廃棄でも越えにくく、肥えた
- * zombie は 1 つで越える）。 */
+/* Start a global GC once terminated, uninherited Ractors hold this many heap pages.  A
+ * small Ractor's objspace is about 13 pages, so discarding many of them still stays
+ * below it, while a single fat zombie crosses it. */
 #define ZOMBIE_PAGES_TRIGGER 256
 
-/* mark/sweep の述語は objspace ごとの during_global_gc を見る。これは driver が
- * barrier 下で取る反復用スナップショット。 */
+/* The mark and sweep predicates read each objspace's during_global_gc; this is the
+ * driver's snapshot of it, taken under the barrier for one iteration. */
 static void objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
 
@@ -992,9 +996,10 @@ struct heap_page {
     unsigned short free_slots;
     unsigned short final_slots;
     unsigned short pinned_slots;
-    /* ページ状態フラグ。writer は所有 Ractor(GVL) か global GC の driver(STW) のみで
-     * 並行しないため bitfield でよい。has_shref/shareable は shref / shareable bit が
-     * このページに 1 つでもある再走査ヒント。 */
+    /* Page state flags.  A bitfield is safe because the only writers are the owning
+     * Ractor (under the GVL) and the global GC driver (stop-the-world), which never run
+     * together.  has_shref and has_shareable hint that the page holds at least one such
+     * bit, for re-scanning. */
     struct {
         unsigned int before_sweep : 1;
         unsigned int has_remembered_objects : 1;
@@ -1005,8 +1010,8 @@ struct heap_page {
 
     rb_heap_t *heap;
 
-    /* このページを所有する objspace。任意のオブジェクトから所有者を 1 ロードで
-     * 引ける（GET_HEAP_OBJSPACE）。ページの所有者が変わる（継承）ときだけ書き換える。 */
+    /* The objspace owning this page, so any object's owner is one load away
+     * (GET_HEAP_OBJSPACE).  Rewritten only when a page changes owner (inheritance). */
     rb_objspace_t *objspace;
 
     struct heap_page *free_next;
@@ -1021,10 +1026,11 @@ struct heap_page {
 
     bits_t remembered_bits[HEAP_PAGE_BITMAP_LIMIT];
 
-    /* オブジェクトごとの追加 2 bit。shareable_bits は local GC の sweep が決して free して
-     * はならないもの（shareable の死は global GC だけが判定できる）を示す。生成時と
-     * rb_gc_impl_obj_became_shareable で立てる。shref_bits は shref（shareable から参照
-     * される unshareable）を示し、local GC は root 扱いする。write barrier が維持する。 */
+    /* Two extra bits per object.  shareable_bits marks what a local GC's sweep must
+     * never free, since only a global GC can decide a shareable object is dead; it is
+     * set at creation and by rb_gc_impl_obj_became_shareable.  shref_bits marks a shref
+     * (an unshareable object referenced from a shareable one), which a local GC treats
+     * as a root; the write barrier maintains it. */
     bits_t shareable_bits[HEAP_PAGE_BITMAP_LIMIT];
     bits_t shref_bits[HEAP_PAGE_BITMAP_LIMIT];
 
@@ -1106,23 +1112,25 @@ slot_index_for_offset(size_t offset, uint64_t reciprocal)
 #define GET_HEAP_SHREF_BITS(x)          (&GET_HEAP_PAGE(x)->shref_bits[0])
 #define GET_HEAP_OBJSPACE(x)            (GET_HEAP_PAGE(x)->objspace)
 
-/* obj が現在の objspace ではなく別 objspace のページに属する(= foreign)。 */
+/* obj lives on a page of another objspace, not the current one (i.e. it is foreign). */
 static inline bool
 gc_foreign_object_p(const rb_objspace_t *objspace, VALUE obj)
 {
     return RB_UNLIKELY(GET_HEAP_OBJSPACE(obj) != objspace);
 }
 
-/* foreign かつ global GC(STW) 中でない。true の間は local GC が obj の per-object な GC 状態
- * (mark/pin/remember 等)に触れてはならない — 所有者、または全員停止の global GC が扱う。 */
+/* Foreign and not inside a stop-the-world global GC.  While true, a local GC must not
+ * touch obj's per-object GC state (mark, pin, remember bits): its owner handles that,
+ * or the global GC does with everyone stopped. */
 static inline bool
 gc_skip_foreign_object_p(const rb_objspace_t *objspace, VALUE obj)
 {
     return gc_foreign_object_p(objspace, obj) && !objspace->flags.during_global_gc;
 }
 
-/* obj を所有ページの shareable として記録する(bit + ページフラグ + 個体数カウンタ)。誕生時の
- * born-shareable と make_shareable の共通処理。writer は所有者スレッドなので素の bit op でよい。 */
+/* Record obj as shareable on its owning page (bit, page flag and population counter).
+ * Shared by born-shareable objects and make_shareable.  The writer is the owner thread,
+ * so plain bit operations suffice. */
 static inline void
 gc_page_add_shareable(struct heap_page *page, VALUE obj)
 {
@@ -1423,9 +1431,9 @@ static int  gc_start(rb_objspace_t *objspace, unsigned int reason);
 static int  gc_start_body(rb_objspace_t *objspace, unsigned int reason, bool allow_global);
 static void gc_rest(rb_objspace_t *objspace);
 
-/* GC サイクルのイベント（ENTER/EXIT/START/END_MARK/END_SWEEP）は、その objspace の
- * Ractor が有効化した場合だけ発火する。並行する local GC が、他 Ractor が変更中の
- * VM グローバル hook リストを走査しないため。NEWOBJ/FREEOBJ は元から同様に絞る。 */
+/* GC cycle events (ENTER, EXIT, START, END_MARK, END_SWEEP) fire only if the objspace's
+ * own Ractor enabled them, so a concurrent local GC never walks the VM-global hook list
+ * while another Ractor mutates it.  NEWOBJ and FREEOBJ were already restricted. */
 #define gc_event_hook(objspace, event) do { \
     if (RB_UNLIKELY((objspace)->hook_events & (event))) { \
         rb_gc_event_hook(0, (event)); \
@@ -1641,22 +1649,23 @@ RVALUE_UNCOLLECTIBLE(rb_objspace_t *objspace, VALUE obj)
 static int rgengc_remember(rb_objspace_t *objspace, VALUE obj);
 static void gc_bitmaps_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref);
 static void rgengc_rememberset_mark(rb_objspace_t *objspace, rb_heap_t *heap);
-static bool verify_pointer_in_any_heap_p(const void *ptr); /* cross-objspace の所属判定 */
+static bool verify_pointer_in_any_heap_p(const void *ptr); /* cross-objspace ownership test */
 
 static int
 check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int terminate)
 {
     int err = 0;
 
-    /* global GC 中は barrier が全 Ractor を止めているので、下の cross-objspace 走査は
-     * VM lock なしで安全。zombie objspace（所有者なし）の sweep では GET_RACTOR() が
-     * NULL になり、ここで lock を取ると NULL 参照になる。 */
+    /* Under a global GC the barrier stops every Ractor, so the cross-objspace walk
+     * below is safe without the VM lock.  Sweeping an ownerless zombie objspace also
+     * leaves GET_RACTOR() NULL, and taking the lock here would dereference it. */
     const bool world_stopped = objspace->flags.during_global_gc;
-    /* 下の VM lock は、write barrier から呼ばれた local GC 中の verify（他 Ractor が走行し
-     * heap を realloc する）での cross-objspace 走査を守る。ただしこの objspace で GC 進行中は
-     * 取ってはいけない。ページは安定で cross-objspace 走査も world 停止時のみ行い、かつ
-     * Ractor が自分の ractor lock を保持済みのことがあり、ractor→VM の逆順ロックになるため。
-     * global GC は barrier を持つので lock 不要。 */
+    /* The VM lock below protects the cross-objspace walk during a verify from inside a
+     * local GC called by the write barrier, while other Ractors run and reallocate their
+     * heaps.  It must not be taken while this objspace is in GC: pages are stable then,
+     * the cross-objspace walk only happens with the world stopped, and the Ractor may
+     * already hold its own Ractor lock, which would invert the Ractor -> VM lock order.
+     * A global GC holds the barrier and needs no lock. */
     const bool take_vm_lock = !world_stopped && !during_gc;
     unsigned int lev = 0;
     if (take_vm_lock) lev = RB_GC_VM_LOCK_NO_BARRIER();
@@ -1666,17 +1675,20 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
             err++;
         }
         else if (!is_pointer_to_heap(objspace, (void *)obj)) {
-            /* obj は別 objspace に住む正当な cross-objspace 参照（shareable や in-flight の
-             * shref payload）かもしれない。is_pointer_to_heap は渡した objspace しか探さない。
-             * どの objspace の heap にも無いときだけ本当に Ruby オブジェクトでない。foreign な
-             * オブジェクトの mark/age/remembered bit は所有者のもので、ここで読むと所有者の
-             * local GC と競合するため、per-object 検査には入らない。 */
+            /* obj may be a legitimate cross-objspace reference living in another
+             * objspace (a shareable object, or an in-flight shref payload), and
+             * is_pointer_to_heap only searches the objspace it is given.  Only when no
+             * objspace's heap holds it is it really not a Ruby object.  A foreign
+             * object's mark, age and remembered bits belong to its owner, so reading
+             * them here would race with the owner's local GC: skip the per-object
+             * checks. */
             if (!world_stopped) {
-                /* local GC 中の verify は no-barrier VM lock しか持たず barrier は持たない。
-                 * 他 Ractor が 自 objspace への割り当てで heap_pages.sorted を realloc しており、
-                 * verify_pointer_in_any_heap_p の page_index 読みはその更新と競合する。
-                 * barrier 無しでは foreign ポインタを確認できないのでここでは許容し、
-                 * global GC の verify（world 停止）が完全な存在検査を行う。 */
+                /* A verify inside a local GC holds only a no-barrier VM lock, not the
+                 * barrier, while other Ractors reallocate heap_pages.sorted as they
+                 * allocate, racing with verify_pointer_in_any_heap_p's page_index read.
+                 * A foreign pointer cannot be checked without the barrier, so accept it
+                 * here; the global GC's verify (world stopped) does the full existence
+                 * check. */
             }
             else if (!verify_pointer_in_any_heap_p((void *)obj)) {
                 struct heap_page *empty_page = objspace->empty_pages;
@@ -1718,8 +1730,8 @@ check_rvalue_consistency_force(rb_objspace_t *objspace, const VALUE obj, int ter
                 err++;
             }
 
-            /* 既に不整合（T_NONE 等）を検出していたら memsize probe は踏まない。probe 側の
-             * rb_bug で本来の診断出力が失われるため。 */
+            /* Do not run the memsize probe once an inconsistency (a T_NONE, say) was
+             * found: an rb_bug inside the probe would lose the real diagnosis. */
             if (err == 0 && BUILTIN_TYPE(obj) != T_DATA) {
                 rb_obj_memsize_of((VALUE)obj);
             }
@@ -1814,9 +1826,10 @@ static inline void
 RVALUE_PAGE_OLD_UNCOLLECTIBLE_SET(rb_objspace_t *objspace, struct heap_page *page, VALUE obj)
 {
     MARK_IN_BITMAP(&page->uncollectible_bits[0], obj);
-    /* promotion はそのオブジェクトの objspace に数える。global GC の unified mark は
-     * driver から全 objspace の slot を aging するため、driver に計上すると他 objspace の
-     * old_objects（サイクル開始時に 0 化）と major GC の頻度がずれる。 */
+    /* Count a promotion in the object's own objspace.  A global GC's unified mark ages
+     * slots of every objspace from the driver, so counting them on the driver would skew
+     * the other objspaces' old_objects (zeroed at the start of a cycle) and with it the
+     * major GC frequency. */
     page->objspace->rgengc.old_objects++;
 
 #if RGENGC_PROFILE >= 2
@@ -1944,8 +1957,9 @@ rb_gc_impl_gc_disable(void *objspace_ptr, bool finish_current_gc)
     dont_gc_on();
 }
 
-/* enabled 状態を変えずに進行中の incremental mark / lazy sweep を完了させる。
- * multi-objspace 化する直前に唯一の objspace を落ち着かせるため gc.c が使う。 */
+/* Finish an incremental mark or lazy sweep in progress without changing the enabled
+ * state.  gc.c uses it to settle the only objspace just before the process goes
+ * multi-objspace. */
 void
 rb_gc_impl_gc_rest(void *objspace_ptr)
 {
@@ -1966,7 +1980,7 @@ void
 rb_gc_impl_set_event_hook(void *objspace_ptr, const rb_event_flag_t event)
 {
     rb_objspace_t *objspace = objspace_ptr;
-    /* FREEOBJ は main objspace のみ（design §3、caller が mask する）。 */
+    /* FREEOBJ is main-objspace only (design section 3; the caller masks it). */
     GC_ASSERT(!(event & RUBY_INTERNAL_EVENT_FREEOBJ) ||
               objspace == global_objspace->main_objspace);
     objspace->hook_events = event & RUBY_INTERNAL_EVENT_OBJSPACE_MASK;
@@ -2005,11 +2019,12 @@ rb_gc_impl_garbage_object_p(void *objspace_ptr, VALUE ptr)
 {
     rb_objspace_t *objspace = objspace_ptr;
 
-    /* foreign なオブジェクトはここでは生きた葉。その生死と回収は所有者の担当で、
-     * type / before_sweep / mark bit を読むと所有者の local GC と競合する。global GC の
-     * barrier 外では garbage と報告しない。fstring / symbol の weak-set 検索は
-     * cross-objspace にこれを引くが、それらは born-shareable で global STW でしか回収
-     * されないため「garbage でない」が正しい。 */
+    /* A foreign object is a live leaf here: its liveness and reclamation belong to its
+     * owner, and reading its type, before_sweep state or mark bit would race with the
+     * owner's local GC.  Outside a global GC's barrier, never report one as garbage.
+     * The fstring and symbol weak-set lookups do reach across objspaces, but those
+     * objects are born shareable and only a global stop-the-world collects them, so
+     * "not garbage" is the correct answer. */
     if (gc_skip_foreign_object_p(objspace, ptr)) {
         return false;
     }
@@ -2064,7 +2079,8 @@ heap_page_add_free_region(rb_objspace_t *objspace, struct heap_page *page, VALUE
 
     asan_unlock_freelist(page);
 
-    /* free した slot が古い shareable/shref bit を次の生に持ち越さないようにする。 */
+    /* Keep a freed slot from carrying its old shareable and shref bits into the next
+     * object born there. */
     CLEAR_IN_BITMAP(GET_HEAP_SHAREABLE_BITS(obj), obj);
     CLEAR_IN_BITMAP(GET_HEAP_SHREF_BITS(obj), obj);
 

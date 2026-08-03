@@ -12,7 +12,7 @@
 // experimental flag because it is not sure it is the common pattern
 #define RUBY_TYPED_FROZEN_SHAREABLE_NO_REC RUBY_FL_FINALIZE
 
-/* 転送中の move payload。off-heap にシリアライズされる（ractor.c で定義）。 */
+/* An in-flight move payload, serialized off-heap (defined in ractor.c). */
 struct rb_ractor_move_courier;
 
 struct rb_ractor_sync {
@@ -47,16 +47,18 @@ struct rb_ractor_sync {
     bool legacy_exc;
     bool legacy_taken; /* Ractor#value already returned the value */
 
-    /* copy を materialize 中の receive の数（owner threads のみが GVL 下で更新）。 */
+    /* Number of receives currently materializing a copy (only the owner's threads
+     * update it, under the GVL). */
     int materializing_copies;
 };
 
 struct ractor_basket;
 
-/* 転送中の copy payload 再構築 1 件（受信側の machine stack 上に置かれる） */
+/* One in-flight copy payload being rebuilt (lives on the receiver's machine
+ * stack) */
 struct ractor_materialize_frame {
-    VALUE snapshot;                          /* sender 側 snapshot */
-    const VALUE *pinned;                     /* snapshot 全 node の pin list（basket 所有） */
+    VALUE snapshot;                          /* the sender-side snapshot */
+    const VALUE *pinned;                     /* pin list of every snapshot node (owned by the basket) */
     size_t pinned_cnt;
     struct ractor_materialize_frame *prev;
 };
@@ -86,9 +88,10 @@ struct rb_ractor_struct {
     struct rb_ractor_pub pub;
     struct rb_ractor_sync sync;
 
-    /* rb_gc_register_mark_object で pin したオブジェクトは per-Ractor: owner が mark し
-     * （live は rb_ractor_mark_local_roots、未 merge の zombie は zombie-objspace scan）、
-     * merge で survivor へ移る。sweep 中の merge が GC へ再入しないよう raw malloc/realloc/free。 */
+    /* Objects pinned with rb_gc_register_mark_object are per-Ractor: the owner marks
+     * them (a live one through rb_ractor_mark_local_roots, an unmerged zombie through
+     * the zombie-objspace scan) and a merge moves them to the survivor.  Raw
+     * malloc/realloc/free, so a merge during sweep does not re-enter GC. */
     VALUE *registered_marks;
     size_t registered_marks_cnt, registered_marks_capa;
 
@@ -122,7 +125,7 @@ struct rb_ractor_struct {
     enum ractor_status status_;
 
     struct ccan_list_node vmlr_node;
-    bool in_terminated_set;  /* vmlr_node が vm->ractor.terminated_set 上にある */
+    bool in_terminated_set;  /* vmlr_node is on vm->ractor.terminated_set */
 
     // ractor local data
 
@@ -142,43 +145,53 @@ struct rb_ractor_struct {
     bool main_ractor;
     void *newobj_cache;
 
-    /* この Ractor の objspace。main Ractor は rb_gc_init_objspaces で boot objspace を
-     * 受け取る。非main Ractor は自分の objspace を持つまで（NULL の間）main と共有する。 */
+    /* This Ractor's objspace.  The main Ractor receives the boot objspace from
+     * rb_gc_init_objspaces; a non-main Ractor shares the main one until it gets its
+     * own (while this is NULL). */
     void *objspace;
 
-    /* 子 Ractor 作成中、子の objspace は populate 済み（Thread/Fiber wrapper がそこで
-     * 生まれる）だがまだ vm->ractor.set に無く whole-VM walk が取りこぼす。wrapper 確保から
-     * vm_insert_ractor までの窓で子 objspace をここに預け global GC に列挙させる。子が
-     * set に入る時 VM lock 下でクリアする。 */
+    /* While a child Ractor is being created its objspace is already populated (the
+     * Thread and Fiber wrappers are born there) but is not yet in vm->ractor.set, so
+     * a whole-VM walk would miss it.  Park the child objspace here for the window
+     * between allocating the wrappers and vm_insert_ractor so the global GC
+     * enumerates it; vm_insert_ractor clears it under the VM lock when the child
+     * joins the set. */
     void *creating_child_objspace;
 
-    /* この Ractor 所有の unshareable オブジェクトの generic fields 表（owner 専有＝無ロック、
-     * shareable 分は variable.c の global 表）。weak-key で host obj が死ねば entry も消える。
-     * local GC は rb_mark_generic_ivar で引き、global GC は mark 後に全表を drain する。
-     * lazy に生成（NULL = まだ空）。 */
-    /* Ractor#send の native copy 中の generic-ivar 対応表。capturing=送信側 snapshot 作成中
-     * だけ true で、host が出たら capture を遅延確保しその fields_obj を記録。materialize=
-     * 受信側で snapshot host の fields_obj を引く。これで受信側が sender の表を跨がない。 */
+    /* Generic fields table for the unshareable objects this Ractor owns (owner-only,
+     * hence lock-free; the shareable ones live in the global table in variable.c).
+     * The keys are weak, so an entry disappears when its host object dies.  A local
+     * GC looks it up through rb_mark_generic_ivar and the global GC drains every
+     * table after marking.  Created lazily (NULL means still empty). */
+    /* Map of generic ivars used while Ractor#send makes a native copy.  capturing is
+     * true only while the sender builds the snapshot: when a host turns up, the
+     * capture is allocated lazily and its fields_obj recorded.  Materializing looks
+     * up a snapshot host's fields_obj on the receiving side, so the receiver never
+     * reaches into the sender's table. */
     bool gen_fields_capturing;
 
-    /* copy snapshot 構築中に全 node を収集する pin list（basket_new が basket へ移送）。
-     * global GC は全 shref を消すため、re-pin は root だけでなく全 node に要る。 */
+    /* Pin list collecting every node while a copy snapshot is built (basket_new
+     * hands it over to the basket).  A global GC clears every shref, so the re-pin
+     * has to cover all nodes, not just the root. */
     VALUE *pin_capture;
     size_t pin_capture_cnt, pin_capture_capa;
-    /* basket_new 完了から enqueue 完了までの in-flight copy basket（re-pin の被覆用） */
+    /* The in-flight copy basket between basket_new and the enqueue, so the re-pin
+     * covers that window too */
     struct ractor_basket *sending_basket;
 }; // rb_ractor_t is defined in vm_core.h
 
-/* Ractor r の C 構造体から GC root を mark する（gc.c の root scan）。 */
+/* Mark the GC roots held in Ractor r's C structs (from the root scan in gc.c). */
 void rb_ractor_mark_local_roots(rb_ractor_t *r);
 void rb_ractor_mark_terminated_join_value(rb_ractor_t *r);
 void rb_ractor_repin_in_flight(rb_ractor_t *r);
 void rb_ractor_mark_in_flight_for_single_objspace(rb_ractor_t *r);
-/* 現 Ractor が到着 copy を materialize 中なら true（詳細は ractor_sync.c の定義）。 */
+/* True while the current Ractor is materializing an arriving copy (see the
+ * definition in ractor_sync.c). */
 bool rb_ractor_materializing_p(void);
 
-/* src の registered_marks を dst へ移送して src を空にする（join / orphan absorb）。
- * absorb は GC sweep 中に走りうるので実装は生 realloc（ractor.c）。 */
+/* Move src's registered_marks to dst and leave src empty (on join or when an orphan
+ * is absorbed).  An absorb can run during a GC sweep, so the implementation uses raw
+ * realloc (ractor.c). */
 void rb_ractor_absorb_registered_marks(rb_ractor_t *dst, rb_ractor_t *src);
 
 enum ractor_wakeup_status {
@@ -363,8 +376,9 @@ rb_ractor_targeted_hooks_cnt(rb_ractor_t *cr)
 
 extern bool rb_ractor_ignore_belonging_flag;
 
-/* obj の所有 Ractor は obj のページが属する objspace で決まる(rb_gc_obj_foreign_p)。
- * unshareable な object を所有者以外が VM スタックに載せたら封じ込め違反。 */
+/* An object's owning Ractor is decided by the objspace its page belongs to
+ * (rb_gc_obj_foreign_p).  Putting an unshareable object on the VM stack of anyone
+ * but its owner is a containment violation. */
 static inline VALUE
 rb_ractor_confirm_belonging(VALUE obj)
 {

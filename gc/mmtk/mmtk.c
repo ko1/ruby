@@ -577,8 +577,9 @@ rb_mmtk_builder_init(void)
 void *
 rb_gc_impl_objspace_alloc(void)
 {
-    /* heap・binding・objspace はプロセスに 1 つ (multi_objspace_p=false)。VM は
-     * 全 Ractor で同じ objspace を共有するので、再入しても同じ実体を返す。 */
+    /* One heap, binding and objspace per process (multi_objspace_p=false).  The VM
+     * shares the same objspace across all Ractors, so a re-entry returns the same
+     * instance. */
     static struct objspace *the_objspace = NULL;
     if (the_objspace == NULL) {
         MMTk_Builder *builder = rb_mmtk_builder_init();
@@ -605,8 +606,8 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
 {
     struct objspace *objspace = objspace_ptr;
 
-    /* objspace は singleton (rb_gc_impl_objspace_alloc 参照)。再 init で
-     * finalizer_table や ractor_caches を潰さない。 */
+    /* The objspace is a singleton (see rb_gc_impl_objspace_alloc).  A re-init must
+     * not clobber finalizer_table or ractor_caches. */
     if (objspace->finalizer_table != NULL) return;
 
     objspace->measure_gc_time = true;
@@ -630,7 +631,7 @@ rb_gc_impl_objspace_init(void *objspace_ptr)
 void
 rb_gc_impl_objspace_free(void *objspace_ptr)
 {
-    /* objspace は process-lifetime の singleton。 */
+    /* The objspace is a process-lifetime singleton. */
 }
 
 void *
@@ -654,7 +655,7 @@ rb_gc_impl_ractor_cache_alloc(void *objspace_ptr, void *ractor)
 void
 rb_gc_impl_objspace_retire_gc(void *objspace_ptr)
 {
-    /* objspace が単一なので終了時の per-Ractor GC は不要 */
+    /* A single objspace needs no per-Ractor GC at teardown. */
 }
 
 void
@@ -1248,13 +1249,13 @@ rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj)
 void
 rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj)
 {
-    /* MMTk はページ単位の shareable ビットを持たない。 */
+    /* MMTk has no per-page shareable bits. */
 }
 
 void
 rb_gc_impl_pin_in_flight_message(void *objspace_ptr, VALUE obj)
 {
-    /* MMTk は objspace が単一なので pin するものがない。 */
+    /* With a single objspace there is nothing to pin. */
 }
 
 void
@@ -1801,8 +1802,9 @@ rb_gc_impl_active_gc_name(void)
 bool
 rb_gc_impl_during_global_gc_p(void *objspace_ptr)
 {
-    /* mmtk の GC は常に STW の global GC。mark 中の helper (ractor_sync_mark 等)が
-     * 「全 mutator 停止済みか」の判定にこれを読む。 */
+    /* An mmtk GC is always a stop-the-world global GC.  Helpers used during marking
+     * (ractor_sync_mark and friends) read this to tell whether every mutator has
+     * stopped. */
     struct objspace *objspace = objspace_ptr;
     return objspace->world_stopped;
 }
@@ -1810,34 +1812,35 @@ rb_gc_impl_during_global_gc_p(void *objspace_ptr)
 bool
 rb_gc_impl_obj_foreign_p(void *objspace_ptr, VALUE obj)
 {
-    /* objspace が単一なので所有者は常に自分 */
+    /* With a single objspace every object is our own. */
     return false;
 }
 
 bool
 rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj)
 {
-    /* objspace が単一なので objspace 間の pin 管理は不要 */
+    /* With a single objspace there is no cross-objspace pinning to track. */
     return false;
 }
 
 size_t
 rb_gc_impl_heap_page_count(void *objspace_ptr)
 {
-    /* objspace が単一なので zombie_objspacesは常に空 */
+    /* With a single objspace zombie_objspaces is always empty. */
     return 0;
 }
 
 void
 rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr)
 {
-    /* objspace が単一 */
+    /* A single objspace. */
 }
 
 void
 rb_gc_impl_gc_rest(void *objspace_ptr)
 {
-    /* mmtk の GC は STW で完結し、incremental mark / lazy sweep の途中状態を持たない */
+    /* An mmtk GC completes stop-the-world: there is no in-progress incremental
+     * mark or lazy sweep state. */
 }
 
 struct each_objects_shareable_data {
@@ -1868,5 +1871,5 @@ rb_gc_impl_each_objects_shareable(void *objspace_ptr, int (*func)(void *, void *
 void
 rb_gc_impl_each_objects_foreign(void *objspace_ptr, int (*func)(void *, void *, size_t, void *), void *data)
 {
-    /* objspace が単一なので foreign な objspace 在住オブジェクトは無い */
+    /* With a single objspace no object lives in a foreign objspace. */
 }

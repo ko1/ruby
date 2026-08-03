@@ -338,10 +338,11 @@ vm_cref_new0(VALUE klass, rb_method_visibility_t visi, int module_func, rb_cref_
     VM_ASSERT(singleton || klass);
 
     rb_cref_t *cref = SHAREABLE_IMEMO_NEW(rb_cref_t, imemo_cref, refinements);
-    /* cref は生まれつき shareable なので、unshareable になりうる子(singleton cref の self、
-     * using の refinements hash)は WB を通して shref を植える。素 store だと owner の
-     * local GC が子を回収し、pin で生き残った cref が dangling になる。next は常に
-     * cref(shareable)なので素 store でよい。 */
+    /* A cref is born shareable, so children that may be unshareable (a singleton
+     * cref's self, the refinements hash of `using`) go through the write barrier to
+     * record a shref.  A plain store would let the owner's local GC collect the
+     * child and leave the pinned cref dangling.  next is always a cref (shareable),
+     * so a plain store is fine there. */
     if (!SPECIAL_CONST_P(refinements)) RB_OBJ_WRITTEN(cref, Qundef, refinements);
     if (klass) {
         RB_OBJ_WRITE(cref, &cref->klass_or_self, klass);
@@ -3895,15 +3896,17 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     rb_gc_mark(ec->local_storage_recursive_hash_for_trace);
     rb_gc_mark(ec->private_const_reference);
 
-    /* materialize 中の copy receive の snapshot。queue を既に離れており、ここが root。
-     * snapshot は送信側常駐なので自 local GC では containment が skip し、global GC が
-     * mark + shref 再 pin する（step5 が全 shref を消すため）。move courier は in-flight
-     * registry が global GC の root として mark+pin する(ractor.c)のでここでは扱わない。 */
+    /* Snapshots of copy receives being materialized.  They already left the queue,
+     * so this is their only root.  A snapshot lives in the sender's objspace, so our
+     * local GC skips it as foreign; the global GC marks it and re-pins its shrefs
+     * (step 5 clears every shref).  Move couriers are not handled here: the
+     * in-flight registry marks and pins them as a global GC root (ractor.c). */
     for (const struct ractor_materialize_frame *f = ec->materialize_frames; f != NULL; f = f->prev) {
         rb_gc_mark(f->snapshot);
         if (f->snapshot && !RB_SPECIAL_CONST_P(f->snapshot) && rb_gc_during_global_gc_p()) {
-            /* root だけでなく全 node（+ fields_obj 群）。compaction が snapshot node を
-             * 動かすとアドレスキーの対応表や dedup 表が壊れる。 */
+            /* Every node, not just the root (plus their fields_obj).  If compaction
+             * moved a snapshot node, the address-keyed maps and the dedup table
+             * would break. */
             rb_gc_pin_in_flight_message(f->snapshot);
             for (size_t i = 0; i < f->pinned_cnt; i++) {
                 rb_gc_pin_in_flight_message(f->pinned[i]);
@@ -3928,9 +3931,9 @@ thread_compact(void *ptr)
     th->self = rb_gc_location(th->self);
 }
 
-/* スレッドが所有するヒープオブジェクトの root を mark する(ec と fiber は
- * 呼び出し側が担当)。local GC が Ractor の local roots から直接これらを
- * root にできるよう thread_mark から分離(rb_ractor_mark_local_roots)。 */
+/* Mark the heap objects a thread owns (the caller handles ec and fiber).  Split
+ * out of thread_mark so that a local GC can root them straight from the Ractor's
+ * local roots (rb_ractor_mark_local_roots). */
 void
 rb_thread_mark_owned_roots(rb_thread_t *th)
 {
@@ -3973,9 +3976,10 @@ thread_mark(void *ptr)
         rb_fiber_mark_self(th->ec->fiber_ptr);
     }
 
-    /* 生きた thread wrapper はその Ractor オブジェクト(dfree 経由で rb_ractor_t)
-     * を生かす。これにより zombie_objspaces 表 は wrapper を mark するだけで終了中の
-     * Ractor を保持でき、継承された Thread も死んだ Ractor を upstream 同様に保つ。 */
+    /* A live thread wrapper keeps its Ractor object alive (and through its dfree the
+     * rb_ractor_t).  That lets the zombie_objspaces table hold on to a terminating
+     * Ractor by marking the wrapper alone, and an inherited Thread keeps a dead
+     * Ractor alive just as it does upstream. */
     if (th->ractor) rb_gc_mark(rb_ractor_self(th->ractor));
     if (th->root_fiber) rb_fiber_mark_self(th->root_fiber);
 
@@ -4790,8 +4794,8 @@ Init_BareVM(void)
     vm_init2(vm);
 
     ruby_current_vm_ptr = vm;
-    /* boot objspace は main Ractor に属するので、rb_gc_init_objspaces が割り当てる
-     * 前に main Ractor が存在していなければならない。 */
+    /* The boot objspace belongs to the main Ractor, so the main Ractor has to exist
+     * before rb_gc_init_objspaces allocates it. */
     vm->ractor.main_ractor = rb_ractor_main_alloc();
     rb_gc_init_objspaces();
     vm->ractor.main_ractor->newobj_cache = rb_gc_ractor_cache_alloc(vm->ractor.main_ractor);
@@ -4862,9 +4866,10 @@ rb_vm_register_global_object(VALUE obj)
       default:
         break;
     }
-    /* 現在の Ractor 自身の pin リスト(生配列)に登録する。append と mark は所有者の
-     * GC だけが行う(GC 中は自スレッド停止)ためロック不要。リストを継承する merge は
-     * global GC の STW 下で走る。 */
+    /* Register in the current Ractor's own pin list (a raw array).  No lock is
+     * needed: only the owner appends, and only the owner's GC marks it (its threads
+     * are stopped during that GC).  The merge that inherits a list runs under the
+     * global GC's stop-the-world. */
     rb_ractor_t *cr = GET_RACTOR();
     if (cr->registered_marks_cnt == cr->registered_marks_capa) {
         size_t nc = cr->registered_marks_capa ? cr->registered_marks_capa * 2 : 64;

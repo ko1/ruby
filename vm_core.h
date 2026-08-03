@@ -687,8 +687,9 @@ typedef const struct rb_builtin_function *RB_BUILTIN;
 struct gc_mark_func_data_struct {
     void *data;
     void (*mark_func)(VALUE v, void *data);
-    /* shareable 検証 walk 中の印(rb_gc_checking_shareable が読む)。slot 自体が
-     * per-Ractor なので、検証している Ractor の walk にだけ作用する。 */
+    /* Marker set while a shareable-verification walk runs (read by
+     * rb_gc_checking_shareable).  The slot is per-Ractor, so it only affects the
+     * walk of the Ractor doing the verification. */
     bool checking_shareable;
 };
 
@@ -697,8 +698,9 @@ typedef struct rb_vm_struct {
 
     struct {
         struct ccan_list_head set;
-        /* 単一 objspace impl (mmtk) 用: terminated 後 ractor_free までの Ractor。
-         * global root scan が registered_marks を mark し続ける。 */
+        /* For a single-objspace impl (mmtk): Ractors between termination and
+         * ractor_free.  The global root scan keeps marking their
+         * registered_marks. */
         struct ccan_list_head terminated_set;
         unsigned int cnt;
         unsigned int blocking_cnt;
@@ -725,10 +727,11 @@ typedef struct rb_vm_struct {
 #endif
         } sync;
 
-        /* Ractor 転送/継承機構の VM-wide lock 群と in-flight move courier の
-         * registry。いずれも leaf lock(臨界区間に safepoint を含めない)。 */
-        rb_nativethread_lock_t generic_fields_lock;   /* variable.c の共有 generic-fields 表 */
-        struct ccan_list_head move_courier_registry;  /* 転送中 courier(ractor.c)。global GC が mark */
+        /* VM-wide locks for the Ractor transfer/inheritance machinery, plus the
+         * registry of in-flight move couriers.  All of them are leaf locks: no
+         * safepoint inside a critical section. */
+        rb_nativethread_lock_t generic_fields_lock;   /* the shared generic-fields table in variable.c */
+        struct ccan_list_head move_courier_registry;  /* couriers in flight (ractor.c); the global GC marks them */
         rb_nativethread_lock_t move_courier_registry_lock;
 
 #ifdef RUBY_THREAD_PTHREAD_H
@@ -820,51 +823,59 @@ typedef struct rb_vm_struct {
     int coverage_mode;
 
     struct {
-        /* VM は rb_global_objspace(page pool 等のプロセス全体の GC データ)のみを
-         * 指す。各 Ractor は r->objspace で自分の rb_objspace を所有し、boot
-         * objspace は main Ractor に属する。 */
+        /* The VM only points at rb_global_objspace, the process-wide GC data such as
+         * the page pool.  Each Ractor owns its own rb_objspace through r->objspace,
+         * and the boot objspace belongs to the main Ractor. */
         struct rb_global_objspace *global_objspace;
-        /* 終了したがまだ継承されていない Ractor の objspace 群。誰も変更しないが
-         * global GC は毎回列挙する必要がある(取りこぼすと stale mark bits = UAF)。
-         * owner_slot は死んだ Ractor の r->objspace で、継承時に VM lock 下でクリア。 */
+        /* Objspaces of Ractors that terminated but have not been inherited yet.
+         * Nobody mutates them, but every global GC has to enumerate them: missing one
+         * leaves stale mark bits, i.e. a use-after-free.  owner_slot is the dead
+         * Ractor's r->objspace, cleared under the VM lock when it is inherited. */
         struct rb_objspace_zombie {
             void *objspace;
             void **owner_slot;
-            /* この zombie の所有 Ractor(終了して vm->ractor.set を外れたがまだ未 merge)。
-             * global GC の generic_fields weak pass が owner の per-Ractor 表を舐めるのに
-             * 使う。orphan(Ractor object 回収済み)は NULL で、表は main へ移送済み。 */
+            /* The Ractor that owns this zombie: it has terminated and left
+             * vm->ractor.set but has not been merged yet.  The global GC's
+             * generic_fields weak pass uses it to walk the owner's per-Ractor table.
+             * NULL for an orphan (its Ractor object was collected), whose table has
+             * already been moved to the main Ractor. */
             struct rb_ractor_struct *owner;
-            /* この zombie が保持する heap page 数(retire 時に測定、各 global cycle
-             * の barrier 下で更新)。下の合計値はエントリ単位で正確に同期する。 */
+            /* Heap pages this zombie holds: measured when it retires and refreshed
+             * under the barrier of each global cycle.  The total below stays exactly
+             * in sync, entry by entry. */
             size_t pages;
         } *zombie_objspaces;
         size_t zombie_objspaces_count;
         size_t zombie_objspaces_capa;
-        /* zombie_objspaces 全体の .pages の合計。global cycle 間では上限値
-         * (zombie のヒープは増えず、global cycle でのみ縮む)。 */
+        /* Sum of .pages over zombie_objspaces.  Between global cycles it is an upper
+         * bound: a zombie's heap never grows and only shrinks at a global cycle. */
         size_t zombie_total_pages;
 
 #if USE_MODULAR_GC
         struct gc_mark_func_data_struct *mark_func_data;
 #endif
-        /* rb_gc_register_address の登録先は VM に 1 つ。登録スロットには後から別
-         * objspace の値が入り得るので per-Ractor 分割せず、全 Ractor の GC が root
-         * walk で保守的に見る。lock は leaf、register/unregister は cold path。 */
+        /* One VM-wide list for rb_gc_register_address.  A registered slot can later
+         * hold a value from another objspace, so it is not split per Ractor: every
+         * Ractor's GC scans it conservatively in its root walk.  The lock is a leaf
+         * lock and register/unregister are cold paths. */
         struct {
             rb_nativethread_lock_t lock;
-            VALUE **addrs;              /* rb_gc_register_address: *addr を mark_maybe */
+            VALUE **addrs;              /* rb_gc_register_address: mark_maybe on *addr */
             size_t addrs_cnt, addrs_capa;
         } registered_globals;
 
-        /* GC を止めている holder の数(atomic)。GC.disable した Ractor
-         * (per-Ractor の gc_disabled フラグ、1 Ractor で高々 1)と、内部の短期
-         * critical 区間が holder になる。1 つでも居れば全 GC を止める。
-         * GC.enable は自分の hold しか外さない(他 Ractor の disable を踏み潰さない)。 */
+        /* Number of holders keeping GC disabled (atomic).  A holder is either a
+         * Ractor that called GC.disable (its per-Ractor gc_disabled flag, at most one
+         * per Ractor) or a short internal critical section.  A single holder stops GC
+         * everywhere.  GC.enable only releases the caller's own hold, so it never
+         * overrides another Ractor's disable. */
         rb_atomic_t disable_holders;
-        /* orphan objspace を main へ併合する postponed job の handle
-         * (rb_postponed_job_handle_t。未登録は POSTPONED_JOB_HANDLE_INVALID)。 */
+        /* Handle of the postponed job that merges an orphan objspace into the main
+         * one (rb_postponed_job_handle_t; POSTPONED_JOB_HANDLE_INVALID when not
+         * registered). */
         unsigned int orphan_merge_pjob;
-        /* VM 終了処理中に objspace 解決へ使う(rb_gc_get_objspace の cleanup 経路)。 */
+        /* Used to resolve the objspace during VM teardown (the cleanup path of
+         * rb_gc_get_objspace). */
         void *cleanup_objspace;
     } gc;
 
@@ -1163,8 +1174,9 @@ struct rb_execution_context_struct {
         VALUE fields_obj;
     } gen_fields_cache;
 
-    /* この EC 上で materialize 中の receive の frame 鎖（LIFO、実体は C スタック）。
-     * thread/fiber 切替があっても各 EC の鎖はその EC の入れ子だけなので崩れない。 */
+    /* Chain of receive frames being materialized on this EC (LIFO; the frames live
+     * on the C stack).  A thread or fiber switch cannot corrupt it, since each EC's
+     * chain only contains that EC's own nesting. */
     struct ractor_materialize_frame *materialize_frames;
 
     /* for GC */
