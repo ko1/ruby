@@ -492,19 +492,6 @@ RACTOR_PTR(VALUE self)
 #define MAIN_RACTOR_ID 1
 static rb_atomic_t ractor_last_id = MAIN_RACTOR_ID;
 
-#if RACTOR_CHECK_MODE > 0
-uint32_t
-rb_ractor_current_id(void)
-{
-    if (GET_THREAD()->ractor == NULL) {
-        return 1; // main ractor
-    }
-    else {
-        return rb_ractor_id(GET_RACTOR());
-    }
-}
-#endif
-
 #include "ractor_sync.c"
 
 // creation/termination
