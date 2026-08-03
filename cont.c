@@ -889,11 +889,12 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
 
     if (DEBUG) fprintf(stderr, "fiber_pool_stack_release: %p used=%"PRIuSIZE"\n", stack->base, stack->pool->used);
 
-    /* 別 Ractor の acquire と競合しないよう pool アクセスを直列化する。
-     * Ractor ごとの GC sweep は VM lock 無しで fiber を解放しうる。release は稀なので
-     * NO_BARRIER で取得し、形成中の global barrier に合流しない。VM destruct の
-     * free-at-exit walk 中は単一スレッドかつ thread struct が先に free 済みなので
-     * lock 不要（vm_locked が current Ractor を deref すると UAF）。 */
+    /* Serialize pool access against another Ractor's acquire: a per-Ractor GC sweep
+     * can free a fiber without the VM lock.  Releases are rare, so take the lock
+     * NO_BARRIER and never join a forming global barrier.  During the free-at-exit
+     * walk of VM destruct no lock is needed: a single thread runs and the thread
+     * structs are already freed (vm_locked would deref the current Ractor and use
+     * freed memory). */
     unsigned int lev = 0;
     const bool lock_here = !ruby_vm_during_cleanup;
     if (lock_here) RB_VM_LOCK_ENTER_LEV_NB(&lev);
@@ -1045,9 +1046,9 @@ fiber_stack_release(rb_fiber_t * fiber)
 static void
 fiber_stack_release_locked(rb_fiber_t *fiber)
 {
-    /* GC の解放処理から呼ばれる。Ractor ごとの objspace では barrier 無し・VM lock
-     * 無しの sweep なので、pool への返却側 (fiber_pool_stack_release) が lock を取る。
-     * ここでは VM lock の assertion を置かない。 */
+    /* Called from GC finalization.  With per-Ractor objspaces the sweep runs with
+     * no barrier and no VM lock, so the side that returns stacks to the pool
+     * (fiber_pool_stack_release) takes the lock.  Do not assert the VM lock here. */
     fiber_stack_release(fiber);
 }
 
@@ -1317,9 +1318,9 @@ fiber_memsize(const void *ptr)
     size_t size = sizeof(*fiber);
     const rb_execution_context_t *saved_ec = &fiber->cont.saved_ec;
 
-    /* root fiber の local_storage は vm.c の thread_memsize が計上済み。
-     * first_proc != 0 は thread を deref せず非 root fiber を選ぶ
-     * (fiber != th->root_fiber と等価)。 */
+    /* thread_memsize in vm.c already accounts for a root fiber's local_storage.
+     * first_proc != 0 picks the non-root fibers without dereferencing the thread
+     * (equivalent to fiber != th->root_fiber). */
     if (saved_ec->local_storage && fiber->first_proc != 0) {
         size += rb_id_table_memsize(saved_ec->local_storage);
         size += rb_obj_memsize_of(saved_ec->storage);

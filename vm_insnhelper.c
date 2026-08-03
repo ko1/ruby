@@ -517,9 +517,10 @@ vm_env_write_slowpath(const VALUE *ep, int index, VALUE v)
     const VALUE envval = VM_ENV_ENVVAL(ep);
 
     if (RB_FL_TEST_RAW(envval, RUBY_FL_SHAREABLE)) {
-        /* SHAREABLE な env(isolated proc)への書き込みは v が unshareable のとき
-         * shareable から unshareable への参照を作る。full barrier だけが v を所有者の
-         * local GC まで生かす shref bit を立てる。WB_REQUIRED は以後の書き込み用に残す。 */
+        /* Writing to a SHAREABLE env (an isolated proc) creates a shareable ->
+         * unshareable edge when v is unshareable.  Only a full barrier sets the
+         * shref bit that keeps v alive through its owner's local GC.  WB_REQUIRED
+         * stays set, since later writes need the barrier too. */
         if (!SPECIAL_CONST_P(v)) {
             rb_gc_writebarrier(envval, v);
         }
@@ -595,18 +596,19 @@ vm_svar_valid_p(VALUE svar)
 }
 #endif
 
-/* このフレームの特殊変数を env の svar スロットに置くべきか。SHAREABLE な
- * env(isolated proc)は複数 Ractor から同時に呼ばれ、svar が Ractor 間共有
- * 可変状態になり foreign オブジェクト保持や $~/$_ 漏れを招くので per-EC に置く。 */
+/* Should this frame's special variables live in the env's svar slot?  A SHAREABLE
+ * env (an isolated proc) can run in several Ractors at once, which would make svar
+ * mutable state shared between them: it could hold foreign objects and leak $~/$_
+ * across Ractors.  Keep them per-EC instead. */
 static inline bool
 lep_svar_in_env_p(const rb_execution_context_t *ec, const VALUE *lep)
 {
     if (!lep) return false;
     if (ec == NULL) return true;
     if (ec->root_lep == lep) return false;
-    /* lep は env が既に escape したフレームの stale な on-stack ep かもしれず、
-     * lep[0] は imemo_env を残すため flags が FIXNUM でなく VM_ENV_ESCAPED_P が
-     * assert する。生きた shareable proc の env ではないので in-env に fall back。 */
+    /* lep may be a stale on-stack ep of a frame whose env already escaped: lep[0]
+     * still holds the imemo_env, so flags is not a FIXNUM and VM_ENV_ESCAPED_P
+     * asserts.  That is not a live shareable proc's env, so fall back to in-env. */
     if (FIXNUM_P(lep[VM_ENV_DATA_INDEX_FLAGS]) &&
             VM_ENV_ESCAPED_P(lep) &&
             RB_FL_TEST_RAW(VM_ENV_ENVVAL(lep), RUBY_FL_SHAREABLE)) {

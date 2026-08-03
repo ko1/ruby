@@ -700,9 +700,10 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
             r->r_stdout = rb_io_prep_stdout();
             r->r_stderr = rb_io_prep_stderr();
 
-            /* 割り込みキューとマスクスタックは親の objspace 上で作られたものなので、
-             * この Ractor 自身が所有するオブジェクトで作り直す。マスクスタックを空で
-             * 始めるのは、継承すると親の unshareable なマスク Hash を参照するため。 */
+            /* The interrupt queue and mask stack were built in the parent's
+             * objspace, so rebuild them out of objects this Ractor owns.  The mask
+             * stack starts empty because inheriting it would reference the parent's
+             * unshareable mask Hash. */
             th->pending_interrupt_queue = rb_ary_hidden_new(0);
             th->pending_interrupt_mask_stack = rb_ary_hidden_new(0);
         }
@@ -919,15 +920,18 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     th->thgroup = current_th->thgroup;
 
     if (th->invoke_type == thread_invoke_type_ractor_proc) {
-        /* 子 Ractor の main thread が起動時(thread_start_func_2)に自分の objspace で
-         * 作り直す。ここで作ると親の objspace 上に root 無しで残り、起動前に親の
-         * local GC に解放され後の mark が解放済みを踏む。0(未初期化)のままにする。 */
+        /* The child Ractor's main thread rebuilds this in its own objspace when it
+         * starts (thread_start_func_2).  Building it here would leave it in the
+         * parent's objspace with no root, so the parent's local GC could free it
+         * before the child starts and a later mark would touch freed memory.  Leave
+         * it 0 (uninitialized). */
         th->pending_interrupt_queue = 0;
         th->pending_interrupt_mask_stack = 0;
         th->pending_interrupt_queue_checked = 0;
-        /* thread group も同様。親 Ractor の objspace 上にあり、ここで保持すると子の
-         * Thread wrapper が shref 無しで foreign な unshareable を指し containment
-         * 違反になる。thread_do_start_proc が作り直すまで 0(未初期化)にする。 */
+        /* Same for the thread group: it lives in the parent Ractor's objspace, and
+         * keeping it here would make the child's Thread wrapper point at a foreign
+         * unshareable object with no shref, which violates containment.  Leave it 0
+         * (uninitialized) until thread_do_start_proc rebuilds it. */
         th->thgroup = 0;
     }
     else {
@@ -942,9 +946,11 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     rb_ractor_living_threads_insert(th->ractor, th);
 
     if (th->invoke_type == thread_invoke_type_ractor_proc) {
-        /* 子が vm->ractor.set に入ってから default port を作り引数を送る。生成〜参照の間に
-         * global GC が走っても root scan が子の default_port を mark する。send が失敗
-         * (copy 不可等)したら set への参加を巻き戻す。残すと terminate_all が待ち続ける。 */
+        /* Create the default port and send the arguments only after the child has
+         * joined vm->ractor.set, so that a global GC running between creation and
+         * use still marks the child's default_port in its root scan.  If the send
+         * fails (an uncopyable argument, say), undo the set membership: leaving it
+         * there would make terminate_all wait forever. */
         rb_ractor_setup_default_port(params->g);
         enum ruby_tag_type state;
         EC_PUSH_TAG(ec);
@@ -1093,36 +1099,43 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
         .proc = proc,
     };
 
-    /* 子 Ractor の main thread とルート Fiber の wrapper を子の objspace へ直接
-     * 割り当て、スレッドを所有オブジェクトで構成する。cr->objspace は whole-VM
-     * walk が参照するので、入れ替えは VM lock 下で他から不可視に行う。 */
+    /* Allocate the wrappers for the child Ractor's main thread and root Fiber
+     * directly in the child's objspace, so the thread is built out of objects it
+     * owns.  A whole-VM walk reads cr->objspace, so swap it under the VM lock where
+     * no one else can observe the swap. */
     VALUE thval;
     rb_ractor_t *cr = GET_RACTOR();
     const bool multi_objspace = rb_gc_multi_objspace_p();
     RB_VM_LOCKING() {
         void *const parent_objspace = cr->objspace;
         if (multi_objspace) cr->objspace = r->objspace;
-        /* 下の wrapper 割り当てで GC を再入させない。cr->objspace が子を指す間は
-         * creator 自身の objspace がどの walk からも漏れ、global GC が飛ばして stale
-         * mark bits = UAF になる。単一オブジェクトなので抑止しても増えるだけ。 */
+        /* Do not let the wrapper allocations below re-enter GC.  While cr->objspace
+         * points at the child, the creator's own objspace is invisible to every
+         * walk, so a global GC would skip it and leave stale mark bits, i.e. a
+         * use-after-free.  These are single allocations, so suppressing GC only
+         * costs a little growth. */
         VALUE gc_was_disabled = rb_gc_local_disable_no_rest();
         thval = rb_thread_alloc(rb_cThread);
         if (gc_was_disabled == Qfalse) rb_gc_local_enable();
         if (multi_objspace) cr->objspace = parent_objspace;
-        /* 子の objspace は wrapper を持つがまだ vm->ractor.set に無い。列挙可能に
-         * 保つ(ここと vm_insert_ractor の間に走る global GC が取りこぼし mark で
-         * ループするのを防ぐ)。vm_insert_ractor が set 参加時に VM lock 下でクリア。
-         * 単一スロット。set〜clear の間に GVL 解放は無く同 Ractor の生成は直列なので
-         * 上書き衝突は起きない(将来 GVL を手放す変更が入ると破れるので assert)。 */
+        /* The child's objspace already holds the wrappers but is not in
+         * vm->ractor.set yet.  Keep it enumerable so a global GC running between
+         * here and vm_insert_ractor does not loop on a missed mark.  vm_insert_ractor
+         * clears this under the VM lock when the child joins the set.  One slot is
+         * enough: the GVL is never released between the set and the clear and one
+         * Ractor creates children serially, so there is no overwrite (asserted, since
+         * a future change that releases the GVL would break it). */
         if (multi_objspace) {
             RUBY_ASSERT(cr->creating_child_objspace == NULL);
             cr->creating_child_objspace = r->objspace;
         }
     }
 
-    /* vm_insert_ractor までに生成は失敗し得る(IsolationError 等)。cover を残すと
-     * 死んだ子の objspace が二重列挙され merge 後に dangle する。失敗時は VM lock
-     * 下で objspace を zombie_objspaces 表 へ渡し cover を落とし r->objspace=NULL にする。 */
+    /* Creation can still fail before vm_insert_ractor (an IsolationError, say).
+     * Leaving the cover in place would enumerate the dead child's objspace twice and
+     * dangle after the merge, so on failure hand the objspace to the
+     * zombie_objspaces table under the VM lock, drop the cover and set
+     * r->objspace = NULL. */
     enum ruby_tag_type state;
     VALUE thret = Qundef;
     rb_execution_context_t *ec = GET_EC();
