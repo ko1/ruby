@@ -1426,7 +1426,9 @@ rb_obj_set_shareable_no_assert(VALUE obj)
     FL_SET_RAW(obj, FL_SHAREABLE);
     rb_gc_obj_became_shareable(obj);
 
-    if (rb_obj_gen_fields_p(obj)) {
+    /* T_OBJECT も too_complex 等で fields imemo を持つ。imemo は生成時の owner が
+     * unshareable なら unshareable のまま(imemo_fields_complex_from_obj)なので揃える。 */
+    if (rb_obj_gen_fields_p(obj) || BUILTIN_TYPE(obj) == T_OBJECT) {
         /* obj は既に shareable なので rb_obj_fields_no_ractor_check は正しい表を引く。
          * ここでは fields imemo 自身を shareable 化し、traversal で届かない
          * 隠しフィールド値の shref を記録する。 */
