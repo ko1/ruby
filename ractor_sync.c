@@ -732,7 +732,7 @@ ractor_sync_mark(rb_ractor_t *r)
         /* materialize 中の copy snapshot の root は各 EC の frame 鎖
          * （rb_execution_context_mark が mark/re-pin する）。 */
         /* 戻り値（exit 時に設定、Ractor#value が読む）の、吸収されるまでの確実な root は
-         * ここだけ（Qundef=未終了なら no-op）。吸収後は successor の value_taken が守る。
+         * ここだけ（Qundef=未終了なら no-op）。#value が返した後は Ruby 側が root。
          * さもないと死んだ main thread の th->value/errinfo 別名に生存を頼ることになり、
          * 例外 teardown 経路がそれを落とすと Ractor#value が解放済みを返す。 */
         rb_gc_mark(r->sync.legacy);
@@ -932,6 +932,10 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
     rb_ractor_t *sr = ractor_set_successor_once(r, cr);
 
     if (sr == cr) {
+        if (r->sync.legacy_taken) {
+            rb_raise(rb_eRactorError, "The value was already taken");
+        }
+
         /* 値は参照で返すので、まず死んだ Ractor の objspace を我々のものへ継承する。
          * merge 後は戻り値も我々のオブジェクトになり、コピー無しで containment が成立。
          * monitor-port の wakeup は死ぬ thread の teardown 終了より前に起こる
@@ -946,13 +950,10 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
          * に残った pin 済みオブジェクトが root を失う。 */
         rb_ractor_absorb_registered_marks(GET_RACTOR(), r);
 
-        /* 初回 absorb かは吸収前の objspace 有無で判る（absorb が NULL 化する）。 */
-        bool first_absorb = (r->objspace != NULL);
         rb_gc_objspace_absorb_into_current(&r->objspace);
 
-        /* legacy を value_taken 登録まで C ローカルで生かす。absorb 後・登録前に GC が
-         * 走ると legacy は C struct からしか届かず無 root で回収されうるため、保守的な
-         * machine-stack mark に拾わせて回収と move を防ぐ（登録後は value_taken が守る）。 */
+        /* legacy を返すまで C ローカルで生かす。absorb 後は C struct からしか届かず
+         * 無 root で回収されうるので、保守的な machine-stack mark に拾わせる。 */
         volatile VALUE legacy_keep = r->sync.legacy;
 
         /* 死んだ Ractor の local storage はこれ以降 Ruby コードから到達不能
@@ -962,21 +963,20 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
         r->local_storage = NULL;
         r->idkey_local_storage = NULL;
 
-        /* legacy は successor の objspace に在り C struct 経由でしか到達できない。shref pin
-         * は sweep からは守るが compaction では move し C slot が stale 化する。successor の
-         * value_taken に載せ、その root scan(rb_ractor_mark_local_roots)で mark+pin(不動化)する。
-         * wrapper 回収時 ractor_free が外す(add/unlink/scan は value_taken_lock で直列化)。 */
-        if (first_absorb) {
-            rb_ractor_value_taken_add(GET_RACTOR(), r);
-        }
+        /* 値は呼び出し元へ返され、以後 Ruby 側の参照が root になる。C struct からは
+         * 手放す: 残すと successor の objspace に在って C 経由でしか届かない参照になり、
+         * mark と compaction 対策の pin を successor 側に用意する羽目になる。 */
+        VALUE legacy = r->sync.legacy;
+        r->sync.legacy = Qnil;
+        r->sync.legacy_taken = true;
         RB_GC_GUARD(legacy_keep);
 
-        ractor_reset_belonging(r->sync.legacy);
+        ractor_reset_belonging(legacy);
 
         if (r->sync.legacy_exc) {
-            rb_exc_raise(ractor_make_remote_exception(r->sync.legacy, self));
+            rb_exc_raise(ractor_make_remote_exception(legacy, self));
         }
-        return r->sync.legacy;
+        return legacy;
     }
     else {
         rb_raise(rb_eRactorError, "Only the successor ractor can take a value");
