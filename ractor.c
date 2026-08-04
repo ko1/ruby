@@ -308,7 +308,7 @@ ractor_mark(void *ptr)
     rb_gc_mark(r->sync.default_port_value);
     /* A single-objspace impl (mmtk) has no zombie_objspaces and no pin/shref bits, so
      * the root scan cannot reach a terminated Ractor's legacy value, queue or in-flight
-     * payloads -- and no shref rule forbids following them from the wrapper. */
+     * payloads; and no shref rule forbids following them from the wrapper. */
     if (!rb_gc_multi_objspace_p()) {
         ractor_mark_unshareable_parts(r);
         rb_ractor_mark_in_flight_for_single_objspace(r);
@@ -610,7 +610,7 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         cr->newobj_cache = NULL;
 
         /* The objspace loses its owning thread: keep it enumerable until inheritance
-         * merges it.  Register in zombie_objspaces BEFORE decrementing cnt -- other
+         * merges it.  Register in zombie_objspaces BEFORE decrementing cnt: other
          * Ractors read rb_gc_single_objspace_p lock-free, and the other order opens a
          * cnt==1-no-zombie window where a GC skips shareable pinning and collects
          * objects (a cc, say) reachable only through this objspace. */
@@ -2698,7 +2698,7 @@ move_preflight(VALUE obj, st_table *seen)
       case T_OBJECT:
         break;                       /* children are ivars only (below) */
       case T_MATCH:
-        break;                       /* child = Regexp（shareable）+ String */
+        break;                       /* child = Regexp (shareable) + String */
       case T_ARRAY:
         for (long i = 0; i < RARRAY_LEN(obj); i++) {
             move_preflight(RARRAY_AREF(obj, i), seen);
@@ -2809,7 +2809,7 @@ VALUE
 rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
 {
     /* A hidden Array roots every shell, keeping them alive while the allocations that
-     * build the rest of the graph -- which can start this Ractor's GC -- run. */
+     * build the rest of the graph (which can start this Ractor's GC) run. */
     VALUE shells = rb_ary_hidden_new(c->count);
 
     for (uint32_t i = 0; i < c->count; i++) {
@@ -3063,7 +3063,7 @@ ractor_native_shallow_copy(VALUE obj)
     }
 
     /* A non-T_OBJECT host keeps its ivars in the generic fields table: copy them.
-     * T_HASH is excluded -- rb_hash_dup already ran rb_copy_generic_ivar, and a second
+     * T_HASH is excluded: rb_hash_dup already ran rb_copy_generic_ivar, and a second
      * call asserts in rb_shape_rebuild (the first gave the copy an ivar shape). */
     if (BUILTIN_TYPE(obj) != T_OBJECT && BUILTIN_TYPE(obj) != T_HASH &&
         UNLIKELY(rb_obj_gen_fields_p(obj))) {
@@ -3106,7 +3106,7 @@ copy_enter(VALUE obj, struct obj_traverse_replace_data *data)
         data->replacement = copy;
         /* Collect every node into the pin list as the snapshot is built: the global
          * GC's re-pin must cover all nodes, not just the root (moving one breaks the
-         * address-keyed dedup table).  fields_obj is not included -- the global
+         * address-keyed dedup table).  fields_obj is not included: the global
          * generic_fields table reaches it and compaction updates that. */
         rb_ractor_t *cr = GET_RACTOR();
         if (cr->gen_fields_capturing) {

@@ -232,7 +232,7 @@ struct ractor_basket {
          * not use v. */
         struct rb_ractor_move_courier *move_courier;
         /* Every node of a native copy snapshot, collected while building it (raw
-         * malloc).  The global GC's re-pin walks this list -- traversing the graph
+         * malloc).  The global GC's re-pin walks this list, since traversing the graph
          * in-GC would need generic-ivar lookups.  NULL: only the root (p.v) is pinned. */
         VALUE *pinned;
         size_t pinned_cnt;
@@ -924,7 +924,7 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
 
         /* The value is returned by reference: inherit the dead Ractor's objspace first,
          * making it our own object (containment without a copy).  Wait for
-         * ractor_terminated -- a monitor-port wakeup arrives before the dying thread
+         * ractor_terminated: a monitor-port wakeup arrives before the dying thread
          * finishes teardown (vm_remove_ractor still touches the objspace). */
         while (!rb_ractor_status_p(r, ractor_terminated)) {
             rb_thread_schedule();
@@ -1098,7 +1098,7 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
 
 /* True while this Ractor materializes an arriving copy: the half-built result
  * legitimately points at the sender-resident (pinned) snapshot, so a local GC's
- * verifier must not report containment violations -- and the copy's own allocations can
+ * verifier must not report containment violations, and the copy's own allocations can
  * start that GC. */
 bool
 rb_ractor_materializing_p(void)
@@ -1125,8 +1125,8 @@ ractor_basket_value(struct ractor_basket *b)
          * finishes.  Marshal.load allocates through this Ractor's normal newobj and
          * write-barrier paths.
          *
-         * Rebuilding can raise -- marshal load hooks and autoload run user code and an
-         * async interrupt can arrive anywhere -- and those hooks can run a nested
+         * Rebuilding can raise (marshal load hooks and autoload run user code and an
+         * async interrupt can arrive anywhere), and those hooks can run a nested
          * Ractor.receive.  The frame is pushed on the machine stack and popped under a
          * TAG, so the chain never leaks a dead materialization or drops an outer one. */
         rb_execution_context_t *ec = rb_current_ec_noinline();

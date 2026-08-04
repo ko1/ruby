@@ -1130,7 +1130,7 @@ rb_thread_create_ractor(rb_ractor_t *r, VALUE args, VALUE proc)
         if (multi_objspace) cr->objspace = parent_objspace;
         /* The child's objspace holds the wrappers but is not in vm->ractor.set yet:
          * keep it enumerable until vm_insert_ractor clears this under the VM lock.  One
-         * slot suffices -- the GVL is never released between set and clear and one
+         * slot suffices: the GVL is never released between set and clear and one
          * Ractor creates children serially, so no overwrite (asserted: releasing the
          * GVL here in the future would break it). */
         if (alloc_state == TAG_NONE && multi_objspace) {

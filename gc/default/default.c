@@ -3341,7 +3341,7 @@ objspace_each_objects_try(VALUE arg)
                      * gc_rest, and objects the sweep is about to free are skipped: on an
                      * unswept page unmarked means dead and its shareable bit merely has
                      * not been bulk-cleared yet.  Passing one to the callback would
-                     * resurrect it -- handing out a reference the owner's sweep frees as
+                     * resurrect it, handing out a reference the owner's sweep frees as
                      * soon as the barrier lifts. */
                     const bool page_unswept = is_lazy_sweeping(objspace) && page->flags.before_sweep;
                     int planes = CEILDIV(page->total_slots, BITS_BITLENGTH);
@@ -3453,7 +3453,7 @@ rb_gc_impl_each_objects_shareable(void *objspace_ptr, each_obj_callback *callbac
     };
     /* Not the protected variant: this objspace belongs to another Ractor (the caller
      * holds the barrier).  The protected path calls gc_rest, which would run the owner's
-     * stopped lazy sweep -- its obj_free and dfree -- on the walking thread with the
+     * stopped lazy sweep (its obj_free and dfree) on the walking thread with the
      * walker's Ractor identity (wrong per-Ractor tables, a foreign T_DATA dfree).  The
      * owner is stopped and its page list is stable, and the walk itself skips dead,
      * unswept objects (the shareable_only branch of objspace_each_objects_try).  The
@@ -4845,7 +4845,7 @@ gc_sweep_step(rb_objspace_t *objspace, rb_heap_t *heap)
 #endif
 
     /* Per-slot pinned-free assert (gc_sweep_context): check only when this cycle's mark
-     * ran the pinned walk.  The current world state would misfire -- a single-world
+     * ran the pinned walk.  The current world state would misfire: a single-world
      * cycle leaves dead shareable objects unmarked and its sweep can straddle the switch
      * to multi-objspace.  A global GC's exact mark does not pin, so it is excluded. */
     const unsigned char check_pinned_free = objspace->last_cycle_pinned;
@@ -6061,7 +6061,7 @@ check_generation_i(const VALUE child, void *ptr)
      * shrefs rather than by the remembered set: the pinned walk at the end of a mark
      * re-marks every shareable object (and its shref'd children) each local cycle, and a
      * global GC rebuilds the generation state.  So the generational old->young invariant
-     * does not hold when either endpoint is shareable -- an old constcache, cc_table or
+     * does not hold when either endpoint is shareable: an old constcache, cc_table or
      * interned string pointing at a core class that is young after a global GC is the
      * typical false positive.  That state outlives the return to a single Ractor until
      * the next major (an old shareable singleton class pointing at a young
@@ -6118,7 +6118,7 @@ check_children_i(const VALUE child, void *ptr)
     }
 
     /* The remaining cross-objspace check (verify_pointer_in_any_heap_p) walks every
-     * objspace's pages, sound only with the world stopped -- mid-local-GC other Ractors
+     * objspace's pages, sound only with the world stopped: mid-local-GC other Ractors
      * change page structures concurrently.  The next world-stopped verify re-checks. */
     if (!data->world_stopped) return;
 
@@ -6566,7 +6566,7 @@ gc_verify_internal_consistency(void *objspace_ptr)
     /* Called mid-GC, take neither the VM lock nor the barrier: waiting would join a
      * pending global barrier mid-collection (a GC must never take the VM lock) and let
      * the global GC sweep the heap this mark is walking.  The barrier is unnecessary
-     * anyway -- the objspace is single-writer, this verify runs on its owner thread, and
+     * anyway; the objspace is single-writer, this verify runs on its owner thread, and
      * the global driver that sets during_gc everywhere already holds both. */
     if (during_gc) {
         /* The world is stopped only when the global GC's driver runs this while holding
@@ -6744,7 +6744,7 @@ gc_marks_finish(rb_objspace_t *objspace)
 
     /* Pin the shareable objects and shrefs ordinary marking missed: a local GC must free
      * neither (another objspace may hold them).  Running after the full walk makes the
-     * pin count a retention metric -- an upper bound on the garbage only a global GC can
+     * pin count a retention metric: an upper bound on the garbage only a global GC can
      * reclaim.  A global GC's exact mark does not pin.  (The allrefs comparison of
      * RGENGC_CHECK_MODE >= 4 does not model these pins; it reports false positives.) */
     objspace->last_cycle_pinned = 0;
@@ -7418,7 +7418,7 @@ gc_bitmaps_clear(rb_objspace_t *objspace, rb_heap_t *heap, bool clear_shref)
         memset(&page->marking_bits[0],    0, HEAP_PAGE_BITMAP_SIZE);
         /* A plain memset can lose a concurrent remember, but only a shareable object can
          * be remembered from another Ractor's thread, and pinned_roots_mark re-marks
-         * those every local cycle -- and this clear precedes a major that re-scans all. */
+         * those every local cycle, and this clear precedes a major that re-scans all. */
         memset(&page->remembered_bits[0], 0, HEAP_PAGE_BITMAP_SIZE);
         memset(&page->pinned_bits[0],     0, HEAP_PAGE_BITMAP_SIZE);
         page->flags.has_uncollectible_wb_unprotected_objects = FALSE;
@@ -7869,7 +7869,7 @@ gc_need_global_p(rb_objspace_t *objspace)
 {
     if (rb_gc_single_objspace_p()) return false;
     if (objspace->shareable_objects > objspace->shareable_objects_limit) return true;
-    /* A zombie's garbage only a global cycle reclaims -- but what survived the last one
+    /* A zombie's garbage only a global cycle reclaims, but what survived the last one
      * is live data, so retrigger only once TRIGGER more pages accumulate on top of it.
      * Otherwise one live-heavy unjoined zombie turns every GC stop-the-world forever. */
     {
@@ -7908,7 +7908,7 @@ gc_start_body(rb_objspace_t *objspace, unsigned int reason, bool allow_global)
     if (!rb_darray_size(objspace->heap_pages.sorted)) return TRUE; /* heap is not ready */
     if (!(reason & GPR_FLAG_METHOD) && !ready_to_gc(objspace)) return TRUE; /* GC is not allowed */
 
-    /* Every local GC entry asks whether a global cycle is needed instead -- including the
+    /* Every local GC entry asks whether a global cycle is needed instead, including the
      * allocation slow path, or an allocation-driven workload slips past every threshold
      * (only a global cycle reclaims dead shareable objects and zombie pages).  The
      * exception is the retire GC, which never promotes: a Ractor's death must not STW. */
@@ -8589,7 +8589,7 @@ genfields_mark_i(VALUE key, VALUE val, void *arg)
     if (RB_SPECIAL_CONST_P(val) || !RVALUE_MARKED_BITMAP(key)) {
         return ST_CONTINUE;
     }
-    /* Record the old(key)->young(val) edge with the host (key) as parent -- even when val
+    /* Record the old(key)->young(val) edge with the host (key) as parent, even when val
      * is already marked: a conservative machine-stack scan can mark a fresh fields_obj
      * parentless before this pass, and branching on the mark bit would leave the key
      * unremembered, so the next minor GC misses the young val ("WB miss (O->Y)").
@@ -8793,7 +8793,7 @@ gc_start_global(rb_objspace_t *driver, bool compact)
 
     /* A global GC never calls gc_marks_finish, which budgets heap growth
      * (allocatable_bytes).  An objspace still full after the global sweep (materializing
-     * a large received copy, say) has no free pages, no empty pages, budget 0 -- its next
+     * a large received copy, say) has no free pages, no empty pages, budget 0, and its next
      * allocation would hit newobj_refill's "cannot create a new page after a major GC".
      * Give every objspace stuck like that the growth budget gc_marks_finish would. */
     for (size_t i = 0; i < global_objspace->global_gc.n_objspaces; i++) {
@@ -8867,8 +8867,8 @@ absorb_finalizer_i(st_data_t key, st_data_t val, st_data_t data)
 
 /* Merge a dead Ractor's objspace into dst under the VM lock.  src has no owner thread and
  * dst is the calling thread's own objspace (join/value) or main with everyone stopped
- * (global GC), so single-writer holds throughout.  Pages move whole -- their bits describe
- * objects, not the objspace -- and dst's next collection is forced full to rebuild the
+ * (global GC), so single-writer holds throughout.  Pages move whole (their bits describe
+ * objects, not the objspace), and dst's next collection is forced full to rebuild the
  * generational state. */
 static void
 objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
@@ -8880,8 +8880,8 @@ objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src)
     const bool prev_absorb = global_objspace->during_absorb;
     global_objspace->during_absorb = true;
 
-    /* Settle dst first: adding pages under a walking lazy-sweep cursor -- or into a
-     * half-marked incremental heap -- would sweep the merged pages with src's stale mark
+    /* Settle dst first: adding pages under a walking lazy-sweep cursor, or into a
+     * half-marked incremental heap, would sweep the merged pages with src's stale mark
      * bits and free live objects.  (Normally settled already: vm_insert_ractor0's settle
      * means no objspace is incremental while a zombie waits to be absorbed.) */
     gc_rest(dst);
@@ -9117,7 +9117,7 @@ rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool i
         if (!immediate_sweep) reason &= ~GPR_FLAG_IMMEDIATE_SWEEP;
     }
 
-    /* An explicit full GC.start with multiple objspaces runs a global GC -- the only
+    /* An explicit full GC.start with multiple objspaces runs a global GC, the only
      * collector that reclaims shareable and cross-objspace garbage.  It stops the world,
      * so auto_compact is honoured here too (mirroring full mark x autocompact locally). */
     if (!rb_gc_single_objspace_p() && (reason & GPR_FLAG_FULL_MARK)) {

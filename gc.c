@@ -1963,7 +1963,7 @@ os_obj_of(VALUE of)
     rb_gc_impl_each_objects(rb_gc_get_objspace(), os_obj_of_i, &oes);
 
     /* Phase 2 (multi-Ractor): other live Ractors' shareable objects, readable only
-     * under the barrier -- where a user block must not run -- so collect them in pure C
+     * under the barrier (where a user block must not run), so collect them in pure C
      * with GC disabled and yield after the barrier is released. */
     if (rb_multi_ractor_p()) {
         struct os_shareable_collect_struct ocs;
@@ -2334,7 +2334,7 @@ rb_gc_obj_free_vm_weak_references(VALUE obj)
 
     /* Drop a generic-fields entry when its host's slot is freed.  The table is
      * process-wide, so no sweep bulk-wipes it; a stale entry would let the global GC's
-     * weak pass -- or a reader after the slot is reused -- walk a freed page. */
+     * weak pass (or a reader after the slot is reused) walk a freed page. */
     if (rb_obj_gen_fields_p(obj)) {
         rb_free_generic_ivar(obj);
     }
@@ -3298,7 +3298,7 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     if (global_gc || objspace == vm->ractor.main_ractor->objspace) {
         /* Only the main Ractor can register at_exit/END procs (a non-main one gets an
          * IsolationError), and end_procs is a lock-free linked list, so only main --
-         * the thread that registers -- or a stop-the-world global GC walks it. */
+         * the thread that registers, or a stop-the-world global GC, walks it. */
         MARK_CHECKPOINT("end_proc");
         rb_mark_end_proc();
 
@@ -3936,7 +3936,7 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
 }
 
 /* Merging an ownerless zombie objspace (its Ractor object was collected) into main
- * runs as a postponed job targeted at main, at main's next safepoint -- never inside
+ * runs as a postponed job targeted at main, at main's next safepoint; never inside
  * the GC cycle that discovered the orphan. */
 
 static void gc_orphan_merge_job(void *unused);
@@ -4102,7 +4102,7 @@ rb_gc_vm_refresh_zombie_pages(void)
 }
 
 /* Incremental marking only runs single-objspace; vm_insert_ractor0 calls this just
- * before a second Ractor becomes visible so any cycle in progress finishes -- a settle
+ * before a second Ractor becomes visible so any cycle in progress finishes; a settle
  * cannot resume, nor inheritance extend, another objspace's partial mark. */
 void
 rb_gc_finish_in_flight_gc(void)
@@ -4129,7 +4129,7 @@ rb_gc_reset_absorbed_since_global_gc(void)
 /* True when the process holds exactly one objspace (one live Ractor, no zombies) and
  * nothing was absorbed since the last global GC.  Only then is a local GC the whole
  * world and the multi-objspace guards can be skipped.  The child-creation window (the
- * child objspace exists while cnt is still 1) and both absorb windows -- during (count
+ * child objspace exists while cnt is still 1) and both absorb windows, during (count
  * already decremented, merge unfinished) and after (merged, next global GC pending) --
  * count as multi: treating them as single would let a GC skip guards such as shareable
  * pinning and collect a live cc. */
@@ -4257,7 +4257,7 @@ rb_gc_objspace_absorb_all_zombies(void)
 {
     rb_vm_t *vm = GET_VM();
 
-    /* Entries whose Ractor object is already gone -- the pending merge job itself,
+    /* Entries whose Ractor object is already gone, i.e. the pending merge job itself,
      * which we run synchronously here. */
     objspace_absorb_disowned_zombies();
 
