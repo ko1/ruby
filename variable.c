@@ -67,7 +67,8 @@ static void setup_const_entry(rb_const_entry_t *, VALUE, VALUE, rb_const_flag_t)
 static VALUE rb_const_search(VALUE klass, ID id, int exclude, int recurse, int visibility, VALUE *found_in);
 static st_table *generic_fields_tbl_;
 
-/* Mutex guarding the shared generic_fields table used for shareable objects.  A
+/* Mutex guarding the single global generic_fields table (all hosts, of every
+ * Ractor).  A
  * local GC's marking (rb_mark_generic_ivar) reads that table but cannot wait for the
  * VM lock: joining a barrier mid-mark would expose a half-collected heap.  Hence a
  * dedicated mutex (vm->ractor.generic_fields_lock).  Cleaning the shared table is the

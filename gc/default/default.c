@@ -8014,9 +8014,10 @@ gc_start_body(rb_objspace_t *objspace, unsigned int reason, bool allow_global)
         objspace->flags.during_incremental_marking = do_full_mark;
     }
 
-    /* Explicit compaction (GC.compact).  Moving objects is incompatible with per-Ractor
-     * objspaces (cross-objspace references, the shareable-objects-do-not-move invariant,
-     * page-resident bitmaps), so it only runs with a single objspace. */
+    /* Compaction on the local GC path (autocompact) runs only with a single objspace:
+     * without the stop-the-world barrier, moving objects would break cross-objspace
+     * references.  With multiple objspaces GC.compact and autocompact go through the
+     * compacting global GC instead (rb_gc_impl_start -> gc_start_global). */
     if (do_full_mark && ruby_enable_autocompact && rb_gc_single_objspace_p()) {
         objspace->flags.during_compacting = TRUE;
 #if RGENGC_CHECK_MODE
@@ -11933,9 +11934,9 @@ gc_verify_compaction_references(int argc, VALUE* argv, VALUE self)
 
     rb_objspace_t *objspace = rb_gc_get_objspace();
 
-    /* Compaction does not run with per-Ractor objspaces (see rb_gc_impl_start).  Demote the
-     * whole verification -- heap expansion and the moved-reference walk included -- to a plain
-     * full GC, as GC.compact does. */
+    /* This verification machinery (heap expansion, toward_empty page ordering, the
+     * moved-reference walk) is built for a single objspace, so with several demote it
+     * to a plain full GC.  Plain GC.compact does compact them via the global GC. */
     if (!rb_gc_single_objspace_p()) {
         rb_gc_impl_start(objspace, true, true, true, false);
         return gc_compact_stats(self);

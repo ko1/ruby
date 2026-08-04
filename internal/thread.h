@@ -110,8 +110,7 @@ void rb_ractor_interrupt_exec(struct rb_ractor_struct *target_r,
 void rb_threadptr_interrupt_exec_task_mark(struct rb_thread_struct *th);
 
 /* Mark the roots of the heap objects a thread owns, excluding ec and fiber.  Used by
- * thread_mark and by a Ractor's local-root marking when a local GC finds the thread's wrapper
- * in another objspace. */
+ * thread_mark and by the Ractor's local-root marking (rb_ractor_mark_local_roots). */
 void rb_thread_mark_owned_roots(struct rb_thread_struct *th);
 
 #endif /* INTERNAL_THREAD_H */

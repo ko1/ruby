@@ -555,8 +555,9 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
-  # A copy send's in-flight snapshot must not be moved by GC.compact (the bundled generic-ivar
-  # table and the dedup table are keyed by address; YJIT reproduced this deterministically).
+  # A copy send's in-flight snapshot must not be moved by GC.compact (the global
+  # generic_fields entries and the dedup table are keyed by address; YJIT reproduced this
+  # deterministically).
   def test_copy_genivar_snapshot_survives_compact
     omit 'GC.compact is unimplemented' unless GC.config[:implementation] == 'default'
     assert_ractor(<<~'RUBY', timeout: 60, args: [{ "RUBY_YJIT_ENABLE" => "1" }])

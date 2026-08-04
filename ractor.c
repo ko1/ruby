@@ -268,14 +268,13 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
         ccan_list_for_each(&r->threads.set, th, lt_node) {
             VM_ASSERT(th != NULL);
             rb_gc_mark(th->self);
-            /* Mark the EC directly: in a local GC the Thread wrapper may still live in
-             * another objspace (until it is re-homed) so its mark function does not run
-             * here, but the stack has to stay alive. */
+            /* Mark the EC directly: the stack must stay alive even in windows where
+             * the Thread wrapper's own mark has not been traversed yet (mid-creation,
+             * teardown). */
             if (th->ec) rb_execution_context_mark(th->ec);
 
             /* A thread's ec lives inside the root fiber struct and is freed with that
-             * fiber's wrapper object.  The main thread's wrapper sits in the creating
-             * Ractor's objspace with no other root, so mark the fiber wrapper here. */
+             * fiber's wrapper object, so keep the fiber wrappers alive from here too. */
             if (th->root_fiber) {
                 VALUE root_fiber_self = rb_fiberptr_self(th->root_fiber);
                 if (root_fiber_self) rb_gc_mark(root_fiber_self);
@@ -285,10 +284,8 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
                 if (fiber_self) rb_gc_mark(fiber_self);
             }
 
-            /* If the wrapper lives in another objspace, thread_mark does not run and
-             * the thread's remaining roots become unreachable.  thgroup in particular
-             * lives in this Ractor's objspace with no other root, so a local GC would
-             * free it unless we mark it directly. */
+            /* Root the thread's remaining possessions directly as well; thgroup in
+             * particular has no other root. */
             rb_thread_mark_owned_roots(th);
         }
     }

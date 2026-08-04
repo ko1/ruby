@@ -231,10 +231,10 @@ struct ractor_basket {
         /* The off-heap (xmalloc) courier of a basket_type_move.  A move basket does
          * not use v. */
         struct rb_ractor_move_courier *move_courier;
-        /* Every node of a native copy snapshot plus their fields_obj, collected while
-         * building it (raw malloc).  A global GC's re-pin walks this list, because
-         * traversing the graph during GC would need generic-ivar table lookups.  NULL
-         * means only the root (p.v) is pinned. */
+        /* Every node of a native copy snapshot, collected while building it (raw
+         * malloc).  A global GC's re-pin walks this list, because traversing the graph
+         * during GC would need generic-ivar table lookups.  NULL means only the root
+         * (p.v) is pinned. */
         VALUE *pinned;
         size_t pinned_cnt;
     } p; // payload
@@ -1007,7 +1007,7 @@ ractor_prepare_payload(rb_execution_context_t *ec, VALUE obj, enum ractor_basket
             VALUE snapshot = Qundef;
             /* A native copy can raise (allocation, async interrupt).  Leaving the
              * capturing flag set would fail the next send's assert and leak a stale
-             * capture table into that basket. */
+             * pin_capture list into that basket. */
             enum ruby_tag_type state;
             EC_PUSH_TAG(ec);
             if ((state = EC_EXEC_TAG()) == TAG_NONE) {
@@ -1066,7 +1066,7 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     b->p.pinned = NULL;
     b->p.pinned_cnt = 0;
     if (type == basket_type_copy) {
-        /* Hand the pin list and the map to the basket, moving the re-pin cover from
+        /* Hand the pin list to the basket, moving the re-pin cover from
          * cr->pin_capture to cr->sending_basket with no safepoint in between. */
         rb_ractor_t *cr = rb_ec_ractor_ptr(ec);
         b->p.pinned = cr->pin_capture;

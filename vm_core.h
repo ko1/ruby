@@ -827,10 +827,11 @@ typedef struct rb_vm_struct {
          * the page pool.  Each Ractor owns its own rb_objspace through r->objspace,
          * and the boot objspace belongs to the main Ractor. */
         struct rb_global_objspace *global_objspace;
-        /* Objspaces of Ractors that terminated but have not been inherited yet.
-         * Nobody mutates them, but every global GC has to enumerate them: missing one
-         * leaves stale mark bits, i.e. a use-after-free.  owner_slot is the dead
-         * Ractor's r->objspace, cleared under the VM lock when it is inherited. */
+        /* Objspaces of Ractors that terminated but have not been inherited yet.  No
+         * mutator runs in them; a global GC sweeps them under the barrier (missing one
+         * leaves stale mark bits, i.e. a use-after-free) and inheritance merges them
+         * under the VM lock.  owner_slot is the dead Ractor's r->objspace, cleared
+         * under the VM lock when it is inherited. */
         struct rb_objspace_zombie {
             void *objspace;
             void **owner_slot;

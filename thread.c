@@ -700,9 +700,9 @@ thread_start_func_2(rb_thread_t *th, VALUE *stack_start)
             r->r_stdout = rb_io_prep_stdout();
             r->r_stderr = rb_io_prep_stderr();
 
-            /* The interrupt queue and mask stack were built in the parent's
-             * objspace, so rebuild them out of objects this Ractor owns.  The mask
-             * stack starts empty because inheriting it would reference the parent's
+            /* Left 0 at creation (building them then would put them in the parent's
+             * objspace), so build them here out of objects this Ractor owns.  The mask
+             * stack starts empty: inheriting it would reference the parent's
              * unshareable mask Hash. */
             th->pending_interrupt_queue = rb_ary_hidden_new(0);
             th->pending_interrupt_mask_stack = rb_ary_hidden_new(0);
@@ -920,7 +920,7 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     th->thgroup = current_th->thgroup;
 
     if (th->invoke_type == thread_invoke_type_ractor_proc) {
-        /* The child Ractor's main thread rebuilds this in its own objspace when it
+        /* The child Ractor's main thread builds this in its own objspace when it
          * starts (thread_start_func_2).  Building it here would leave it in the
          * parent's objspace with no root, so the parent's local GC could free it
          * before the child starts and a later mark would touch freed memory.  Leave
@@ -931,7 +931,7 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
         /* Same for the thread group: it lives in the parent Ractor's objspace, and
          * keeping it here would make the child's Thread wrapper point at a foreign
          * unshareable object with no shref, which violates containment.  Leave it 0
-         * (uninitialized) until thread_do_start_proc rebuilds it. */
+         * (uninitialized) until thread_do_start_proc builds it. */
         th->thgroup = 0;
     }
     else {

@@ -3904,9 +3904,9 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     for (const struct ractor_materialize_frame *f = ec->materialize_frames; f != NULL; f = f->prev) {
         rb_gc_mark(f->snapshot);
         if (f->snapshot && !RB_SPECIAL_CONST_P(f->snapshot) && rb_gc_during_global_gc_p()) {
-            /* Every node, not just the root (plus their fields_obj).  If compaction
-             * moved a snapshot node, the address-keyed maps and the dedup table
-             * would break. */
+            /* Every node, not just the root: if compaction moved a snapshot node,
+             * the address-keyed generic_fields entries and the dedup table would
+             * break. */
             rb_gc_pin_in_flight_message(f->snapshot);
             for (size_t i = 0; i < f->pinned_cnt; i++) {
                 rb_gc_pin_in_flight_message(f->pinned[i]);
@@ -3977,9 +3977,8 @@ thread_mark(void *ptr)
     }
 
     /* A live thread wrapper keeps its Ractor object alive (and through its dfree the
-     * rb_ractor_t).  That lets the zombie_objspaces table hold on to a terminating
-     * Ractor by marking the wrapper alone, and an inherited Thread keeps a dead
-     * Ractor alive just as it does upstream. */
+     * rb_ractor_t), so an inherited Thread keeps a dead Ractor alive just as it does
+     * upstream. */
     if (th->ractor) rb_gc_mark(rb_ractor_self(th->ractor));
     if (th->root_fiber) rb_fiber_mark_self(th->root_fiber);
 

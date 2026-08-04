@@ -316,8 +316,9 @@ rb_gc_set_pending_interrupt(void)
 }
 
 /* Schedule an objspace's deferred finalizers.  A global GC sweeps other Ractors'
- * objspaces too, so run what it deferred on the owning Ractor rather than on the
- * sweeping driver; an ownerless zombie's run on its heir after the absorb. */
+ * objspaces too, so target the owning Ractor rather than the sweeping driver.  For an
+ * objspace with no live owner the untargeted fallback is only a wake-up: a zombie's
+ * entries move to the inheriting objspace in the absorb, which re-triggers there. */
 void
 rb_gc_trigger_finalize_deferred(void *objspace, rb_postponed_job_handle_t pjob)
 {
