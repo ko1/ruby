@@ -4590,7 +4590,7 @@ struct global_vm_table_foreach_data {
     struct st_table *gen_fields_current_tbl;
     /* Re-inserting a moved key adds an entry, which can rehash and break the running
      * iterator, so collect them and insert after the walk (raw realloc: we are in GC). */
-    struct gen_fields_deferred_insert { st_data_t k, v; struct st_table *tbl; } *gf_deferred;
+    struct gen_fields_deferred_insert { st_data_t k, v; } *gf_deferred;
     size_t gf_deferred_cnt, gf_deferred_capa;
 };
 
@@ -4712,10 +4712,7 @@ vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
             iter_data->gf_deferred_capa = nc;
         }
         iter_data->gf_deferred[iter_data->gf_deferred_cnt++] =
-            (struct gen_fields_deferred_insert){
-                .k = (st_data_t)new_key, .v = (st_data_t)new_value,
-                .tbl = iter_data->gen_fields_current_tbl,
-            };
+            (struct gen_fields_deferred_insert){ .k = (st_data_t)new_key, .v = (st_data_t)new_value };
     }
     else if (value != new_value) {
         DURING_GC_COULD_MALLOC_REGION_START();
@@ -4833,7 +4830,7 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
             {
                 for (size_t i = 0; i < foreach_data.gf_deferred_cnt; i++) {
                     struct gen_fields_deferred_insert *const d = &foreach_data.gf_deferred[i];
-                    st_insert(d->tbl, d->k, d->v);
+                    st_insert(foreach_data.gen_fields_current_tbl, d->k, d->v);
                 }
             }
             DURING_GC_COULD_MALLOC_REGION_END();
