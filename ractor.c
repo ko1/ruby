@@ -24,6 +24,7 @@
 #include "internal/re.h"
 #include "internal/struct.h"
 #include "internal/st.h"
+#include "internal/string.h"
 #include "internal/thread.h"
 #include "internal/vm.h"
 #include "ruby/encoding.h"
@@ -2422,6 +2423,11 @@ move_neutralize_source(VALUE obj)
      * entry would let the global GC walk a freed value. */
     rb_free_generic_ivar(obj);
 
+    /* A copy-on-write sharer reads its bytes straight out of an embedded root's slot
+     * (String#dup of a frozen string), and it outlives the move, so that body has to
+     * survive as it is. */
+    const bool wipe_body = !(RB_TYPE_P(obj, T_STRING) && rb_str_embedded_shared_root_p(obj));
+
     VALUE flags = T_OBJECT | FL_FREEZE | (RBASIC(obj)->flags & FL_PROMOTED);
     /* Read the slot size before the header is rewritten. */
     size_t slot_size = rb_gc_obj_slot_size(obj);
@@ -2433,7 +2439,9 @@ move_neutralize_source(VALUE obj)
      * C code holding the object from before the move still reads it with its old type
      * (a running Array iteration, the RMatch capa of a $~ entry): a zeroed body makes
      * those reads see an empty object instead of stale internals. */
-    MEMZERO((char *)obj + sizeof(struct RBasic), char, slot_size - sizeof(struct RBasic));
+    if (wipe_body) {
+        MEMZERO((char *)obj + sizeof(struct RBasic), char, slot_size - sizeof(struct RBasic));
+    }
 }
 
 struct move_hash_ctx {
