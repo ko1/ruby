@@ -835,10 +835,9 @@ typedef struct rb_vm_struct {
             void *objspace;
             void **owner_slot;
             /* The Ractor that owns this zombie: it has terminated and left
-             * vm->ractor.set but has not been merged yet.  The global GC's
-             * generic_fields weak pass uses it to walk the owner's per-Ractor table.
-             * NULL for an orphan (its Ractor object was collected), whose table has
-             * already been moved to the main Ractor. */
+             * vm->ractor.set but has not been merged yet.  A root scan uses it to reach
+             * the owner's rb_gc_register_mark_object pins and its join value.  NULL for
+             * an orphan, whose Ractor struct is gone and has neither any more. */
             struct rb_ractor_struct *owner;
             /* Heap pages this zombie holds: measured when it retires and refreshed
              * under the barrier of each global cycle.  The total below stays exactly

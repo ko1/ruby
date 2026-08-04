@@ -4018,9 +4018,9 @@ rb_gc_objspace_retire(void **objspace_slot)
 
     RB_VM_LOCKING() {
         gc_orphan_merge_pjob_ensure();
-        /* owner_slot is always &r->objspace of the retiring Ractor.  owner is recorded
-         * so the global GC's generic_fields weak pass can walk this zombie's per-Ractor
-         * table; rb_gc_objspace_disown clears it when the zombie becomes an orphan. */
+        /* owner_slot is always &r->objspace of the retiring Ractor.  owner is recorded so a
+         * root scan can still reach the dead Ractor's registered_marks pins and its join
+         * value; rb_gc_objspace_disown clears it when the zombie becomes an orphan. */
         struct rb_ractor_struct *owner =
             (struct rb_ractor_struct *)((char *)objspace_slot - offsetof(rb_ractor_t, objspace));
         zombie_objspaces_push(vm, *objspace_slot, objspace_slot, owner);
@@ -4041,8 +4041,8 @@ rb_gc_objspace_disown(void *objspace)
     for (size_t i = 0; i < vm->gc.zombie_objspaces_count; i++) {
         if (vm->gc.zombie_objspaces[i].objspace == objspace) {
             vm->gc.zombie_objspaces[i].owner_slot = NULL;
-            /* The Ractor object is being collected, so drop owner too; ractor_free
-             * already moved its per-Ractor generic_fields table to main. */
+            /* The Ractor struct is being freed, so drop owner too: nothing may read its
+             * registered_marks or join value after this. */
             vm->gc.zombie_objspaces[i].owner = NULL;
             found = true;
             break;
@@ -4585,9 +4585,8 @@ struct global_vm_table_foreach_data {
     vm_table_update_callback_func update_callback;
     void *data;
     bool weak_only;
-    /* generic_fields is split into one shared global table plus a per-Ractor table for
-     * each Ractor, so compaction updates references table by table.  Keep the table
-     * being walked here, so a moved key is re-inserted into the one it belongs to. */
+    /* The generic_fields table being walked, so compaction can re-insert a moved key
+     * into it (rb_generic_fields_tables_foreach hands the table to the callback). */
     struct st_table *gen_fields_current_tbl;
     /* Re-inserting a moved key adds an entry, which can rehash and break the running
      * iterator, so collect them and insert after the walk (raw realloc: we are in GC). */
