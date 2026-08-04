@@ -88,10 +88,9 @@ struct rb_ractor_struct {
     struct rb_ractor_pub pub;
     struct rb_ractor_sync sync;
 
-    /* Objects pinned with rb_gc_register_mark_object are per-Ractor: the owner marks
-     * them (a live one through rb_ractor_mark_local_roots, an unmerged zombie through
-     * the zombie-objspace scan) and a merge moves them to the survivor.  Raw
-     * malloc/realloc/free, so a merge during sweep does not re-enter GC. */
+    /* rb_gc_register_mark_object pins, per Ractor: the owner marks them (live via
+     * rb_ractor_mark_local_roots, unmerged zombie via the zombie scan) and a merge moves
+     * them to the survivor.  Raw malloc, so a merge during sweep cannot re-enter GC. */
     VALUE *registered_marks;
     size_t registered_marks_cnt, registered_marks_capa;
 
@@ -150,12 +149,10 @@ struct rb_ractor_struct {
      * own (while this is NULL). */
     void *objspace;
 
-    /* While a child Ractor is being created its objspace is already populated (the
-     * Thread and Fiber wrappers are born there) but is not yet in vm->ractor.set, so
-     * a whole-VM walk would miss it.  Park the child objspace here for the window
-     * between allocating the wrappers and vm_insert_ractor so the global GC
-     * enumerates it; vm_insert_ractor clears it under the VM lock when the child
-     * joins the set. */
+    /* A child Ractor's objspace is populated (Thread/Fiber wrappers) before it joins
+     * vm->ractor.set, so a whole-VM walk would miss it.  Park it here from wrapper
+     * allocation until vm_insert_ractor clears it (under the VM lock) so the global GC
+     * still enumerates it. */
     void *creating_child_objspace;
 
     /* True while Ractor#send builds a native copy snapshot; copy_enter then collects

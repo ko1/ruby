@@ -517,10 +517,9 @@ vm_env_write_slowpath(const VALUE *ep, int index, VALUE v)
     const VALUE envval = VM_ENV_ENVVAL(ep);
 
     if (RB_FL_TEST_RAW(envval, RUBY_FL_SHAREABLE)) {
-        /* Writing to a SHAREABLE env (an isolated proc) creates a shareable ->
-         * unshareable edge when v is unshareable.  Only a full barrier sets the
-         * shref bit that keeps v alive through its owner's local GC.  WB_REQUIRED
-         * stays set, since later writes need the barrier too. */
+        /* Writing to a SHAREABLE env (an isolated proc) can create a shareable ->
+         * unshareable edge; only a full barrier sets the shref bit keeping v alive
+         * through its owner's local GC.  WB_REQUIRED stays: later writes need it too. */
         if (!SPECIAL_CONST_P(v)) {
             rb_gc_writebarrier(envval, v);
         }
@@ -596,10 +595,9 @@ vm_svar_valid_p(VALUE svar)
 }
 #endif
 
-/* Should this frame's special variables live in the env's svar slot?  A SHAREABLE
- * env (an isolated proc) can run in several Ractors at once, which would make svar
- * mutable state shared between them: it could hold foreign objects and leak $~/$_
- * across Ractors.  Keep them per-EC instead. */
+/* Should this frame's special variables live in the env's svar slot?  A SHAREABLE env
+ * (isolated proc) can run in several Ractors at once, making svar shared mutable state
+ * leaking $~/$_ across Ractors: keep them per-EC instead. */
 static inline bool
 lep_svar_in_env_p(const rb_execution_context_t *ec, const VALUE *lep)
 {

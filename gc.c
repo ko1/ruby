@@ -1918,10 +1918,9 @@ os_obj_of_i(void *vstart, void *vend, size_t stride, void *data)
     return 0;
 }
 
-/* Like os_obj_of_i but collects into an array instead of yielding, because another
- * Ractor's shareable objects are walked under the barrier where yielding is unsafe
- * (see os_obj_of).  Pure C that allocates no object -- rb_ary_push only grows the
- * buffer -- so it reaches no safepoint. */
+/* Like os_obj_of_i but collects into an array: foreign shareable objects are walked
+ * under the barrier, where yielding is unsafe (see os_obj_of).  Pure C, allocates no
+ * object (rb_ary_push only grows the buffer), so it reaches no safepoint. */
 struct os_shareable_collect_struct {
     VALUE of;
     VALUE buffer;
@@ -1963,10 +1962,9 @@ os_obj_of(VALUE of)
      * concurrently, so no VM lock is needed and the block may allocate, GC or block. */
     rb_gc_impl_each_objects(rb_gc_get_objspace(), os_obj_of_i, &oes);
 
-    /* Phase 2 (multi-Ractor): the shareable objects other live Ractors own.  They are
-     * only readable while the barrier is held, and running a user block under the
-     * barrier would break VM locking or deadlock, so collect them in pure C with GC
-     * disabled and yield after the barrier is released. */
+    /* Phase 2 (multi-Ractor): other live Ractors' shareable objects, readable only
+     * under the barrier -- where a user block must not run -- so collect them in pure C
+     * with GC disabled and yield after the barrier is released. */
     if (rb_multi_ractor_p()) {
         struct os_shareable_collect_struct ocs;
         ocs.of = of;
@@ -3232,10 +3230,9 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     const bool global_gc = rb_gc_impl_during_global_gc_p(objspace) ||
                            !rb_gc_impl_multi_objspace_p();
 
-    /* Mark the current Ractor's own roots from its C structs: a local GC cannot rely
-     * on the heap Ractor/Thread wrappers, which may live in another objspace.  A global
-     * GC does the same for every Ractor and re-pins the in-flight payloads whose shrefs
-     * the clear pass dropped. */
+    /* Mark the current Ractor's roots from its C structs (a local GC must not depend on
+     * heap wrapper traversal).  A global GC does the same for every Ractor and re-pins
+     * the in-flight payloads whose shrefs its clear pass dropped. */
     MARK_CHECKPOINT("ractor");
     if (global_gc) {
         rb_ractor_t *r;
@@ -3263,10 +3260,9 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
             }
         }
 
-        /* Single-objspace impl: keep the rb_gc_register_mark_object entries of Ractors
-         * that terminated before ractor_free alive without depending on wrapper
-         * reachability.  With multiple objspaces zombie_objspaces does this and the
-         * list stays empty. */
+        /* Single-objspace impl: keep terminated-but-not-freed Ractors'
+         * rb_gc_register_mark_object entries alive without depending on wrapper
+         * reachability.  With multiple objspaces zombie_objspaces covers this. */
         if (!rb_gc_impl_multi_objspace_p()) {
             rb_ractor_t *tr;
             rb_native_mutex_lock(&vm->gc.registered_globals.lock);
@@ -3281,10 +3277,9 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
         rb_ractor_mark_local_roots(rb_ec_ractor_ptr(ec));
     }
 
-    /* rb_gc_register_address slots live in one VM-wide list.  *addr can later hold a
-     * value from another objspace, so it is not split per Ractor: every Ractor's GC
-     * scans all of them conservatively, marking only its own and leaving the rest to
-     * their owners. */
+    /* rb_gc_register_address slots live in one VM-wide list: *addr can later hold
+     * another objspace's value, so every Ractor's GC scans all slots conservatively,
+     * marking only its own residents. */
     MARK_CHECKPOINT("registered_globals");
     rb_native_mutex_lock(&vm->gc.registered_globals.lock);
     for (size_t i = 0; i < vm->gc.registered_globals.addrs_cnt; i++) {
@@ -3292,10 +3287,9 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
     }
     rb_native_mutex_unlock(&vm->gc.registered_globals.lock);
 
-    /* A non-main Ractor's String trap handlers also live in the VM-global
-     * vm->trap_list.cmd[].  It is a fixed array of aligned VALUEs (signal.c uses
-     * ACCESS_ONCE), so no lock is needed: a racing walk reads either the old or the new
-     * handler, and both are alive. */
+    /* Trap handlers live in the VM-global vm->trap_list.cmd[], a fixed array of aligned
+     * VALUEs (signal.c uses ACCESS_ONCE): a racing walk reads either the old or the new
+     * handler, both alive, so no lock. */
     MARK_CHECKPOINT("trap_list");
     rb_gc_mark_values(RUBY_NSIG, vm->trap_list.cmd);
 
@@ -3319,10 +3313,9 @@ rb_gc_mark_roots(void *objspace, const char **categoryp)
         if (vm_mark_needs_lock) RB_GC_VM_UNLOCK_NO_BARRIER(vm_mark_lock_lev);
 
         if (global_gc) {
-            /* Mark and pin the shareable REFs an in-flight (off-heap) move courier
-             * carries, closing the window where one is transient between the queue and
-             * a materialize frame.  Only a global GC frees a shareable object, so only
-             * it needs this pass. */
+            /* Mark and pin the shareable REFs of in-flight (off-heap) move couriers,
+             * covering the transient window between queue and materialize frame.  Only
+             * a global GC frees shareable objects, so only it needs this pass. */
             MARK_CHECKPOINT("move_couriers");
             void rb_ractor_move_courier_registry_mark(void);
             rb_ractor_move_courier_registry_mark();
@@ -3901,10 +3894,9 @@ rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *
         rb_gc_impl_each_objects(self, callback, data);
 
         /* Like upstream, cover every object in the process: walk the other live
-         * Ractors' objspaces too, skipping ones being created or already zombies.  The
-         * callback is pure C and must not yield, and the whole walk runs under the VM
-         * lock and the barrier.  A stopped lazy sweep in another objspace is not
-         * settled but skipped by the walk. */
+         * Ractors' objspaces too, under the VM lock and barrier, with a pure-C callback.
+         * A foreign objspace's stopped lazy sweep is not settled; the walk skips its
+         * dead objects. */
         rb_vm_t *vm = GET_VM();
         rb_ractor_t *r;
         ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
@@ -3917,10 +3909,9 @@ rb_objspace_each_objects(int (*callback)(void *, void *, size_t, void *), void *
 
 
 
-/* Enumerate every objspace in the process: those of live Ractors and the zombies of
- * terminated ones not yet inherited.  Callers must hold the VM lock, and reading
- * another objspace also needs the barrier.  Missing even one leaves stale mark bits
- * behind for the global GC. */
+/* Enumerate every objspace: live Ractors' plus uninherited zombies.  Callers hold the
+ * VM lock (reading another objspace also needs the barrier).  Missing even one leaves
+ * stale mark bits behind for the global GC. */
 void
 rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
 {
@@ -3932,10 +3923,9 @@ rb_gc_vm_each_objspace(void (*func)(void *objspace, void *data), void *data)
         if (r->objspace) {
             func(r->objspace, data);
         }
-        /* A child being created is not in the set yet, but its objspace already holds
-         * the Thread and Fiber wrappers.  Enumerate it through its creator so a global
-         * GC (a concurrent GC.compact, say) cannot miss it and keep marking into an
-         * objspace it never cleared. */
+        /* A child being created is not in the set yet but its objspace already holds
+         * the Thread/Fiber wrappers; enumerate it through its creator so a global GC
+         * cannot miss it and mark into an objspace it never cleared. */
         if (r->creating_child_objspace) {
             func(r->creating_child_objspace, data);
         }
@@ -4028,10 +4018,9 @@ rb_gc_objspace_retire(void **objspace_slot)
     }
 }
 
-/* The Ractor object owning this objspace was collected, so nobody can join it any
- * more: drop the owner slot in zombie_objspaces and hand the merge to the main Ractor.
- * Called from ractor_free, i.e. from inside a sweep, so the accounting allocator is
- * unavailable -- but the table itself is stable. */
+/* The owning Ractor object was collected, so nobody can join any more: drop the owner
+ * slot in zombie_objspaces and hand the merge to main.  Called from ractor_free (inside
+ * a sweep), where the accounting allocator is unavailable; the table itself is stable. */
 void
 rb_gc_objspace_disown(void *objspace)
 {
@@ -4082,10 +4071,9 @@ rb_gc_vm_forget_zombie(void *objspace)
     }
 }
 
-/* Total zombie pages, used to decide whether to start a global GC.  It is an upper
- * bound between global cycles and each cycle re-measures it under the barrier, so a
- * stale value cannot re-trigger.  A deciding local GC may read it without the lock:
- * at worst it fires one cycle early or late. */
+/* Total zombie pages, deciding whether to start a global GC.  An upper bound between
+ * global cycles (each re-measures under the barrier), so a stale value cannot
+ * re-trigger; a lock-free read at worst fires one cycle early or late. */
 size_t
 rb_gc_vm_zombie_total_pages(void)
 {
@@ -4113,10 +4101,9 @@ rb_gc_vm_refresh_zombie_pages(void)
     vm->gc.zombie_total_pages = total;
 }
 
-/* Incremental marking only runs in a single-objspace world.  vm_insert_ractor0 calls
- * this just before a second Ractor becomes visible, so the only objspace finishes any
- * cycle in progress: a settle cannot resume another objspace's partial mark, and
- * inheritance cannot extend a half-finished one. */
+/* Incremental marking only runs single-objspace; vm_insert_ractor0 calls this just
+ * before a second Ractor becomes visible so any cycle in progress finishes -- a settle
+ * cannot resume, nor inheritance extend, another objspace's partial mark. */
 void
 rb_gc_finish_in_flight_gc(void)
 {
@@ -4128,10 +4115,9 @@ rb_gc_finish_in_flight_gc(void)
  * the process looks single-objspace. */
 static int gc_absorbing_zombie = 0;
 
-/* True once a zombie objspace has been absorbed since the last global GC.  Until the
- * unified mark runs, a single-objspace local mark can miss absorbed shareable objects
- * (a cc reached through a class's cc_table, say), so stop treating the process as
- * single until then; a finished global GC clears this. */
+/* True once a zombie objspace was absorbed since the last global GC: until the unified
+ * mark runs, a single-objspace local mark can miss absorbed shareable objects (a cc in
+ * a class's cc_table, say), so stop treating the process as single until then. */
 static bool gc_absorbed_since_global_gc = false;
 
 void
@@ -4174,10 +4160,9 @@ rb_gc_single_objspace_p(void)
             vm->ractor.main_ractor->creating_child_objspace == NULL);
 }
 
-/* Inherit a dead Ractor's objspace into the calling Ractor.  It goes through the owner
- * slot, so clearing the slot and releasing the objspace happen in one VM-lock section.
- * The merge itself runs with the inheritor's GC disabled, since moving the finalizer st
- * table can otherwise trigger that GC. */
+/* Inherit a dead Ractor's objspace into the calling Ractor.  Going through the owner
+ * slot clears it and releases the objspace in one VM-lock section; the merge runs with
+ * the inheritor's GC disabled (moving the finalizer st table could trigger it). */
 static void
 objspace_absorb_merge(void *dst, void *src)
 {
@@ -4218,10 +4203,9 @@ objspace_absorb_disowned_zombies(void)
         while (i < vm->gc.zombie_objspaces_count) {
             if (vm->gc.zombie_objspaces[i].owner_slot == NULL) {
                 void *zombie = vm->gc.zombie_objspaces[i].objspace;
-                /* Remove it with forget, which also subtracts the entry's pages from
-                 * zombie_total_pages.  A hand-written swap-remove would leave the pages
-                 * counted, and the phantom total would keep starting stop-the-world
-                 * global cycles. */
+                /* Remove via forget, which also subtracts the entry's pages from
+                 * zombie_total_pages; a hand-written swap-remove would leave a phantom
+                 * total that keeps starting stop-the-world global cycles. */
                 gc_absorbing_zombie++;
                 rb_gc_vm_forget_zombie(zombie);
                 objspace_absorb_merge(rb_gc_get_objspace(), zombie);
@@ -4265,10 +4249,9 @@ rb_gc_zombie_objspaces_atfork(void)
     }
 }
 
-/* Called at VM teardown, right after every other Ractor was killed, to merge all
- * uninherited objspaces into main.  The existing at-exit processing then covers every
- * object and a dead Ractor's deferred finalizers run on main.  Going through the owner
- * slot also neutralizes already-collected Ractor objects. */
+/* VM teardown, right after every other Ractor was killed: merge all uninherited
+ * objspaces into main so at-exit processing covers every object and dead Ractors'
+ * deferred finalizers run on main.  The owner slot also covers collected wrappers. */
 void
 rb_gc_objspace_absorb_all_zombies(void)
 {
@@ -4888,10 +4871,9 @@ gf_drain_i(st_data_t key, st_data_t val, st_data_t data)
 {
     struct gf_drain_ctx *ctx = (struct gf_drain_ctx *)data;
     if (ctx->is_dead((VALUE)key)) {
-        /* The weak pass only drains: it removes a dead key's entry and never touches
-         * the key itself.  Once the global GC settled another objspace's lazy sweep the
-         * key may already be freed (its slot poisoned), and writing a shape there would
-         * be a use-after-poison. */
+        /* The weak pass only drains dead keys' entries, never touching the key itself:
+         * after the global GC settled another objspace's lazy sweep the key may already
+         * be freed (poisoned), and writing a shape there would be a use-after-poison. */
         return ST_DELETE;
     }
     return ST_CONTINUE;
@@ -6383,10 +6365,10 @@ check_shareable_i(const VALUE child, void *ptr)
     struct check_shareable_data *data = (struct check_shareable_data *)ptr;
 
     if (!rb_gc_obj_shareable_p(child)) {
-        /* A shareable object may reference an unshareable one only when the write
-         * barrier recorded that edge in the target's shref bit, which keeps the target
-         * alive past its owner's local GC.  Exceptions treated as roots (Ractor private
-         * fields, cref, JIT) are hidden while checking_shareable is set. */
+        /* A shareable object may reference an unshareable one only if the write barrier
+         * recorded the edge in the target's shref bit (keeping it alive past its owner's
+         * local GC).  Root-like exceptions (Ractor private fields, cref, JIT) are hidden
+         * while checking_shareable is set. */
         if (rb_gc_impl_shref_marked_p(rb_gc_get_objspace(), child)) {
             return;
         }

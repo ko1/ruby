@@ -129,11 +129,10 @@ update_global_event_hooks(rb_hook_list_t *list, rb_event_flag_t prev_events, rb_
     rb_execution_context_t *ec = rb_current_execution_context(false);
     unsigned int lev;
 
-    // Take the VM lock only when there is a current Ractor.  ec is NULL in MMTk's hook-list
-    // free, and a global GC's sweep frees a dead Ractor's hook list with GET_RACTOR() == NULL,
-    // where locking is both unsafe (NULL deref) and unnecessary (the barrier is already held).
-    // During VM destruct's free-at-exit walk the thread structs are freed first, so
-    // GET_RACTOR()'s ec->thread_ptr read would be a UAF; that walk is single-threaded anyway.
+    // Lock only with a current Ractor.  ec is NULL in MMTk's hook-list free; a global
+    // GC's sweep frees dead Ractors' hook lists with GET_RACTOR() == NULL (locking =
+    // NULL deref, and the barrier already excludes); in VM destruct's free-at-exit walk
+    // the thread structs are freed first (GET_RACTOR() = UAF) and it is single-threaded.
     const bool vm_locked_here = ec && !ruby_vm_during_cleanup && GET_RACTOR() != NULL;
     if (vm_locked_here) {
         RB_VM_LOCK_ENTER_LEV(&lev);

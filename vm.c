@@ -338,11 +338,10 @@ vm_cref_new0(VALUE klass, rb_method_visibility_t visi, int module_func, rb_cref_
     VM_ASSERT(singleton || klass);
 
     rb_cref_t *cref = SHAREABLE_IMEMO_NEW(rb_cref_t, imemo_cref, refinements);
-    /* A cref is born shareable, so children that may be unshareable (a singleton
-     * cref's self, the refinements hash of `using`) go through the write barrier to
-     * record a shref.  A plain store would let the owner's local GC collect the
-     * child and leave the pinned cref dangling.  next is always a cref (shareable),
-     * so a plain store is fine there. */
+    /* A cref is born shareable, so possibly-unshareable children (a singleton cref's
+     * self, `using`'s refinements hash) go through the write barrier to record a shref;
+     * a plain store would let the owner's local GC collect the child under the pinned
+     * cref.  next is always a cref (shareable): plain store. */
     if (!SPECIAL_CONST_P(refinements)) RB_OBJ_WRITTEN(cref, Qundef, refinements);
     if (klass) {
         RB_OBJ_WRITE(cref, &cref->klass_or_self, klass);
@@ -3896,11 +3895,10 @@ rb_execution_context_mark(const rb_execution_context_t *ec)
     rb_gc_mark(ec->local_storage_recursive_hash_for_trace);
     rb_gc_mark(ec->private_const_reference);
 
-    /* Snapshots of copy receives being materialized.  They already left the queue,
-     * so this is their only root.  A snapshot lives in the sender's objspace, so our
-     * local GC skips it as foreign; the global GC marks it and re-pins its shrefs
-     * (step 5 clears every shref).  Move couriers are not handled here: the
-     * in-flight registry marks and pins them as a global GC root (ractor.c). */
+    /* Snapshots of copy receives being materialized; off the queue, this is their only
+     * root.  A snapshot is sender-resident, skipped as foreign by our local GC; the
+     * global GC marks it and re-pins its shrefs (its clear pass dropped all).  Move
+     * couriers are covered by the in-flight registry instead (ractor.c). */
     for (const struct ractor_materialize_frame *f = ec->materialize_frames; f != NULL; f = f->prev) {
         rb_gc_mark(f->snapshot);
         if (f->snapshot && !RB_SPECIAL_CONST_P(f->snapshot) && rb_gc_during_global_gc_p()) {
@@ -4865,10 +4863,9 @@ rb_vm_register_global_object(VALUE obj)
       default:
         break;
     }
-    /* Register in the current Ractor's own pin list (a raw array).  No lock is
-     * needed: only the owner appends, and only the owner's GC marks it (its threads
-     * are stopped during that GC).  The merge that inherits a list runs under the
-     * global GC's stop-the-world. */
+    /* Register in the current Ractor's own pin list (a raw array).  No lock: only the
+     * owner appends and only the owner's GC marks it; the merge that inherits a list
+     * runs stop-the-world. */
     rb_ractor_t *cr = GET_RACTOR();
     if (cr->registered_marks_cnt == cr->registered_marks_capa) {
         size_t nc = cr->registered_marks_capa ? cr->registered_marks_capa * 2 : 64;

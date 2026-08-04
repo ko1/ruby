@@ -232,9 +232,8 @@ struct ractor_basket {
          * not use v. */
         struct rb_ractor_move_courier *move_courier;
         /* Every node of a native copy snapshot, collected while building it (raw
-         * malloc).  A global GC's re-pin walks this list, because traversing the graph
-         * during GC would need generic-ivar table lookups.  NULL means only the root
-         * (p.v) is pinned. */
+         * malloc).  The global GC's re-pin walks this list -- traversing the graph
+         * in-GC would need generic-ivar lookups.  NULL: only the root (p.v) is pinned. */
         VALUE *pinned;
         size_t pinned_cnt;
     } p; // payload
@@ -718,10 +717,9 @@ ractor_sync_mark(rb_ractor_t *r)
      * as one aligned word, so any GC can read it safely. */
     rb_gc_mark(r->sync.default_port_value);
 
-    /* The owner rewrites these under its sync lock, so a lock-free foreign mark could
-     * read them torn; their contents are foreign to this marker anyway and stay alive
-     * through the sender's in-flight pin or a shareable pin.  Walk them only with no
-     * concurrent owner: our own Ractor, or under the global GC's barrier. */
+    /* The owner rewrites these under its sync lock: a lock-free foreign mark could read
+     * them torn (their contents stay alive via in-flight or shareable pins anyway).
+     * Walk only with no concurrent owner: our own Ractor, or under the barrier. */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (r == cr || rb_gc_during_global_gc_p()) {
         /* (A copy snapshot being materialized is not marked here: each EC's frame
@@ -731,10 +729,10 @@ ractor_sync_mark(rb_ractor_t *r)
         rb_gc_mark(r->sync.legacy);
 
         if (r->sync.ports) {
-            /* Foreign senders write recv_queue and the port table under r's sync
-             * lock, so our own concurrent local GC must take it to exclude them.  It
-             * cannot self-deadlock: malloc-triggered GC is disabled while any Ractor
-             * lock is held.  Under a global GC every sender is stopped. */
+            /* Foreign senders write recv_queue and the port table under r's sync lock,
+             * so our own local GC takes it to exclude them (no self-deadlock:
+             * malloc-triggered GC is disabled while any Ractor lock is held).  Under a
+             * global GC every sender is stopped. */
             bool lock_against_senders = (r == cr) && !rb_gc_during_global_gc_p();
             if (lock_against_senders) RACTOR_LOCK(r);
             ractor_queue_mark(r->sync.recv_queue);
@@ -924,11 +922,10 @@ ractor_value(rb_execution_context_t *ec, VALUE self)
             rb_raise(rb_eRactorError, "The value was already taken");
         }
 
-        /* The value is returned by reference, so inherit the dead Ractor's objspace
-         * first: after the merge it is our own object and containment holds without a
-         * copy.  Wait for the terminated state, since a monitor-port wakeup happens
-         * before the dying thread finishes teardown (vm_remove_ractor still touches
-         * the objspace) and that state is set under the VM lock afterwards. */
+        /* The value is returned by reference: inherit the dead Ractor's objspace first,
+         * making it our own object (containment without a copy).  Wait for
+         * ractor_terminated -- a monitor-port wakeup arrives before the dying thread
+         * finishes teardown (vm_remove_ractor still touches the objspace). */
         while (!rb_ractor_status_p(r, ractor_terminated)) {
             rb_thread_schedule();
         }
@@ -1048,10 +1045,9 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     }
     else {
         v = ractor_prepare_payload(ec, obj, &type, &marshaled);
-        /* copy_enter pinned every node at construction, with cr->pin_capture as the
-         * re-pin source.  Hand it to the basket only after basket_alloc (which may
-         * GC), so the cover never lapses; a marshaled String is pinned here instead,
-         * since no walk reaches it. */
+        /* copy_enter pinned every node at construction with cr->pin_capture as the
+         * re-pin source; hand it to the basket only after basket_alloc (which may GC)
+         * so the cover never lapses.  A marshaled String is pinned here instead. */
         if (type == basket_type_copy && marshaled) {
             rb_gc_pin_in_flight_message(v);
         }
@@ -1079,10 +1075,10 @@ ractor_basket_new(rb_execution_context_t *ec, VALUE obj, enum ractor_basket_type
     return b;
 }
 
-/* True while this Ractor materializes an arriving copy (ractor_basket_value ->
- * ractor_copy_native_try).  In that window the half-built result legitimately points
- * at the sender-resident (pinned) snapshot, so a local GC's verifier must not report a
- * containment violation -- and the copy's own allocations can start that GC. */
+/* True while this Ractor materializes an arriving copy: the half-built result
+ * legitimately points at the sender-resident (pinned) snapshot, so a local GC's
+ * verifier must not report containment violations -- and the copy's own allocations can
+ * start that GC. */
 bool
 rb_ractor_materializing_p(void)
 {
@@ -1135,11 +1131,10 @@ ractor_basket_value(struct ractor_basket *b)
         EC_POP_TAG();
         ec->materialize_frames = frame.prev;
         cr->sync.materializing_copies--;
-        /* rb_copy_generic_ivar left the sender's snapshot host and fields_obj (both
-         * sender-resident) in this EC's gen_fields_cache.  The snapshot is garbage on
-         * the sender now, so once the receiver allocates a new object at that address a
-         * stale cache hit would deref a freed foreign fields_obj.  Invalidate it (the
-         * raise path resets it the same way). */
+        /* rb_copy_generic_ivar left the sender-resident snapshot host and fields_obj in
+         * this EC's gen_fields_cache; the snapshot is garbage on the sender now, and a
+         * stale cache hit on a reused address would deref a freed foreign fields_obj.
+         * Invalidate (the raise path resets it the same way). */
         ec->gen_fields_cache.obj = Qundef;
         ec->gen_fields_cache.fields_obj = Qundef;
         if (state != TAG_NONE) {
@@ -1166,11 +1161,10 @@ ractor_basket_value(struct ractor_basket *b)
          * courier is still owned by the basket, whose teardown frees it. */
         rb_execution_context_t *ec = rb_current_ec_noinline();
         struct rb_ractor_move_courier *courier = b->p.move_courier;
-        /* Keep the materialized graph on the machine stack (result) for the rest of
-         * this function: it is the only root until it reaches the caller's stack.
-         * rb_ractor_move_courier_free runs a long loop right below, so leaving the
-         * graph only in the malloc'd basket's p.v would open a wide window for a
-         * concurrent global GC to collect it. */
+        /* Keep the materialized graph on the machine stack (result): it is the only
+         * root until it reaches the caller.  courier_free below runs a long loop, and
+         * only the malloc'd basket's p.v holding it would give a concurrent global GC a
+         * wide window. */
         VALUE result = Qundef;
         enum ruby_tag_type state;
         EC_PUSH_TAG(ec);

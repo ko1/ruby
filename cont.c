@@ -889,12 +889,11 @@ fiber_pool_stack_release(struct fiber_pool_stack * stack)
 
     if (DEBUG) fprintf(stderr, "fiber_pool_stack_release: %p used=%"PRIuSIZE"\n", stack->base, stack->pool->used);
 
-    /* Serialize pool access against another Ractor's acquire: a per-Ractor GC sweep
-     * can free a fiber without the VM lock.  Releases are rare, so take the lock
-     * NO_BARRIER and never join a forming global barrier.  During the free-at-exit
-     * walk of VM destruct no lock is needed: a single thread runs and the thread
-     * structs are already freed (vm_locked would deref the current Ractor and use
-     * freed memory). */
+    /* Serialize pool access against other Ractors' acquires: a per-Ractor GC sweep can
+     * free a fiber without the VM lock.  Releases are rare, so take it NO_BARRIER,
+     * never joining a forming global barrier.  VM destruct's free-at-exit walk takes no
+     * lock: single-threaded, and the thread structs are already freed (vm_locked would
+     * deref the current Ractor = freed memory). */
     unsigned int lev = 0;
     const bool lock_here = !ruby_vm_during_cleanup;
     if (lock_here) RB_VM_LOCK_ENTER_LEV_NB(&lev);

@@ -251,10 +251,9 @@ ractor_mark_unshareable_parts(rb_ractor_t *r)
     // mark the received messages (the structures the owner mutates guard themselves)
     ractor_sync_mark(r);
 
-    /* Below are structures the owner mutates while running (a thread, EC or fiber can
-     * also be freed concurrently).  Only the root scan calls this: a local GC for
-     * itself, a global GC for the whole set under the barrier.  A terminated Ractor has
-     * left the set and is covered by zombie_objspaces instead. */
+    /* Structures the owner mutates while running follow.  Only the root scan calls
+     * this: a local GC for itself, a global GC for the whole set under the barrier.  A
+     * terminated Ractor has left the set; zombie_objspaces covers it instead. */
     VM_ASSERT(r == rb_current_ractor_raw(false) || rb_gc_during_global_gc_p());
     VM_ASSERT(!rb_ractor_status_p(r, ractor_terminated));
 
@@ -298,23 +297,18 @@ ractor_mark(void *ptr)
 {
     rb_ractor_t *r = (rb_ractor_t *)ptr;
 
-    /* Only the wrapper's direct references.  Unshareable roots are marked by the root
-     * scan (rb_ractor_mark_local_roots) of the owner's local GC and of the global GC;
-     * a terminated Ractor is covered by zombie_objspaces.  Following an unshareable
-     * object from a shareable wrapper would break the shref rule, so it is not done
-     * here -- the root scan covers inter-Ractor values instead. */
+    /* Only the wrapper's direct references: following an unshareable object from the
+     * shareable wrapper would break the shref rule.  Unshareable roots are marked by the
+     * root scan (rb_ractor_mark_local_roots); zombie_objspaces covers the terminated. */
     rb_gc_mark(r->loc);
     rb_gc_mark(r->name);
-    /* The default port is shareable, so following it here does not break the shref
-     * rule.  Other Ractors still use it for send and value after termination, so keep it
-     * alive as long as the wrapper is.  A terminated Ractor can drop out of the root
-     * scan of the set and of zombie_objspaces (once its objspace was orphan-merged), and
-     * then the wrapper's marker is the only cover left. */
+    /* The default port is shareable, so following it breaks no rule.  Other Ractors
+     * still send/value through it after termination, and once a terminated Ractor left
+     * both the set and zombie_objspaces (orphan-merged) this marker is its only cover. */
     rb_gc_mark(r->sync.default_port_value);
-    /* A single-objspace impl (mmtk) has no zombie_objspaces and no pin or shref bits,
-     * so the root scan cannot reach a terminated Ractor's legacy value, queue or
-     * in-flight payloads.  It has no shref rule either, so follow them from the
-     * wrapper. */
+    /* A single-objspace impl (mmtk) has no zombie_objspaces and no pin/shref bits, so
+     * the root scan cannot reach a terminated Ractor's legacy value, queue or in-flight
+     * payloads -- and no shref rule forbids following them from the wrapper. */
     if (!rb_gc_multi_objspace_p()) {
         ractor_mark_unshareable_parts(r);
         rb_ractor_mark_in_flight_for_single_objspace(r);
@@ -338,10 +332,9 @@ rb_ractor_mark_local_roots(rb_ractor_t *r)
 
 }
 
-/* Mark and pin the return value (legacy) of a terminated Ractor that is not freed yet;
- * the global GC calls this from zombie_objspaces.  The pin is required because
- * compaction does not update C-struct references.  The default port is already covered
- * by the mutual wrapper/port marking: if both are unreachable, nobody can read it. */
+/* Mark and pin a terminated, unfreed Ractor's return value (legacy); the global GC
+ * calls this via zombie_objspaces.  Pinned because compaction does not update C-struct
+ * slots.  The default port is covered by the mutual wrapper/port marking instead. */
 void
 rb_ractor_mark_terminated_join_value(rb_ractor_t *r)
 {
@@ -409,10 +402,10 @@ ractor_free(void *ptr)
         r->newobj_cache = NULL;
     }
 
-    /* A Ractor that died unjoined: its handle is gone and nobody can inherit it.  We
-     * are in a sweep under the global GC barrier, so release the zombie_objspaces entry
-     * and hand the merge to main as a postponed job.  main itself arrives through the
-     * free-at-exit walk, so leave it and its objspace alone (VM destruct frees it). */
+    /* Died unjoined and the handle is collected: nobody can inherit it.  We are in a
+     * sweep under the global GC barrier, so disown the zombie_objspaces entry and post
+     * the merge to main.  main itself only gets here in the free-at-exit walk: leave it
+     * and its objspace to VM destruct. */
     if (r->objspace && !r->main_ractor) {
         rb_gc_objspace_disown(r->objspace);
         r->objspace = NULL;
@@ -573,10 +566,9 @@ vm_insert_ractor(rb_vm_t *vm, rb_ractor_t *r)
             cancel_single_ractor_mode();
             vm_insert_ractor0(vm, r, true);
             vm_ractor_blocking_cnt_inc(vm, r, __FILE__, __LINE__);
-            /* Same as the multi-Ractor branch above: the child joined the set, so drop
-             * the creator's cover.  The single-to-multi path used to skip this, and the
-             * global GC then enumerated and swept the child's objspace twice, freeing
-             * its live main Thread and root Fiber and breaking startup. */
+            /* As in the multi-Ractor branch: the child joined the set, so drop the
+             * creator's cover, or a global GC enumerates the child's objspace twice and
+             * sweeps its live main Thread and root Fiber. */
             rb_ractor_t *cur = rb_current_ractor_raw(false);
             if (cur && cur->creating_child_objspace == r->objspace) {
                 cur->creating_child_objspace = NULL;
@@ -617,12 +609,11 @@ vm_remove_ractor(rb_vm_t *vm, rb_ractor_t *cr)
         rb_gc_ractor_cache_free(cr->newobj_cache);
         cr->newobj_cache = NULL;
 
-        /* The objspace loses its owning thread here, so keep it enumerable for the
-         * global GC until inheritance merges it.  Register it in zombie_objspaces before
-         * decrementing cnt, because other Ractors' local GCs read
-         * rb_gc_single_objspace_p lock-free: the other order opens a window with cnt==1
-         * and no zombie, where a GC would skip shareable pinning and collect objects --
-         * a cc, say -- reachable only through this objspace. */
+        /* The objspace loses its owning thread: keep it enumerable until inheritance
+         * merges it.  Register in zombie_objspaces BEFORE decrementing cnt -- other
+         * Ractors read rb_gc_single_objspace_p lock-free, and the other order opens a
+         * cnt==1-no-zombie window where a GC skips shareable pinning and collects
+         * objects (a cc, say) reachable only through this objspace. */
         if (cr->objspace) {
             rb_gc_objspace_retire(&cr->objspace);
         }
@@ -963,10 +954,9 @@ ractor_check_blocking(rb_ractor_t *cr, unsigned int remained_thread_cnt, const c
 }
 
 
-/* Remove a child from the set that never started because send_parameters failed during
- * creation.  The creator calls this (rb_ractor_living_threads_remove assumes the
- * current Ractor), and disowning the objspace happens in the same VM-lock section, so
- * there is no window between leaving the set and joining zombie_objspaces. */
+/* Remove a child that never started (send_parameters failed during creation).  The
+ * creator calls this (rb_ractor_living_threads_remove assumes the current Ractor);
+ * leaving the set and disowning the objspace share one VM-lock section, no window. */
 void
 rb_ractor_cancel_creation(rb_ractor_t *r, rb_thread_t *th)
 {
@@ -1963,10 +1953,9 @@ struct obj_traverse_replace_data {
     rb_obj_traverse_replace_enter_func enter_func;
     rb_obj_traverse_replace_leave_func leave_func;
 
-    /* old -> new map, a plain st_table.  An OLD key may live in another Ractor's
-     * objspace, so it must not become a GC edge of this Ractor: marking a freed foreign
-     * key would be a use-after-free.  Keys are only compared by address; the
-     * replacements are kept alive by rec_keepalive. */
+    /* old -> new map, a plain st_table: an OLD key may live in another Ractor's
+     * objspace and must not become a GC edge here (marking a freed foreign key is a
+     * UAF).  Keys compare by address; replacements stay alive via rec_keepalive. */
     st_table *rec;
     VALUE rec_keepalive;
 
@@ -2077,10 +2066,9 @@ obj_traverse_replace_i(VALUE obj, struct obj_traverse_replace_data *data)
         return 0;
     }
 
-    /* Dedup before enter_func, so a revisited shared or cyclic node reuses the recorded
-     * replacement without entering.  Otherwise the copy path would build a temporary
-     * copy holding a cross-objspace edge and break objspace containment (besides being
-     * wasteful). */
+    /* Dedup before enter_func, so a revisited shared/cyclic node reuses its recorded
+     * replacement; otherwise the copy path would build a wasteful temporary holding a
+     * containment-breaking cross-objspace edge. */
     if (UNLIKELY(st_lookup(obj_traverse_replace_rec(data), (st_data_t)obj, &replacement))) {
         data->replacement = (VALUE)replacement;
         return 0;
@@ -2355,17 +2343,14 @@ struct rb_ractor_move_courier {
     struct ccan_list_node reg_node;  /* in-flight courier registry (a GC root while it lives) */
 };
 
-/* VM-global list of the move couriers in flight.  A courier is off-heap and carries
- * shareable REFs as raw pointers, and while it lives there are windows where it is only
- * reachable through a transient (a stack-local message queue, say) that neither the
- * queue nor a materialize frame covers, so a global GC could collect the REFs.  Each
- * courier is registered from build to free and marked and pinned by the global GC's
- * root pass.  Only shareable objects are carried, and only a global GC frees those, so
- * only it needs the pass.  Registering and removing run concurrently in several
- * Ractors and take the lock; marking is stop-the-world and does not.  Lockless marking
- * is only sound because add and remove contain no safepoint (no allocation, no
- * interrupt check) -- adding one would let a mark see a half-linked list across the
- * barrier.  (The list and lock live in vm->ractor.move_courier_registry.) */
+/* VM-global list of move couriers in flight (vm->ractor.move_courier_registry).  A
+ * courier is off-heap and carries shareable REFs as raw pointers; in some windows only
+ * a transient (a stack-local message queue, say) reaches it, so a global GC could
+ * collect the REFs.  Registered from build to free, marked and pinned by the global
+ * GC's root pass (only a global GC frees shareable objects, so only it needs this).
+ * add/remove run concurrently and take the lock; stop-the-world marking does not, which
+ * is sound only because add/remove contain no safepoint (none may be added: a mark
+ * could then see a half-linked list across the barrier). */
 
 static void
 move_courier_registry_add(struct rb_ractor_move_courier *c)
@@ -2426,17 +2411,15 @@ move_alloc_node(struct rb_ractor_move_courier *c)
 static void
 move_neutralize_source(VALUE obj)
 {
-    /* The shell stays in the original slot, so keep the capacity bits and give it a
-     * frozen, field-less ROBJECT shape.  The old body is then never read as ivars, and
-     * compaction's slot_size / shape_slot_size check still holds.  Read it before the
-     * flags are overwritten. */
+    /* The shell stays in the original slot: keep the capacity bits, give it a frozen
+     * field-less ROBJECT shape (read before the flags are overwritten).  The old body is
+     * then never read as ivars and compaction's slot-size check still holds. */
     shape_id_t shape_id = (RBASIC_SHAPE_ID(obj) & SHAPE_ID_CAPACITY_MASK) |
                           ROOT_SHAPE_ID | SHAPE_ID_LAYOUT_ROBJECT | SHAPE_ID_FL_FROZEN;
 
-    /* If the source is a non-T_OBJECT host (a String or Array with ivars, say), drop
-     * its generic_fields entry: obj stops being a host below and its fields_obj is
-     * collected, so a stale entry pointing at a freed value would be walked by the
-     * global GC. */
+    /* A non-T_OBJECT host (a String with ivars, say) must drop its generic_fields
+     * entry: obj stops being a host below and its fields_obj is collected, so a stale
+     * entry would let the global GC walk a freed value. */
     rb_free_generic_ivar(obj);
 
     VALUE flags = T_OBJECT | FL_FREEZE | (RBASIC(obj)->flags & FL_PROMOTED);
@@ -2499,10 +2482,10 @@ move_capture_ivars(struct move_build *b, VALUE obj, uint32_t id)
     b->c->nodes[id].iv_vals = oc.vals;
 }
 
-/* Capture obj into the courier, recurse into its children and return its node id.  The
- * id is registered before recursing, so a cycle back to obj resolves to the same node.
- * c->nodes can be reallocated while recursing, so node fields are written afterwards,
- * and the source is neutralized exactly once after the switch. */
+/* Capture obj into the courier, recurse into its children, return its node id.  The id
+ * is registered before recursing (a cycle back resolves to the same node); node fields
+ * are written after (recursion can realloc c->nodes); the source is neutralized exactly
+ * once after the switch. */
 static uint32_t
 move_capture(struct move_build *b, VALUE obj)
 {
@@ -2644,10 +2627,9 @@ move_capture(struct move_build *b, VALUE obj)
 
       case T_FILE:
       {
-        /* Carry the whole fptr (and its fd) by pointer, leaving the source as a shell
-         * that does not close it.  fptr's VALUE members are sender-side objects that
-         * lose their root once it becomes T_MOVED, so capture them as ordinary child
-         * nodes, detach them from fptr, and let rebuild write them into the shell. */
+        /* Carry the whole fptr (fd included) by pointer; the source shell does not
+         * close it.  fptr's VALUE members lose their root once the source is T_MOVED,
+         * so capture them as ordinary child nodes, detached; rebuild writes them back. */
         struct rb_io *fptr = RFILE(obj)->fptr;
         VM_ASSERT(!RTEST(fptr->tied_io_for_writing) && !RTEST(fptr->wakeup_mutex));
         uint32_t pathv_id   = move_capture(b, fptr->pathv);
@@ -2701,10 +2683,9 @@ move_preflight_hash_i(st_data_t key, st_data_t val, st_data_t arg)
     return ST_CONTINUE;
 }
 
-/* A read-only pre-walk following the same decision tree as move_capture.  Capture turns
- * each source into T_MOVED as it goes, so hitting an unmovable object midway would
- * leave the graph broken beyond repair; every "can not move" error is raised here,
- * before anything is mutated. */
+/* A read-only pre-walk of move_capture's decision tree.  Capture turns sources into
+ * T_MOVED as it goes, so an unmovable object midway would leave the graph broken beyond
+ * repair; every "can not move" error is raised here, before anything is mutated. */
 static void
 move_preflight(VALUE obj, st_table *seen)
 {
@@ -2784,12 +2765,10 @@ rb_ractor_move_courier_build(VALUE obj)
     struct rb_ractor_move_courier *c = ZALLOC(struct rb_ractor_move_courier);
     struct move_build b = { c, st_init_numtable() };
 
-    /* Between the send and the receiver's materialization, an off-heap courier's
-     * shareable REFs pass through windows where nothing roots them (a transient like a
-     * stack-local message queue that neither the queue nor a materialize frame covers),
-     * and a global GC could collect them.  Register the courier for its whole lifetime
-     * so the registry root marks and pins them.  Registering before the sources become
-     * T_MOVED is safe: partial nodes are initialized to be mark-safe. */
+    /* Between send and materialization the courier's shareable REFs pass through
+     * windows where nothing else roots them; register it for its whole lifetime so the
+     * registry root pass marks and pins them.  Registering before the sources become
+     * T_MOVED is safe: partial nodes are initialized mark-safe. */
     move_courier_registry_add(c);
 
     enum ruby_tag_type state;
@@ -2810,10 +2789,9 @@ rb_ractor_move_courier_build(VALUE obj)
     return c;
 }
 
-/* Shells are created with the base or real class, so re-attach the original subclass or
- * singleton class to keep the class (classes are shareable, so the reference is safe).
- * A singleton's attached object is still the sender's source, so re-attach it to the
- * shell. */
+/* Shells are created with the base/real class, so re-attach the original subclass or
+ * singleton class (classes are shareable; the reference is safe).  A singleton's
+ * attached object still points at the sender's source: re-attach it to the shell. */
 static void
 move_apply_moved_klass(VALUE shell, VALUE klass)
 {
@@ -2890,10 +2868,9 @@ rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
             }
             break;
           case MOVE_KIND_HASH:
-            /* Inserting entries is deferred to a third pass (below): insertion calls
-             * the key's #hash and #eql?, and a content-based custom #hash would collide
-             * on every key while the graph is still empty, collapsing entries and
-             * mixing up values. */
+            /* Entry insertion is deferred to a third pass: insertion calls the key's
+             * #hash / #eql?, and a content-based #hash would collide on every key while
+             * the graph is still empty, collapsing entries. */
             break;
           case MOVE_KIND_STRUCT:
             for (long j = 0; j < n->u.strct.len; j++) {
@@ -2925,10 +2902,9 @@ rb_ractor_move_courier_materialize(struct rb_ractor_move_courier *c)
         }
     }
 
-    /* Insert hash entries only once every shell is filled.  Node ids are assigned
-     * depth-first, so children have larger ids: inserting in reverse settles nested
-     * hash keys from the inside out (a pathological #hash cycling through itself is out
-     * of scope). */
+    /* Insert hash entries only once every shell is filled.  Ids are assigned
+     * depth-first (children larger), so inserting in reverse settles nested hash keys
+     * inside-out (a #hash cycling through itself is out of scope). */
     for (uint32_t i = c->count; i > 0; i--) {
         struct move_node *n = &c->nodes[i - 1];
         if (n->kind != MOVE_KIND_HASH) continue;
@@ -2984,10 +2960,9 @@ rb_ractor_move_courier_free(struct rb_ractor_move_courier *c)
             rb_match_move_free(n->u.match.regs);
             break;
           case MOVE_KIND_IO:
-            /* A delivered IO left fptr == NULL: the rebuilt IO owns it.  One that was
-             * never delivered (the send failed, or the queue was torn down) still owns
-             * the fd, and the source IO is already a RactorMovedObject, so nobody else
-             * can close it.  Close it here instead of leaking the descriptor. */
+            /* A delivered IO left fptr == NULL (the rebuilt IO owns it).  An
+             * undelivered one still owns the fd and its source is already a
+             * RactorMovedObject nobody can close: close it here, not leak it. */
             if (n->u.io.fptr) {
                 rb_io_fptr_finalize(n->u.io.fptr);
                 n->u.io.fptr = NULL;
@@ -3087,11 +3062,9 @@ ractor_native_shallow_copy(VALUE obj)
         return Qundef;
     }
 
-    /* A non-T_OBJECT host keeps its instance variables in the generic fields table, so
-     * copy them; T_HASH is excluded because rb_hash_dup already called
-     * rb_copy_generic_ivar (hash.c).  Calling it twice gives the copy an ivar shape on
-     * the first call, and the second rb_shape_rebuild asserts on its SHAPE_ROOT
-     * expectation (deterministically in a RUBY_DEBUG build). */
+    /* A non-T_OBJECT host keeps its ivars in the generic fields table: copy them.
+     * T_HASH is excluded -- rb_hash_dup already ran rb_copy_generic_ivar, and a second
+     * call asserts in rb_shape_rebuild (the first gave the copy an ivar shape). */
     if (BUILTIN_TYPE(obj) != T_OBJECT && BUILTIN_TYPE(obj) != T_HASH &&
         UNLIKELY(rb_obj_gen_fields_p(obj))) {
         rb_copy_generic_ivar(copy, obj);
@@ -3131,17 +3104,15 @@ copy_enter(VALUE obj, struct obj_traverse_replace_data *data)
         VALUE copy = ractor_native_shallow_copy(obj);
         if (UNDEF_P(copy)) return traverse_stop; /* no native copy for this type */
         data->replacement = copy;
-        /* Collect every node into the pin list while the snapshot is built: the basket
-         * keeps it so the global GC's re-pin covers all nodes, not just the root, since
-         * moving a snapshot node would break the address-keyed dedup table.  A generic
-         * ivar's fields_obj is not included: it is reachable through the global table,
-         * which compaction updates. */
+        /* Collect every node into the pin list as the snapshot is built: the global
+         * GC's re-pin must cover all nodes, not just the root (moving one breaks the
+         * address-keyed dedup table).  fields_obj is not included -- the global
+         * generic_fields table reaches it and compaction updates that. */
         rb_ractor_t *cr = GET_RACTOR();
         if (cr->gen_fields_capturing) {
-            /* Pin from the moment it is born (the shref bit, plus the pin bit during a
-             * global compaction).  rb_ractor_repin_in_flight re-pins the list under
-             * construction through cr->pin_capture, so the cover runs unbroken from
-             * construction through enqueue to materialization. */
+            /* Pin from birth (shref bit, plus the pin bit during a global compaction).
+             * rb_ractor_repin_in_flight re-pins via cr->pin_capture, so the cover runs
+             * unbroken from construction through enqueue to materialization. */
             ractor_pin_capture_push(cr, copy);
         }
         return traverse_cont;
@@ -3401,18 +3372,16 @@ rb_ractor_local_storage_ptr_set(rb_ractor_local_key_t key, void *ptr)
 void
 rb_ractor_finish_marking(void)
 {
-    /* A freed key's struct can only be released by a collection that purged it from
-     * every Ractor's storage with no other marker running: a global GC, or a single
-     * objspace.  A local GC also reaches here through gc_marks_finish and does nothing,
-     * which prevents a double free. */
+    /* A freed key's struct may only be released by a collection that purged every
+     * Ractor's storage with no other marker running: a global GC, or a single objspace.
+     * A local GC also reaches here (gc_marks_finish) and must do nothing. */
     if (!(rb_gc_single_objspace_p() || rb_gc_during_global_gc_p())) {
         return;
     }
 
-    /* The root scan's purge never reaches the storage of a zombie (terminated but not
-     * merged): it is not in the set, and zombie_objspaces only marks the join slot.
-     * Purge here before the struct is freed, or a later ractor_free reads a freed key.
-     * Runs under the barrier. */
+    /* The root scan's purge never reaches a zombie's storage (not in the set;
+     * zombie_objspaces only marks the join slot): purge here, under the barrier, before
+     * the struct is freed, or a later ractor_free reads a freed key. */
     rb_vm_t *vm = GET_VM();
     for (size_t zi = 0; zi < vm->gc.zombie_objspaces_count; zi++) {
         rb_ractor_t *owner = vm->gc.zombie_objspaces[zi].owner;

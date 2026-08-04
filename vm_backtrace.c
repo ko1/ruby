@@ -586,10 +586,9 @@ backtrace_alloc_capa(long num_frames, rb_backtrace_t **backtrace)
     return btobj;
 }
 
-/* Duplicate the backtrace so an exception copy does not carry a raw pointer to the sender's
- * into another objspace.  A frame only references shareable iseq / method entry imemos, so
- * duplicating is safe.  The lazily built strings and location array are left unset and
- * regenerated on the receiving side. */
+/* Duplicate the backtrace so an exception copy carries no raw pointer to the sender's.
+ * A frame only references shareable iseq / method-entry imemos, so duplicating is safe;
+ * the lazily built strings and location array are regenerated on the receiving side. */
 VALUE
 rb_backtrace_dup(VALUE btobj)
 {

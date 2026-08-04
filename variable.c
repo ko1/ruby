@@ -67,13 +67,11 @@ static void setup_const_entry(rb_const_entry_t *, VALUE, VALUE, rb_const_flag_t)
 static VALUE rb_const_search(VALUE klass, ID id, int exclude, int recurse, int visibility, VALUE *found_in);
 static st_table *generic_fields_tbl_;
 
-/* Mutex guarding the single global generic_fields table (all hosts, of every
- * Ractor).  A
- * local GC's marking (rb_mark_generic_ivar) reads that table but cannot wait for the
- * VM lock: joining a barrier mid-mark would expose a half-collected heap.  Hence a
- * dedicated mutex (vm->ractor.generic_fields_lock).  Cleaning the shared table is the
- * global GC's weak pass, which runs under the barrier and needs no lock.  Sections
- * that may allocate disable GC first so they cannot re-enter themselves. */
+/* Mutex guarding the single global generic_fields table (all hosts, every Ractor).  A
+ * dedicated mutex (vm->ractor.generic_fields_lock) because a local GC's marking reads
+ * the table and must not wait for the VM lock: joining a barrier mid-mark would expose
+ * a half-collected heap.  The global GC's weak pass cleans the table under the barrier,
+ * lock-free.  Sections that may allocate disable GC first: no self-re-entry. */
 
 typedef int rb_ivar_foreach_callback_func(ID key, VALUE val, st_data_t arg);
 static void rb_field_foreach(VALUE obj, rb_ivar_foreach_callback_func *func, st_data_t arg, bool ivar_only);
@@ -1405,10 +1403,9 @@ rb_free_generic_ivar(VALUE obj)
                  * obj_free), taking the table's mutex; never from a global GC sweep
                  * (the during_global_gc guard below). */
                 if (rb_gc_during_global_gc_p() || ruby_vm_during_cleanup) {
-                    /* Leave dead keys to the weak pass, which drains the table (the
-                     * same reasoning as the skip in rb_mark_generic_ivar).  The
-                     * free-at-exit walk of VM destruct discards the whole table, so it
-                     * needs no per-entry removal either. */
+                    /* Leave dead keys to the weak pass's drain (same reasoning as the
+                     * skip in rb_mark_generic_ivar); VM destruct's free-at-exit walk
+                     * discards the whole table, needing no per-entry removal either. */
                     break;
                 }
                 int deleted = 0;
@@ -1455,11 +1452,10 @@ rb_obj_set_fields(VALUE obj, VALUE fields_obj, ID field_name, VALUE original_fie
 
           default:
             {
-                /* st_insert may malloc.  Disable this Ractor's GC first, so holding
-                 * the lock cannot start our own local GC, whose marking would take
-                 * gf_lock again and deadlock against ourselves.  Growing the table can
-                 * still raise NoMemoryError, and leaking gf_lock would hang every later
-                 * generic-fields access, so unwind through a tag. */
+                /* st_insert may malloc: disable this Ractor's GC first, or our own
+                 * local GC's marking takes gf_lock again and self-deadlocks.  Growing
+                 * can still raise NoMemoryError, and leaking gf_lock hangs every later
+                 * generic-fields access: unwind through a tag. */
                 bool gc_disabled = RTEST(rb_gc_local_disable_no_rest());
                 rb_execution_context_t *insert_ec = GET_EC();
                 enum ruby_tag_type state;
@@ -1779,10 +1775,9 @@ static int
 imemo_fields_shref_i(ID key, VALUE val, st_data_t arg)
 {
     VALUE fields_obj = (VALUE)arg;
-    /* The fields_obj became shareable (rb_obj_set_shareable_no_assert) while this
-     * field value stayed unshareable -- a hidden [path, line] ivar, say, which
-     * make_shareable's traversal never reaches.  Record a shref so the shareable ->
-     * unshareable edge is tracked. */
+    /* The fields_obj became shareable while this field value stayed unshareable (a
+     * hidden [path, line] ivar, say, which make_shareable's traversal never reaches):
+     * record a shref so the shareable -> unshareable edge is tracked. */
     if (!SPECIAL_CONST_P(val) && !RB_OBJ_SHAREABLE_P(val)) {
         rb_gc_writebarrier(fields_obj, val);
     }

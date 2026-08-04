@@ -827,18 +827,16 @@ typedef struct rb_vm_struct {
          * the page pool.  Each Ractor owns its own rb_objspace through r->objspace,
          * and the boot objspace belongs to the main Ractor. */
         struct rb_global_objspace *global_objspace;
-        /* Objspaces of Ractors that terminated but have not been inherited yet.  No
-         * mutator runs in them; a global GC sweeps them under the barrier (missing one
-         * leaves stale mark bits, i.e. a use-after-free) and inheritance merges them
-         * under the VM lock.  owner_slot is the dead Ractor's r->objspace, cleared
-         * under the VM lock when it is inherited. */
+        /* Objspaces of terminated, not-yet-inherited Ractors.  No mutator runs in
+         * them; a global GC sweeps them under the barrier (missing one leaves stale
+         * mark bits = UAF), inheritance merges them under the VM lock.  owner_slot is
+         * the dead Ractor's r->objspace, cleared when inherited. */
         struct rb_objspace_zombie {
             void *objspace;
             void **owner_slot;
-            /* The Ractor that owns this zombie: it has terminated and left
-             * vm->ractor.set but has not been merged yet.  A root scan uses it to reach
-             * the owner's rb_gc_register_mark_object pins and its join value.  NULL for
-             * an orphan, whose Ractor struct is gone and has neither any more. */
+            /* The terminated Ractor owning this zombie; a root scan reaches its
+             * rb_gc_register_mark_object pins and join value through it.  NULL for an
+             * orphan, whose Ractor struct is gone and has neither any more. */
             struct rb_ractor_struct *owner;
             /* Heap pages this zombie holds: measured when it retires and refreshed
              * under the barrier of each global cycle.  The total below stays exactly
@@ -854,21 +852,19 @@ typedef struct rb_vm_struct {
 #if USE_MODULAR_GC
         struct gc_mark_func_data_struct *mark_func_data;
 #endif
-        /* One VM-wide list for rb_gc_register_address.  A registered slot can later
-         * hold a value from another objspace, so it is not split per Ractor: every
-         * Ractor's GC scans it conservatively in its root walk.  The lock is a leaf
-         * lock and register/unregister are cold paths. */
+        /* One VM-wide list for rb_gc_register_address: a slot can later hold another
+         * objspace's value, so it is not split per Ractor and every Ractor's GC scans it
+         * conservatively.  Leaf lock; register/unregister are cold paths. */
         struct {
             rb_nativethread_lock_t lock;
             VALUE **addrs;              /* rb_gc_register_address: mark_maybe on *addr */
             size_t addrs_cnt, addrs_capa;
         } registered_globals;
 
-        /* Number of holders keeping GC disabled (atomic).  A holder is either a
-         * Ractor that called GC.disable (its per-Ractor gc_disabled flag, at most one
-         * per Ractor) or a short internal critical section.  A single holder stops GC
-         * everywhere.  GC.enable only releases the caller's own hold, so it never
-         * overrides another Ractor's disable. */
+        /* Holders keeping GC disabled (atomic): Ractors that called GC.disable (at
+         * most one hold each) plus short internal critical sections.  One holder stops
+         * GC everywhere; GC.enable releases only the caller's own hold, never
+         * overriding another Ractor's disable. */
         rb_atomic_t disable_holders;
         /* Handle of the postponed job that merges an orphan objspace into the main
          * one (rb_postponed_job_handle_t; POSTPONED_JOB_HANDLE_INVALID when not
