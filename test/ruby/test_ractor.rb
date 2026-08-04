@@ -599,6 +599,28 @@ class TestRactor < Test::Unit::TestCase
     RUBY
   end
 
+  # A moved-away object is hollowed out in place; C code that still holds it
+  # (here an Enumerator's iteration over the Array) must not read the old body.
+  def test_move_object_iterated_by_enumerator
+    assert_ractor(<<~'RUBY', timeout: 60)
+      r = Ractor.new { loop { break if Ractor.receive == :eof } }
+      20.times do
+        a = [1, 2, 3, +"s"]
+        e = a.each
+        assert_equal 1, e.next
+        r.send(a, move: true)
+        begin
+          e.next
+        rescue Ractor::MovedError, StopIteration, TypeError
+          # a Ruby-level error is fine; a crash is not
+        end
+        GC.start
+      end
+      r.send(:eof)
+      r.value
+    RUBY
+  end
+
   # move must preserve the class of a String/Array/Hash subclass.
   def test_move_preserves_subclass
     assert_ractor(<<~'RUBY', timeout: 60)

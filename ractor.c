@@ -2426,6 +2426,13 @@ move_neutralize_source(VALUE obj)
     RBASIC_SET_CLASS_RAW(obj, rb_cRactorMovedObject);
     RBASIC(obj)->flags = flags;
     RBASIC_SET_FULL_SHAPE_ID(obj, shape_id);
+
+    /* Wipe the old body.  The shell has no fields, so nothing reads it as ivars, but
+     * C code holding the object from before the move still reads it with its old type
+     * (a running Array iteration, the RMatch capa of a $~ entry): a zeroed body makes
+     * those reads see an empty object instead of stale internals. */
+    size_t slot_size = rb_gc_obj_slot_size(obj);
+    MEMZERO((char *)obj + sizeof(struct RBasic), char, slot_size - sizeof(struct RBasic));
 }
 
 struct move_hash_ctx {
