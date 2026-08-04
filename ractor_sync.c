@@ -724,8 +724,8 @@ ractor_sync_mark(rb_ractor_t *r)
      * concurrent owner: our own Ractor, or under the global GC's barrier. */
     rb_ractor_t *cr = rb_current_ractor_raw(false);
     if (r == cr || rb_gc_during_global_gc_p()) {
-        /* The root of a copy snapshot being materialized is the frame chain of each EC
-         * (rb_execution_context_mark marks and re-pins it). */
+        /* (A copy snapshot being materialized is not marked here: each EC's frame
+         * chain roots it in rb_execution_context_mark, which also re-pins it.) */
         /* Until the value is absorbed this is its only reliable root (Qundef while the
          * Ractor still runs); after Ractor#value returns it, the Ruby side roots it. */
         rb_gc_mark(r->sync.legacy);

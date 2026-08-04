@@ -158,16 +158,8 @@ struct rb_ractor_struct {
      * joins the set. */
     void *creating_child_objspace;
 
-    /* Generic fields table for the unshareable objects this Ractor owns (owner-only,
-     * hence lock-free; the shareable ones live in the global table in variable.c).
-     * The keys are weak, so an entry disappears when its host object dies.  A local
-     * GC looks it up through rb_mark_generic_ivar and the global GC drains every
-     * table after marking.  Created lazily (NULL means still empty). */
-    /* Map of generic ivars used while Ractor#send makes a native copy.  capturing is
-     * true only while the sender builds the snapshot: when a host turns up, the
-     * capture is allocated lazily and its fields_obj recorded.  Materializing looks
-     * up a snapshot host's fields_obj on the receiving side, so the receiver never
-     * reaches into the sender's table. */
+    /* True while Ractor#send builds a native copy snapshot; copy_enter then collects
+     * every snapshot node into pin_capture below.  Owner thread only. */
     bool gen_fields_capturing;
 
     /* Pin list collecting every node while a copy snapshot is built (basket_new

@@ -1504,9 +1504,9 @@ rb_gc_obj_needs_cleanup_p(VALUE obj)
         return rb_gc_imemo_needs_cleanup_p(obj);
     }
 
-    /* A host with generic fields must drop its table entry when it is freed.  With
-     * per-Ractor and shared tables, the bulk cleanup at the start of a sweep can only
-     * touch our own table, so this per-object cleanup carries the correctness. */
+    /* A host with generic fields must drop its table entry when it is freed.  The
+     * process-wide table holds every Ractor's entries, so a sweep cannot bulk-wipe it;
+     * this per-object cleanup carries the correctness. */
     shape_id_t shape_id = RBASIC_SHAPE_ID(obj);
     if (rb_shape_has_fields(shape_id) && rb_shape_layout(shape_id) == SHAPE_ID_LAYOUT_OTHER) {
         return true;
@@ -2332,10 +2332,9 @@ rb_gc_obj_free_vm_weak_references(VALUE obj)
 {
     ASSUME(!RB_SPECIAL_CONST_P(obj));
 
-    /* Drop a generic-fields entry when its host's slot is freed.  With several tables,
-     * relying on the bulk cleanup would leave stale entries pointing at a dead key or
-     * fields_obj in the tables it does not touch, and the global GC's weak pass -- or a
-     * reader after the slot is reused -- would walk a freed page. */
+    /* Drop a generic-fields entry when its host's slot is freed.  The table is
+     * process-wide, so no sweep bulk-wipes it; a stale entry would let the global GC's
+     * weak pass -- or a reader after the slot is reused -- walk a freed page. */
     if (rb_obj_gen_fields_p(obj)) {
         rb_free_generic_ivar(obj);
     }
@@ -4751,9 +4750,9 @@ void rb_fstring_foreach_with_replace(int (*callback)(VALUE *str, void *data), vo
 bool
 rb_gc_vm_weak_table_essential_p(enum rb_gc_vm_weak_tables table)
 {
-    /* No bulk cleanup: generic fields tables are cleaned per object again
-     * (rb_gc_obj_free_vm_weak_references).  With several tables a local GC cannot wipe
-     * them all, and the bulk approach left stale entries in the ones it missed. */
+    /* No bulk cleanup: the generic_fields table is process-wide, so a local GC must not
+     * wipe other Ractors' live entries.  They are dropped per freed object instead
+     * (rb_gc_obj_free_vm_weak_references), and dead keys drain in the global GC's weak pass. */
     switch (table) {
       default:
         return false;
@@ -4815,10 +4814,9 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
       }
       case RB_GC_VM_GENERIC_FIELDS_TABLE: {
         /* There is one table.  A global GC walks it without a lock under the
-         * stop-the-world barrier; a local compaction is already excluded from other GCs
-         * by the GC-wide lock, so foreign keys cannot move and fall through the moved
-         * check.  The table's mutex (taken by shared_table_foreach) excludes mutator
-         * inserts. */
+         * stop-the-world barrier; a local compaction holds the barrier VM lock taken in
+         * gc_enter, so foreign keys cannot move and fall through the moved check.  The
+         * table's mutex (taken by shared_table_foreach) excludes mutator inserts. */
         if (rb_gc_during_global_gc_p()) {
             rb_generic_fields_tables_foreach(vm_weak_table_gen_fields_tbl_cb, (void *)&foreach_data);
         }

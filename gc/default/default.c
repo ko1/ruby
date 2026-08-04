@@ -619,7 +619,7 @@ typedef struct rb_objspace {
     mark_stack_t mark_stack;
     size_t marked_slots;
 
-    /* One allocator per objspace. */
+    /* Moved out of the per-Ractor newobj cache: allocation state is per objspace. */
     size_t incremental_mark_step_allocated_slots;
 
     /* Inputs of the global GC trigger, all owned by this objspace's thread.
@@ -835,8 +835,6 @@ static rb_global_objspace_t *global_objspace = NULL;
  * below it, while a single fat zombie crosses it. */
 #define ZOMBIE_PAGES_TRIGGER 256
 
-/* The mark and sweep predicates read each objspace's during_global_gc; this is the
- * driver's snapshot of it, taken under the barrier for one iteration. */
 static void objspace_absorb(rb_objspace_t *dst, rb_objspace_t *src);
 
 
@@ -4458,8 +4456,8 @@ gc_sweep_page(rb_objspace_t *objspace, rb_heap_t *heap, struct gc_sweep_context 
      * VM-global weak table (rb_gc_obj_free_vm_weak_references: ci_table, fstring, symbol,
      * cme) mutates that table, so wrap the page's free loop in a no-barrier VM lock.
      * Under a global GC the barrier already protects those tables, and a compacting
-     * local GC holds the GC-wide lock, so this nests harmlessly.  A non-main Ractor's
-     * local GC never frees such objects and does not take it. */
+     * local GC holds the barrier VM lock from gc_enter, so this nests harmlessly.  A
+     * non-main Ractor's local GC never frees such objects and does not take it. */
     const bool sweep_needs_vm_lock =
         objspace == global_objspace->main_objspace && rb_gc_multi_ractor_p() && !objspace->flags.during_global_gc;
     unsigned int sweep_lock_lev = 0;
