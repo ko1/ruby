@@ -58,8 +58,8 @@ VALUE rb_ivar_get_at_no_ractor_check(VALUE obj, attr_index_t index);
 void rb_generic_fields_lock_atfork(void);
 void rb_imemo_fields_record_shrefs(VALUE fields_obj);
 
-/* 単一の global generic_fields 表について cb(tbl,arg) を呼ぶ。global GC の weak pass と
- * compaction の参照更新（gc.c）から使う。 */
+/* Call cb(tbl, arg) for the single global generic_fields table.  Used by the global GC's weak
+ * pass and by compaction's reference update (gc.c). */
 void rb_generic_fields_tables_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg);
 void rb_generic_fields_shared_table_foreach(void (*cb)(struct st_table *tbl, void *arg), void *arg);
 

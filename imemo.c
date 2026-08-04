@@ -547,9 +547,9 @@ rb_imemo_mark_and_move(VALUE obj, bool reference_updating)
       case imemo_fields: {
         rb_gc_mark_and_move((VALUE *)&RBASIC(obj)->klass);
 
-        /* shareable な imemo_fields (class/module の fields) も unshareable な値を
-         * 参照しうる。write barrier がそれらを shref として記録するため、
-         * shareable 制約チェックがここを辿る。 */
+        /* A shareable imemo_fields (a class/module's fields) can reference unshareable values
+         * too.  The write barrier records those as shrefs, so the shareable constraint check
+         * walks here. */
         if (rb_obj_shape_complex_p(obj)) {
             st_table *tbl = rb_imemo_fields_complex_tbl(obj);
             if (reference_updating) {

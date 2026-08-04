@@ -1080,9 +1080,9 @@ match_set_regs(VALUE match, int num_regs, const OnigPosition *beg, const OnigPos
     rm->num_regs = num_regs;
 }
 
-/* Ractor#send(move:) で MatchData を別 objspace へ移送する補助。
- * match のレジスタを onig 非依存の blob へ書き出し、元の malloc 領域を解放して
- * 移送元を空殻にできるようにし、受信側で blob から match を組み立て直す。 */
+/* Helpers for carrying a MatchData to another objspace via Ractor#send(move:).  The match's
+ * registers are written out to an onig-independent blob so the original malloc'd area can be
+ * freed, leaving an empty shell behind, and rebuilt from the blob on the receiving side. */
 void *
 rb_match_move_dump(VALUE match, VALUE *regexp_out, VALUE *str_out, int *num_regs_out)
 {

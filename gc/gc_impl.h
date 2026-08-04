@@ -133,11 +133,12 @@ GC_IMPL_FN void rb_gc_impl_pin_in_flight_message(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN void rb_gc_impl_each_objects(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
 GC_IMPL_FN void rb_gc_impl_each_objects_shareable(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
 GC_IMPL_FN void rb_gc_impl_each_objects_foreign(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
-/* impl が per-Ractor の複数 objspace を扱えるか。false なら VM は objspace を 1 つに
- * 共有し、retire/absorb 等の per-Ractor objspace 機構を素通しにする。 */
+/* Whether the impl supports multiple per-Ractor objspaces.  When false the VM shares a single
+ * objspace and passes the per-Ractor objspace machinery (retire, absorb, ...) straight through. */
 GC_IMPL_FN bool rb_gc_impl_multi_objspace_p(void);
 GC_IMPL_FN bool rb_gc_impl_during_global_gc_p(void *objspace_ptr);
-/* obj が objspace_ptr ではない別 objspace の所有か。単一 objspace の impl は常に false。 */
+/* Whether obj is owned by an objspace other than objspace_ptr.  Always false for a single
+ * objspace impl. */
 GC_IMPL_FN bool rb_gc_impl_obj_foreign_p(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN bool rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN size_t rb_gc_impl_heap_page_count(void *objspace_ptr);
