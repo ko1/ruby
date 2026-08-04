@@ -8244,7 +8244,7 @@ gc_enter(rb_objspace_t *objspace, enum gc_enter_event event, unsigned int *lock_
      *
      * Hence a GC must never take the VM lock from inside itself: the waiter would join a
      * pending barrier mid-collection and expose its half-collected heap to the global GC.
-     * Shared structures the GC paths touch use their own native mutexes (id2ref, registered
+     * Shared structures the GC paths touch use their own native mutexes (registered
      * globals, generic fields) or the page-pool lock.
      *
      * Under RGENGC_CHECK_MODE a non-main local GC also takes the no-barrier VM lock
