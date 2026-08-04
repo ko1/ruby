@@ -7110,8 +7110,8 @@ pinned_roots_mark(rb_objspace_t *objspace, rb_heap_t *heap)
      *   - a shref is marked and traversed, like a remembered old->young target: without
      *     that, the referring shareable object is never walked and it would look
      *     unreachable.
-     * Objects can become shareable between GCs, so this runs at the start of a mark rather
-     * than during the previous sweep. */
+     * Objects can become shareable between GCs, so this pass scans the bitmaps in every
+     * mark (gc_marks_finish) instead of maintaining a pin set across the sweep. */
     ccan_list_for_each(&heap->pages, page, page_node) {
         if (!(page->flags.has_shareable_objects | page->flags.has_shref_objects)) continue;
 
