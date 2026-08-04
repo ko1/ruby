@@ -1978,7 +1978,7 @@ void
 rb_gc_impl_set_event_hook(void *objspace_ptr, const rb_event_flag_t event)
 {
     rb_objspace_t *objspace = objspace_ptr;
-    /* FREEOBJ is main-objspace only (design section 3; the caller masks it). */
+    /* FREEOBJ is main-objspace only (rb_objspace_set_event_hook masks it elsewhere). */
     GC_ASSERT(!(event & RUBY_INTERNAL_EVENT_FREEOBJ) ||
               objspace == global_objspace->main_objspace);
     objspace->hook_events = event & RUBY_INTERNAL_EVENT_OBJSPACE_MASK;
@@ -4732,8 +4732,9 @@ gc_sweep_start(rb_objspace_t *objspace)
     objspace->rincgc.pooled_slots = 0;
 
     if (RB_UNLIKELY(objspace->hook_events & RUBY_INTERNAL_EVENT_FREEOBJ)) {
-        /* FREEOBJ is never enabled outside the main objspace, so the hook cannot run
-         * during a worker's lock-free local sweep (a safety assumption of design §3). */
+        /* FREEOBJ is never enabled outside the main objspace
+         * (rb_objspace_set_event_hook), so this hook, which runs user callbacks,
+         * cannot fire during a non-main Ractor's lock-free local sweep. */
         GC_ASSERT(objspace == global_objspace->main_objspace);
         gc_sweep_freeobj_hooks(objspace);
     }
@@ -6609,7 +6610,7 @@ gc_verify_internal_consistency(void *objspace_ptr)
      * driver that sets during_gc everywhere already holds the lock and the barrier. */
     if (during_gc) {
         /* The world is stopped only when the global GC's driver runs this while holding
-         * the barrier; a non-main worker GC does not stop other Ractors. */
+         * the barrier; a non-main Ractor's local GC does not stop other Ractors. */
         gc_verify_internal_consistency_body(objspace, rb_gc_impl_during_global_gc_p(objspace));
         return;
     }

@@ -19,7 +19,7 @@ class TestObjSpaceRactor < Test::Unit::TestCase
     assert_ractor(<<~'RUBY', require: 'objspace')
       ready = Ractor::Port.new
       ch = Ractor.new(ready) do |port|
-        marker = +"RLGC_DUMP_MARKER_FOREIGN"
+        marker = +"DUMP_ALL_MARKER_FOREIGN"
         port << :built
         Ractor.receive
         marker.size
@@ -27,7 +27,7 @@ class TestObjSpaceRactor < Test::Unit::TestCase
       ready.receive
 
       dump = ObjectSpace.dump_all(output: :string)
-      assert_include dump, "RLGC_DUMP_MARKER_FOREIGN"
+      assert_include dump, "DUMP_ALL_MARKER_FOREIGN"
 
       ch.send(:go)
       ch.value

@@ -1040,8 +1040,8 @@ rb_gc_init_objspaces(void)
 }
 
 /* Stays true once the process has gone multi-Ractor (rb_multi_ractor_p goes back to
- * false when the workers finish).  Used by verification that spans generation state
- * built while multiple Ractors ran. */
+ * false when the other Ractors finish).  Used by verification that spans generation
+ * state built while multiple Ractors ran. */
 static bool gc_ever_multi_ractor = false;
 
 bool
@@ -1841,8 +1841,9 @@ rb_gc_obj_free(void *objspace, VALUE obj)
 void
 rb_objspace_set_event_hook(const rb_event_flag_t event)
 {
-    /* The FREEOBJ hook is main-objspace only (design section 3), so it never runs
-     * during a worker's lock-free local sweep.  Extending it VM-wide is future work. */
+    /* Only the main objspace may enable the FREEOBJ hook: it runs user callbacks from
+     * inside the sweep, which is unsafe in a non-main Ractor's lock-free local GC.
+     * Extending it VM-wide is future work. */
     rb_event_flag_t e = event;
     const rb_ractor_t *const cr = rb_current_ractor_raw(false);
     if (cr != NULL && cr != GET_VM()->ractor.main_ractor) {
