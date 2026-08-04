@@ -30,9 +30,9 @@ mark_cc_entry_i(VALUE ccs_ptr, void *data)
     VM_ASSERT(vm_ccs_p(ccs));
 
     if (METHOD_ENTRY_INVALIDATED(ccs->cme)) {
-        /* GC からは決して prune しない（mark のみ）。cc table の walk（dup 等）は
-         * 途中の割り当てで GC を起こしうるので、mark 時の xfree+DELETE は walk 中の
-         * iterator を脱線させ freed ccs を読ませる。掃除は mutator（VM lock 下）が行う。 */
+        /* Never prune from a GC, only mark.  A cc table walk (dup and friends) can trigger a
+         * GC from an allocation midway, so an xfree+DELETE while marking would derail the
+         * walking iterator into freed ccs.  The mutator cleans up, under the VM lock. */
         rb_gc_mark_movable((VALUE)ccs->cme);
         for (int i = 0; i < ccs->len; i++) {
             rb_gc_mark_movable((VALUE)ccs->entries[i].cc);

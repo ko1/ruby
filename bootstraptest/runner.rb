@@ -749,10 +749,10 @@ def assert_normal_exit(testsrc, *rest, timeout: BT.timeout, **opt)
   end
 end
 
-# timeout した子の hang 地点を CI ログへ残す。ABRT で ruby の crash report
-# (control frame / C backtrace / threading) を吐かせてから KILL する。
+# Record where a timed-out child hung in the CI log: ABRT makes ruby print its crash report
+# (control frame / C backtrace / threading) before we KILL it.
 def kill_after_dump(pid)
-  # Windows は子への ABRT 配送に対応しない。POSIX でのみ dump を試みる
+  # Windows does not deliver ABRT to a child, so only attempt the dump on POSIX
   if Signal.list.key?("ABRT") && !RUBY_PLATFORM.match?(/mswin|mingw/)
     begin
       Process.kill :ABRT, pid

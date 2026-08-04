@@ -421,10 +421,11 @@ rb_iseq_mark_and_move(rb_iseq_t *iseq, bool reference_updating)
         }
 
 #if USE_YJIT || USE_ZJIT
-        /* jit payload の排他域は VM lock (他 Ractor の compile/invalidate と競合し、
-         * yjit/zjit 側も rb_assert_holding_vm_lock)。lock-free な local GC からも
-         * 来るため barrier 非参加で取る。単一 objspace impl (mmtk) の mark は EC の
-         * 無い GC worker で走り lock は取得不能、STW なので競合も無く素で呼ぶ。 */
+        /* The JIT payload's critical section is the VM lock (it races another Ractor's
+         * compile/invalidate, and yjit/zjit call rb_assert_holding_vm_lock too).  A lock-free
+         * local GC reaches here as well, so take it without joining a barrier.  A single
+         * objspace impl (mmtk) marks on a GC worker with no EC, where the lock cannot be
+         * acquired and, being stop-the-world, is not needed. */
         const bool jit_payload_lock_p = rb_gc_multi_objspace_p();
         bool jit_payload_p = false;
 # if USE_YJIT

@@ -13,8 +13,8 @@ class TestObjSpaceRactor < Test::Unit::TestCase
     RUBY
   end
 
-  # dump_all / memsize_of_all は全 Ractor の objspace を対象にし、
-  # 他 Ractor の unshareable オブジェクトも含める
+  # dump_all / memsize_of_all cover every Ractor's objspace, including other Ractors'
+  # unshareable objects
   def test_dump_all_covers_all_ractors
     assert_ractor(<<~'RUBY', require: 'objspace')
       ready = Ractor::Port.new
